@@ -162,6 +162,13 @@ scode
 The REPL accepts prose and slash commands. Tab completion expands slash
 command names, model aliases, permission modes, and recent session IDs.
 
+The live status follows the foreground engine lifecycle. `Working...` remains
+visible during response output and tool execution; `Reasoning...` identifies
+streamed thinking content. A question or permission request shows a static
+`Waiting for your input` until answered. After the turn ends, the activity cue
+disappears and the normal result/footer returns. Background work keeps its
+separate task summary in the existing footer.
+
 `/memory` opens the discovered instruction file in `$VISUAL`, then `$EDITOR`,
 or `vi` when neither is set. With several instruction files, type to filter
 the file picker, press Enter to edit, or Esc to cancel. With none, it creates
@@ -200,7 +207,7 @@ green on success; and red on failure. The opening and closing
 caps stay bold to separate adjacent calls; long vertical borders use normal
 weight without dimming. Colors adapt to dark/light backgrounds and terminal
 color depth. `ColorTheme` is the single semantic color interface; its `info`
-role (including Thinking/Reasoning) and successful tool borders share one
+role (including Working/Reasoning) and successful tool borders share one
 soft-green definition. Syntax-backed colors load on demand and stay cached.
 Tool names use the shared Codex blue accent. Titles occupy one
 row and use an ellipsis when they exceed the available width. Running titles
@@ -210,7 +217,8 @@ list items keep their continuation lines aligned with the item text, including
 in session replay. Replayed message blocks have one blank separator.
 
 In the live REPL UI, Bash and MCP progress replaces the existing live
-status row; it does not append partial output or spinner summaries to terminal
+status row while working; input requests take priority over progress. It does
+not append partial output or spinner summaries to terminal
 history. The completed tool card retains its normal output preview. Progress
 is laid out with the same column and grapheme rules as other terminal text;
 external cursor/screen commands cannot take ownership of the live region.

@@ -270,7 +270,7 @@ fn iocraft_repl_ctrlc_hint_auto_dismisses() {
     wait_for_no_row_containing(&mut sess, HINT, Duration::from_secs(15));
 }
 
-/// Working activity renders in the StatusSlot during a turn.
+/// Working activity renders in the `StatusSlot` during a turn.
 /// Verifies the spinner shows the model name during streaming.
 /// This is the foundation test for the TurnPhase ChromeSlot — it
 /// confirms that phase-based rendering works end-to-end.
