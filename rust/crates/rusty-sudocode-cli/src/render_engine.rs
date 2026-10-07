@@ -242,12 +242,12 @@ impl EngineEventRenderer {
                 );
                 self.resume_spinner();
                 if let Some(spinner) = &self.spinner {
-                    spinner.set_retry(*attempt, *max_retries, reason.clone());
+                    spinner.set_retry(*attempt, *max_retries, reason);
                 }
             }
             RetryEvent::Resumed => {
                 if let Some(spinner) = &self.spinner {
-                    spinner.set_thinking(true);
+                    spinner.set_thinking(false);
                 }
             }
         }
@@ -517,8 +517,8 @@ impl EngineEventRenderer {
             }
             EngineEvent::PermissionRequest { id, request } => RenderOutcome::NeedPermission { id, request },
             EngineEvent::QuestionRequest { id, request } => RenderOutcome::NeedQuestion { id, request },
-            // No direct terminal effect: lifecycle/state/telemetry events. The
-            // spinner already tracks progress from the deltas above.
+            // No transcript output: the REPL event bridge projects lifecycle
+            // into live chrome; deltas above update response progress and phase.
             EngineEvent::PermissionDenied { .. }
             | EngineEvent::TurnStarted { .. }
             | EngineEvent::State(_)
@@ -612,7 +612,7 @@ fn format_tool_progress(progress: &ToolProgressEvent) -> String {
 ///
 /// ```text
 /// [hook PreToolUse] bash: echo hook-observed
-/// ⠙ 🦀 Thinking... [claude-sonnet-4-6] (0.4s)          ] bash: echo hook-observed
+/// ⠙ 🦀 Working... [claude-sonnet-4-6] (0.4s)           ] bash: echo hook-observed
 /// ```
 ///
 /// Every other event in this renderer already went through `write_out`, which

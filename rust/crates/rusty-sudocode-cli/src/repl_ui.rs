@@ -13,7 +13,7 @@
 //!
 //! ```text
 //! [PendingSlot]   ← in-flight tools and queued messages
-//! [StatusSlot]    ← spinner | turn_result | tips | empty
+//! [StatusSlot]    ← activity | turn_result | tips | empty
 //! [TodoSlot]      ← todo summary and items | empty
 //! ──── separator ────
 //! [InputSlot]     ← hint | text_input | question_panel
@@ -21,15 +21,15 @@
 //! [FooterSlot]    ← hint (3s) > turn_active > minimal > full
 //! ```
 
-use std::fmt::Write as FmtWrite;
 use std::io::{self, Write};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use crate::render::activity::ActivityState;
 use commands::suggest_slash_commands;
 use crossterm::style::Color as TerminalColor;
+use engine_events::EngineState;
 use iocraft::prelude::*;
 
 mod ansi_text;
@@ -145,192 +145,15 @@ mod stderr_redirect {
     }
 }
 
-// ── TurnPhase + SpinnerState ───────────────────────────────────────────
-
-/// Phase of the current agent turn — drives spinner icon/label selection.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum TurnPhase {
-    Thinking,
-    Reasoning,
-    Retry {
-        attempt: u32,
-        max_retries: u32,
-        reason: String,
-    },
-    Paused,
-}
-
-/// Shared state for the spinner, read by the render thread and written
-/// by the runner thread.
-#[derive(Clone)]
-pub struct SpinnerState {
-    pub(crate) progress: Arc<crate::render::spinner_progress::SpinnerProgress>,
-    phase: Arc<Mutex<TurnPhase>>,
-    active: Arc<AtomicBool>,
-    start_time: Arc<Mutex<Instant>>,
-    label: Arc<Mutex<String>>,
-    model: Arc<Mutex<Option<String>>>,
-    token_budget: Arc<Mutex<Option<u32>>>,
-}
-
-impl SpinnerState {
-    /// Create a new inactive spinner state.
-    #[must_use]
-    pub fn new_inactive() -> Self {
-        Self {
-            progress: Arc::new(crate::render::spinner_progress::SpinnerProgress::new()),
-            phase: Arc::new(Mutex::new(TurnPhase::Thinking)),
-            active: Arc::new(AtomicBool::new(false)),
-            start_time: Arc::new(Mutex::new(Instant::now())),
-            label: Arc::new(Mutex::new(String::new())),
-            model: Arc::new(Mutex::new(None)),
-            token_budget: Arc::new(Mutex::new(None)),
-        }
-    }
-
-    /// Reset and activate for a new turn.
-    pub fn start_turn(&self, label: &str, model: Option<&str>, token_budget: Option<u32>) {
-        self.progress.reset();
-        *self.phase.lock().unwrap() = TurnPhase::Thinking;
-        *self.start_time.lock().unwrap() = Instant::now();
-        *self.label.lock().unwrap() = label.to_string();
-        *self.model.lock().unwrap() = model.map(ToString::to_string);
-        *self.token_budget.lock().unwrap() = token_budget;
-        self.active.store(true, Ordering::SeqCst);
-    }
-
-    /// Deactivate after a turn ends.
-    pub fn stop_turn(&self) {
-        self.active.store(false, Ordering::SeqCst);
-    }
-
-    /// Read the current turn phase.
-    pub fn phase(&self) -> TurnPhase {
-        self.phase.lock().unwrap().clone()
-    }
-
-    /// Convenience: check whether the current phase is `Paused`.
-    pub fn is_paused(&self) -> bool {
-        *self.phase.lock().unwrap() == TurnPhase::Paused
-    }
-
-    /// Return a clone of the phase `Arc` for sharing with other threads.
-    pub fn phase_arc(&self) -> Arc<Mutex<TurnPhase>> {
-        Arc::clone(&self.phase)
-    }
-
-    /// Render the current spinner frame as a colored ANSI string.
-    /// Returns empty string when inactive or paused.
-    pub fn render_frame(&self, frame_index: usize) -> String {
-        if !self.active.load(Ordering::SeqCst) {
-            return String::new();
-        }
-
-        let current_phase = self.phase.lock().unwrap().clone();
-        if current_phase == TurnPhase::Paused {
-            return String::new();
-        }
-
-        let is_reasoning = current_phase == TurnPhase::Reasoning;
-        let is_retry = matches!(current_phase, TurnPhase::Retry { .. });
-
-        let (frame, current_label): (String, String) = if is_retry {
-            if let TurnPhase::Retry {
-                attempt,
-                max_retries,
-                ref reason,
-            } = current_phase
-            {
-                (
-                    "\u{27f3}".to_string(),
-                    format!("Retry {attempt}/{max_retries}: {reason}"),
-                )
-            } else {
-                unreachable!()
-            }
-        } else if is_reasoning {
-            let reasoning_frames: &[&str] = &["\u{25d0}", "\u{25d3}", "\u{25d1}", "\u{25d2}"];
-            (
-                reasoning_frames[frame_index % reasoning_frames.len()].to_string(),
-                "\u{1f9e0} Reasoning...".to_string(),
-            )
-        } else {
-            let thinking_frames: &[&str] = &[
-                "\u{280b}", "\u{2819}", "\u{2839}", "\u{2838}", "\u{283c}", "\u{2834}", "\u{2826}",
-                "\u{2827}", "\u{2807}", "\u{280f}",
-            ];
-            let label = self.label.lock().unwrap();
-            (
-                thinking_frames[frame_index % thinking_frames.len()].to_string(),
-                label.clone(),
-            )
-        };
-
-        let elapsed = self.start_time.lock().unwrap().elapsed().as_secs_f64();
-
-        let mut line = format!("{frame} {current_label}");
-        if let Some(ref m) = *self.model.lock().unwrap() {
-            let _ = write!(line, " [{m}]");
-        }
-        let _ = write!(line, " ({elapsed:.1}s)");
-
-        let bytes = self.progress.response_bytes();
-        let token_budget = *self.token_budget.lock().unwrap();
-        if bytes > 0 && elapsed >= 1.0 {
-            let approx_tokens = bytes / 4;
-            if let Some(budget) = token_budget {
-                let pct = (f64::from(approx_tokens) / f64::from(budget) * 100.0).min(100.0);
-                let fmt_t = format_compact_tokens(approx_tokens);
-                let fmt_b = format_compact_tokens(budget);
-                let _ = write!(line, " \u{2193} {fmt_t} / {fmt_b} ({pct:.0}%)");
-                if approx_tokens >= 2000 && elapsed > 5.0 {
-                    let rate = f64::from(approx_tokens) / elapsed;
-                    let remaining = f64::from(budget.saturating_sub(approx_tokens));
-                    let eta_secs = remaining / rate;
-                    let _ = if eta_secs >= 60.0 {
-                        write!(line, " ~{:.0}m", eta_secs / 60.0)
-                    } else {
-                        write!(line, " ~{eta_secs:.0}s")
-                    };
-                }
-            } else {
-                let _ = if approx_tokens >= 1000 {
-                    write!(
-                        line,
-                        " \u{2193} {:.1}k tokens",
-                        f64::from(approx_tokens) / 1000.0
-                    )
-                } else {
-                    write!(line, " \u{2193} {approx_tokens} tokens")
-                };
-            }
-        }
-
-        let color =
-            crate::render::theme().spinner_fg(is_retry || self.progress.is_stalled(is_reasoning));
-        format!("{color}{line}{}", crate::render::RESET)
-    }
-}
-
-fn format_compact_tokens(tokens: u32) -> String {
-    if tokens >= 1_000_000 {
-        format!("{:.1}M", f64::from(tokens) / 1_000_000.0)
-    } else if tokens >= 1_000 {
-        format!("{:.1}k", f64::from(tokens) / 1_000.0)
-    } else {
-        tokens.to_string()
-    }
-}
-
 // ── ChromeSlot enums ──────────────────────────────────────────────────
 
 /// ChromeSlot: status area above the separator. One variant renders at a time.
 ///
-/// Priority: Spinner > TurnResult > Tips > Empty.
+/// Priority: Activity > TurnResult > Tips > Empty.
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum StatusSlot {
-    /// Animated progress during a turn.
-    Spinner(String),
+    /// Running activity or an explicit input request.
+    Active(String),
     /// Turn result (tokens/cost/ctx). Cleared when the next turn starts.
     TurnResult(Arc<StyledText>),
     /// First-run tips. Dismissed on first submit.
@@ -1115,7 +938,7 @@ pub struct ReplHandle {
     pub output: OutputSender,
     pub ui: UiCommandSender,
     pub input_rx: Receiver<InputEvent>,
-    pub spinner: SpinnerState,
+    pub spinner: ActivityState,
     ui_thread: Option<std::thread::JoinHandle<()>>,
 }
 
@@ -1150,7 +973,7 @@ impl ReplHandle {
         OutputSender,
         UiCommandSender,
         Receiver<InputEvent>,
-        SpinnerState,
+        ActivityState,
         Box<dyn FnOnce()>,
     ) {
         let join_fn = {
@@ -1437,7 +1260,7 @@ struct ReplContext {
     terminal_handoff: Arc<Mutex<Option<TerminalHandoff>>>,
     ui_rx: Arc<Mutex<Receiver<UiCommand>>>,
     input_tx: SyncSender<InputEvent>,
-    spinner: SpinnerState,
+    spinner: ActivityState,
     permission_mode: String,
     tips_line: String,
     stderr_redir: Arc<Mutex<Option<stderr_redirect::StderrRedirect>>>,
@@ -1497,7 +1320,7 @@ fn ReplApp(mut hooks: Hooks) -> impl Into<AnyElement<'static>> {
     let mut system = hooks.use_context_mut::<SystemContext>();
     let mut input_value = hooks.use_state(String::new);
     let mut frame = hooks.use_state(|| 0usize);
-    let mut spinner_text = hooks.use_state(String::new);
+    let mut activity_frame = hooks.use_state(|| (EngineState::Idle, String::new()));
     let mut tool_progress = hooks.use_state(|| None::<String>);
     let mut turn_result = hooks.use_state(|| None::<Arc<StyledText>>);
     let mut has_submitted = hooks.use_state(|| false);
@@ -1745,7 +1568,10 @@ fn ReplApp(mut hooks: Hooks) -> impl Into<AnyElement<'static>> {
             if let Some(deadline) = todo_hide_deadline {
                 if Instant::now() >= deadline {
                     if let Ok(mut items) = todo_items_for_future.lock() {
-                        items.clear();
+                        if !items.is_empty() {
+                            items.clear();
+                            frame.set(frame.get().wrapping_add(1));
+                        }
                     }
                     todo_hide_deadline = None;
                 }
@@ -1760,34 +1586,21 @@ fn ReplApp(mut hooks: Hooks) -> impl Into<AnyElement<'static>> {
                 footer_hint.set(None);
             }
 
-            // Update spinner.  When a new turn starts (spinner becomes
-            // active), clear the previous turn's result — the spinner
-            // takes priority in the StatusSlot and the old result is stale.
-            //
-            // Only mutate state when it actually changes. `render_frame`
-            // returns "" whenever the spinner is inactive (idle), so the old
-            // unconditional `frame.set(idx+1)` + `spinner_text.set("")` churned
-            // identical state on every 80ms idle tick. Per iocraft's render
-            // model an unconditional `State::set` — even to the same value —
-            // resolves `component.wait()` and can starve `term.wait()`, dropping
-            // keyboard events (the failure mode guarded by
-            // `iocraft_repl_keyboard_input_not_frozen`). Leaving idle ticks
-            // untouched keeps key-event distribution alive between renders.
+            // One lifecycle snapshot drives the status and footer. Animate
+            // only Running; AwaitingInput is static, Idle changes no UI state.
+            // Identical idle State::set calls starve keyboard delivery in iocraft.
             let idx = frame.get();
-            let text = spinner_for_future.render_frame(idx);
-            if !text.is_empty() {
-                frame.set(idx.wrapping_add(1));
-                if turn_result.read().is_some() {
-                    turn_result.set(None);
-                }
-            }
-            if is_preview_changed && text.is_empty() {
-                // A stable Markdown block may pause the spinner. Subsequent
-                // pending prose still needs one coalesced layout on this tick.
+            let state = spinner_for_future.engine_state();
+            let text = spinner_for_future.render_frame(idx, state);
+            if state == EngineState::Running || is_preview_changed {
                 frame.set(idx.wrapping_add(1));
             }
-            if *spinner_text.read() != text {
-                spinner_text.set(text);
+            if state != EngineState::Idle && turn_result.read().is_some() {
+                turn_result.set(None);
+            }
+            let next = (state, text);
+            if *activity_frame.read() != next {
+                activity_frame.set(next);
             }
         }
     });
@@ -2379,19 +2192,23 @@ fn ReplApp(mut hooks: Hooks) -> impl Into<AnyElement<'static>> {
     }
 
     // ── Derive ChromeSlots from state ──────────────────────────────────
-    let st = spinner_text.read().clone();
+    let (activity_state, st) = activity_frame.read().clone();
     let val = input_value.read().clone();
     let current_input_slot = input_slot.read().clone();
     let submitted = *has_submitted.read();
 
-    // StatusSlot: Spinner > TurnResult > Tips > Empty
-    let status_slot = if !st.is_empty() {
+    // StatusSlot: Activity > TurnResult > Tips > Empty
+    let status_slot = if activity_state != EngineState::Idle {
         // Reuse the existing status row and shared column layout. No additional
         // live rows can spill into scrollback as tool output grows.
-        let text = tool_progress.read().as_ref().map_or(st, |text| {
-            crate::render::text_layout::truncate_to_width(text, term_width as usize)
-        });
-        StatusSlot::Spinner(text)
+        let text = if activity_state == EngineState::Running {
+            tool_progress.read().as_ref().map_or(st, |text| {
+                crate::render::text_layout::truncate_to_width(text, term_width as usize)
+            })
+        } else {
+            st
+        };
+        StatusSlot::Active(text)
     } else if let Some(ref tr) = *turn_result.read() {
         StatusSlot::TurnResult(tr.clone())
     } else if !submitted {
@@ -2403,7 +2220,7 @@ fn ReplApp(mut hooks: Hooks) -> impl Into<AnyElement<'static>> {
     // FooterSlot: Hint > TurnActive > Minimal > Full
     let footer_slot = if let Some((ref msg, _)) = *footer_hint.read() {
         FooterSlot::Hint(msg.clone())
-    } else if matches!(status_slot, StatusSlot::Spinner(_)) {
+    } else if activity_state != EngineState::Idle {
         FooterSlot::TurnActive
     } else if submitted {
         FooterSlot::Minimal
@@ -2493,7 +2310,7 @@ fn ReplApp(mut hooks: Hooks) -> impl Into<AnyElement<'static>> {
     let question_style = chrome_style(TerminalColor::Cyan);
     let status_rows = {
         let rows = match &status_slot {
-            StatusSlot::Spinner(text) => chrome_rows(text, w),
+            StatusSlot::Active(text) => chrome_rows(text, w),
             StatusSlot::TurnResult(text) => chrome_rows(&text.text, w),
             StatusSlot::Tips => chrome_rows(&tips_text, w),
             StatusSlot::Empty => 0,
@@ -2548,7 +2365,7 @@ fn ReplApp(mut hooks: Hooks) -> impl Into<AnyElement<'static>> {
     let preview_height = Size::Length(u32::try_from(preview_rows).unwrap_or(0));
     let status_height = Size::Length(u32::try_from(status_rows).unwrap_or(0));
     let status_element = match &status_slot {
-        StatusSlot::Spinner(s) => Some(AnyElement::from(
+        StatusSlot::Active(s) => Some(AnyElement::from(
             element! { AnsiText(content: s.clone(), width: slot_width) },
         )),
         StatusSlot::TurnResult(s) => Some(AnyElement::from(
@@ -2716,7 +2533,7 @@ pub fn spawn_repl_ui(
     let (output_tx, output_rx) = mpsc::sync_channel::<OutputMsg>(512);
     let (ui_tx, ui_rx) = mpsc::sync_channel::<UiCommand>(16);
     let (input_tx, input_rx) = mpsc::sync_channel::<InputEvent>(16);
-    let spinner = SpinnerState::new_inactive();
+    let spinner = ActivityState::new();
 
     let stderr_redir: Arc<Mutex<Option<stderr_redirect::StderrRedirect>>> =
         Arc::new(Mutex::new(None));
