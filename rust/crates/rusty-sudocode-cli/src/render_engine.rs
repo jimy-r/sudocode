@@ -563,11 +563,7 @@ impl Drop for EngineEventRenderer {
 /// (`ToolProgressEvent`) and the ANSI/glyph formatting lives here, above the
 /// seam. External output is text, never terminal cursor or screen control.
 fn format_tool_progress(progress: &ToolProgressEvent) -> String {
-    let summary = |text: &str| {
-        crate::render::styled_text::StyledText::from_ansi(text)
-            .text
-            .replace(['\r', '\n', '\t'], " ")
-    };
+    use crate::render::text_layout::single_line as summary;
     match progress {
         ToolProgressEvent::Bash {
             last_line,

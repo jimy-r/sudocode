@@ -14,6 +14,17 @@ fn strip_ansi(input: &str) -> Cow<'_, str> {
     }
 }
 
+/// Keep transient status descriptions on one row and discard terminal controls.
+#[inline]
+pub(crate) fn single_line(input: &str) -> Cow<'_, str> {
+    let plain = strip_ansi(input);
+    if plain.contains(['\n', '\r', '\t']) {
+        Cow::Owned(plain.replace(['\n', '\r', '\t'], " "))
+    } else {
+        plain
+    }
+}
+
 pub(crate) fn display_width(input: &str) -> usize {
     let plain = strip_ansi(input);
     if !plain.contains('\t') {

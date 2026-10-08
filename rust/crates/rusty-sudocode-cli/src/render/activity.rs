@@ -249,7 +249,8 @@ pub(super) fn progress_line(
     }
     let logo = brand_spinner::frame(frame_index);
     let reserved = text_layout::display_width(logo) + 1 + text_layout::display_width(&details);
-    let label = text_layout::truncate_to_width(label, width.saturating_sub(reserved));
+    let label = text_layout::single_line(label);
+    let label = text_layout::truncate_to_width(&label, width.saturating_sub(reserved));
     let theme = theme();
     let line = format!(
         "{}{logo}{} {label}{details}{RESET}",
