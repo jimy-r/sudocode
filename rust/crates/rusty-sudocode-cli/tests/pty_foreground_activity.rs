@@ -174,6 +174,10 @@ fn streaming_output_cannot_hide_a_running_foreground_turn() {
 }
 
 #[test]
+#[allow(
+    clippy::redundant_closure_for_method_calls,
+    reason = "PTY render needs a higher-ranked closure over screen lifetimes."
+)]
 fn question_owns_the_status_until_answered_then_running_resumes() {
     let env = quiet_fixture("foreground-question-activity", "QUESTION_TOOL_FINISHED");
     let mut session = start(&env);
@@ -212,10 +216,10 @@ fn question_owns_the_status_until_answered_then_running_resumes() {
         common::DEFAULT_TIMEOUT,
         "question panel owns input without an animation or duplicate waiting row",
     );
-    let waiting = session.render(pty_expect::Screen::contents);
+    let waiting = session.render(|screen| screen.contents());
     std::thread::sleep(Duration::from_millis(320));
     assert_eq!(
-        session.render(pty_expect::Screen::contents),
+        session.render(|screen| screen.contents()),
         waiting,
         "waiting does not animate"
     );
