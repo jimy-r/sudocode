@@ -9,10 +9,12 @@ use std::{
 
 use engine_events::EngineState;
 
-use super::{ansi_fg, spinner_progress::SpinnerProgress, theme, RESET};
+use super::{spinner_progress::SpinnerProgress, text_layout, theme, RESET};
 
-pub(crate) const WORKING_LABEL: &str = "🦀 Working...";
-pub(super) const REASONING_LABEL: &str = "🧠 Reasoning...";
+mod brand_spinner;
+
+pub(crate) const THINKING_LABEL: &str = "Thinking...";
+pub(super) const REASONING_LABEL: &str = "Reasoning...";
 
 #[derive(Clone)]
 enum ActivityPhase {
@@ -96,79 +98,136 @@ impl ActivityState {
         };
     }
 
-    /// Render a frame for one lifecycle snapshot, shared by status and footer.
-    pub(crate) fn render_frame(&self, frame_index: usize, state: EngineState) -> String {
-        match state {
-            EngineState::Idle => return String::new(),
-            EngineState::AwaitingInput => {
-                return format!(
-                    "{}? Waiting for your input{RESET}",
-                    ansi_fg(theme().warning)
-                )
-            }
-            EngineState::Running => {}
+    /// Render one status content variant; lifecycle still owns the footer.
+    pub(crate) fn render_frame(
+        &self,
+        frame_index: usize,
+        state: EngineState,
+        tools: ToolActivity<'_>,
+        width: usize,
+    ) -> String {
+        // Questions and approvals already own InputSlot. Remove the working
+        // row while waiting rather than adding a second instruction above it.
+        if state != EngineState::Running {
+            return String::new();
         }
-        let phase = self.phase.lock().unwrap().clone();
-        let reasoning = matches!(phase, ActivityPhase::Reasoning);
-        let retry = matches!(phase, ActivityPhase::Retry { .. });
-        let retry_label;
-        let (frame, label) = match phase {
+        let phase = self.phase.lock().unwrap();
+        let content = match &*phase {
             ActivityPhase::Retry {
                 attempt,
                 max_retries,
                 reason,
-            } => {
-                retry_label = format!("Retry {attempt}/{max_retries}: {reason}");
-                ("⟳", retry_label.as_str())
+            } => StatusContent::Retry {
+                attempt: *attempt,
+                max_retries: *max_retries,
+                reason,
+            },
+            ActivityPhase::Reasoning => StatusContent::Reasoning,
+            ActivityPhase::Working if tools.count > 0 || tools.progress.is_some() => {
+                StatusContent::Tools(tools)
             }
-            ActivityPhase::Reasoning => (animation_frame(frame_index, true), REASONING_LABEL),
-            ActivityPhase::Working => (animation_frame(frame_index, false), WORKING_LABEL),
+            ActivityPhase::Working => StatusContent::Thinking,
         };
+        let reasoning = matches!(content, StatusContent::Reasoning);
+        let warning =
+            matches!(content, StatusContent::Retry { .. }) || self.progress.is_stalled(reasoning);
+        let label = content.label();
         let metadata = self.metadata.lock().unwrap();
-        let line = progress_line(
-            frame,
-            label,
-            metadata.model.as_deref(),
-            metadata.start.elapsed().as_secs_f64(),
-            self.progress.response_bytes(),
-            metadata.token_budget,
-        );
-        let color = theme().spinner_fg(retry || self.progress.is_stalled(reasoning));
-        format!("{color}{line}{RESET}")
+        progress_line(
+            frame_index,
+            &label,
+            ProgressValues {
+                model: metadata.model.as_deref(),
+                elapsed: metadata.start.elapsed().as_secs_f64(),
+                bytes: self.progress.response_bytes(),
+                token_budget: metadata.token_budget,
+            },
+            width,
+            warning,
+        )
     }
 }
 
-#[inline]
-pub(super) fn animation_frame(index: usize, reasoning: bool) -> &'static str {
-    let frames: &[&str] = if reasoning {
-        &["◐", "◓", "◑", "◒"]
-    } else {
-        &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
-    };
-    frames[index % frames.len()]
+/// Borrowed projection of the existing pending cards and latest progress.
+/// This is not a second tool registry or independently maintained counter.
+#[derive(Default)]
+pub(crate) struct ToolActivity<'a> {
+    pub(crate) count: usize,
+    pub(crate) name: Option<&'a str>,
+    pub(crate) progress: Option<&'a str>,
+}
+
+/// Mutually exclusive content modules inside the existing status row.
+enum StatusContent<'a> {
+    Thinking,
+    Reasoning,
+    Tools(ToolActivity<'a>),
+    Retry {
+        attempt: u32,
+        max_retries: u32,
+        reason: &'a str,
+    },
+}
+
+impl StatusContent<'_> {
+    #[inline]
+    fn label(&self) -> std::borrow::Cow<'_, str> {
+        match self {
+            Self::Thinking => THINKING_LABEL.into(),
+            Self::Reasoning => REASONING_LABEL.into(),
+            Self::Retry {
+                attempt,
+                max_retries,
+                reason,
+            } => format!("Retry {attempt}/{max_retries}: {reason}").into(),
+            Self::Tools(tools) => {
+                let mut label = match tools.count {
+                    0 => "Running…".to_string(),
+                    1 => format!("Running {}…", tools.name.unwrap_or("tool")),
+                    count => format!("Running {count} tools…"),
+                };
+                if let Some(progress) = tools.progress {
+                    let _ = write!(label, " · {progress}");
+                }
+                label.into()
+            }
+        }
+    }
+}
+
+pub(super) struct ProgressValues<'a> {
+    pub(super) model: Option<&'a str>,
+    pub(super) elapsed: f64,
+    pub(super) bytes: u32,
+    pub(super) token_budget: Option<u32>,
 }
 
 /// One formatter for inline and one-shot model/time/token/budget/ETA display.
 #[inline]
 pub(super) fn progress_line(
-    frame: &str,
+    frame_index: usize,
     label: &str,
-    model: Option<&str>,
-    elapsed: f64,
-    bytes: u32,
-    token_budget: Option<u32>,
+    values: ProgressValues<'_>,
+    width: usize,
+    warning: bool,
 ) -> String {
-    let mut line = format!("{frame} {label}");
+    let ProgressValues {
+        model,
+        elapsed,
+        bytes,
+        token_budget,
+    } = values;
+    let mut details = String::new();
     if let Some(model) = model {
-        let _ = write!(line, " [{model}]");
+        let _ = write!(details, " [{model}]");
     }
-    let _ = write!(line, " ({elapsed:.1}s)");
+    let _ = write!(details, " ({elapsed:.1}s)");
     if bytes > 0 && elapsed >= 1.0 {
         let tokens = bytes / 4;
         if let Some(budget) = token_budget {
             let pct = (f64::from(tokens) / f64::from(budget) * 100.0).min(100.0);
             let _ = write!(
-                line,
+                details,
                 " ↓ {} / {} ({pct:.0}%)",
                 compact_tokens(tokens),
                 compact_tokens(budget)
@@ -177,18 +236,32 @@ pub(super) fn progress_line(
                 let rate = f64::from(tokens) / elapsed;
                 let eta = f64::from(budget.saturating_sub(tokens)) / rate;
                 let _ = if eta >= 60.0 {
-                    write!(line, " ~{:.0}m", eta / 60.0)
+                    write!(details, " ~{:.0}m", eta / 60.0)
                 } else {
-                    write!(line, " ~{eta:.0}s")
+                    write!(details, " ~{eta:.0}s")
                 };
             }
         } else if tokens >= 1000 {
-            let _ = write!(line, " ↓ {:.1}k tokens", f64::from(tokens) / 1000.0);
+            let _ = write!(details, " ↓ {:.1}k tokens", f64::from(tokens) / 1000.0);
         } else {
-            let _ = write!(line, " ↓ {tokens} tokens");
+            let _ = write!(details, " ↓ {tokens} tokens");
         }
     }
-    line
+    let logo = brand_spinner::frame(frame_index);
+    let reserved = text_layout::display_width(logo) + 1 + text_layout::display_width(&details);
+    let label = text_layout::truncate_to_width(label, width.saturating_sub(reserved));
+    let theme = theme();
+    let line = format!(
+        "{}{logo}{} {label}{details}{RESET}",
+        theme.logo_fg(),
+        theme.spinner_fg(warning),
+    );
+    // On extremely narrow terminals even metadata cannot fit. Keep one row.
+    if reserved > width {
+        text_layout::truncate_to_width(&line, width)
+    } else {
+        line
+    }
 }
 
 fn compact_tokens(tokens: u32) -> String {

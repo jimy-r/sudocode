@@ -12,9 +12,15 @@ fn running_status(screen: &str) -> bool {
         let line = line.trim_start();
         line.chars().next().is_some_and(|glyph| {
             ('\u{2800}'..='\u{28ff}').contains(&glyph) || ['◐', '◓', '◑', '◒'].contains(&glyph)
-        }) && ["Working...", "Thinking...", "Reasoning..."]
-            .iter()
-            .any(|label| line.contains(label))
+        }) && [
+            "Working...",
+            "Thinking...",
+            "Reasoning...",
+            "Running",
+            "Retry",
+        ]
+        .iter()
+        .any(|label| line.contains(label))
     })
 }
 
@@ -185,9 +191,20 @@ fn question_owns_the_status_until_answered_then_running_resumes() {
     );
     common::expect_screen(
         &session,
-        |view| view.contains("Waiting for your input") && !running_status(view),
+        |view| {
+            view.contains("[2] Second")
+                && !running_status(view)
+                && !view.contains("Waiting for your input")
+        },
         common::DEFAULT_TIMEOUT,
-        "a question must not pretend the model is still thinking",
+        "question panel owns input without an animation or duplicate waiting row",
+    );
+    let waiting = session.render(|screen| screen.contents());
+    std::thread::sleep(Duration::from_millis(320));
+    assert_eq!(
+        session.render(|screen| screen.contents()),
+        waiting,
+        "waiting does not animate"
     );
     session.send("\x1b[B\r").unwrap();
     common::expect_screen(
@@ -207,6 +224,133 @@ fn question_owns_the_status_until_answered_then_running_resumes() {
         common::LIVE_TURN_BUDGET,
         "remaining tool completed",
     );
+    finish(&mut session, &marker);
+}
+
+#[test]
+fn brand_animation_and_parallel_summary_share_one_status_row() {
+    let env = TestEnv::new_mock("brand-parallel-status");
+    for name in ["first", "second"] {
+        fs::write(
+            env.workspace_root().join(format!("{name}.sh")),
+            format!("printf started > {name}-started; while test ! -f release-{name}; do sleep 0.1; done; printf '{name}_DONE\\n'"),
+        )
+        .unwrap();
+    }
+    let mut session = env.spawn_with_env(
+        &["--permission-mode", "danger-full-access"],
+        &[
+            ("SUDOCODE_INTERRUPT_QUEUE_MODE", "queue"),
+            ("NO_COLOR", ""),
+            ("TERM", "xterm-256color"),
+            ("COLORTERM", "truecolor"),
+            ("COLORFGBG", "15;0"),
+        ],
+    );
+    session.resize(60, 100).unwrap();
+    common::expect_input_line_cleared(&session, common::DEFAULT_TIMEOUT, "initial prompt");
+    let marker = common::turn_status_marker(&session);
+    let calls = json!([
+        {"id":"first", "name":"bash", "input":{"command":"sh first.sh", "timeout":30000}},
+        {"id":"second", "name":"bash", "input":{"command":"sh second.sh", "timeout":30000}}
+    ]);
+    submit(
+        &mut session,
+        &format!("PARITY_SCENARIO:tool_concurrency TOOL_BATCH:{calls}"),
+    );
+    common::expect_screen(
+        &session,
+        |view| {
+            env.workspace_root().join("first-started").exists()
+                && env.workspace_root().join("second-started").exists()
+                && view
+                    .lines()
+                    .any(|line| line.contains("Running 2 tools…") && line.contains("[claude"))
+        },
+        common::DEFAULT_TIMEOUT,
+        "both running calls share one aggregate status",
+    );
+    let first_frame = session.render(|screen| {
+        let raw = screen.raw();
+        let rows: Vec<_> = raw
+            .rows(0, raw.size().1)
+            .enumerate()
+            .filter(|(_, line)| line.contains("Running 2 tools…") && line.contains("[claude"))
+            .collect();
+        assert_eq!(rows.len(), 1, "one live status row");
+        let (row, line) = &rows[0];
+        assert!(!line.contains('🦀') && !line.contains('🧠'));
+        let logo: String = line.chars().take(4).collect();
+        assert!(logo
+            .chars()
+            .all(|ch| ('\u{2800}'..='\u{28ff}').contains(&ch)));
+        for col in 0..4 {
+            assert_eq!(
+                format!(
+                    "{:?}",
+                    raw.cell(u16::try_from(*row).unwrap(), col)
+                        .unwrap()
+                        .fgcolor()
+                ),
+                "Idx(214)",
+                "logo uses brand amber"
+            );
+        }
+        logo
+    });
+    common::expect_screen(
+        &session,
+        |view| {
+            view.lines().any(|line| {
+                line.contains("Running 2 tools…")
+                    && line.chars().take(4).collect::<String>() != first_frame
+            })
+        },
+        Duration::from_secs(2),
+        "brand frames animate",
+    );
+    session.send("brand-draft").unwrap();
+    common::expect_input_line(
+        &session,
+        "brand-draft",
+        common::DEFAULT_TIMEOUT,
+        "typing beside animation",
+    );
+    session.send("\x15").unwrap();
+    session.resize(60, 44).unwrap();
+    common::expect_screen(
+        &session,
+        |view| {
+            view.lines().any(|line| {
+                line.contains("Running")
+                    && !line.contains("Running 2 tools…")
+                    && line.contains("[claude")
+                    && line.contains("s)")
+            })
+        },
+        common::DEFAULT_TIMEOUT,
+        "narrow status truncates the description before metadata",
+    );
+    session.resize(60, 100).unwrap();
+    common::expect_screen(
+        &session,
+        |view| view.lines().any(|line| line.contains("Running 2 tools…")),
+        common::DEFAULT_TIMEOUT,
+        "widening restores the full tool summary",
+    );
+    fs::write(env.workspace_root().join("release-first"), "go").unwrap();
+    common::expect_screen(
+        &session,
+        |view| {
+            view.contains("first_DONE")
+                && view
+                    .lines()
+                    .any(|line| line.contains("Running Bash…") && line.contains("[claude"))
+        },
+        common::DEFAULT_TIMEOUT,
+        "completion updates the remaining tool summary",
+    );
+    fs::write(env.workspace_root().join("release-second"), "go").unwrap();
     finish(&mut session, &marker);
 }
 

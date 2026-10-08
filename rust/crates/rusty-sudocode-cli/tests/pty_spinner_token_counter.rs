@@ -127,7 +127,7 @@ fn spinner_warning_tracks_idle_time_and_recovers_on_progress() {
             raw.rows(0, raw.size().1)
                 .enumerate()
                 .filter_map(|(row, line)| {
-                    let col = line.find("Working")?;
+                    let col = line.find("Thinking")?;
                     let column = unicode_width::UnicodeWidthStr::width(&line[..col]);
                     let cell = raw.cell(u16::try_from(row).ok()?, u16::try_from(column).ok()?)?;
                     Some((line, format!("{:?}", cell.fgcolor())))

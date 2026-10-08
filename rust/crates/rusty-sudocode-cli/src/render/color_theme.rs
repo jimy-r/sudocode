@@ -198,6 +198,11 @@ impl ColorTheme {
         ansi_fg(support.color(color))
     }
 
+    /// Brand animation uses the existing logo role, independently of status.
+    pub fn logo_fg(&self) -> String {
+        ansi_fg(ColorSupport::detect().color(self.logo))
+    }
+
     /// Inline-code and file-link foreground from the selected syntax asset.
     pub(super) fn inline_code_color(&self, support: ColorSupport) -> Color {
         code_theme::inline_color(self.light_background, support)

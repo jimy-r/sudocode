@@ -4884,7 +4884,7 @@ impl LiveCli {
         let token_budget = crate::render::parse_token_budget(input);
         let model = self.lifecycle.current_model();
         let mut spinner = SpinnerHandle::new(
-            render::activity::WORKING_LABEL,
+            render::activity::THINKING_LABEL,
             Some(model.as_str()),
             TerminalRenderer::new().color_theme(),
             token_budget,

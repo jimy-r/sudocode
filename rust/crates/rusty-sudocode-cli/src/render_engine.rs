@@ -201,7 +201,10 @@ impl EngineEventRenderer {
         } else {
             // Without an interactive live region, retain a bounded log line.
             let text = crate::render::text_layout::truncate_to_width(&text, query_terminal_width());
-            self.write_block(&text, OutputBlock::Activity);
+            self.write_block(
+                &format!("  {DIM}\u{27f3} {text}{RESET}"),
+                OutputBlock::Activity,
+            );
         }
         self.resume_spinner();
     }
@@ -577,7 +580,7 @@ fn format_tool_progress(progress: &ToolProgressEvent) -> String {
                 format!("{total_bytes} B")
             };
             format!(
-                "  {DIM}\u{27f3} {}  ({total_lines} lines, {bytes_display}){RESET}",
+                "{} ({total_lines} lines, {bytes_display})",
                 summary(last_line)
             )
         }
@@ -594,9 +597,9 @@ fn format_tool_progress(progress: &ToolProgressEvent) -> String {
                 _ => String::new(),
             };
             if let Some(msg) = message {
-                format!("  {DIM}\u{27f3} {}{status}{RESET}", summary(msg))
+                format!("{}{status}", summary(msg))
             } else {
-                format!("  {DIM}\u{27f3} progress: {progress:.0}{status}{RESET}")
+                format!("progress: {progress:.0}{status}")
             }
         }
     }

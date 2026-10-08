@@ -162,12 +162,14 @@ scode
 The REPL accepts prose and slash commands. Tab completion expands slash
 command names, model aliases, permission modes, and recent session IDs.
 
-The live status follows the foreground engine lifecycle. `Working...` remains
-visible during response output and tool execution; `Reasoning...` identifies
-streamed thinking content. A question or permission request shows a static
-`Waiting for your input` until answered. After the turn ends, the activity cue
-disappears and the normal result/footer returns. Background work keeps its
-separate task summary in the existing footer.
+The live status follows the foreground engine lifecycle. A single amber
+character animation approximates the Sudoprivacy logo in one row. Model work
+shows `Thinking...` or `Reasoning...`, with model, elapsed time and tokens.
+Foreground tools use the same row: `Running Bash…` or `Running 2 tools…`, plus
+available progress. Long descriptions truncate before the time/token details.
+Questions and approvals stop the animation and use the existing input panel;
+there is no additional waiting row. After the turn ends, the normal result and
+footer return. Background work keeps its separate task summary in the footer.
 
 `/memory` opens the discovered instruction file in `$VISUAL`, then `$EDITOR`,
 or `vi` when neither is set. With several instruction files, type to filter
@@ -207,7 +209,7 @@ green on success; and red on failure. The opening and closing
 caps stay bold to separate adjacent calls; long vertical borders use normal
 weight without dimming. Colors adapt to dark/light backgrounds and terminal
 color depth. `ColorTheme` is the single semantic color interface; its `info`
-role (including Working/Reasoning) and successful tool borders share one
+role (including Thinking/Reasoning) and successful tool borders share one
 soft-green definition. Syntax-backed colors load on demand and stay cached.
 Tool names use the shared Codex blue accent. Titles occupy one
 row and use an ellipsis when they exceed the available width. Running titles
@@ -216,10 +218,10 @@ Bash commands that cannot fit the title are preserved in the card body. Long
 list items keep their continuation lines aligned with the item text, including
 in session replay. Replayed message blocks have one blank separator.
 
-In the live REPL UI, Bash and MCP progress replaces the existing live
-status row while working; input requests take priority over progress. It does
-not append partial output or spinner summaries to terminal
-history. The completed tool card retains its normal output preview. Progress
+In the live REPL UI, Bash and MCP progress joins the existing tool status
+summary; input requests take priority over activity. It does not append partial
+output or spinner summaries to terminal history. The completed tool card
+retains its normal output preview. Progress
 is laid out with the same column and grapheme rules as other terminal text;
 external cursor/screen commands cannot take ownership of the live region.
 Paths without a live UI retain bounded progress log lines. Buffered answer and

@@ -339,18 +339,19 @@ impl SpinnerHandle {
                         &label
                     };
                     let line = activity::progress_line(
-                        activity::animation_frame(frame_index, thinking),
+                        frame_index,
                         current_label,
-                        model.as_deref(),
-                        start_time.elapsed().as_secs_f64(),
-                        progress.response_bytes(),
-                        token_budget,
+                        activity::ProgressValues {
+                            model: model.as_deref(),
+                            elapsed: start_time.elapsed().as_secs_f64(),
+                            bytes: progress.response_bytes(),
+                            token_budget,
+                        },
+                        query_terminal_width(),
+                        progress.is_stalled(thinking),
                     );
                     frame_index += 1;
-
-                    let color = theme().spinner_fg(progress.is_stalled(thinking));
-                    let colored = format!("{color}{line}{RESET}");
-                    pb.set_message(colored);
+                    pb.set_message(line);
                     pb.tick();
                 }
                 drop(draw);

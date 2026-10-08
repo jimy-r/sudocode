@@ -26,7 +26,7 @@ use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use crate::render::activity::ActivityState;
+use crate::render::activity::{ActivityState, ToolActivity};
 use commands::suggest_slash_commands;
 use crossterm::style::Color as TerminalColor;
 use engine_events::EngineState;
@@ -152,7 +152,7 @@ mod stderr_redirect {
 /// Priority: Activity > TurnResult > Tips > Empty.
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum StatusSlot {
-    /// Running activity or an explicit input request.
+    /// Running model, tool, or retry activity; input panels own waiting states.
     Active(String),
     /// Turn result (tokens/cost/ctx). Cleared when the next turn starts.
     TurnResult(Arc<StyledText>),
@@ -372,6 +372,7 @@ impl FuzzySelectState {
 #[derive(Clone, Debug)]
 pub struct ToolCard {
     pub id: String,
+    name: String,
     input: String,
     status: crate::cli::format::ToolStatus,
     content: Arc<crate::cli::format::ToolCardContent>,
@@ -381,6 +382,7 @@ impl ToolCard {
     fn new(id: String, name: &str, input: &str) -> Self {
         Self {
             id,
+            name: crate::cli::format::ToolKind::visible_name(name).to_string(),
             input: input.to_string(),
             status: crate::cli::format::ToolStatus::Queued,
             // Parsing and syntax highlighting happen once per tool event,
@@ -1320,7 +1322,7 @@ fn ReplApp(mut hooks: Hooks) -> impl Into<AnyElement<'static>> {
     let mut system = hooks.use_context_mut::<SystemContext>();
     let mut input_value = hooks.use_state(String::new);
     let mut frame = hooks.use_state(|| 0usize);
-    let mut activity_frame = hooks.use_state(|| (EngineState::Idle, String::new()));
+    let mut foreground_state = hooks.use_state(|| EngineState::Idle);
     let mut tool_progress = hooks.use_state(|| None::<String>);
     let mut turn_result = hooks.use_state(|| None::<Arc<StyledText>>);
     let mut has_submitted = hooks.use_state(|| false);
@@ -1587,20 +1589,18 @@ fn ReplApp(mut hooks: Hooks) -> impl Into<AnyElement<'static>> {
             }
 
             // One lifecycle snapshot drives the status and footer. Animate
-            // only Running; AwaitingInput is static, Idle changes no UI state.
+            // only Running; waiting hides the row, Idle changes no UI state.
             // Identical idle State::set calls starve keyboard delivery in iocraft.
             let idx = frame.get();
             let state = spinner_for_future.engine_state();
-            let text = spinner_for_future.render_frame(idx, state);
             if state == EngineState::Running || is_preview_changed {
                 frame.set(idx.wrapping_add(1));
             }
             if state != EngineState::Idle && turn_result.read().is_some() {
                 turn_result.set(None);
             }
-            let next = (state, text);
-            if *activity_frame.read() != next {
-                activity_frame.set(next);
+            if foreground_state.get() != state {
+                foreground_state.set(state);
             }
         }
     });
@@ -2192,23 +2192,37 @@ fn ReplApp(mut hooks: Hooks) -> impl Into<AnyElement<'static>> {
     }
 
     // ── Derive ChromeSlots from state ──────────────────────────────────
-    let (activity_state, st) = activity_frame.read().clone();
+    let activity_state = foreground_state.get();
+    let w = usize::from(term_width);
     let val = input_value.read().clone();
     let current_input_slot = input_slot.read().clone();
     let submitted = *has_submitted.read();
 
     // StatusSlot: Activity > TurnResult > Tips > Empty
-    let status_slot = if activity_state != EngineState::Idle {
+    let status_slot = if activity_state == EngineState::Running {
         // Reuse the existing status row and shared column layout. No additional
         // live rows can spill into scrollback as tool output grows.
-        let text = if activity_state == EngineState::Running {
-            tool_progress.read().as_ref().map_or(st, |text| {
-                crate::render::text_layout::truncate_to_width(text, term_width as usize)
-            })
-        } else {
-            st
+        let progress = tool_progress.read();
+        let pending = pending.lock().unwrap();
+        let mut tools = ToolActivity {
+            progress: progress.as_deref(),
+            ..Default::default()
         };
-        StatusSlot::Active(text)
+        for item in pending.iter() {
+            if let PendingItem::Tool(card) = item {
+                if card.status == crate::cli::format::ToolStatus::Running {
+                    tools.count += 1;
+                    tools.name.get_or_insert(&card.name);
+                }
+            }
+        }
+        // Format with the same iocraft width snapshot as the other chrome,
+        // including the very first frame after a resize.
+        StatusSlot::Active(spinner.render_frame(frame.get(), activity_state, tools, w))
+    } else if activity_state == EngineState::AwaitingInput {
+        // The existing question/approval panel owns this interaction. No
+        // animation or duplicate waiting instruction above InputSlot.
+        StatusSlot::Empty
     } else if let Some(ref tr) = *turn_result.read() {
         StatusSlot::TurnResult(tr.clone())
     } else if !submitted {
@@ -2250,7 +2264,6 @@ fn ReplApp(mut hooks: Hooks) -> impl Into<AnyElement<'static>> {
     };
 
     let perm = permission_mode.clone();
-    let w = term_width as usize;
     let sep = "\u{2500}".repeat(w);
     let mut browser = tasks
         .lock()

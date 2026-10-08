@@ -312,7 +312,7 @@ fn info_uses_shared_green(light: bool, truecolor: bool, no_color: bool) {
     common::expect_screen(
         &sess,
         |_| {
-            ["Working...", "Reasoning..."].iter().any(|label| {
+            ["Thinking...", "Reasoning..."].iter().any(|label| {
                 attributes(&sess, label)
                     .is_some_and(|(color, bold, dim)| color == green && !bold && !dim)
             })
