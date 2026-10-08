@@ -348,6 +348,7 @@ impl SpinnerHandle {
                             token_budget,
                         },
                         query_terminal_width(),
+                        text_layout::ColumnMetric::Terminal,
                         progress.is_stalled(thinking),
                     );
                     frame_index += 1;

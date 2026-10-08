@@ -143,6 +143,7 @@ impl ActivityState {
                 token_budget: metadata.token_budget,
             },
             width,
+            text_layout::ColumnMetric::Canvas,
             warning,
         )
     }
@@ -212,6 +213,7 @@ pub(super) fn progress_line(
     label: &str,
     values: ProgressValues<'_>,
     width: usize,
+    metric: text_layout::ColumnMetric,
     warning: bool,
 ) -> String {
     let ProgressValues {
@@ -251,9 +253,9 @@ pub(super) fn progress_line(
         }
     }
     let logo = brand_spinner::frame(frame_index);
-    let reserved = text_layout::display_width(logo) + 1 + text_layout::display_width(&details);
+    let reserved = metric.width(logo) + 1 + metric.width(&details);
     let label = text_layout::single_line(label);
-    let label = text_layout::truncate_to_width(&label, width.saturating_sub(reserved));
+    let label = metric.truncate(&label, width.saturating_sub(reserved));
     let theme = theme();
     let line = format!(
         "{}{logo}{} {label}{details}{RESET}",
@@ -262,7 +264,7 @@ pub(super) fn progress_line(
     );
     // On extremely narrow terminals even metadata cannot fit. Keep one row.
     if reserved > width {
-        text_layout::truncate_to_width(&line, width)
+        metric.truncate(&line, width)
     } else {
         line
     }
