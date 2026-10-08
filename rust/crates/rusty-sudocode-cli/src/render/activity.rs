@@ -181,15 +181,17 @@ impl StatusContent<'_> {
                 reason,
             } => format!("Retry {attempt}/{max_retries}: {reason}").into(),
             Self::Tools(tools) => {
-                let mut label = match tools.count {
+                // Actual progress has priority; pending cards already show the
+                // tool identities. Quiet tools fall back to their name/count.
+                if let Some(progress) = tools.progress {
+                    return progress.into();
+                }
+                match tools.count {
                     0 => "Running…".to_string(),
                     1 => format!("Running {}…", tools.name.unwrap_or("tool")),
                     count => format!("Running {count} tools…"),
-                };
-                if let Some(progress) = tools.progress {
-                    let _ = write!(label, " · {progress}");
                 }
-                label.into()
+                .into()
             }
         }
     }

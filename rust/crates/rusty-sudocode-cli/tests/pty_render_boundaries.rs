@@ -171,8 +171,15 @@ fn bash_progress_is_live_then_clears_without_entering_history() {
     common::expect_screen(
         &sess,
         |s| {
-            s.lines()
-                .any(|l| l.contains('⟳') && l.contains("PROGRESS-FIRST"))
+            s.lines().any(|line| {
+                line.chars()
+                    .take(4)
+                    .all(|ch| ('\u{2800}'..='\u{28ff}').contains(&ch))
+                    && line.contains("界👩🏽‍💻")
+                    && line.contains('…')
+                    && line.contains("[claude")
+                    && line.contains("s)")
+            })
         },
         Duration::from_secs(60),
         "live tool progress",
@@ -185,7 +192,12 @@ fn bash_progress_is_live_then_clears_without_entering_history() {
         "completed tool",
     );
     assert!(
-        !screen.contains('⟳'),
+        !screen.lines().any(|line| {
+            line.chars()
+                .take(4)
+                .all(|ch| ('\u{2800}'..='\u{28ff}').contains(&ch))
+                && line.contains("界👩🏽‍💻")
+        }),
         "transient progress leaked into history: {screen}"
     );
     assert!(
