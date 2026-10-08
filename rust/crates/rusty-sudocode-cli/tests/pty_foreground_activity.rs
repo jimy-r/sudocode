@@ -7,21 +7,34 @@ use common::TestEnv;
 use pty_expect::PtySession;
 use serde_json::json;
 
+// The vt100 test parser can retain previous live rows on resize. Inspect the
+// current chrome between the two separators rather than old screen history.
+fn live_status(screen: &str) -> &str {
+    let mut lines = screen.lines().rev();
+    for _ in 0..2 {
+        if lines
+            .find(|line| !line.is_empty() && line.chars().all(|ch| ch == '─'))
+            .is_none()
+        {
+            return "";
+        }
+    }
+    lines.next().unwrap_or_default().trim_start()
+}
+
 fn running_status(screen: &str) -> bool {
-    screen.lines().any(|line| {
-        let line = line.trim_start();
-        line.chars().next().is_some_and(|glyph| {
-            ('\u{2800}'..='\u{28ff}').contains(&glyph) || ['◐', '◓', '◑', '◒'].contains(&glyph)
-        }) && [
-            "Working...",
-            "Thinking...",
-            "Reasoning...",
-            "Running",
-            "Retry",
-        ]
-        .iter()
-        .any(|label| line.contains(label))
-    })
+    let line = live_status(screen);
+    line.chars().next().is_some_and(|glyph| {
+        ('\u{2800}'..='\u{28ff}').contains(&glyph) || ['◐', '◓', '◑', '◒'].contains(&glyph)
+    }) && [
+        "Working...",
+        "Thinking...",
+        "Reasoning...",
+        "Running",
+        "Retry",
+    ]
+    .iter()
+    .any(|label| line.contains(label))
 }
 
 fn submit(session: &mut PtySession, prompt: &str) {
@@ -287,8 +300,8 @@ fn brand_animation_and_parallel_summary_share_one_status_row() {
     common::expect_screen(
         &session,
         |view| {
-            view.lines()
-                .any(|line| line.contains("Running 2 tools…") && line.contains("[claude"))
+            let line = live_status(view);
+            line.contains("Running 2 tools…") && line.contains("[claude")
         },
         common::DEFAULT_TIMEOUT,
         "both running calls share one aggregate status",
@@ -324,10 +337,9 @@ fn brand_animation_and_parallel_summary_share_one_status_row() {
     common::expect_screen(
         &session,
         |view| {
-            view.lines().any(|line| {
-                line.contains("Running 2 tools…")
-                    && line.chars().take(4).collect::<String>() != first_frame
-            })
+            let line = live_status(view);
+            line.contains("Running 2 tools…")
+                && line.chars().take(4).collect::<String>() != first_frame
         },
         Duration::from_secs(2),
         "brand frames animate",
@@ -344,12 +356,11 @@ fn brand_animation_and_parallel_summary_share_one_status_row() {
     common::expect_screen(
         &session,
         |view| {
-            view.lines().any(|line| {
-                line.contains("Running")
-                    && !line.contains("Running 2 tools…")
-                    && line.contains("[claude")
-                    && line.contains("s)")
-            })
+            let line = live_status(view);
+            line.contains("Running")
+                && !line.contains("Running 2 tools…")
+                && line.contains("[claude")
+                && line.contains("s)")
         },
         common::DEFAULT_TIMEOUT,
         "narrow status truncates the description before metadata",
@@ -357,7 +368,7 @@ fn brand_animation_and_parallel_summary_share_one_status_row() {
     session.resize(60, 100).unwrap();
     common::expect_screen(
         &session,
-        |view| view.lines().any(|line| line.contains("Running 2 tools…")),
+        |view| live_status(view).contains("Running 2 tools…"),
         common::DEFAULT_TIMEOUT,
         "widening restores the full tool summary",
     );
@@ -366,10 +377,10 @@ fn brand_animation_and_parallel_summary_share_one_status_row() {
     common::expect_screen(
         &session,
         |view| {
+            let line = live_status(view);
             view.contains("first_DONE")
-                && view
-                    .lines()
-                    .any(|line| line.contains("Running Bash…") && line.contains("[claude"))
+                && line.contains("Running Bash…")
+                && line.contains("[claude")
         },
         common::DEFAULT_TIMEOUT,
         "completion updates the remaining tool summary",
