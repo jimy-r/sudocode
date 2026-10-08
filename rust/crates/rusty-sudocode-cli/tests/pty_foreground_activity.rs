@@ -228,12 +228,16 @@ fn question_owns_the_status_until_answered_then_running_resumes() {
 }
 
 #[test]
+#[cfg(unix)]
 fn brand_animation_and_parallel_summary_share_one_status_row() {
+    use nix::{libc, sys::stat::Mode, unistd::mkfifo};
+    use std::{fs::OpenOptions, io::Write, os::unix::fs::OpenOptionsExt, time::Instant};
+
     let env = TestEnv::new_mock("brand-parallel-status");
-    for name in ["first", "second"] {
-        fs::write(
-            env.workspace_root().join(format!("{name}.sh")),
-            format!("printf started > {name}-started; while test ! -f release-{name}; do sleep 0.1; done; printf '{name}_DONE\\n'"),
+    for name in ["first.fifo", "second.fifo"] {
+        mkfifo(
+            &env.workspace_root().join(name),
+            Mode::S_IRUSR | Mode::S_IWUSR,
         )
         .unwrap();
     }
@@ -251,21 +255,40 @@ fn brand_animation_and_parallel_summary_share_one_status_row() {
     common::expect_input_line_cleared(&session, common::DEFAULT_TIMEOUT, "initial prompt");
     let marker = common::turn_status_marker(&session);
     let calls = json!([
-        {"id":"first", "name":"bash", "input":{"command":"sh first.sh", "timeout":30000}},
-        {"id":"second", "name":"bash", "input":{"command":"sh second.sh", "timeout":30000}}
+        {"id":"first", "name":"bash", "input":{"command":"cat first.fifo", "timeout":30000}},
+        {"id":"second", "name":"Bash", "input":{"command":"cat second.fifo", "timeout":30000}}
     ]);
     submit(
         &mut session,
         &format!("PARITY_SCENARIO:tool_concurrency TOOL_BATCH:{calls}"),
     );
+    // Both nonblocking writers can open only after both real readers start.
+    // The commands are read-only, so the scheduler may overlap them.
+    let writer = |name: &str| {
+        let deadline = Instant::now() + common::DEFAULT_TIMEOUT;
+        loop {
+            match OpenOptions::new()
+                .write(true)
+                .custom_flags(libc::O_NONBLOCK)
+                .open(env.workspace_root().join(name))
+            {
+                Ok(file) => break file,
+                Err(error)
+                    if error.raw_os_error() == Some(libc::ENXIO) && Instant::now() < deadline =>
+                {
+                    std::thread::sleep(Duration::from_millis(10))
+                }
+                Err(error) => panic!("FIFO reader did not start: {name}: {error}"),
+            }
+        }
+    };
+    let mut first = writer("first.fifo");
+    let mut second = writer("second.fifo");
     common::expect_screen(
         &session,
         |view| {
-            env.workspace_root().join("first-started").exists()
-                && env.workspace_root().join("second-started").exists()
-                && view
-                    .lines()
-                    .any(|line| line.contains("Running 2 tools…") && line.contains("[claude"))
+            view.lines()
+                .any(|line| line.contains("Running 2 tools…") && line.contains("[claude"))
         },
         common::DEFAULT_TIMEOUT,
         "both running calls share one aggregate status",
@@ -338,7 +361,8 @@ fn brand_animation_and_parallel_summary_share_one_status_row() {
         common::DEFAULT_TIMEOUT,
         "widening restores the full tool summary",
     );
-    fs::write(env.workspace_root().join("release-first"), "go").unwrap();
+    writeln!(first, "first_DONE").unwrap();
+    drop(first);
     common::expect_screen(
         &session,
         |view| {
@@ -350,7 +374,8 @@ fn brand_animation_and_parallel_summary_share_one_status_row() {
         common::DEFAULT_TIMEOUT,
         "completion updates the remaining tool summary",
     );
-    fs::write(env.workspace_root().join("release-second"), "go").unwrap();
+    writeln!(second, "second_DONE").unwrap();
+    drop(second);
     finish(&mut session, &marker);
 }
 
