@@ -212,10 +212,10 @@ fn question_owns_the_status_until_answered_then_running_resumes() {
         common::DEFAULT_TIMEOUT,
         "question panel owns input without an animation or duplicate waiting row",
     );
-    let waiting = session.render(|screen| screen.contents());
+    let waiting = session.render(pty_expect::Screen::contents);
     std::thread::sleep(Duration::from_millis(320));
     assert_eq!(
-        session.render(|screen| screen.contents()),
+        session.render(pty_expect::Screen::contents),
         waiting,
         "waiting does not animate"
     );
@@ -242,6 +242,10 @@ fn question_owns_the_status_until_answered_then_running_resumes() {
 
 #[test]
 #[cfg(unix)]
+#[allow(
+    clippy::too_many_lines,
+    reason = "Connected PTY workflow exercises overlap, animation, resizing and input."
+)]
 fn brand_animation_and_parallel_summary_share_one_status_row() {
     use nix::{libc, sys::stat::Mode, unistd::mkfifo};
     use std::{fs::OpenOptions, io::Write, os::unix::fs::OpenOptionsExt, time::Instant};
@@ -289,7 +293,7 @@ fn brand_animation_and_parallel_summary_share_one_status_row() {
                 Err(error)
                     if error.raw_os_error() == Some(libc::ENXIO) && Instant::now() < deadline =>
                 {
-                    std::thread::sleep(Duration::from_millis(10))
+                    std::thread::sleep(Duration::from_millis(10));
                 }
                 Err(error) => panic!("FIFO reader did not start: {name}: {error}"),
             }

@@ -195,6 +195,7 @@ impl StatusContent<'_> {
     }
 }
 
+#[derive(Clone, Copy)]
 pub(super) struct ProgressValues<'a> {
     pub(super) model: Option<&'a str>,
     pub(super) elapsed: f64,
