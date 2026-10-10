@@ -58,10 +58,6 @@ module_name_repetitions = "allow"
 missing_panics_doc = "allow"
 missing_errors_doc = "allow"
 
-# Ed25519 hashes complete plugin libraries at startup, including debug symbols.
-[profile.dev.package."sha2:0.10.9"]
-opt-level = 3
-
 # The daemon links the kernel and hosted session engine. Optimize across crate
 # boundaries and remove release symbols so it fits the existing artifact limits.
 [profile.cohost-release]
