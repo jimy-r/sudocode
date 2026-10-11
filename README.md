@@ -50,9 +50,10 @@ live in the [roadmap](sudo-code-roadmap.html).
 share physical memory between CPU and GPU. Runtime memory therefore competes
 with local inference memory.
 
-The [performance measurement guide](e2e/terminal-resize/README.md#runtime-memory)
-defines RSS, measurement scope, and a recorded example. Its adjacent release
-gate describes workloads and regression checks; the
+The [runtime memory reference](docs/usage.md#runtime-memory)
+defines RSS, measurement scope, and a recorded example. The
+[release performance gate](e2e/terminal-resize/README.md#release-performance-gate)
+describes workloads and regression checks; the
 [versioned policy](e2e/terminal-resize/performance-policy.json) owns the budgets.
 
 ## Position in the larger picture
