@@ -2,6 +2,40 @@
 
 Day-to-day `scode` workflows.
 
+## Installation and updates
+
+Install macOS/Linux with the [installer](../install.sh), or choose a platform
+package from [GitHub Releases](https://github.com/sudoprivacy/sudocode/releases/latest).
+Release builds check for updates in the background when an interactive terminal
+session starts. The banner reads previously cached metadata, and the next launch
+shows a newly discovered version. The check runs at most once per 20 hours after
+a successful refresh, in the local config home's `cache/release.json`.
+
+```sh
+scode update --check
+scode update
+scode update --version vX.Y.Z
+```
+
+Version checks work on every platform. `scode update` installs and restarts on
+macOS/Linux; the Windows startup notice links the matching zip. Set
+`SCODE_CHECK_UPDATES=0` to disable startup checks; `1` enables them in a source
+build as well. An unavailable service leaves the terminal usable and retains the
+previous metadata.
+
+The default source is GitHub, with COS as the metadata fallback. Choose the China
+mirror explicitly with `SCODE_MIRROR`:
+
+```sh
+export SCODE_MIRROR=https://sudowork-release-1309794936.cos.ap-beijing.myqcloud.com/sudocode/release/latest
+```
+
+An explicit mirror supplies its version pointer, archive and published checksum
+manifest. Both the installer and updater resolve `/latest` once, then download
+from the immutable sibling `vX.Y.Z` directory. A versioned mirror directory pins
+its own version. The publisher verifies the complete mirror before promoting the
+pointer; the client verifies the downloaded archive's SHA-256 before installation.
+
 ## Editing a prompt
 
 `Ctrl+U` clears the current draft. You can immediately continue typing or paste
