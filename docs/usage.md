@@ -7,8 +7,9 @@ Day-to-day `scode` workflows.
 Install macOS/Linux with the [installer](../install.sh), or choose a platform
 package from [GitHub Releases](https://github.com/sudoprivacy/sudocode/releases/latest).
 Release builds check for updates in the background when an interactive terminal
-session starts. The banner reads previously cached metadata, and the next launch
-shows a newly discovered version. The check runs at most once per 20 hours after
+session starts. A cached newer release offers **Update now**, **Skip**, or
+**Skip until next version** before the session starts. The next launch shows a
+newly discovered version. The check runs at most once per 20 hours after
 a successful refresh, in the local config home's `cache/release.json`.
 
 ```sh
@@ -17,8 +18,9 @@ scode update
 scode update --version vX.Y.Z
 ```
 
-Version checks work on every platform. `scode update` installs and restarts on
-macOS/Linux; the Windows startup notice links the matching zip. Set
+Selecting **Update now** installs the checked release and restarts with the same
+arguments and working directory. Self-update works on macOS, Linux and Windows;
+`scode update` also provides an explicit installation command. Set
 `SCODE_CHECK_UPDATES=0` to disable startup checks; `1` enables them in a source
 build as well. An unavailable service leaves the terminal usable and retains the
 previous metadata.

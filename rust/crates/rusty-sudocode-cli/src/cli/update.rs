@@ -1,20 +1,11 @@
-//! Release discovery, startup notices and explicit CLI self-update.
+//! Release discovery, startup choices and CLI self-update.
 //!
-//! Mirrors the release layout that `install.sh` publishes and installs against,
-//! so a binary installed either way can update itself:
-//!   - latest tag  → `GET https://api.github.com/repos/<repo>/releases/latest`
-//!   - archive     → `…/releases/download/<tag>/scode-<target>.tar.gz`,
-//!     overridable with `SCODE_MIRROR` for faster CN downloads
-//!   - checksums   → the same published manifest on the selected release source
-//!
-//! Flow: resolve the target tag, download the archive + checksums, verify
-//! SHA-256, extract `scode-<target>/scode`, atomically swap it over the running
-//! executable (rename on the same filesystem — safe while the old image stays
-//! mapped), then re-exec the new binary so the caller lands on the new version.
+//! Startup and explicit updates share the platform archive, checksum and install
+//! path. Release sources and installation workflows are documented in usage.md.
 
 use sha2::{Digest, Sha256};
 use std::error::Error;
-use std::io::{Read, Write};
+use std::io::{IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -41,27 +32,43 @@ struct ReleaseCache {
     checked_at: u64,
     source: String,
     release: Release,
+    #[serde(default)]
+    dismissed_version: Option<String>,
 }
 
-/// Read the cached notice and refresh metadata off the terminal's startup path.
-/// The next launch displays the refreshed version, as in Codex's startup check.
-pub(crate) fn startup_notice() -> Option<String> {
+fn cache_path() -> PathBuf {
+    runtime::config::default_config_home()
+        .join("cache")
+        .join("release.json")
+}
+
+fn read_cache() -> Option<ReleaseCache> {
+    std::fs::read(cache_path())
+        .ok()
+        .and_then(|raw| serde_json::from_slice(&raw).ok())
+}
+
+fn write_cache(cache: &ReleaseCache) -> R<()> {
+    let path = cache_path();
+    std::fs::create_dir_all(path.parent().ok_or("missing cache directory")?)?;
+    StdFsBackend.write_atomic(&path.to_string_lossy(), &serde_json::to_vec(cache)?)?;
+    Ok(())
+}
+
+/// Refresh metadata in the background and offer the cached release before any
+/// engine or REPL takes ownership of the terminal.
+pub(crate) fn startup_prompt() -> R<()> {
     let is_enabled = match std::env::var("SCODE_CHECK_UPDATES").as_deref() {
         Ok("0" | "false" | "off") => false,
         Ok("1" | "true" | "on") => true,
         _ => !cfg!(debug_assertions),
     };
-    if !is_enabled {
-        return None;
+    if !is_enabled || !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
+        return Ok(());
     }
     let source = configured_mirror().unwrap_or_default();
-    let path = runtime::config::default_config_home()
-        .join("cache")
-        .join("release.json");
-    let cached = std::fs::read(&path)
-        .ok()
-        .and_then(|raw| serde_json::from_slice::<ReleaseCache>(&raw).ok())
-        .filter(|cache| cache.source == source && is_stable_tag(&cache.release.tag));
+    let cached =
+        read_cache().filter(|cache| cache.source == source && is_stable_tag(&cache.release.tag));
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |time| time.as_secs());
@@ -85,34 +92,45 @@ pub(crate) fn startup_notice() -> Option<String> {
                     checked_at: now,
                     source,
                     release,
+                    dismissed_version: read_cache().and_then(|cache| cache.dismissed_version),
                 };
-                let Ok(raw) = serde_json::to_vec(&cache) else {
-                    return;
-                };
-                if let Some(parent) = path.parent() {
-                    if std::fs::create_dir_all(parent).is_ok() {
-                        let _ = StdFsBackend.write_atomic(&path.to_string_lossy(), &raw);
-                    }
-                }
+                let _ = write_cache(&cache);
             });
     }
-    let cache = cached.filter(|cache| is_newer(&cache.release.tag, &format!("v{CURRENT}")))?;
-    #[cfg(windows)]
-    let action = format!(
-        "Download {}/scode-windows-{}.zip",
-        cache.release.download_base,
-        if std::env::consts::ARCH == "aarch64" {
-            "arm64"
-        } else {
-            "x64"
+    let Some(mut cache) = cached.filter(|cache| {
+        is_newer(&cache.release.tag, &format!("v{CURRENT}"))
+            && cache.dismissed_version.as_deref() != Some(&cache.release.tag)
+    }) else {
+        return Ok(());
+    };
+    let selection = dialoguer::Select::with_theme(&dialoguer::theme::ColorfulTheme::default())
+        .with_prompt(format!(
+            "Update available: v{CURRENT} → {}",
+            cache.release.tag
+        ))
+        .items(&["Update now", "Skip", "Skip until next version"])
+        .default(0)
+        .interact_opt()
+        .unwrap_or_else(|error| {
+            eprintln!("Could not read update choice: {error}");
+            None
+        });
+    match selection {
+        Some(0) => {
+            let args = std::env::args_os().skip(1).collect::<Vec<_>>();
+            if let Err(error) = install_release(&cache.release, &args) {
+                eprintln!("Update failed: {error}");
+            }
         }
-    );
-    #[cfg(not(windows))]
-    let action = "Run scode update";
-    Some(format!(
-        "Update available: v{CURRENT} → {}. {action}.",
-        cache.release.tag
-    ))
+        Some(2) => {
+            cache.dismissed_version = Some(cache.release.tag.clone());
+            if let Err(error) = write_cache(&cache) {
+                eprintln!("Could not save update preference: {error}");
+            }
+        }
+        _ => {}
+    }
+    Ok(())
 }
 
 type R<T> = Result<T, Box<dyn Error>>;
@@ -153,13 +171,21 @@ pub(crate) fn run(version: Option<&str>, check: bool, yes: bool) -> R<()> {
         println!("already up to date");
         return Ok(());
     }
-    let target = detect_target()?;
     if !yes && !confirm(&format!("update {current_tag} → {latest}?"))? {
         println!("aborted");
         return Ok(());
     }
 
-    let archive = format!("scode-{target}.tar.gz");
+    install_release(&release, &["--version".into()])
+}
+
+fn install_release(release: &Release, restart_args: &[std::ffi::OsString]) -> R<()> {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    let target = detect_target()?;
+    let extension = if cfg!(windows) { "zip" } else { "tar.gz" };
+    let archive = format!("scode-{target}.{extension}");
     let archive_url = format!("{}/{archive}", release.download_base);
     let checksum_url = format!("{}/{CHECKSUM_FILE}", release.download_base);
 
@@ -177,9 +203,9 @@ pub(crate) fn run(version: Option<&str>, check: bool, yes: bool) -> R<()> {
 
     let exe = current_exe()?;
     install_over(&exe, &new_binary)?;
-    println!("installed {latest} → {}", exe.display());
+    println!("installed {} → {}", release.tag, exe.display());
 
-    restart(&exe)
+    restart(&exe, restart_args)
 }
 
 // ---------------------------------------------------------------------------
@@ -197,6 +223,7 @@ fn detect_target() -> R<String> {
     let os = match std::env::consts::OS {
         "macos" => "macos",
         "linux" => "linux",
+        "windows" => "windows",
         other => return Err(format!("unsupported OS for self-update: {other}").into()),
     };
     Ok(format!("{os}-{arch}"))
@@ -239,7 +266,10 @@ fn parse_semver(tag: &str) -> Option<(u64, u64, u64)> {
 // ---------------------------------------------------------------------------
 
 fn client() -> R<reqwest::Client> {
-    Ok(reqwest::Client::builder().user_agent(USER_AGENT).build()?)
+    Ok(reqwest::Client::builder()
+        .user_agent(USER_AGENT)
+        .timeout(Duration::from_secs(120))
+        .build()?)
 }
 
 fn configured_mirror() -> Option<String> {
@@ -363,7 +393,8 @@ fn hex(bytes: &[u8]) -> String {
     s
 }
 
-/// Pull the `scode` binary out of the `.tar.gz` (entry `scode-<target>/scode`).
+/// Read only the documented executable entry from the platform archive.
+#[cfg(not(windows))]
 fn extract_binary(archive: &[u8], target: &str) -> R<Vec<u8>> {
     let want = format!("scode-{target}/{BIN_NAME}");
     let gz = flate2::read::GzDecoder::new(archive);
@@ -371,9 +402,7 @@ fn extract_binary(archive: &[u8], target: &str) -> R<Vec<u8>> {
     for entry in tar.entries()? {
         let mut entry = entry?;
         let path = entry.path()?.to_path_buf();
-        // Match the documented path, but also accept a bare `scode` file name
-        // in case the archive layout is flattened.
-        let is_match = path == Path::new(&want) || path.file_name().is_some_and(|n| n == BIN_NAME);
+        let is_match = path == Path::new(&want) || path == Path::new(BIN_NAME);
         if is_match {
             let mut buf = Vec::new();
             entry.read_to_end(&mut buf)?;
@@ -383,6 +412,19 @@ fn extract_binary(archive: &[u8], target: &str) -> R<Vec<u8>> {
         }
     }
     Err(format!("`{BIN_NAME}` not found inside the release archive").into())
+}
+
+#[cfg(windows)]
+fn extract_binary(archive: &[u8], target: &str) -> R<Vec<u8>> {
+    let mut archive = zip::ZipArchive::new(std::io::Cursor::new(archive))?;
+    let want = format!("scode-{target}/{BIN_NAME}.exe");
+    let mut entry = archive.by_name(&want)?;
+    if entry.size() == 0 || entry.size() > 256 * 1024 * 1024 {
+        return Err("release executable has invalid size".into());
+    }
+    let mut bytes = Vec::new();
+    entry.read_to_end(&mut bytes)?;
+    Ok(bytes)
 }
 
 /// Resolve the real path of the running executable (following symlinks so we
@@ -395,6 +437,7 @@ fn current_exe() -> R<PathBuf> {
 /// Atomically replace `exe` with `new_binary`: write to a sibling temp file on
 /// the same filesystem, mark it executable, then `rename` over the target. The
 /// running process keeps its already-mapped image, so this is safe live.
+#[cfg(not(windows))]
 fn install_over(exe: &Path, new_binary: &[u8]) -> R<()> {
     let dir = exe
         .parent()
@@ -425,25 +468,36 @@ fn install_over(exe: &Path, new_binary: &[u8]) -> R<()> {
     Ok(())
 }
 
+#[cfg(windows)]
+fn install_over(exe: &Path, new_binary: &[u8]) -> R<()> {
+    let dir = exe
+        .parent()
+        .ok_or("cannot determine the install directory")?;
+    let mut candidate = tempfile::NamedTempFile::new_in(dir)?;
+    candidate.write_all(new_binary)?;
+    candidate.as_file().sync_all()?;
+    self_replace::self_replace(candidate.path())?;
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // restart / prompt
 // ---------------------------------------------------------------------------
 
-/// Restart into the freshly installed binary. On Unix this `exec`s in place
-/// (the process image becomes the new `scode`), so it never returns on success;
-/// we run `--version` so the caller sees the new version and a clean exit.
-fn restart(exe: &Path) -> R<()> {
+/// Start the installed binary with the caller's selected arguments. Unix replaces
+/// this process; Windows waits for the new process and propagates its exit code.
+fn restart(exe: &Path, args: &[std::ffi::OsString]) -> R<()> {
     println!("restarting…");
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
-        let err = std::process::Command::new(exe).arg("--version").exec();
+        let err = std::process::Command::new(exe).args(args).exec();
         // `exec` only returns on failure.
         Err(format!("failed to restart {}: {err}", exe.display()).into())
     }
     #[cfg(not(unix))]
     {
-        let status = std::process::Command::new(exe).arg("--version").status()?;
+        let status = std::process::Command::new(exe).args(args).status()?;
         std::process::exit(status.code().unwrap_or(0));
     }
 }
@@ -451,12 +505,18 @@ fn restart(exe: &Path) -> R<()> {
 /// Ask the user to confirm on the terminal. A non-interactive/closed stdin is
 /// treated as "no" — use `--yes` to update unattended.
 fn confirm(prompt: &str) -> R<bool> {
-    print!("{prompt} [y/N] ");
-    std::io::stdout().flush()?;
-    let mut line = String::new();
-    if std::io::stdin().read_line(&mut line)? == 0 {
-        return Ok(false);
-    }
+    let line = if std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
+        crate::prompt_choice_via_shared_editor(&format!("{prompt} [y/N] "))
+            .map_err(std::io::Error::other)?
+    } else {
+        print!("{prompt} [y/N] ");
+        std::io::stdout().flush()?;
+        let mut line = String::new();
+        if std::io::stdin().read_line(&mut line)? == 0 {
+            return Ok(false);
+        }
+        line
+    };
     let a = line.trim().to_ascii_lowercase();
     Ok(a == "y" || a == "yes")
 }
@@ -498,14 +558,15 @@ mod tests {
 
     #[test]
     fn extracts_scode_from_archive() {
-        let target = "macos-arm64";
+        let target = detect_target().unwrap();
         let payload = b"#!/fake/scode binary payload";
-        let archive = make_archive(&format!("scode-{target}/scode"), payload);
-        let got = extract_binary(&archive, target).unwrap();
+        let binary = if cfg!(windows) { "scode.exe" } else { "scode" };
+        let archive = make_archive(&format!("scode-{target}/{binary}"), payload);
+        let got = extract_binary(&archive, &target).unwrap();
         assert_eq!(got, payload);
     }
 
-    /// Build a `.tar.gz` holding one file at `inner_path`.
+    #[cfg(not(windows))]
     fn make_archive(inner_path: &str, content: &[u8]) -> Vec<u8> {
         let mut tar_bytes = Vec::new();
         {
@@ -522,5 +583,15 @@ mod tests {
         let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
         gz.write_all(&tar_bytes).unwrap();
         gz.finish().unwrap()
+    }
+
+    #[cfg(windows)]
+    fn make_archive(inner_path: &str, content: &[u8]) -> Vec<u8> {
+        let mut archive = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        archive
+            .start_file(inner_path, zip::write::SimpleFileOptions::default())
+            .unwrap();
+        archive.write_all(content).unwrap();
+        archive.finish().unwrap().into_inner()
     }
 }

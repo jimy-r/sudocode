@@ -842,6 +842,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     // Only writer in the process; a second `set` cannot happen.
     set_cli_prompt_overrides(prompt_overrides);
     startup::measure("legacy_config", auto_migrate_legacy_config);
+    let is_interactive_session = matches!(&action, CliAction::Repl { .. })
+        || matches!(&action, CliAction::ResumeSession { commands, output_format: CliOutputFormat::Text, .. } if commands.is_empty());
+    if is_interactive_session {
+        cli::update::startup_prompt()?;
+    }
     // Informational commands (help, version, config, login, logout) are
     // dispatched immediately and must never block on a credential check.
     // If an ensure_authenticated() call is ever added below this point it
@@ -4434,17 +4439,13 @@ impl LiveCli {
             })
             .collect();
 
-        let banner = format!(
+        format!(
             "{}\n\n{}\n{}\n{}",
             logo,
             top,
             boxed_lines.join("\n"),
             bottom,
-        );
-        match cli::update::startup_notice() {
-            Some(notice) => format!("{banner}\n\n{notice}"),
-            None => banner,
-        }
+        )
     }
 
     /// Render the restored conversation history to a scrollback string, or an
