@@ -750,6 +750,7 @@ fn whole_completion_as_chunk(body: &str) -> Option<ChatCompletionChunk> {
         choices: vec![ChunkChoice {
             delta: ChunkDelta {
                 content: choice.message.content,
+                reasoning: choice.message.reasoning,
                 reasoning_content: choice.message.reasoning_content,
                 tool_calls: choice
                     .message
@@ -823,7 +824,9 @@ impl ChatStreamState {
         }
 
         for choice in chunk.choices {
-            if let Some(reasoning) = choice.delta.reasoning_content {
+            if let Some(reasoning) =
+                normalize_reasoning(choice.delta.reasoning, choice.delta.reasoning_content)
+            {
                 if !reasoning.is_empty() {
                     // Native structured reasoning already establishes the
                     // protocol. Its answer may contain literal <think> text.
@@ -1582,9 +1585,25 @@ struct ChatMessage {
     #[serde(default)]
     content: Option<String>,
     #[serde(default)]
+    reasoning: Option<String>,
+    #[serde(default)]
     reasoning_content: Option<String>,
     #[serde(default)]
     tool_calls: Vec<ResponseToolCall>,
+}
+
+/// vLLM uses `reasoning`; older compatible APIs use `reasoning_content`.
+/// Read both separately because a serde alias rejects responses carrying both.
+/// Prefer the nonempty current field, with the legacy field as a fallback.
+fn normalize_reasoning(
+    reasoning: Option<String>,
+    reasoning_content: Option<String>,
+) -> Option<String> {
+    match (reasoning, reasoning_content) {
+        (Some(reasoning), _) if !reasoning.is_empty() => Some(reasoning),
+        (_, Some(legacy)) => Some(legacy),
+        (reasoning, None) => reasoning,
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -1690,6 +1709,8 @@ struct ChunkChoice {
 struct ChunkDelta {
     #[serde(default)]
     content: Option<String>,
+    #[serde(default)]
+    reasoning: Option<String>,
     #[serde(default)]
     reasoning_content: Option<String>,
     #[serde(default, deserialize_with = "deserialize_null_as_empty_vec")]
@@ -2460,10 +2481,9 @@ fn normalize_response(
             "chat completion response missing choices",
         ))?;
     let mut content = Vec::new();
-    if let Some(thinking) = choice
-        .message
-        .reasoning_content
-        .filter(|value| !value.is_empty())
+    if let Some(thinking) =
+        normalize_reasoning(choice.message.reasoning, choice.message.reasoning_content)
+            .filter(|value| !value.is_empty())
     {
         content.push(OutputContentBlock::Thinking {
             thinking,
@@ -2922,6 +2942,7 @@ mod tests {
                 message: super::ChatMessage {
                     role: "assistant".to_string(),
                     content: Some("final answer".to_string()),
+                    reasoning: None,
                     reasoning_content: Some("hidden thought".to_string()),
                     tool_calls: Vec::new(),
                 },
@@ -2954,6 +2975,7 @@ mod tests {
                 message: super::ChatMessage {
                     role: "assistant".to_string(),
                     content: Some("final answer".to_string()),
+                    reasoning: None,
                     reasoning_content: None,
                     tool_calls: Vec::new(),
                 },
@@ -3038,6 +3060,7 @@ mod tests {
                 choices: vec![super::ChunkChoice {
                     delta: super::ChunkDelta {
                         content: Some("answer".to_string()),
+                        reasoning: None,
                         reasoning_content: None,
                         tool_calls: Vec::new(),
                     },
@@ -3198,6 +3221,7 @@ mod tests {
                 choices: vec![super::ChunkChoice {
                     delta: super::ChunkDelta {
                         content: None,
+                        reasoning: None,
                         reasoning_content: Some("think".to_string()),
                         tool_calls: Vec::new(),
                     },
@@ -3214,6 +3238,7 @@ mod tests {
                     choices: vec![super::ChunkChoice {
                         delta: super::ChunkDelta {
                             content: Some(" answer".to_string()),
+                            reasoning: None,
                             reasoning_content: None,
                             tool_calls: Vec::new(),
                         },
@@ -3274,6 +3299,7 @@ mod tests {
                 choices: vec![super::ChunkChoice {
                     delta: super::ChunkDelta {
                         content: None,
+                        reasoning: None,
                         reasoning_content: Some(String::new()),
                         tool_calls: Vec::new(),
                     },
@@ -3290,6 +3316,7 @@ mod tests {
                     choices: vec![super::ChunkChoice {
                         delta: super::ChunkDelta {
                             content: None,
+                            reasoning: None,
                             reasoning_content: None,
                             tool_calls: vec![super::DeltaToolCall {
                                 index: 0,
