@@ -115,13 +115,13 @@ curl -fsSL https://sudowork-release-1309794936.cos.ap-beijing.myqcloud.com/sudoc
   SCODE_MIRROR=https://sudowork-release-1309794936.cos.ap-beijing.myqcloud.com/sudocode/release/latest sh
 ```
 
-This installer uses GitHub for the checksum manifest. Windows binaries and
+The mirror supplies the archive and its published checksum manifest. Windows binaries and
 platform packages are available on the
 [Releases page](https://github.com/sudoprivacy/sudocode/releases/latest).
 
-Configure a model and credentials using the
-[authentication guide](docs/authentication.md). Run `scode update --check` to
-check the latest version, or `scode update` to install it on macOS or Linux.
+The [installation and updates guide](docs/usage.md#installation-and-updates)
+covers startup checks, mirror selection and version pinning. Configure a model
+and credentials using the [authentication guide](docs/authentication.md).
 
 ## Quick Start
 
