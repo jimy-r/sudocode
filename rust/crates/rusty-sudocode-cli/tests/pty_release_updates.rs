@@ -2,7 +2,7 @@
 mod common;
 
 use std::collections::HashMap;
-use std::io::{Read, Write};
+use std::io::{BufRead, Write};
 use std::net::TcpListener;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -10,6 +10,15 @@ use std::time::{Duration, Instant};
 
 fn screen_contents(screen: &pty_expect::Screen<'_>) -> String {
     screen.contents()
+}
+
+fn wait_for_repl(child: &mut pty_expect::PtySession) {
+    // The update picker also uses the prompt glyph. The engine banner marks
+    // the transition from startup choices to a session ready for commands.
+    child.expect("Auth mode").unwrap_or_else(|error| {
+        panic!("session banner: {error}\n{}", child.render(screen_contents))
+    });
+    child.expect("❯").unwrap();
 }
 
 struct Mirror {
@@ -41,12 +50,18 @@ impl Mirror {
                     std::thread::sleep(Duration::from_millis(10));
                     continue;
                 };
+                stream.set_nonblocking(false).unwrap();
                 stream
                     .set_read_timeout(Some(Duration::from_secs(2)))
                     .unwrap();
-                let mut request = [0; 2048];
-                let count = stream.read(&mut request).unwrap();
-                let request = String::from_utf8_lossy(&request[..count]);
+                let mut request = String::new();
+                if std::io::BufReader::new(&mut stream)
+                    .read_line(&mut request)
+                    .unwrap()
+                    == 0
+                {
+                    continue;
+                }
                 let path = request.split_whitespace().nth(1).unwrap();
                 thread_requests.fetch_add(1, Ordering::SeqCst);
                 while !thread_release.load(Ordering::SeqCst) && !thread_stop.load(Ordering::SeqCst)
@@ -251,7 +266,10 @@ impl Drop for Mirror {
     fn drop(&mut self) {
         self.stopped.store(true, Ordering::SeqCst);
         if let Some(thread) = self.thread.take() {
-            thread.join().unwrap();
+            let result = thread.join();
+            if !std::thread::panicking() {
+                result.unwrap();
+            }
         }
     }
 }
@@ -296,7 +314,7 @@ fn startup_is_available_before_network_reply_and_next_launch_uses_cache() {
         restored.expect("Update available:").unwrap();
         restored.expect("v999.0.0").unwrap();
         restored.send("\x1b[B\r").unwrap();
-        restored.expect("❯").unwrap();
+        wait_for_repl(&mut restored);
         restored.send("/exit\r").unwrap();
         assert_eq!(restored.expect_eof().unwrap(), 0);
         assert_eq!(mirror.requests.load(Ordering::SeqCst), 1);
@@ -325,7 +343,7 @@ fn dismissing_a_release_keeps_sessions_available_without_another_prompt() {
     let mut child = env.spawn_with_env(&[], &options);
     child.expect("Update available:").unwrap();
     child.send("\x1b[B\x1b[B\r").unwrap();
-    child.expect("❯").unwrap();
+    wait_for_repl(&mut child);
     child.send("/exit\r").unwrap();
     assert_eq!(child.expect_eof().unwrap(), 0);
     let record: serde_json::Value =
