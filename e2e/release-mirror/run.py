@@ -76,6 +76,8 @@ import os, sys, urllib.request, urllib.error
 args = sys.argv[1:]
 url = args[-1]
 base = os.environ['MIRROR_TEST_URL']
+if os.environ.get('MIRROR_BLOCK_GITHUB') == '1' and 'github.com/' in url:
+    raise RuntimeError('GitHub is unavailable in this region')
 for remote, local in [
     ('https://api.github.com/repos/sudoprivacy/sudocode/releases', '/api'),
     ('https://github.com/sudoprivacy/sudocode/releases/download', '/github'),
@@ -157,10 +159,10 @@ else:
 
     installed = root / "installed"
 
-    def install(expected, *flags, success=True):
+    def install(expected, *flags, success=True, extra=None):
         result = run(
             ["sh", str(ROOT / "install.sh"), "--prefix", str(installed), "--no-sudo", *flags],
-            success=success,
+            success=success, extra=extra,
         )
         if success:
             assert run([str(installed / "scode")]).stdout.strip() == expected
@@ -177,7 +179,9 @@ else:
     publish("stage", "v1.0.0")
     assert not pointer.exists()
     publish("promote", "v1.0.0")
-    install("v1.0.0")
+    requests.clear()
+    install("v1.0.0", extra={"MIRROR_BLOCK_GITHUB": "1"})
+    assert all(not path.startswith(("/api/", "/github/")) for path in requests)
     prepare("v1.0.1", is_bundle=True)
     dist = root / "v1.0.1"
     manifest = dist / "SHA256SUMS.txt"
@@ -210,7 +214,7 @@ else:
     requests.clear()
     install("v1.0.0")
     assert "/api/latest" not in requests
-    assert "/github/v1.0.0/SHA256SUMS.txt" in requests
+    assert "/sudocode/release/v1.0.0/SHA256SUMS.txt" in requests
     publish("promote", "v1.0.1", success=False)
     assert pointer.read_text().strip() == "v1.0.0"
     publish("stage", "v1.0.1")

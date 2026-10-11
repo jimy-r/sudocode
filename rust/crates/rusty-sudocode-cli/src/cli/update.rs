@@ -1,11 +1,11 @@
-//! `scode update` — self-update from GitHub Releases, then restart.
+//! Release discovery, startup notices and explicit CLI self-update.
 //!
 //! Mirrors the release layout that `install.sh` publishes and installs against,
 //! so a binary installed either way can update itself:
 //!   - latest tag  → `GET https://api.github.com/repos/<repo>/releases/latest`
 //!   - archive     → `…/releases/download/<tag>/scode-<target>.tar.gz`,
 //!     overridable with `SCODE_MIRROR` for faster CN downloads
-//!   - checksums   → `…/releases/download/<tag>/SHA256SUMS.txt` (always GitHub)
+//!   - checksums   → the same published manifest on the selected release source
 //!
 //! Flow: resolve the target tag, download the archive + checksums, verify
 //! SHA-256, extract `scode-<target>/scode`, atomically swap it over the running
@@ -16,6 +16,9 @@ use sha2::{Digest, Sha256};
 use std::error::Error;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use runtime::{FsBackend, StdFsBackend};
 
 const REPO: &str = "sudoprivacy/sudocode";
 /// The version compiled into *this* binary (no leading `v`).
@@ -23,6 +26,94 @@ const CURRENT: &str = env!("CARGO_PKG_VERSION");
 const BIN_NAME: &str = "scode";
 const CHECKSUM_FILE: &str = "SHA256SUMS.txt";
 const USER_AGENT: &str = concat!("scode-update/", env!("CARGO_PKG_VERSION"));
+const COS_LATEST: &str =
+    "https://sudowork-release-1309794936.cos.ap-beijing.myqcloud.com/sudocode/release/latest";
+const CHECK_INTERVAL_SECS: u64 = 20 * 60 * 60;
+
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+struct Release {
+    tag: String,
+    download_base: String,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct ReleaseCache {
+    checked_at: u64,
+    source: String,
+    release: Release,
+}
+
+/// Read the cached notice and refresh metadata off the terminal's startup path.
+/// The next launch displays the refreshed version, as in Codex's startup check.
+pub(crate) fn startup_notice() -> Option<String> {
+    let is_enabled = match std::env::var("SCODE_CHECK_UPDATES").as_deref() {
+        Ok("0" | "false" | "off") => false,
+        Ok("1" | "true" | "on") => true,
+        _ => !cfg!(debug_assertions),
+    };
+    if !is_enabled {
+        return None;
+    }
+    let source = configured_mirror().unwrap_or_default();
+    let path = runtime::config::default_config_home()
+        .join("cache")
+        .join("release.json");
+    let cached = std::fs::read(&path)
+        .ok()
+        .and_then(|raw| serde_json::from_slice::<ReleaseCache>(&raw).ok())
+        .filter(|cache| cache.source == source && is_stable_tag(&cache.release.tag));
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |time| time.as_secs());
+    let is_fresh = cached.as_ref().is_some_and(|cache| {
+        cache.checked_at <= now && now - cache.checked_at < CHECK_INTERVAL_SECS
+    });
+    if !is_fresh {
+        let _ = std::thread::Builder::new()
+            .name("scode-release-check".into())
+            .spawn(move || {
+                let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                else {
+                    return;
+                };
+                let Ok(release) = runtime.block_on(resolve_release(None)) else {
+                    return;
+                };
+                let cache = ReleaseCache {
+                    checked_at: now,
+                    source,
+                    release,
+                };
+                let Ok(raw) = serde_json::to_vec(&cache) else {
+                    return;
+                };
+                if let Some(parent) = path.parent() {
+                    if std::fs::create_dir_all(parent).is_ok() {
+                        let _ = StdFsBackend.write_atomic(&path.to_string_lossy(), &raw);
+                    }
+                }
+            });
+    }
+    let cache = cached.filter(|cache| is_newer(&cache.release.tag, &format!("v{CURRENT}")))?;
+    #[cfg(windows)]
+    let action = format!(
+        "Download {}/scode-windows-{}.zip",
+        cache.release.download_base,
+        if std::env::consts::ARCH == "aarch64" {
+            "arm64"
+        } else {
+            "x64"
+        }
+    );
+    #[cfg(not(windows))]
+    let action = "Run scode update";
+    Some(format!(
+        "Update available: v{CURRENT} → {}. {action}.",
+        cache.release.tag
+    ))
+}
 
 type R<T> = Result<T, Box<dyn Error>>;
 
@@ -31,8 +122,7 @@ type R<T> = Result<T, Box<dyn Error>>;
 /// * `version` — pin a release tag (`v0.1.27` or `0.1.27`); `None` = latest.
 /// * `check`   — only report current vs. latest, download nothing.
 /// * `yes`     — skip the interactive confirmation.
-pub(crate) fn run(version: Option<String>, check: bool, yes: bool) -> R<()> {
-    let target = detect_target()?;
+pub(crate) fn run(version: Option<&str>, check: bool, yes: bool) -> R<()> {
     let current_tag = format!("v{CURRENT}");
 
     // Networked steps run on a short-lived runtime — `main` is synchronous and
@@ -40,14 +130,12 @@ pub(crate) fn run(version: Option<String>, check: bool, yes: bool) -> R<()> {
     let rt = tokio::runtime::Runtime::new()?;
 
     let pinned = version.is_some();
-    let latest = match version {
-        Some(v) => normalize_tag(&v),
-        None => rt.block_on(resolve_latest_tag())?,
-    };
+    let release = rt.block_on(resolve_release(version))?;
+    let latest = &release.tag;
 
-    println!("scode {current_tag} → {latest}  ({target})");
+    println!("scode {current_tag} → {latest}");
 
-    let up_to_date = !is_newer(&latest, &current_tag);
+    let up_to_date = !is_newer(latest, &current_tag);
     if check {
         println!(
             "{}",
@@ -65,18 +153,15 @@ pub(crate) fn run(version: Option<String>, check: bool, yes: bool) -> R<()> {
         println!("already up to date");
         return Ok(());
     }
+    let target = detect_target()?;
     if !yes && !confirm(&format!("update {current_tag} → {latest}?"))? {
         println!("aborted");
         return Ok(());
     }
 
     let archive = format!("scode-{target}.tar.gz");
-    let archive_url = match std::env::var("SCODE_MIRROR") {
-        Ok(m) if !m.is_empty() => format!("{}/{archive}", m.trim_end_matches('/')),
-        _ => format!("https://github.com/{REPO}/releases/download/{latest}/{archive}"),
-    };
-    let checksum_url =
-        format!("https://github.com/{REPO}/releases/download/{latest}/{CHECKSUM_FILE}");
+    let archive_url = format!("{}/{archive}", release.download_base);
+    let checksum_url = format!("{}/{CHECKSUM_FILE}", release.download_base);
 
     println!("downloading {archive}");
     let (bytes, sums) = rt.block_on(async {
@@ -137,9 +222,16 @@ fn is_newer(candidate: &str, current: &str) -> bool {
 }
 
 fn parse_semver(tag: &str) -> Option<(u64, u64, u64)> {
-    let t = tag.trim_start_matches('v');
-    let mut it = t.split('.').map(|p| p.parse::<u64>().ok());
-    Some((it.next()??, it.next()??, it.next()??))
+    let t = tag.strip_prefix('v').unwrap_or(tag);
+    let mut it = t.split('.').map(|part| {
+        if !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit()) {
+            part.parse::<u64>().ok()
+        } else {
+            None
+        }
+    });
+    let version = (it.next()??, it.next()??, it.next()??);
+    it.next().is_none().then_some(version)
 }
 
 // ---------------------------------------------------------------------------
@@ -150,16 +242,80 @@ fn client() -> R<reqwest::Client> {
     Ok(reqwest::Client::builder().user_agent(USER_AGENT).build()?)
 }
 
+fn configured_mirror() -> Option<String> {
+    std::env::var("SCODE_MIRROR")
+        .ok()
+        .map(|base| base.trim().trim_end_matches('/').to_string())
+        .filter(|base| !base.is_empty())
+}
+
+fn is_stable_tag(tag: &str) -> bool {
+    tag.starts_with('v') && parse_semver(tag).is_some()
+}
+
+/// Resolve one immutable release. Explicit mirrors keep all metadata and
+/// content requests on that source; the default falls back from GitHub to COS.
+async fn resolve_release(version: Option<&str>) -> R<Release> {
+    if let Some(base) = configured_mirror() {
+        return mirror_release(&base, version).await;
+    }
+    let tag = match version {
+        Some(version) => normalize_tag(version),
+        None => match resolve_latest_tag().await {
+            Ok(tag) if is_stable_tag(&tag) => tag,
+            _ => return mirror_release(COS_LATEST, None).await,
+        },
+    };
+    Ok(Release {
+        download_base: format!("https://github.com/{REPO}/releases/download/{tag}"),
+        tag,
+    })
+}
+
+async fn mirror_release(base: &str, version: Option<&str>) -> R<Release> {
+    let (tag, download_base) = if let Some(root) = base.strip_suffix("/latest") {
+        let tag = match version {
+            Some(version) => normalize_tag(version),
+            None => metadata_text(&format!("{base}/version.txt"))
+                .await?
+                .trim()
+                .to_string(),
+        };
+        let download_base = format!("{root}/{tag}");
+        (tag, download_base)
+    } else {
+        let tag = base.rsplit('/').next().unwrap_or_default().to_string();
+        if version.is_some_and(|version| normalize_tag(version) != tag) {
+            return Err("mirror directory differs from requested version".into());
+        }
+        (tag, base.to_string())
+    };
+    if !is_stable_tag(&tag) {
+        return Err("mirror must name a stable vX.Y.Z release".into());
+    }
+    Ok(Release { tag, download_base })
+}
+
+async fn metadata_text(url: &str) -> R<String> {
+    let client = reqwest::Client::builder()
+        .user_agent(USER_AGENT)
+        .timeout(Duration::from_secs(8))
+        .build()?;
+    let mut response = client.get(url).send().await?.error_for_status()?;
+    let mut raw = Vec::new();
+    while let Some(chunk) = response.chunk().await? {
+        if raw.len() + chunk.len() > 64 * 1024 {
+            return Err("release metadata exceeds 64 KiB".into());
+        }
+        raw.extend_from_slice(&chunk);
+    }
+    Ok(String::from_utf8(raw)?)
+}
+
 /// Resolve the latest release tag from the GitHub API.
 async fn resolve_latest_tag() -> R<String> {
     let url = format!("https://api.github.com/repos/{REPO}/releases/latest");
-    let value: serde_json::Value = client()?
-        .get(&url)
-        .send()
-        .await?
-        .error_for_status()?
-        .json()
-        .await?;
+    let value: serde_json::Value = serde_json::from_str(&metadata_text(&url).await?)?;
     value
         .get("tag_name")
         .and_then(|t| t.as_str())

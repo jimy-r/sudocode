@@ -1093,7 +1093,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             version,
             check,
             yes,
-        } => cli::update::run(version, check, yes)?,
+        } => cli::update::run(version.as_deref(), check, yes)?,
     }
     Ok(())
 }
@@ -4434,13 +4434,17 @@ impl LiveCli {
             })
             .collect();
 
-        format!(
+        let banner = format!(
             "{}\n\n{}\n{}\n{}",
             logo,
             top,
             boxed_lines.join("\n"),
             bottom,
-        )
+        );
+        match cli::update::startup_notice() {
+            Some(notice) => format!("{banner}\n\n{notice}"),
+            None => banner,
+        }
     }
 
     /// Render the restored conversation history to a scrollback string, or an
