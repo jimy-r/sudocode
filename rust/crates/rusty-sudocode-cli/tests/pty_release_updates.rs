@@ -1,6 +1,7 @@
 //! Release discovery through the real CLI and an isolated HTTP mirror.
 mod common;
 
+use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -21,6 +22,10 @@ struct Mirror {
 
 impl Mirror {
     fn new(tag: &'static str, is_released: bool) -> Self {
+        Self::with_files(tag, is_released, HashMap::new())
+    }
+
+    fn with_files(tag: &'static str, is_released: bool, files: HashMap<String, Vec<u8>>) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
         let base = format!("http://{}/release/latest", listener.local_addr().unwrap());
@@ -41,18 +46,27 @@ impl Mirror {
                     .unwrap();
                 let mut request = [0; 2048];
                 let count = stream.read(&mut request).unwrap();
-                assert!(String::from_utf8_lossy(&request[..count])
-                    .starts_with("GET /release/latest/version.txt "));
+                let request = String::from_utf8_lossy(&request[..count]);
+                let path = request.split_whitespace().nth(1).unwrap();
                 thread_requests.fetch_add(1, Ordering::SeqCst);
                 while !thread_release.load(Ordering::SeqCst) && !thread_stop.load(Ordering::SeqCst)
                 {
                     std::thread::sleep(Duration::from_millis(10));
                 }
+                let body = if path == "/release/latest/version.txt" {
+                    tag.as_bytes()
+                } else {
+                    files
+                        .get(path)
+                        .unwrap_or_else(|| panic!("unexpected release URL: {path}"))
+                        .as_slice()
+                };
                 let response = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{tag}",
-                    tag.len()
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
                 );
                 let _ = stream.write_all(response.as_bytes());
+                let _ = stream.write_all(body);
             }
         });
         Self {
@@ -63,6 +77,174 @@ impl Mirror {
             thread: Some(thread),
         }
     }
+}
+
+fn payload_archive(bytes: &[u8]) -> (String, Vec<u8>) {
+    let os = match std::env::consts::OS {
+        "macos" => "macos",
+        "windows" => "windows",
+        _ => "linux",
+    };
+    let arch = if std::env::consts::ARCH == "aarch64" {
+        "arm64"
+    } else {
+        "x64"
+    };
+    let target = format!("scode-{os}-{arch}");
+    #[cfg(windows)]
+    {
+        let mut archive = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        archive
+            .start_file(
+                format!("{target}/scode.exe"),
+                zip::write::SimpleFileOptions::default(),
+            )
+            .unwrap();
+        archive.write_all(bytes).unwrap();
+        (
+            format!("{target}.zip"),
+            archive.finish().unwrap().into_inner(),
+        )
+    }
+    #[cfg(not(windows))]
+    {
+        let gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        let mut archive = tar::Builder::new(gz);
+        let mut header = tar::Header::new_gnu();
+        header.set_size(bytes.len() as u64);
+        header.set_mode(0o755);
+        header.set_cksum();
+        archive
+            .append_data(&mut header, format!("{target}/scode"), bytes)
+            .unwrap();
+        (
+            format!("{target}.tar.gz"),
+            archive.into_inner().unwrap().finish().unwrap(),
+        )
+    }
+}
+
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+fn spawn_installed(
+    env: &common::TestEnv,
+    installed: &std::path::Path,
+    mirror: &str,
+    args: &[&str],
+) -> pty_expect::PtySession {
+    let record = env.workspace_root().join("restart arguments.txt");
+    let command = format!(
+        "{} exec /usr/bin/env -u SCODE_GLOBAL_CONFIG_DIR -u SCODE_PROJECT_CONFIG_DIR SUDO_CODE_CONFIG_HOME={} SCODE_MIRROR={} SCODE_CHECK_UPDATES=1 SCODE_UPDATE_RECORD={} {} {}",
+        if cfg!(windows) { "MSYS2_ARG_CONV_EXCL='*'" } else { "" },
+        shell_quote(&env.config_home().to_string_lossy()), shell_quote(mirror),
+        shell_quote(&record.to_string_lossy()), shell_quote(&installed.to_string_lossy()),
+        args.iter().map(|arg| shell_quote(arg)).collect::<Vec<_>>().join(" ")
+    );
+    let mut child =
+        pty_expect::PtySession::spawn(&common::resolve_sh(), &["-c", &command]).unwrap();
+    child.set_default_timeout(common::DEFAULT_TIMEOUT);
+    child
+}
+
+#[test]
+fn selecting_update_installs_the_checked_archive_and_restarts_with_original_arguments() {
+    use sha2::{Digest, Sha256};
+    let env = common::TestEnv::new("release-install");
+    let root = env.workspace_root();
+    let exe_name = if cfg!(windows) {
+        "installed scode.exe"
+    } else {
+        "installed scode"
+    };
+    let installed = root.join(exe_name);
+    std::fs::copy(common::scode_bin(), &installed).unwrap();
+    let source = root.join("replacement.rs");
+    std::fs::write(
+        &source,
+        r#"fn main() {
+        let args = std::env::args().skip(1).collect::<Vec<_>>().join("|");
+        std::fs::write(std::env::var("SCODE_UPDATE_RECORD").unwrap(), args).unwrap();
+        println!("updated scode fixture");
+    }"#,
+    )
+    .unwrap();
+    let replacement = root.join(if cfg!(windows) {
+        "replacement.exe"
+    } else {
+        "replacement"
+    });
+    assert!(std::process::Command::new("rustc")
+        .arg(&source)
+        .arg("-o")
+        .arg(&replacement)
+        .status()
+        .unwrap()
+        .success());
+    let payload = std::fs::read(&replacement).unwrap();
+    let (name, archive) = payload_archive(&payload);
+    let checksum = format!("{:x}  {name}\n", Sha256::digest(&archive));
+    let mirror = Mirror::with_files(
+        "v999.0.0",
+        true,
+        HashMap::from([
+            (format!("/release/v999.0.0/{name}"), archive),
+            (
+                "/release/v999.0.0/SHA256SUMS.txt".into(),
+                checksum.into_bytes(),
+            ),
+        ]),
+    );
+    let cache = env.config_home().join("cache/release.json");
+    std::fs::create_dir_all(cache.parent().unwrap()).unwrap();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    std::fs::write(&cache, serde_json::to_vec(&serde_json::json!({
+        "checked_at": now, "source": mirror.base,
+        "release": {"tag": "v999.0.0", "download_base": mirror.base.replace("/latest", "/v999.0.0")}
+    })).unwrap()).unwrap();
+    let record = root.join("restart arguments.txt");
+    let mut child = spawn_installed(&env, &installed, &mirror.base, &["--model", "sonnet"]);
+    child.expect("Update available:").unwrap();
+    child.send("\r").unwrap();
+    child.expect("checksum verified").unwrap();
+    child
+        .expect("updated scode fixture")
+        .unwrap_or_else(|error| panic!("replacement: {error}\n{}", child.render(screen_contents)));
+    assert_eq!(child.expect_eof().unwrap(), 0);
+    assert_eq!(std::fs::read(&installed).unwrap(), payload);
+    assert_eq!(std::fs::read_to_string(&record).unwrap(), "--model|sonnet");
+    assert_eq!(mirror.requests.load(Ordering::SeqCst), 2);
+}
+
+#[test]
+fn a_bad_checksum_preserves_the_installed_executable() {
+    let env = common::TestEnv::new("release-tampered");
+    let installed = env
+        .workspace_root()
+        .join(if cfg!(windows) { "scode.exe" } else { "scode" });
+    std::fs::copy(common::scode_bin(), &installed).unwrap();
+    let original = std::fs::read(&installed).unwrap();
+    let (name, archive) = payload_archive(b"tampered release bytes");
+    let mirror = Mirror::with_files(
+        "v999.0.0",
+        true,
+        HashMap::from([
+            (format!("/release/v999.0.0/{name}"), archive),
+            (
+                "/release/v999.0.0/SHA256SUMS.txt".into(),
+                format!("{}  {name}\n", "0".repeat(64)).into_bytes(),
+            ),
+        ]),
+    );
+    let mut child = spawn_installed(&env, &installed, &mirror.base, &["update", "--yes"]);
+    child.expect("checksum mismatch").unwrap();
+    assert_ne!(child.expect_eof().unwrap(), 0);
+    assert_eq!(std::fs::read(&installed).unwrap(), original);
+    assert!(!env.workspace_root().join("restart arguments.txt").exists());
 }
 
 impl Drop for Mirror {
@@ -113,11 +295,50 @@ fn startup_is_available_before_network_reply_and_next_launch_uses_cache() {
         let mut restored = env.spawn_with_env(&[], &options);
         restored.expect("Update available:").unwrap();
         restored.expect("v999.0.0").unwrap();
+        restored.send("\x1b[B\r").unwrap();
         restored.expect("❯").unwrap();
         restored.send("/exit\r").unwrap();
         assert_eq!(restored.expect_eof().unwrap(), 0);
         assert_eq!(mirror.requests.load(Ordering::SeqCst), 1);
     }
+}
+
+#[test]
+fn dismissing_a_release_keeps_sessions_available_without_another_prompt() {
+    let env = common::TestEnv::new("release-dismiss");
+    let mirror = Mirror::new("v999.0.0", true);
+    let options = [
+        ("SCODE_MIRROR", mirror.base.as_str()),
+        ("SCODE_CHECK_UPDATES", "1"),
+    ];
+    let cache = env.config_home().join("cache/release.json");
+    std::fs::create_dir_all(cache.parent().unwrap()).unwrap();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    std::fs::write(&cache, serde_json::to_vec(&serde_json::json!({
+        "checked_at": now,
+        "source": mirror.base,
+        "release": {"tag": "v999.0.0", "download_base": mirror.base.replace("/latest", "/v999.0.0")}
+    })).unwrap()).unwrap();
+    let mut child = env.spawn_with_env(&[], &options);
+    child.expect("Update available:").unwrap();
+    child.send("\x1b[B\x1b[B\r").unwrap();
+    child.expect("❯").unwrap();
+    child.send("/exit\r").unwrap();
+    assert_eq!(child.expect_eof().unwrap(), 0);
+    let record: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&cache).unwrap()).unwrap();
+    assert_eq!(record["dismissed_version"], "v999.0.0");
+    let mut restored = env.spawn_with_env(&[], &options);
+    restored.expect("❯").unwrap();
+    assert!(!restored
+        .render(screen_contents)
+        .contains("Update available:"));
+    restored.send("/exit\r").unwrap();
+    assert_eq!(restored.expect_eof().unwrap(), 0);
+    assert_eq!(mirror.requests.load(Ordering::SeqCst), 0);
 }
 
 #[test]
