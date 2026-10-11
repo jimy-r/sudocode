@@ -465,7 +465,7 @@ coverage starts fresh and is tracked here as the single source.</p>
   </tbody>
 </table>
 
-<h4>1a. Real-time feedback (visibility + controllability)</h4>
+<h4 id="real-time-feedback">1a. Real-time feedback (visibility + controllability)</h4>
 
 <div class="callout">
   <strong>Hacker-critical UX.</strong> These features give the user real-time
@@ -1881,17 +1881,16 @@ href="#collaboration-as-unit">Collaboration as a unit</a> below):</p>
   is one of the concrete things claude-code's pager / fullscreen
   prompts do that hackers route around.</li>
   <li><strong>Alternate-screen breaks copilot-worker attach.</strong>
-  In the copilot-worker topology, an operator (or hydra-style UI)
+  In the copilot-worker topology, an operator using Sudowork
   attaches to a worker's terminal to inspect live state. A worker
   that ran in alternate-screen would hijack the operator's terminal
   on attach and erase its scrollback on detach. Inline scrollback
   IS the affordance that makes attach/detach safe.</li>
   <li><strong>Pipe-friendliness is load-bearing.</strong> <code>scode
-  "plan X" | tee /proc/p_worker/chat-with-me</code> only works when
-  scode writes to a regular tty / pipe. Alternate-screen makes scode
-  a black-box program, breaking unix composition. The same primitive
-  that lets a hacker pipe scode output around is what lets sudocode
-  participate as a unit in nexus-vfs chat-with-me streams.</li>
+  "plan X" | tee plan.md</code> composes with ordinary shell tools
+  because scode writes to a regular tty or pipe. Agent communication
+  uses the <a href="https://s.shareone.vip/s/nexus-integration-architecture#a2a">Nexus
+  conversation transport</a>.</li>
 </ul>
 
 <p>What <strong>is</strong> in scope, and already shipped in PR #180
@@ -2072,211 +2071,75 @@ CC's plan mode comes first (per the
 standing rule</a>), then a design write-up, then a priority decision.
 Logged here so the insight isn't lost to discussion-only memory.</p>
 
-<h2 id="goal-4">Goal 4 · Be a good unit in the copilot-worker topology</h2>
+<h2 id="goal-4">Goal 4 · Agent storage, communication and execution</h2>
 
-<p id="collaboration-as-unit">The positioning — sudocode as one
-agent unit among peers on the nexus VFS chat-with-me plane,
-interchangeable with Claude / Codex / humans at the mailbox
-primitive — and the three diagrams (topology · one-binary-three-modes
-· hydra evolution) live in <a
-href="https://github.com/sudoprivacy/sudocode/blob/main/README.md#position-in-the-larger-picture"><code>README.md</code>
-§ Position in the larger picture</a>. That's where a hacker should
-first encounter the framing, alongside the rest of the philosophy.</p>
+<p id="collaboration-as-unit">Product principles and the component overview live in
+<a href="README.md#position-in-the-larger-picture">README</a>.
+The <a href="docs/design/agent-context-storage-matrix.html#agent-delivery-contract">Agent storage contract</a>
+owns identity, durable paths, indexes, delivery and host transparency.
+The <a href="https://s.shareone.vip/s/nexus-integration-architecture">Nexus integration architecture</a>
+owns transport and runtime service boundaries. This section tracks implementation
+and acceptance against those references.</p>
 
-<p>This goal section holds the engineering plan: what sudocode
-commits to implementing against the nexus protocol, what is
-deliberately not in scope, and the work sequencing. The protocol
-SSOT itself lives upstream in <a
-href="https://shareone.app/s/nexus-integration-architecture">nexus
-integration architecture</a> (public, Apache-2.0, joint-owned with
-the nexus team; SSOT at <code>nexus/docs/architecture/nexus-integration-architecture.html</code>). sudocode does not vendor it.</p>
-
-<h3>What sudocode commits to — implementation contract</h3>
-
-<ol>
-  <li><strong>Spawn surface.</strong> A sudocode session may be
-  started by an external orchestrator through
-  <code>ManagedAgentService.start_session_v1({agent_id, repos, model,
-  owner_id, zone_id})</code>. The returned <code>session_id</code>
-  currently names the AgentRegistry pid. The engine creates a separate
-  durable session-id for its transcript. Those identities have different
-  lifetimes; the control API's field name does not make them the same.
-  Co-host recovery and the interface migration choice are tracked in
-  <a href="https://s.shareone.vip/s/agent-context-storage-matrix#q1">the storage matrix, Q1</a>.
-  The CLI also runs standalone without a shared Nexus daemon.</li>
-
-  <li><strong>FsBackend trait.</strong> File tools and session persistence use the
-  <code>FsBackend</code> trait with three impls:
-  <code>KernelFsBackend&lt;Kernel&gt;</code> (in-process kernel
-  syscalls, either the CLI's embedded kernel or the shared daemon's kernel),
-  <code>StdFsBackend</code> (host files, including standalone session storage),
-  and <code>NexusVfsFsBackend</code> (gRPC to a remote kernel).
-  <code>HostContext</code> supplies the filesystem and host-side configuration
-  and shell roots. Kernel backend type alone does not determine the session
-  storage root; <code>managed_root(ManagedRoot::Sessions)</code> can select
-  <code>/sessions</code> or defer to the local store's partition.</li>
-
-  <li><strong>Mailbox read / write.</strong> A sudocode session
-  watches its own <code>/proc/{self_pid}/chat-with-me</code> via
-  <code>sys_watch</code> for incoming prompts; it writes responses
-  to the conversation peer's <code>chat-with-me</code> using
-  <code>sys_write</code>. The on-disk envelope's <code>from</code>
-  field is stamped by the kernel (<code>MailboxStampingHook</code>);
-  sudocode does not forge it.</li>
-
-  <li><strong>Peer addressing inside a workspace.</strong> An
-  agent staged at <code>/proc/{pid}/workspace/...</code> writes
-  <code>chat-with-me</code> relative to its cwd — that path is a
-  DT_LINK back to the workspace owner's mailbox. sudocode honours
-  the convention; it does not bypass the link to find the owner
-  pid out-of-band.</li>
-
-  <li><strong>Workspace boundary.</strong> A write into another
-  agent's <code>workspace/</code> returns EPERM from
-  <code>WorkspaceBoundaryHook</code> with a structured payload
-  telling the LLM where to write instead (the
-  <code>chat-with-me</code> link). sudocode surfaces this EPERM
-  verbatim back to the LLM rather than catching and retrying — the
-  path layout is the SSOT for permissions and the error message
-  is the teaching channel.</li>
-
-  <li><strong>Session state placement and recovery.</strong> The <code>nexusd-cohost</code>
-  composition installs sudocode's spawn adapter. Its transcript lives at <code>/sessions/&lt;sid&gt;/transcript.jsonl</code>, with
-  an agent index at <code>/agents/{name}/sessions/&lt;sid&gt;</code>. The
-  compatible control API keeps <code>session_id</code> as the process handle,
-  returns a separate <code>durable_session_id</code>, and accepts
-  <code>resume_session_id</code> to restore a stopped run on a new pid.
-  Recovery reads and continues writing through the session's VFS backend.
-  Persisted agent, owner, zone and repository bindings must match; old
-  transcripts without those bindings need a separate migration. A kernel
-  advisory lease excludes concurrent co-host writers during normal operation;
-  this does not provide storage fencing during network partitions.
-  Standalone retains its local workspace partition and resume behavior.
-  See <a href="docs/permissions-and-sandbox.md">hosted recovery operations</a>
-  and the storage matrix's Q1 for the identity contract.</li>
-
-  <li><strong>Lifecycle.</strong> Out-of-band termination
-  (SIGTERM / SIGKILL / orphan reap from <code>AgentRegistry</code>)
-  must drop the session cleanly — flush in-flight chat-with-me
-  writes, close streams, release locks. No long-running
-  in-memory state that doesn't survive a host restart; the
-  <code>--session-id</code> transcript is the SSOT.</li>
-
-  <li><strong>Concurrency model.</strong> Each managed-agent loop
-  currently runs on its own OS thread (<code>std::thread::spawn</code>
-  per pid, with a per-thread current-thread tokio runtime driving the
-  turn). An agent is a sequential conversation — one turn at a time —
-  so it needs no internal parallelism; parallelism is across agents.
-  This is correct and simplest for a modest number of co-hosted agents.
-  <strong>Planned evolution:</strong> move each agent loop from
-  <code>std::thread</code> onto <code>tokio::spawn</code> as a task on a
-  shared multi-thread runtime, so N agents become N cheap tasks rather
-  than N OS threads (each with a multi-MB stack) — the scaling path for
-  a large agent fleet.</li>
-</ol>
-
-<h3>What is NOT sudocode's job here</h3>
-
-<ul>
-  <li><strong>Orchestration.</strong> Deciding which workers exist,
-  when to spawn, when to cancel — that is the orchestrator
-  (sudowork / hydra / a script). sudocode receives spawn calls; it
-  does not invent them.</li>
-  <li><strong>Multi-agent UI.</strong> Dashboards, worker-vital
-  sidebars, attach buttons — sudowork (Feishu / web) and hydra (VS
-  Code sidebar) own that surface. sudocode stays the unit. This is
-  the deepest reason the alternate-screen TUI rule (Goal 3) is
-  bright-line: a dashboard inside the unit is a category error.</li>
-  <li><strong>Cross-instance transport.</strong> Raft replication of
-  DT_STREAM, federation Raft cluster topology, Matrix C-S adapter
-  for stock chat clients — all kernel / nexus-services concerns.
-  sudocode reads and writes through <code>FsBackend</code> and
-  doesn't care whether the stream is same-host or replicated.</li>
-  <li><strong>Audit.</strong> <code>AuditHook</code> is a kernel
-  POST-write hook fired by every <code>sys_write</code>; sudocode
-  needs to do nothing to participate.</li>
-</ul>
-
-<h3 id="linkage">Linkage: sudocode_runtime is statically linked into the daemon</h3>
-
-<p>In managed-agent mode the sudocode runtime is compiled <em>into</em> the
-nexus daemon <code>nexusd-cluster</code> (which already links the nexus
-<code>kernel</code> crate), and <code>KernelFsBackend&lt;Kernel&gt;</code>
-monomorphises there, so an agent's file operations are ordinary in-process
-Rust calls. The daemon is the host — there is no separate sudocode host
-binary; <code>scode</code> standalone stays on <code>StdFsBackend</code>.
-nexus also offers a C-ABI dylib plugin boundary (<code>plugin-abi</code>),
-which FUSE and the vault use. sudocode does not: <strong>the dylib
-boundary is reserved for code that is third-party, untrusted, or must
-stay ABI-stable across independent release cycles.</strong> Our own
-runtime, sitting on the agent's IOPS path, links statically.</p>
-
-<p>The cost is in the marshalling, and it lands hardest on exactly the
-operations a coding agent issues most. Per-call overhead versus the
-same operation monomorphised in-process:</p>
+<h3 id="agent-runtime-tasks">Implementation and acceptance tasks</h3>
 
 <table>
-  <thead>
-    <tr><th>Syscall</th><th>C-ABI shape</th><th>Overhead vs in-process</th></tr>
-  </thead>
-  <tbody>
-    <tr><td><code>sys_write</code></td><td><code>data: *const u8, len</code> — zero-copy</td><td>&lt; 10%</td></tr>
-    <tr><td><code>sys_read</code></td><td><code>out_buf: *mut *mut u8</code> — kernel heap-allocs + memcpy, plugin <code>nexus_free</code>s</td><td>~10–30%</td></tr>
-    <tr><td><code>sys_stat</code> / <code>sys_readdir</code></td><td><code>out_json: *mut *mut u8</code> — serialize + alloc + plugin-side parse</td><td><strong>100%–1000%</strong></td></tr>
-  </tbody>
+<thead><tr><th>Task</th><th>Implementation evidence</th><th>Next acceptance</th></tr></thead>
+<tbody>
+<tr><td>Align AgentHome across hosts</td><td>Cohost uses flat durable sessions.
+Standalone retains local discovery partitions and mailbox storage.</td><td>Run the
+same identity, session, link and attachment recovery workflow through cohost and
+standalone; transport and physical placement remain behind their common interfaces.</td></tr>
+<tr><td>Define execution placement at spawn</td><td><code>agent_spawn</code> creates an
+in-process child task. <code>ManagedAgentService.start_session_v1</code> creates
+an independent managed runtime with a new PID. <code>AgentRegistry</code> is a
+node-local PID map, and the cohost writer lease is per durable session.</td><td>Define
+the owning box and delivery role for one Agent, preserving Agent→PID one-to-many.
+Race starts from two boxes and verify the resulting ownership before exposing Move.</td></tr>
+<tr><td>Fence execution and message consumption</td><td>The reader register currently
+uses read/write/read acquisition; renewal shares the thread that runs its sink.
+The writer lease supports explicit stop/resume. Replicated register writes alone
+do not exclude two running loops.</td><td>Resolve ownership at the runtime service;
+verify long turns, loss of connectivity, handoff and stale progress rejection.
+Keep durable consumption separate from live ownership.</td></tr>
+<tr><td>Share one managed local service</td><td>Sudowork and standalone have separate
+install/start paths. <a href="https://github.com/sudoprivacy/sudowork/pull/1223">Sudowork #1223</a>
+removes port-based process ownership and verifies cleanup of owned children.</td><td>Use
+one runtime-owned install/discovery/start implementation from both clients.
+Verify concurrent startup, stale discovery, compatibility and UI disconnect.</td></tr>
+<tr><td>Align cloud placement and credentials</td><td>Nexus
+<a href="https://github.com/nexi-lab/nexus-vfs/pull/421">#421</a> provides the
+root-to-user-runtime gateway;
+<a href="https://github.com/nexi-lab/nexus-vfs/pull/425">#425</a> provides owner-bound
+runtime credentials; <a href="https://github.com/nexi-lab/nexus-vfs/pull/422">#422</a>
+keeps process metadata outside durable storage.</td><td>Accept the composed
+user cohost, scoped credentials and production pod cold restart with real approvals
+and model turns.</td></tr>
+<tr><td>Accept zone admission and replica isolation</td><td>
+<a href="https://github.com/nexi-lab/nexus-vfs/pull/412">Nexus #412</a> fixes
+canonical stream identity across mount aliases. Its native probe also demonstrates
+that subtree views retain the backing zone's metadata and stream replication.</td><td>Send
+A↔B messages, replicate authorized data, then inspect C's actual metadata, WAL and
+content. Reject unauthorized zone membership and blob reads.</td></tr>
+<tr><td>Accept offline delivery through every host</td><td>
+<a href="https://github.com/sudoprivacy/sudocode/pull/918">Sudocode #918</a>
+retains receipts until persisted turns, leaves interrupted inputs pending and joins
+pollers on exit. Real CLI crash/restart and graceful-exit workflows passed with the
+configured live model. The live cancellation case stopped at a provider refusal;
+its deterministic regression passes.</td><td>Send before first start and after
+shutdown; restore on another authorized box; reject stale control. Complete live
+cancellation, one-shot consumer and hosted error acknowledgement acceptance.</td></tr>
+<tr><td>Confirm Move content before execution handoff</td><td>Local writes and
+remote fetch are the normal storage behavior. A complete namespace listing alone
+does not establish that required bytes have arrived.</td><td>Verify all referenced
+content and links at the destination, disconnect the source, restore the Agent,
+then verify runtime handoff and unread message continuity.</td></tr>
+</tbody>
 </table>
 
-<p>An agent's working set is dominated by <code>stat</code>,
-<code>readdir</code>, and small reads — the three worst rows. FUSE
-tolerates the same marshalling only because its baseline already
-includes an OS FUSE round-trip (a ~5–20&nbsp;µs context switch) that
-dwarfs the JSON hop; against a sub-microsecond in-process baseline that
-tolerance disappears.</p>
-
-<p>There is a second, harder reason. <code>plugin-abi</code> carries no
-hook or observer surface — <code>register_service_hook</code> is an
-in-process Rust API. A dylib therefore cannot register a kernel dispatch
-hook, and <code>MailboxStampingHook</code> (the thing that makes the
-envelope's <code>from</code> unforgeable, contract item 3 above) is a
-dispatch hook. <strong>A2A participation requires static linkage; it is
-not expressible as a plugin.</strong></p>
-
-<h3>Sequencing</h3>
-
-<p>The work falls into a few sequenced chunks; each ships its own
-PR. None of this depends on Goal 3 inline polish; the two streams
-proceed in parallel.</p>
-
-<ol>
-  <li><strong>FsBackend trait + StdFsBackend.</strong> Audit every
-  <code>std::fs</code> call site in the sudocode runtime, route
-  through the trait. No behavioural change to standalone CLI;
-  this is a refactor that opens the door for the other two
-  backends. <strong>DONE — PR #120.</strong></li>
-  <li><strong>NexusVfsFsBackend.</strong> gRPC client against the
-  nexus <code>NexusVFSService.Call</code> surface. First end-to-end
-  validation: a standalone scode pointing at a remote nexus serves
-  its session jsonl from the kernel. <strong>PARTIAL — code exists, lacks e2e validation.</strong></li>
-  <li><strong>KernelFsBackend + in-process host in the daemon.</strong>
-  The nexus daemon <code>nexusd-cluster</code> (nexus repo <code>rust/nexusd</code>)
-  links <code>kernel</code> + <code>services</code> + <code>sudocode_runtime</code>
-  and monomorphises <code>SpawnTask&lt;Kernel&gt;</code> against one kernel rev —
-  the single <code>nexus → sudocode</code> edge, at that binary leaf only.
-  <strong>PARTIAL — <code>KernelFsBackend</code> + <code>spawn_task</code>
-  implemented in this runtime; remaining on our side: bump the nexus-vfs
-  <code>kernel</code> pin to match the daemon's rev + expose the
-  <code>spawn_task</code> adapter shape. The daemon wires it via the
-  nexus-side <code>install_managed_agent_with_spawn</code> seam.</strong></li>
-  <li><strong>Mailbox read/write loop.</strong> Inside the managed
-  runtime, replace stdin/stdout prompts with
-  <code>sys_watch</code> on <code>/proc/{self_pid}/chat-with-me</code>
-  and <code>sys_write</code> on the peer's mailbox. The runtime
-  surface to the LLM stays the same. <strong>DONE — PR #119, <code>sys_watch</code> condvar.</strong></li>
-  <li><strong>WorkspaceBoundaryHook EPERM round-trip.</strong>
-  Surface the kernel's structured EPERM verbatim into the LLM
-  conversation; confirm by PTY scenario that the LLM learns the
-  <code>chat-with-me</code> redirect without system-prompt edits. <strong>NOT STARTED.</strong></li>
-</ol>
+<p id="linkage">The <a href="https://s.shareone.vip/s/nexus-integration-architecture#orchestration">runtime composition reference</a>
+owns binary-edge placement. The <a href="rust/README.md">crate map</a> owns workspace
+dependencies. Tests and deployment records belong with the tasks above.</p>
 
 <h2 id="feature-parity">Feature-parity standing rule: sudocode &harr; sudowork dedup</h2>
 
@@ -2302,30 +2165,11 @@ proceed in parallel.</p>
 
 <h2 id="deployment-modes">Deployment Modes</h2>
 
-<p>sudocode runs in three modes, selected by which <code>FsBackend</code>
-implementation is wired at the binary edge. Application code writes one
-path; the backend determines where bytes land.</p>
-
-<table>
-  <thead><tr><th>Mode</th><th>Binary</th><th>FsBackend</th><th>Scenario</th><th>Production status</th></tr></thead>
-  <tbody>
-    <tr><td><strong>Standalone CLI</strong></td><td><code>scode</code></td><td><code>StdFsBackend</code></td><td>Developer laptop, direct filesystem</td><td>Current production path</td></tr>
-    <tr><td><strong>Edge / Dev CLI</strong></td><td><code>scode</code></td><td><code>NexusVfsFsBackend</code></td><td>CLI connecting to remote nexus kernel via gRPC</td><td>Code exists, lacks e2e validation</td></tr>
-    <tr><td><strong>Managed agent</strong></td><td><code>nexusd-cluster</code> (hosts sudocode_runtime)</td><td><code>KernelFsBackend&lt;Kernel&gt;</code></td><td>In-process inside the nexus daemon, direct Rust syscalls</td><td>Target production path; runtime pieces implemented, kernel-pin bump + daemon adapter pending</td></tr>
-  </tbody>
-</table>
-
-<div class="callout">
-  <strong>Migration note:</strong> The target production path is
-  <code>sudocode_runtime</code> hosted in-process by <code>nexusd-cluster</code>
-  (the nexus daemon), via the <code>SpawnTask</code> adapter. Current production
-  runs standalone <code>scode</code> with <code>StdFsBackend</code>. Migration
-  requires: (1) bump this runtime's nexus-vfs <code>kernel</code> pin to match the
-  daemon's rev (so <code>SpawnTask&lt;Kernel&gt;</code> is one type),
-  (2) validate session/config/cache paths work identically on <code>KernelFsBackend</code>,
-  (3) the nexus daemon (<code>rust/nexusd</code>) wires the adapter via
-  <code>install_managed_agent_with_spawn</code>. Track in Goal&nbsp;4 sequencing PR&nbsp;#3.
-</div>
+<p>The <a href="https://s.shareone.vip/s/nexus-integration-architecture#runtime">Nexus integration architecture</a>
+defines host and filesystem composition. The
+<a href="docs/design/agent-context-storage-matrix.html#agent-delivery-contract">Agent storage contract</a>
+defines the shared durable layout. Implementation and deployment acceptance are
+tracked in <a href="#agent-runtime-tasks">Goal 4's task list</a>.</p>
 
 <h2 id="model-capabilities-service">Model Capabilities Service</h2>
 

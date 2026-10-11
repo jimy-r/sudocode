@@ -687,3 +687,23 @@ cancels the engine. An unwritable pipe cannot receive a final result.
 Exit codes: success `0`, execution/startup/output failure `1`, invalid arguments
 or input `2`, SIGINT `130`, SIGTERM `143` (Unix). Structured errors use the same
 result envelope as success, with `is_error: true` and an error subtype.
+
+## Runtime memory
+
+Performance reports measure peak resident set size (RSS), RSS after the workload,
+and growth across turns for the release `scode` process. Relevant PRs use paired
+baseline and candidate runs; the daily stress profile adds 30 turns. The
+[performance CI](https://github.com/sudoprivacy/sudocode/actions/workflows/render-performance.yml)
+retains the raw reports, and the
+[measurement guide](../e2e/terminal-resize/README.md#release-performance-gate)
+defines the workloads and regression checks.
+
+The [2026-10-09 UTC stress run](https://github.com/sudoprivacy/sudocode/actions/runs/37995377154)
+measured **28.27–32.71 MiB peak RSS** across its scenarios, using the median of
+seven candidate runs per scenario. Its 30-turn scenario peaked at **29.42 MiB**,
+with **1.77 MiB** growth from the first to the last turn. The run used Linux and
+a deterministic provider. Scope is one `scode` process; child tools, browsers,
+Nexus, and the model server are measured separately when assessing a complete
+deployment. Apple/Spark measurements require workloads on that hardware.
+RSS includes shared pages; unique memory across several processes requires a
+measure such as proportional set size (PSS).
