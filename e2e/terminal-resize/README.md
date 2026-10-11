@@ -40,6 +40,24 @@ workspace. `SCODE_CONPTY_BACKEND=system` runs the strict system-host diagnostic;
 it currently exposes history loss on Windows build 26300 even in static controls
 without application redraw. CI uses VS Code's bundled ConPTY.
 
+## Runtime memory
+
+Reports measure peak resident set size (RSS), RSS after the workload, and growth
+across turns for the release `scode` process. Relevant PRs use paired baseline
+and candidate runs; the daily stress profile adds 30 turns. The
+[performance CI](https://github.com/sudoprivacy/sudocode/actions/workflows/render-performance.yml)
+retains the raw reports.
+
+The [2026-10-09 UTC stress run](https://github.com/sudoprivacy/sudocode/actions/runs/37995377154)
+measured **28.27–32.71 MiB peak RSS** across its scenarios, using the median of
+seven candidate runs per scenario. Its 30-turn scenario peaked at **29.42 MiB**,
+with **1.77 MiB** growth from the first to the last turn. The run used Linux and
+a deterministic provider. Scope is one `scode` process; child tools, browsers,
+Nexus, and the model server are measured separately when assessing a complete
+deployment. Apple/Spark measurements require workloads on that hardware.
+RSS includes shared pages; unique memory across several processes requires a
+measure such as proportional set size (PSS).
+
 ## Release performance gate
 
 `pty_render_performance` reuses TestEnv, the protocol fixture and this terminal

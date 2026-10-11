@@ -64,7 +64,7 @@ the code first.
 
 - **No in-CLI multi-agent dashboard.** sudocode is an agent unit,
   not a hub. Multi-agent orchestration UI belongs in sudowork /
-  hydra / your tmux — not inside scode. (See ROADMAP § Goal 4.)
+  your tmux — not inside scode. (See ROADMAP § Goal 4.)
 
 - **No CLA, no copyright assignment, no closed-source escape
   hatch.** Contributors retain their copyright; their code is
@@ -91,7 +91,7 @@ the code first.
   and [`.../src/session.rs`](./rust/crates/engine-core/src/session.rs).
   A CI `boundary-gate` job enforces it. (See ROADMAP → ACP-cut / #100.)
 
-The full Always / Never list lives in [`README.md` § Design
+The product principles live in [`README.md` § Design
 principles](./README.md#design-principles). When in doubt, read
 that section before opening the PR.
 
