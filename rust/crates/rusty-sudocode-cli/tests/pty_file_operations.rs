@@ -22,7 +22,9 @@ use common::TestEnv;
 fn windows_verbatim_paths_read_the_same_file() {
     use runtime::{ContentBlock, SessionStore};
 
-    let env = TestEnv::new("verbatim-file-paths");
+    // Feed every spelling through the CLI's tool loop as an exact fixture.
+    // The assertion covers Windows path handling in the VFS and transcript.
+    let env = TestEnv::new_mock("verbatim-file-paths");
     let nonce = format!(
         "path-content-{}-{}",
         std::process::id(),

@@ -33,6 +33,7 @@ on:
       - scripts/generate_cache_metrics.py
       - scripts/cache_metrics.py
       - spec/cache_metrics.json
+      - spec/prompt_cache_observations.json
   pull_request:
     branches:
       - main
@@ -63,6 +64,7 @@ on:
       - scripts/generate_cache_metrics.py
       - scripts/cache_metrics.py
       - spec/cache_metrics.json
+      - spec/prompt_cache_observations.json
   workflow_dispatch:
     inputs:
       render_performance:
@@ -536,6 +538,13 @@ jobs:
           PROXY_BASE_URL: https://api.sudorouter.ai/v1
           SCODE_LIVE_MODEL: gpt-6-luna
         run: cargo test -p rusty-sudocode-cli --test acp_live_smoke -- --test-threads=1
+      - name: Claude native cache and subagent smoke
+        working-directory: rust
+        env:
+          PROXY_AUTH_TOKEN: ${{ secrets.SUDOROUTER_CI_API_KEY }}
+          PROXY_BASE_URL: https://api.sudorouter.ai/v1
+          SCODE_LIVE_MODEL: claude-sonnet-4-6
+        run: cargo test -p rusty-sudocode-cli --test acp_live_smoke live_subagent_smoke_stdio -- --test-threads=1
       - name: Real model through the co-host controller mailbox
         working-directory: rust
         env:
@@ -594,12 +603,14 @@ jobs:
           SCODE_LIVE_MODEL=deepseek-v3.2-azure cargo test -p rusty-sudocode-cli --test pty_azure_inline_reasoning azure_live_file_roundtrip_has_a_final_answer -- --test-threads=1 --nocapture
           cargo test -p rusty-sudocode-cli --test pty_model_flag_priority configured_model_reads_updated_file_after_resume -- --test-threads=1 --nocapture
           cargo test -p rusty-sudocode-cli --test pty_a2a_overlay queued_and_offline_messages_survive_receiver_restart -- --test-threads=1 --nocapture
+          cargo test -p rusty-sudocode-cli --test pty_a2a_overlay pending_batch_and_two_runtimes_share_one_durable_reader -- --test-threads=1 --nocapture
           cargo test -p rusty-sudocode-cli --test pty_agent_permission_bubble -- --test-threads=1 --nocapture
           cargo test -p rusty-sudocode-cli --test pty_bash_process_tree --test pty_input_batch --test pty_hook_progress --test pty_arrow_keys -- --test-threads=1 --nocapture
           cargo test -p rusty-sudocode-cli --test pty_background_tasks inspecting_running_task_does_not_acknowledge_its_future_result -- --nocapture
           cargo test -p rusty-sudocode-cli --test pty_background_tasks exiting_during_a_foreground_tool_reaps_both_process_groups -- --nocapture
           if [[ "$RUNNER_OS" == "Windows" ]]; then
             cargo test -p rusty-sudocode-cli --test pty_file_operations windows_verbatim_paths_read_the_same_file -- --nocapture
+            cargo test -p rusty-sudocode-cli --test pty_file_operations edit_then_verify_on_disk -- --nocapture
           fi
           cargo test -p rusty-sudocode-cli --test pty_block_spacing -- --test-threads=1 --nocapture
       - name: Summarize live model routing evidence
