@@ -73,6 +73,23 @@ session. The original file stays unchanged and its SHA-256 is recorded and
 checked. `--history-messages 8` limits the copy to the first eight messages.
 No personal conversation fixture is committed to this repository.
 
+The copied history redacts API keys from every proxy profile in the selected
+config, including inactive profiles. Startup records the replacement count.
+The recording proxy also rejects bodies containing any of those keys before
+saving or forwarding them. This protects known configured keys; review private
+fixtures for other credentials before replaying them through a provider.
+
+`credential_replay.py` runs the same funded journey with a harmless key from
+an inactive test profile embedded in the legacy fixture. It requires one
+redaction and sends a separate local request containing that harmless key to
+verify rejection before forwarding. It checks that all three client and upstream request bodies retain the
+visible answer and replacement marker, and verifies that the source stayed
+unchanged. The temporary credential config is removed even if the run fails.
+
+```powershell
+python e2e/thinking/credential_replay.py C:/path/to/scode.exe --profile sudorouter --upstream-channel 52 --drop-global-cache-scope --artifacts C:/path/to/artifacts
+```
+
 The runner captures startup scrollback before sending a message. With
 `--require-replay-label card`, it requires the historical `card` to be visible
 while the recorded API message request count is still zero. This distinguishes

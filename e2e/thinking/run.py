@@ -101,6 +101,29 @@ history_bytes = args.history_fixture.read_bytes() if args.history_fixture else N
 history_hash = (
     hashlib.sha256(history_bytes).hexdigest() if history_bytes is not None else None
 )
+profiles = json.loads(args.config.read_text(encoding="utf-8-sig"))["auth_modes"][
+    "proxy"
+]
+profile = profiles[args.profile]
+known_keys = sorted(
+    {p["apiKey"] for p in profiles.values() if p.get("apiKey")}, key=len, reverse=True
+)
+history_credential_redactions = 0
+
+
+def redact_history(value):
+    global history_credential_redactions
+    if isinstance(value, str):
+        for key in known_keys:
+            history_credential_redactions += value.count(key)
+            value = value.replace(key, "[REDACTED_PROFILE_KEY]")
+    elif isinstance(value, list):
+        value = [redact_history(item) for item in value]
+    elif isinstance(value, dict):
+        value = {key: redact_history(item) for key, item in value.items()}
+    return value
+
+
 history_rows = []
 if history_bytes is not None:
     history_rows = [
@@ -112,6 +135,7 @@ if history_bytes is not None:
         history_rows = history_rows[: args.history_messages]
     if not history_rows:
         parser.error("history fixture must contain saved message rows")
+    history_rows = redact_history(history_rows)
 maintenance_requests = int(args.expect_compaction)
 code = "LIVE-" + secrets.token_hex(5)
 fixture_root = Path(os.environ["PUBLIC"]).resolve()
@@ -159,9 +183,6 @@ session.write_text(
 with session.open("a", encoding="utf-8") as history_file:
     for row in history_rows:
         history_file.write(json.dumps(row, ensure_ascii=False) + "\n")
-profile = json.loads(args.config.read_text(encoding="utf-8-sig"))["auth_modes"][
-    "proxy"
-][args.profile]
 target = urlsplit(profile["baseUrl"])
 assert target.scheme == "https"
 origin = target.scheme + "://" + target.netloc
@@ -201,6 +222,10 @@ class Proxy(BaseHTTPRequestHandler):
 
     def forward(self, method):
         raw = self.rfile.read(int(self.headers.get("Content-Length", "0")))
+        if any(key in raw.decode("utf-8", errors="replace") for key in known_keys):
+            self.send_error(400, "configured API key found in request body")
+            print(json.dumps({"credential_body_rejected": True}), flush=True)
+            return
         is_message = method == "POST" and self.path.split("?")[0].endswith("/messages")
         if is_message:
             with lock:
@@ -463,6 +488,7 @@ try:
                 "session_id": session_id,
                 "history_messages": len(history_rows),
                 "history_sha256": history_hash,
+                "history_credential_redactions": history_credential_redactions,
                 "expected_compactions": maintenance_requests,
                 "upstream_channel": args.upstream_channel,
                 "drop_global_cache_scope": args.drop_global_cache_scope,
