@@ -5,6 +5,7 @@ Credentials stay in memory; request bodies and raw SSE are local artifacts.
 """
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -53,6 +54,32 @@ parser.add_argument(
     "--config", type=Path, default=Path.home() / ".nexus/sudocode/sudocode.json"
 )
 parser.add_argument(
+    "--history-fixture", type=Path, help="Resume a copy of saved JSONL messages"
+)
+parser.add_argument(
+    "--history-messages", type=int, help="Copy only this many fixture messages"
+)
+parser.add_argument(
+    "--expect-compaction",
+    action="store_true",
+    help="Require one compaction before Read",
+)
+parser.add_argument(
+    "--require-replay-label",
+    choices=("course", "court", "card"),
+    help="Require this historical label before any API message request",
+)
+parser.add_argument(
+    "--upstream-channel",
+    type=int,
+    help="Select a new-api channel using its admin key suffix",
+)
+parser.add_argument(
+    "--drop-global-cache-scope",
+    action="store_true",
+    help="Remove only system[0]'s global cache scope for a diagnostic comparison",
+)
+parser.add_argument(
     "--artifacts",
     type=Path,
     help="Keep request bodies, SSE and screens in a fresh child directory",
@@ -62,6 +89,30 @@ if os.name != "nt":
     parser.error("this acceptance runner requires Windows ConPTY")
 if not args.binary.is_file():
     parser.error("binary must be an existing scode executable")
+if args.history_messages is not None and (
+    not args.history_fixture or args.history_messages < 1
+):
+    parser.error("--history-messages requires --history-fixture and a positive count")
+if (args.expect_compaction or args.require_replay_label) and not args.history_fixture:
+    parser.error("compaction and historical-label checks require --history-fixture")
+if args.upstream_channel is not None and args.upstream_channel < 1:
+    parser.error("--upstream-channel must be positive")
+history_bytes = args.history_fixture.read_bytes() if args.history_fixture else None
+history_hash = (
+    hashlib.sha256(history_bytes).hexdigest() if history_bytes is not None else None
+)
+history_rows = []
+if history_bytes is not None:
+    history_rows = [
+        row
+        for line in history_bytes.decode("utf-8-sig").splitlines()
+        if (row := json.loads(line)).get("type") == "message"
+    ]
+    if args.history_messages is not None:
+        history_rows = history_rows[: args.history_messages]
+    if not history_rows:
+        parser.error("history fixture must contain saved message rows")
+maintenance_requests = int(args.expect_compaction)
 code = "LIVE-" + secrets.token_hex(5)
 fixture_root = Path(os.environ["PUBLIC"]).resolve()
 temporary = tempfile.TemporaryDirectory(prefix="scode-" + code + "-", dir=fixture_root)
@@ -105,6 +156,9 @@ session.write_text(
     + "\n",
     encoding="utf-8",
 )
+with session.open("a", encoding="utf-8") as history_file:
+    for row in history_rows:
+        history_file.write(json.dumps(row, ensure_ascii=False) + "\n")
 profile = json.loads(args.config.read_text(encoding="utf-8-sig"))["auth_modes"][
     "proxy"
 ][args.profile]
@@ -163,6 +217,12 @@ class Proxy(BaseHTTPRequestHandler):
             # Preserve the selected thinking profile throughout the tool journey.
             body["thinking"] = {"type": "adaptive", "display": args.thinking_display}
             body["output_config"] = {"effort": args.effort}
+            if args.drop_global_cache_scope:
+                system = body.get("system")
+                if isinstance(system, list) and system:
+                    control = system[0].get("cache_control", {})
+                    if control.get("scope") == "global":
+                        del control["scope"]
             raw = json.dumps(body, ensure_ascii=False).encode()
             (workspace / f"request-{number}-live.json").write_bytes(raw)
         headers = {
@@ -178,7 +238,10 @@ class Proxy(BaseHTTPRequestHandler):
                 "accept-encoding",
             }
         }
-        headers.update({"x-api-key": profile["apiKey"], "accept-encoding": "identity"})
+        upstream_key = profile["apiKey"]
+        if args.upstream_channel is not None:
+            upstream_key += f"-{args.upstream_channel}"
+        headers.update({"x-api-key": upstream_key, "accept-encoding": "identity"})
         try:
             with (
                 requests.Session() as client,
@@ -398,12 +461,35 @@ try:
                 "effort": args.effort,
                 "check_context": args.check_context,
                 "session_id": session_id,
+                "history_messages": len(history_rows),
+                "history_sha256": history_hash,
+                "expected_compactions": maintenance_requests,
+                "upstream_channel": args.upstream_channel,
+                "drop_global_cache_scope": args.drop_global_cache_scope,
                 "live_api_inference": True,
             }
         ),
         flush=True,
     )
     start()
+    if history_rows:
+        assert not records, "startup unexpectedly made an API message request"
+        replay = visible()
+        (workspace / "before-read-screen.txt").write_text(replay, encoding="utf-8")
+        replay_labels = re.findall(r"(?im)^\s*(course|court|card)\s*$", replay)
+        if args.require_replay_label:
+            assert args.require_replay_label in replay_labels, (
+                "required historical label was absent from startup replay"
+            )
+        print(
+            json.dumps(
+                {
+                    "startup_api_message_requests": 0,
+                    "historical_labels_visible_before_api": replay_labels,
+                }
+            ),
+            flush=True,
+        )
     read_prompt = "Read values.txt with the Read tool. Return only READ_DONE <code from file> sum=<a+b>."
     read_expected = f"READ_DONE {code} sum={a + b}"
     resume_expected = f"RESUME_DONE {code} value={a + b - 17}"
@@ -426,10 +512,12 @@ try:
         assert context_nonce not in json.dumps(original["messages"]), (
             "nonce must come from project instructions, not the user prompt"
         )
-        assert len(records) == 2, (
+        assert len(records) == maintenance_requests + 2, (
             "project context check required extra tool or retry requests"
         )
-        blocks, _, _ = parse_sse((workspace / "response-1.sse").read_bytes())
+        blocks, _, _ = parse_sse(
+            (workspace / f"response-{maintenance_requests + 1}.sse").read_bytes()
+        )
         answer = "".join(block.get("text", "") for block in blocks).strip()
         assert answer == read_expected, (
             "provider did not return the exact project instruction nonce with the Read result"
@@ -452,8 +540,25 @@ try:
     wait(lambda: len(records) >= 3 and all(r.get("completed") for r in records))
     (workspace / "resume-screen.txt").write_text(visible(), encoding="utf-8")
     close()
-    assert len(records) == 3, "unexpected tool or retry requests"
-    first_blocks, _, _ = parse_sse((workspace / "response-0.sse").read_bytes())
+    assert len(records) == maintenance_requests + 3, "unexpected tool or retry requests"
+    if args.expect_compaction:
+        compact_request = json.loads((workspace / "request-0-client.json").read_bytes())
+        assert "CRITICAL: Respond with TEXT ONLY. Do NOT call any tools." in json.dumps(
+            compact_request["messages"][-1]
+        ), "first request must be compaction"
+        compact_blocks, _, stopped = parse_sse(
+            (workspace / "response-0.sse").read_bytes()
+        )
+        assert stopped and all(b["type"] == "text" for b in compact_blocks), (
+            "compaction must return complete text without tool calls"
+        )
+        summary = "".join(b.get("text", "") for b in compact_blocks).strip()
+        assert summary.startswith("<summary>") and summary.endswith("</summary>"), (
+            "compaction must return a complete summary"
+        )
+    first_blocks, _, _ = parse_sse(
+        (workspace / f"response-{maintenance_requests}.sse").read_bytes()
+    )
     signed_thinking = [
         b
         for b in first_blocks
@@ -466,7 +571,9 @@ try:
         + args.thinking_display
         + " signed thinking block"
     )
-    second = json.loads((workspace / "request-1-client.json").read_bytes())
+    second = json.loads(
+        (workspace / f"request-{maintenance_requests + 1}-client.json").read_bytes()
+    )
     results = [
         b
         for m in second["messages"]
@@ -495,7 +602,9 @@ try:
         for thought in signed_thinking
     )
     assert intact, "signed thinking was dropped or changed before the tool continuation"
-    resumed = json.loads((workspace / "request-2-client.json").read_bytes())
+    resumed = json.loads(
+        (workspace / f"request-{maintenance_requests + 2}-client.json").read_bytes()
+    )
     if context_nonce:
         assert context_nonce in json.dumps(resumed["system"]), (
             "project instruction nonce was lost during restart/resume"
@@ -521,8 +630,8 @@ try:
         for r in records
     ), "all streams must finish"
     for number, expected in (
-        (1, read_expected),
-        (2, resume_expected),
+        (maintenance_requests + 1, read_expected),
+        (maintenance_requests + 2, resume_expected),
     ):
         blocks, _, _ = parse_sse((workspace / f"response-{number}.sse").read_bytes())
         answer = "".join(block.get("text", "") for block in blocks).strip()
@@ -530,6 +639,11 @@ try:
     assert not any(r.get("artifact_words") for r in records), (
         "new course/court/card text generated"
     )
+    if args.history_fixture:
+        assert (
+            hashlib.sha256(args.history_fixture.read_bytes()).hexdigest()
+            == history_hash
+        ), "original history fixture changed"
     print(
         json.dumps(
             {
