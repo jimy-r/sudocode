@@ -1713,7 +1713,8 @@ fn apply_request_metadata(body: &mut Value, request: &MessageRequest) {
 /// Translate provider-agnostic [`CacheHints`] into Anthropic-specific
 /// `cache_control` markers on the JSON body.
 ///
-/// - `system_static` → system block with `cache_control: {type: "ephemeral", scope: "global"}`
+/// - `system_static` → global cache when every preceding tool is globally
+///   scoped; otherwise use the ordinary cache scope
 /// - `system_dynamic` → system block with `cache_control: {type: "ephemeral"}`
 /// - `breakpoint_last_message` → `cache_control: {type: "ephemeral"}` on the last
 ///   content block of the last message
@@ -1739,6 +1740,19 @@ fn apply_cache_hints(body: &mut Value, request: &MessageRequest, ttl_1h: bool) {
         return;
     };
 
+    // Tools precede system blocks in the cached prefix. Static system text
+    // alone cannot make a prefix containing ordinary tools globally scoped.
+    let is_global_prefix = match obj.get("tools") {
+        None => true,
+        Some(Value::Array(tools)) => tools.iter().all(|tool| {
+            tool.get("cache_control")
+                .and_then(|cache| cache.get("scope"))
+                .and_then(Value::as_str)
+                == Some("global")
+        }),
+        Some(_) => false,
+    };
+
     // --- System blocks ---
     let mut system_blocks: Vec<Value> = Vec::new();
     if let Some(text) = &hints.system_static {
@@ -1746,7 +1760,7 @@ fn apply_cache_hints(body: &mut Value, request: &MessageRequest, ttl_1h: bool) {
             system_blocks.push(serde_json::json!({
                 "type": "text",
                 "text": text,
-                "cache_control": cache_control(true),
+                "cache_control": cache_control(is_global_prefix),
             }));
         }
     }
