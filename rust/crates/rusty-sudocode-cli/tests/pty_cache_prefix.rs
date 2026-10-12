@@ -251,6 +251,23 @@ fn thinking_blocks_survive_turns_and_resume_without_merging_or_dropping() {
     let capture = Capture::new();
     capture.thinking_blocks.store(true, Ordering::Relaxed);
     let path = fixture(&env, &capture);
+    let mut legacy = Session::load_from_path(&path).unwrap();
+    legacy
+        .push_message(ConversationMessage::assistant(vec![
+            ContentBlock::Thinking {
+                thinking: String::new(),
+                signature: Some(String::new()),
+            },
+            ContentBlock::Thinking {
+                thinking: "Legacy unsigned reasoning.".into(),
+                signature: Some(String::new()),
+            },
+            ContentBlock::Text {
+                text: "LEGACY_UNSIGNED_ANSWER".into(),
+            },
+        ]))
+        .unwrap();
+    legacy.save_to_path(&path).unwrap();
     let mut cli = spawn(&env, &path);
     turn(&mut cli, "First signed response.");
     turn(&mut cli, "Replay the signed response.");
@@ -262,6 +279,24 @@ fn thinking_blocks_survive_turns_and_resume_without_merging_or_dropping() {
     let requests = capture.bodies();
     assert_thinking_replayed(&requests[2], 1);
     assert_thinking_replayed(&requests[2], 2);
+    for request in &requests {
+        let blocks: Vec<_> = request["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|message| message["content"].as_array().unwrap())
+            .collect();
+        assert!(blocks
+            .iter()
+            .any(|block| block["text"] == "LEGACY_UNSIGNED_ANSWER"));
+        assert!(
+            blocks.iter().all(|block| {
+                block["type"] != "thinking"
+                    || block["signature"].as_str().is_some_and(|s| !s.is_empty())
+            }),
+            "unsigned legacy thinking must not invalidate the resumed request"
+        );
+    }
 }
 
 #[test]

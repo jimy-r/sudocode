@@ -200,6 +200,7 @@ pub fn convert_messages(messages: &[ConversationMessage]) -> Vec<InputMessage> {
                     signature,
                 } => signature
                     .as_ref()
+                    .filter(|signature| !signature.is_empty())
                     .map(|signature| InputContentBlock::Thinking {
                         thinking: thinking.clone(),
                         signature: Some(signature.clone()),
