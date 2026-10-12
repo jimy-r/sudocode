@@ -602,6 +602,7 @@ jobs:
           cargo test -p rusty-sudocode-cli --test pty_background_tasks exiting_during_a_foreground_tool_reaps_both_process_groups -- --nocapture
           if [[ "$RUNNER_OS" == "Windows" ]]; then
             cargo test -p rusty-sudocode-cli --test pty_file_operations windows_verbatim_paths_read_the_same_file -- --nocapture
+            cargo test -p rusty-sudocode-cli --test pty_file_operations edit_then_verify_on_disk -- --nocapture
           fi
           cargo test -p rusty-sudocode-cli --test pty_block_spacing -- --test-threads=1 --nocapture
       - name: Summarize live model routing evidence
