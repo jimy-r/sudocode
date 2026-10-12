@@ -6,7 +6,7 @@ calculates their sum, exits, removes the input file, resumes the saved session,
 and subtracts 17 using the persisted result.
 
 It checks the actual tool result and both outgoing assistant histories against
-the empty signed thinking block received in the original raw SSE. Missing,
+the signed thinking block received in the original raw SSE. Missing,
 changed or lost signatures fail even if a gateway tolerates the broken history
 and returns a correct answer. Final answers must contain only the computed
 result, so repeated planning prose also fails. New standalone `course`, `court`
@@ -20,6 +20,8 @@ python e2e/thinking/run.py C:/path/to/scode.exe --profile sudorouter --model cla
 python e2e/thinking/run.py C:/path/to/scode.exe --profile sudorouter --model claude-sonnet-4-6 --effort high --artifacts C:/path/to/artifacts
 # Also require the real provider to retain project instructions:
 python e2e/thinking/run.py C:/path/to/scode.exe --profile sudorouter --model claude-sonnet-4-6 --effort high --check-context --artifacts C:/path/to/artifacts
+# Require a nonempty thinking summary and preserve its text and signature:
+python e2e/thinking/run.py C:/path/to/scode.exe --profile sudorouter --model claude-sonnet-4-6 --thinking-display summarized --effort high --check-context --artifacts C:/path/to/artifacts
 ```
 
 Credentials come from the named proxy profile in
@@ -27,9 +29,12 @@ Credentials come from the named proxy profile in
 process has an isolated home/config and only a placeholder key. Real keys stay
 in the recording proxy's memory and are excluded from saved requests.
 
-The proxy sets `thinking: {type: adaptive, display: omitted}` and the selected
-`--effort` (`low` by default, or `high`) to obtain the target block from the real
-provider. The startup output records the selected effort. It caps each response at
+The proxy sets `thinking: {type: adaptive, display: omitted}` by default.
+`--thinking-display summarized` selects a separate profile that requires a
+nonempty signed summary; it does not count as empty-block coverage. Both profiles
+compare the returned thinking text and signature exactly against the tool
+continuation and resumed request. The selected `--effort` is `low` by default,
+or `high`. The startup output records both controls. It caps each response at
 2048 tokens and permits at most five message requests. The expected journey
 uses three requests. This validates signed-block preservation with that
 explicit profile; it does not test the CLI's default thinking configuration.
@@ -47,9 +52,11 @@ This holds the requested session identity constant when comparing fresh
 workspaces or request profiles. Each workspace still has new file values and a new context
 nonce, so a cached old answer cannot pass.
 
-The provider must support that profile and return an empty signed block;
-otherwise the test fails instead of counting another response shape as
-coverage. Workspaces are created beneath `%PUBLIC%` and must have no inherited
+The provider must support the selected profile and return its required signed
+block shape; otherwise the test fails instead of counting another response shape
+as coverage. The runner waits for the complete captured response before exiting
+each process, so final text arriving before `message_stop` cannot leave the
+last response unrecorded. Workspaces are created beneath `%PUBLIC%` and must have no inherited
 agent instructions. Processes, the local recording server and workspace are
 cleaned up on completion or failure. `--artifacts` retains individual request
 bodies, raw responses and terminal screens in a fresh directory.

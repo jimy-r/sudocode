@@ -1,4 +1,4 @@
-"""Windows live acceptance: Read, restart, and replay empty signed thinking.
+"""Windows live acceptance: Read, restart, and replay signed thinking.
 
 The recording proxy caps output and selects an explicit thinking profile.
 Credentials stay in memory; request bodies and raw SSE are local artifacts.
@@ -27,6 +27,12 @@ parser = argparse.ArgumentParser()
 parser.add_argument("binary", type=Path)
 parser.add_argument("--profile", default="sudorouter")
 parser.add_argument("--model", default="claude-sonnet-4-6")
+parser.add_argument(
+    "--thinking-display",
+    choices=("omitted", "summarized"),
+    default="omitted",
+    help="Require empty or summarized signed thinking from the provider",
+)
 parser.add_argument(
     "--effort",
     choices=("low", "high"),
@@ -154,9 +160,8 @@ class Proxy(BaseHTTPRequestHandler):
                     session_id
                 ), "CLI did not preserve the selected diagnostic session id"
             body["max_tokens"] = 2048
-            # Omitted summaries cause the real provider to emit an empty signed
-            # block. Hold the same bounded profile throughout the tool journey.
-            body["thinking"] = {"type": "adaptive", "display": "omitted"}
+            # Preserve the selected thinking profile throughout the tool journey.
+            body["thinking"] = {"type": "adaptive", "display": args.thinking_display}
             body["output_config"] = {"effort": args.effort}
             raw = json.dumps(body, ensure_ascii=False).encode()
             (workspace / f"request-{number}-live.json").write_bytes(raw)
@@ -207,6 +212,8 @@ class Proxy(BaseHTTPRequestHandler):
                         ConnectionAbortedError,
                     ):
                         pass
+                    if is_message and parse_sse(b"".join(chunks))[2]:
+                        break
                 if is_message:
                     payload = b"".join(chunks)
                     (workspace / f"response-{number}.sse").write_bytes(payload)
@@ -387,7 +394,7 @@ try:
                 "binary": str(args.binary),
                 "profile": args.profile,
                 "model": args.model,
-                "thinking_control": "adaptive-omitted",
+                "thinking_control": "adaptive-" + args.thinking_display,
                 "effort": args.effort,
                 "check_context": args.check_context,
                 "session_id": session_id,
@@ -409,9 +416,9 @@ try:
         resume_expected += f" context={context_nonce}"
     send(read_prompt)
     wait(lambda: f"READ_DONE {code} sum={a + b}" in visible())
+    wait(lambda: len(records) >= 2 and all(r.get("completed") for r in records))
     (workspace / "read-screen.txt").write_text(visible(), encoding="utf-8")
     if context_nonce:
-        wait(lambda: len(records) >= 2 and records[1].get("completed"))
         original = json.loads((workspace / "request-0-client.json").read_bytes())
         assert context_nonce in json.dumps(original["system"]), (
             "CLI did not load the project instruction nonce"
@@ -442,16 +449,23 @@ try:
         )
     send(resume_prompt)
     wait(lambda: f"RESUME_DONE {code} value={a + b - 17}" in visible())
+    wait(lambda: len(records) >= 3 and all(r.get("completed") for r in records))
     (workspace / "resume-screen.txt").write_text(visible(), encoding="utf-8")
     close()
     assert len(records) == 3, "unexpected tool or retry requests"
     first_blocks, _, _ = parse_sse((workspace / "response-0.sse").read_bytes())
-    empty_signed = [
+    signed_thinking = [
         b
         for b in first_blocks
-        if b["type"] == "thinking" and not b.get("thinking") and b.get("signature")
+        if b["type"] == "thinking"
+        and b.get("signature")
+        and bool(b.get("thinking")) == (args.thinking_display == "summarized")
     ]
-    assert empty_signed, "provider did not emit the target empty signed thinking block"
+    assert signed_thinking, (
+        "provider did not emit the target "
+        + args.thinking_display
+        + " signed thinking block"
+    )
     second = json.loads((workspace / "request-1-client.json").read_bytes())
     results = [
         b
@@ -474,15 +488,13 @@ try:
     intact = all(
         any(
             b.get("type") == "thinking"
-            and b.get("thinking") == ""
+            and b.get("thinking") == thought.get("thinking", "")
             and b.get("signature") == thought["signature"]
             for b in replayed
         )
-        for thought in empty_signed
+        for thought in signed_thinking
     )
-    assert intact, (
-        "empty signed thinking was dropped or changed before the tool continuation"
-    )
+    assert intact, "signed thinking was dropped or changed before the tool continuation"
     resumed = json.loads((workspace / "request-2-client.json").read_bytes())
     if context_nonce:
         assert context_nonce in json.dumps(resumed["system"]), (
@@ -498,12 +510,12 @@ try:
     assert all(
         any(
             b.get("type") == "thinking"
-            and b.get("thinking") == ""
+            and b.get("thinking") == thought.get("thinking", "")
             and b.get("signature") == thought["signature"]
             for b in resumed_blocks
         )
-        for thought in empty_signed
-    ), "empty signed thinking was lost during restart/resume"
+        for thought in signed_thinking
+    ), "signed thinking was lost during restart/resume"
     assert all(
         r.get("completed") and r.get("http") == 200 and r.get("message_stop")
         for r in records
@@ -522,7 +534,11 @@ try:
         json.dumps(
             {
                 "passed_workflow": True,
-                "empty_signed_thinking_replayed": intact,
+                "signed_thinking_replayed": intact,
+                "thinking_display": args.thinking_display,
+                "empty_signed_thinking_replayed": (
+                    intact and args.thinking_display == "omitted"
+                ),
                 "project_context_checked": args.check_context,
                 "requests": len(records),
                 "live_api_inference": True,
