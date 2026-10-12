@@ -1787,6 +1787,7 @@ impl FsBackend for NexusVfsFsBackend {
         }
         self.client
             .stream_read_at(path, cursor, block_ms > 0, block_ms, &self.auth_token)
+            .map(|result| (result.data, result.next_offset, result.eof))
     }
 }
 
