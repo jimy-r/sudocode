@@ -96,3 +96,11 @@ is `global`; some routes reject this marker after tools with narrower scope.
 Both flags default off and their values appear in the startup record. A pass
 with these controls does not validate the CLI's unmodified transport on that
 route, another channel, or the first cause of historical artifact text.
+
+`fixtures/empty-legacy-signature.jsonl` represents old records with an empty
+signature string. These unsigned blocks must be omitted from outgoing history;
+the original assistant text must survive. Run the same real Read/restart journey
+with `--history-fixture e2e/thinking/fixtures/empty-legacy-signature.jsonl`.
+The provider's newly issued signed thinking must still survive both continuations.
+The portable CI regression also restores empty legacy signatures before checking
+valid empty, summarized and redacted thinking through two turns and restart.
