@@ -13,16 +13,37 @@
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
 use crate::types::{MessageRequest, MessageResponse, Usage};
 
-const DEFAULT_COMPLETION_TTL_SECS: u64 = 30;
-const DEFAULT_PROMPT_TTL_SECS: u64 = 5 * 60;
-const DEFAULT_BREAK_MIN_DROP: u32 = 2_000;
+/// Shared with endpoint probes through a pinned copy of the public contract.
+#[derive(Deserialize)]
+struct CacheContract {
+    defaults: CacheContractDefaults,
+}
+
+#[derive(Deserialize)]
+struct CacheContractDefaults {
+    completion_ttl_seconds: u64,
+    prompt_ttl_seconds: u64,
+    cache_break_min_drop: u32,
+}
+
+fn contract_defaults() -> &'static CacheContractDefaults {
+    static CONTRACT: OnceLock<CacheContract> = OnceLock::new();
+    &CONTRACT
+        .get_or_init(|| {
+            serde_json::from_str(include_str!(
+                "../../../../spec/prompt_cache_observations.json"
+            ))
+            .expect("embedded prompt cache contract must be valid")
+        })
+        .defaults
+}
 const MAX_SANITIZED_LENGTH: usize = 80;
 const REQUEST_FINGERPRINT_VERSION: u32 = 2;
 const REQUEST_FINGERPRINT_PREFIX: &str = "v1";
@@ -40,11 +61,12 @@ pub struct PromptCacheConfig {
 impl PromptCacheConfig {
     #[must_use]
     pub fn new(session_id: impl Into<String>) -> Self {
+        let defaults = contract_defaults();
         Self {
             session_id: session_id.into(),
-            completion_ttl: Duration::from_secs(DEFAULT_COMPLETION_TTL_SECS),
-            prompt_ttl: Duration::from_secs(DEFAULT_PROMPT_TTL_SECS),
-            cache_break_min_drop: DEFAULT_BREAK_MIN_DROP,
+            completion_ttl: Duration::from_secs(defaults.completion_ttl_seconds),
+            prompt_ttl: Duration::from_secs(defaults.prompt_ttl_seconds),
+            cache_break_min_drop: defaults.cache_break_min_drop,
         }
     }
 }
@@ -159,12 +181,10 @@ pub struct CacheBreakEvent {
 /// One line of [`PromptCachePaths::requests_path`].
 ///
 /// Deliberately small: enough to reconstruct a session's cache history and to
-/// join it against a gateway's own ledger, and nothing else. The join key is
-/// `gateway_request_id` — a pooling gateway records that same value against the
-/// upstream account it picked, so this is what turns "the prefix went cold" into
-/// "the prefix went cold *because the account changed*". Without it those two
-/// are indistinguishable from here, which is why a rollup was never going to be
-/// enough.
+/// join it against independent routing records. `gateway_request_id` and
+/// `provider_request_id` carry response correlation values; their semantics
+/// belong to the selected gateway. An account-change attribution uses a routing
+/// record that associates a value with a specific upstream account.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PromptCacheRequestRow {
     pub at_unix_secs: u64,
@@ -200,10 +220,8 @@ pub struct PromptCacheRequestRow {
 /// call site can swap them, and dropping one is invisible at the call site.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ResponseTraceIds {
-    /// `x-client-request-id` — which upstream *account* a pooling gateway
-    /// selected. The only value that separates "cold prefix" from "the request
-    /// went to a different account", which is the first question in every
-    /// cache-break investigation.
+    /// `x-client-request-id` — a gateway correlation value. Join it with
+    /// independent routing evidence using the selected gateway's semantics.
     pub gateway: Option<String>,
     /// `request-id` / `x-request-id` / `x-oneapi-request-id` — keys the
     /// gateway's own request log: which channel served the call, and its cost.

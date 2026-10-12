@@ -31,7 +31,7 @@ pub use http_transport::{
 };
 pub use prompt_cache::{
     cache_break_cause, cache_root, CacheBreakEvent, PromptCache, PromptCacheConfig,
-    PromptCachePaths, PromptCacheRecord, PromptCacheRequestRow, PromptCacheStats,
+    PromptCachePaths, PromptCacheRecord, PromptCacheRequestRow, PromptCacheStats, ResponseTraceIds,
 };
 pub use providers::anthropic::{
     is_anthropic_api_key, is_claude_code_oauth_token, is_proxy_auth_token, AnthropicClient,
