@@ -2138,6 +2138,9 @@ fn responses_tool_definition(tool: &ToolDefinition) -> Value {
         "type": "function",
         "name": tool.name,
         "parameters": parameters,
+        // Preserve optional arguments; Responses otherwise attempts strict
+        // schema normalization, which can require credential-path overrides.
+        "strict": false,
     });
     if let Some(desc) = &tool.description {
         def["description"] = json!(desc);
@@ -2450,6 +2453,9 @@ fn openai_tool_definition(tool: &ToolDefinition) -> Value {
             "name": tool.name,
             "description": tool.description,
             "parameters": parameters,
+            // Keep the same optional-argument contract through gateways that
+            // translate Chat Completions function tools into Responses tools.
+            "strict": false,
         }
     })
 }

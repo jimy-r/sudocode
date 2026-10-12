@@ -1383,6 +1383,44 @@ async fn request_metadata_user_id_reaches_the_wire_on_both_transports() {
     }
 }
 
+#[tokio::test]
+async fn gemini_preserves_nullable_enum_on_the_http_wire() {
+    let state = Arc::new(Mutex::new(Vec::<CapturedRequest>::new()));
+    let event = "data: {\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"ok\"}]},\"finishReason\":\"STOP\"}]}\n\n";
+    let server = spawn_server(
+        state.clone(),
+        vec![http_response("200 OK", "text/event-stream", event)],
+    )
+    .await;
+    let client = api::GeminiClient::from_resolved(&ResolvedProvider {
+        kind: ProviderKind::Gemini,
+        api_format: ApiFormat::GeminiGenerateContent,
+        base_url: server.base_url(),
+        credential: Credential::ApiKey("fixture-key".into()),
+        model_id: "gemini-test".into(),
+        extra_body: Default::default(),
+        cache_ttl_1h: Some(false),
+    })
+    .expect("Gemini client");
+    let mut input = sample_request(false);
+    input.model = "gemini-test".into();
+    input.tools.as_mut().expect("sample tools")[0].input_schema["properties"]["units"] = json!({"type": ["string", "null"], "enum": ["celsius", "fahrenheit", null], "default": null});
+    client
+        .send_message(&input, None)
+        .await
+        .expect("Gemini reply");
+    let captured = state.lock().await;
+    let body: serde_json::Value =
+        serde_json::from_str(&captured[0].body).expect("Gemini wire JSON");
+    let schema = &body["tools"][0]["functionDeclarations"][0]["parameters"];
+    assert_eq!(schema["required"], json!(["city"]));
+    let units = &schema["properties"]["units"];
+    assert_eq!(units["type"], "string");
+    assert_eq!(units["nullable"], true);
+    assert_eq!(units["enum"], json!(["celsius", "fahrenheit"]));
+    assert!(units.get("default").is_none());
+}
+
 fn sample_request(stream: bool) -> MessageRequest {
     MessageRequest {
         model: "claude-3-7-sonnet-latest".to_string(),

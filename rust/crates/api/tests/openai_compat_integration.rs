@@ -56,6 +56,7 @@ async fn send_message_uses_openai_compatible_endpoint_and_auth() {
         Some("Bearer xai-test-key")
     );
     let body: serde_json::Value = serde_json::from_str(&request.body).expect("json body");
+    assert_eq!(body["tools"][0]["function"]["strict"], json!(false));
     assert_eq!(body["model"], json!("grok-3"));
     assert_eq!(body["messages"][0]["role"], json!("system"));
     assert_eq!(body["tools"][0]["type"], json!("function"));
@@ -339,8 +340,11 @@ async fn send_message_uses_responses_endpoint_when_configured() {
     let client = OpenAiCompatClient::new("openai-test-key", OpenAiCompatConfig::openai())
         .with_api_format(ApiFormat::OpenAiResponses)
         .with_base_url(server.base_url());
+    let mut input = sample_request(false);
+    input.tools.as_mut().expect("sample tools")[0].input_schema["properties"]["units"] =
+        json!({"type": "string", "enum": ["celsius", "fahrenheit"]});
     let response = client
-        .send_message(&sample_request(false), None)
+        .send_message(&input, None)
         .await
         .expect("responses request should succeed");
 
@@ -362,6 +366,12 @@ async fn send_message_uses_responses_endpoint_when_configured() {
     assert_eq!(body["input"][0]["role"], json!("user"));
     assert_eq!(body["instructions"], json!("Use tools when needed"));
     assert_eq!(body["tools"][0]["type"], json!("function"));
+    assert_eq!(body["tools"][0]["strict"], json!(false));
+    assert_eq!(body["tools"][0]["parameters"]["required"], json!(["city"]));
+    assert_eq!(
+        body["tools"][0]["parameters"]["properties"]["units"],
+        json!({"type": "string", "enum": ["celsius", "fahrenheit"]})
+    );
     assert_eq!(body["tool_choice"], json!("auto"));
     assert_eq!(body["stream"], json!(true));
     assert_eq!(body["max_output_tokens"], json!(64));

@@ -542,6 +542,8 @@ async fn scenario_subagent_calculations(client: &mut AcpTestClient, session_id: 
                     "  model: <LIVE_MODEL>\n",
                     "  description: \"calc <N>\"\n",
                     "  prompt: \"What is <expr>? Reply with ONLY the number.\"\n\n",
+                    "Omit auth_mode entirely: all child agents must inherit this session's current credential path.\n",
+                    "No switch to subscription or api-key authentication is requested.\n\n",
                     "Calculations:\n",
                     "1. 101 + 102\n",
                     "2. 201 + 202\n",
@@ -775,6 +777,26 @@ async fn run_subagent_scenarios(client: &mut AcpTestClient, workspace: &TestWork
     scenario_initialize(client).await;
     let session_id = scenario_session_new(client, &workspace.root).await;
     scenario_subagent_calculations(client, &session_id).await;
+    let session = runtime::SessionStore::from_cwd(&workspace.root)
+        .expect("subagent test session store")
+        .load_session("latest")
+        .expect("subagent test must persist its transcript")
+        .session;
+    let mut spawns = 0;
+    for block in session.messages.iter().flat_map(|message| &message.blocks) {
+        if let runtime::ContentBlock::ToolUse { name, input, .. } = block {
+            if matches!(name.as_str(), "Agent" | "agent_spawn") {
+                let args: Value = serde_json::from_str(input).expect("agent tool arguments");
+                assert!(
+                    args.get("auth_mode").is_none_or(Value::is_null),
+                    "auth inheritance requires an omitted or null auth_mode, got {:?}",
+                    args.get("auth_mode")
+                );
+                spawns += 1;
+            }
+        }
+    }
+    assert_eq!(spawns, 3, "must inspect every persisted Agent call");
 }
 
 // ---------------------------------------------------------------------------
