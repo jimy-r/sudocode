@@ -1257,7 +1257,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
                     "name": { "type": "string", "description": "Optional human-readable label for this agent." },
                     "model": { "type": "string", "description": "Model ID override; when omitted, inherits the parent agent's current model." },
                     "run_in_background": { "type": "boolean", "description": "When true (default), launch async; interactive terminal sessions receive completion automatically. When false, wait and return the result. Use false for dependencies and print mode." },
-                    "auth_mode": { "type": "string", "enum": ["api-key", "proxy", "subscription"], "description": "Explicit auth mode for the subagent. Overrides auto-detection from config." },
+                    "auth_mode": { "type": ["string", "null"], "enum": ["api-key", "proxy", "subscription", null], "default": null, "description": "Optional credential-path override. Omit or pass null to inherit the parent session's current auth mode. Set a string only when the user explicitly requests a different auth mode." },
                     "permission_mode": { "type": "string", "enum": ["bubble"], "description": "Permission escalation mode. `bubble` (the default and only currently-supported value) routes any permission prompt the sub-agent would show up to the parent process's terminal/ACP prompter — the parent human (or the driving ACP client) approves on the sub-agent's behalf. Reserved for future modes." }
                 },
                 "required": ["prompt"],

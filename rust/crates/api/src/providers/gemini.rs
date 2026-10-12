@@ -614,6 +614,9 @@ fn sanitize_schema_for_gemini(schema: &Value) -> Value {
                     // Flatten type arrays: ["string","null"] → "string"
                     "type" => {
                         if let Some(arr) = value.as_array() {
+                            if arr.iter().any(|value| value.as_str() == Some("null")) {
+                                out.insert("nullable".to_string(), Value::Bool(true));
+                            }
                             let non_null: Vec<&Value> =
                                 arr.iter().filter(|v| v.as_str() != Some("null")).collect();
                             if non_null.len() == 1 {
@@ -626,6 +629,21 @@ fn sanitize_schema_for_gemini(schema: &Value) -> Value {
                             }
                         } else {
                             out.insert("type".to_string(), value.clone());
+                        }
+                    }
+                    // Proto enums contain strings; null is represented by nullable.
+                    "enum" => {
+                        if let Some(values) = value.as_array() {
+                            out.insert(
+                                key.clone(),
+                                Value::Array(
+                                    values
+                                        .iter()
+                                        .filter(|value| !value.is_null())
+                                        .cloned()
+                                        .collect(),
+                                ),
+                            );
                         }
                     }
                     // Recursively sanitize nested schemas.

@@ -538,6 +538,13 @@ jobs:
           PROXY_BASE_URL: https://api.sudorouter.ai/v1
           SCODE_LIVE_MODEL: gpt-6-luna
         run: cargo test -p rusty-sudocode-cli --test acp_live_smoke -- --test-threads=1
+      - name: Claude native cache and subagent smoke
+        working-directory: rust
+        env:
+          PROXY_AUTH_TOKEN: ${{ secrets.SUDOROUTER_CI_API_KEY }}
+          PROXY_BASE_URL: https://api.sudorouter.ai/v1
+          SCODE_LIVE_MODEL: claude-sonnet-4-6
+        run: cargo test -p rusty-sudocode-cli --test acp_live_smoke live_subagent_smoke_stdio -- --test-threads=1
       - name: Real model through the co-host controller mailbox
         working-directory: rust
         env:
@@ -603,6 +610,7 @@ jobs:
           cargo test -p rusty-sudocode-cli --test pty_background_tasks exiting_during_a_foreground_tool_reaps_both_process_groups -- --nocapture
           if [[ "$RUNNER_OS" == "Windows" ]]; then
             cargo test -p rusty-sudocode-cli --test pty_file_operations windows_verbatim_paths_read_the_same_file -- --nocapture
+            cargo test -p rusty-sudocode-cli --test pty_file_operations edit_then_verify_on_disk -- --nocapture
           fi
           cargo test -p rusty-sudocode-cli --test pty_block_spacing -- --test-threads=1 --nocapture
       - name: Summarize live model routing evidence
