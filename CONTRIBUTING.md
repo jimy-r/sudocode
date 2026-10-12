@@ -317,6 +317,12 @@ the PR description first.
 
 ## Required checks
 
+Prompt cache observation defaults, field semantics and synthetic scenarios live
+in [`spec/prompt_cache_observations.json`](./spec/prompt_cache_observations.json).
+The native ledger reads that specification directly. Endpoint probes can pin
+the same public file by commit and SHA-256. Cache efficiency formulas remain
+in [`spec/cache_metrics.json`](./spec/cache_metrics.json).
+
 ### Startup latency
 
 `SCODE_TRACE_STARTUP=1 scode version` prints local phase durations to stderr.

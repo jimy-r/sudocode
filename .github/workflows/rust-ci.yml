@@ -33,6 +33,7 @@ on:
       - scripts/generate_cache_metrics.py
       - scripts/cache_metrics.py
       - spec/cache_metrics.json
+      - spec/prompt_cache_observations.json
   pull_request:
     branches:
       - main
@@ -63,6 +64,7 @@ on:
       - scripts/generate_cache_metrics.py
       - scripts/cache_metrics.py
       - spec/cache_metrics.json
+      - spec/prompt_cache_observations.json
   workflow_dispatch:
     inputs:
       render_performance:
