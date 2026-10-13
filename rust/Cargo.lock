@@ -4447,6 +4447,7 @@ dependencies = [
  "transport",
  "tree-sitter",
  "tree-sitter-bash",
+ "uuid",
  "walkdir",
 ]
 

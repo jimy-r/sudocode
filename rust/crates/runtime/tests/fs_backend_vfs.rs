@@ -322,6 +322,8 @@ fn host_backend_links_a_directory_without_a_privilege() {
 
     let fs = StdFsBackend;
     fs.link(&alias, &target).expect("link a directory");
+    let original = std::path::Path::new(&target).join("persistent.txt");
+    std::fs::write(&original, b"durable object").expect("write target content");
 
     assert!(
         fs.symlink_metadata(&alias)
@@ -345,6 +347,10 @@ fn host_backend_links_a_directory_without_a_privilege() {
         "the index must appear in a listing by name"
     );
 
+    fs.delete(&alias)
+        .expect("unlink the runtime directory alias");
+    assert!(std::fs::symlink_metadata(&alias).is_err());
+    assert_eq!(std::fs::read(&original).unwrap(), b"durable object");
     std::fs::remove_dir_all(&root).ok();
 }
 

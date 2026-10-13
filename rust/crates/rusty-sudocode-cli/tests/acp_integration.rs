@@ -3746,8 +3746,9 @@ fn dump_subagent_events(label: &str, notifs: &[Value]) {
 /// Without the opt-in, the wire is what it was before sub-agent events
 /// existed. The fixtures were captured from the pre-contract binary
 /// (`origin/main` e3000e02) over these same scenarios and normalized the same
-/// way: workspace path, version, generated ids / timestamps (runs of ten or
-/// more digits), the palette colour hashed from an agent id, and the size
+/// way: workspace path, version, the returned session ID, generated ids and
+/// timestamps (runs of ten or more digits), the palette colour hashed from an
+/// agent id, and the size
 /// estimate that depends on path lengths. Background children are given time
 /// to finish so a late update would be caught too.
 /// Independent terminal tool updates may arrive in completion order; only
@@ -3788,6 +3789,9 @@ async fn acp_subagent_events_off_matches_pre_contract_output() {
         let canonical = fs::canonicalize(&workspace.root).expect("canonical root");
         let normalize = |line: &str| -> String {
             let mut line = line
+                // Session IDs are opaque. Keep the original fixture marker
+                // while checking every other field in the pre-contract wire.
+                .replace(&session_id, "session-<N>-0")
                 .replace(canonical.to_string_lossy().as_ref(), "<WS>")
                 .replace(workspace.root.to_string_lossy().as_ref(), "<WS>")
                 .replace(

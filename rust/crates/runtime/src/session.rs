@@ -2298,9 +2298,9 @@ fn current_time_millis() -> u64 {
 }
 
 fn generate_session_id() -> String {
-    let millis = current_time_millis();
-    let counter = SESSION_ID_COUNTER.fetch_add(1, Ordering::Relaxed);
-    format!("session-{millis}-{counter}")
+    // Durable objects can share a flat store across independent processes and
+    // nodes. Wall clocks and process-local counters cannot identify that object.
+    format!("session-{}", uuid::Uuid::new_v4())
 }
 
 #[cfg(test)]
