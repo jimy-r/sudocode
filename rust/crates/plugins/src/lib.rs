@@ -2173,15 +2173,10 @@ fn detect_unsupported_manifest_contracts(
 
     let mut errors = Vec::new();
 
-    for (field, detail) in [(
-        "agents",
-        "plugin manifest field `agents` uses the SudoCode plugin contract; `scode` does not load plugin-managed agent markdown catalogs from plugin manifests.",
-    )] {
-        if root.contains_key(field) {
-            errors.push(PluginManifestValidationError::UnsupportedManifestContract {
-                detail: detail.to_string(),
-            });
-        }
+    if root.contains_key("agents") {
+        errors.push(PluginManifestValidationError::UnsupportedManifestContract {
+            detail: "plugin manifest field `agents` uses the SudoCode plugin contract; `scode` does not load plugin-managed agent markdown catalogs from plugin manifests.".to_string(),
+        });
     }
 
     if root
