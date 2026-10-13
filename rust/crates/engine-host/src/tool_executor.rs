@@ -435,7 +435,11 @@ impl ToolExecutor for CliToolExecutor {
             .as_ref()
             .and_then(|message| message.model.as_deref())
             .unwrap_or("");
-        ToolOutput::from_dispatch(&output_name, output, model)
+        if is_mcp_tool {
+            ToolOutput::from_mcp_result(output, model)
+        } else {
+            ToolOutput::from_dispatch(&output_name, output, model)
+        }
     }
 
     fn set_abort_signal(&mut self, abort_signal: runtime::HookAbortSignal) {

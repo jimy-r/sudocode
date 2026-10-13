@@ -4356,9 +4356,110 @@ async fn acp_session_new_injects_stdio_mcp() {
     workspace.cleanup();
 }
 
-/// Injected mcp survives a model switch: handle_acp_model_switch rebuilds the
-/// runtime and reuses the session's mcp_servers (stored on AcpCliSession), so
-/// the dummy is respawned (proof rewritten) and the tool still works.
+/// The actual HTTP MCP authorization and tool are retained when ACP rebuilds
+/// its runtime for a model switch. The server receipt proves a new invocation.
+#[tokio::test]
+async fn acp_http_mcp_auth_and_tool_survive_model_switch() {
+    let model = MockAnthropicService::spawn()
+        .await
+        .expect("start model fixture");
+    let workspace = TestWorkspace::new("http-mcp-model-switch");
+    workspace.create();
+    workspace.write_sudocode_json(&model.base_url());
+    let proof = workspace.root.join("http-mcp-receipts.jsonl");
+    let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/http_mcp.py");
+    let mut remote = Command::new(python::resolve_python())
+        .arg("-u")
+        .arg(script)
+        .arg(&proof)
+        .arg("fixture-remote-token")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .expect("start real HTTP MCP server");
+    let mut ready = BufReader::new(remote.stdout.take().expect("MCP readiness pipe"));
+    let mut url = String::new();
+    tokio::time::timeout(Duration::from_secs(30), ready.read_line(&mut url))
+        .await
+        .expect("HTTP MCP readiness deadline")
+        .expect("HTTP MCP readiness");
+    assert!(
+        url.starts_with("http://127.0.0.1:"),
+        "unexpected readiness: {url}"
+    );
+    let mut client = spawn_stdio_client_danger(&workspace);
+    let (_, initialized) = client
+        .send_request("initialize", json!({"protocolVersion": 1}))
+        .await;
+    assert_eq!(
+        initialized["result"]["agentCapabilities"]["mcpCapabilities"]["http"],
+        true
+    );
+    let (_, created) = client.send_request("session/new", json!({
+        "cwd": workspace.root.to_string_lossy(),
+        "mcpServers": [{"name": "parity", "type": "http", "url": url.trim(),
+            "headers": [{"name": "Authorization", "value": "Bearer fixture-remote-token"}]}],
+    })).await;
+    let session = created["result"]["sessionId"]
+        .as_str()
+        .expect("HTTP MCP session");
+    {
+        let (_, switched) = client
+            .send_request(
+                "session/set_model",
+                json!({"sessionId": session, "modelId": "haiku"}),
+            )
+            .await;
+        assert!(
+            switched.get("error").is_none(),
+            "model switch failed: {switched}"
+        );
+        let (updates, response) = client.send_request("session/prompt", json!({
+            "sessionId": session,
+            "prompt": [{"type": "text", "text": format!("{SCENARIO_PREFIX}mcp_tool_roundtrip")}],
+        })).await;
+        assert!(
+            response.get("error").is_none(),
+            "remote prompt failed: {response}"
+        );
+        let text = serde_json::to_string(&updates).expect("ACP updates");
+        assert!(
+            text.contains("echo:hello from mcp parity"),
+            "HTTP echo missing: {text}"
+        );
+    }
+    let calls: Vec<Value> = fs::read_to_string(proof)
+        .expect("real MCP receipt")
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("MCP receipt JSON"))
+        .collect();
+    let invoked: Vec<_> = calls
+        .iter()
+        .filter(|call| call["method"] == "tools/call")
+        .collect();
+    assert_eq!(
+        invoked.len(),
+        1,
+        "the prompt after rebuilding must call the authenticated remote tool once"
+    );
+    assert!(
+        calls
+            .iter()
+            .filter(|call| call["method"] == "initialize")
+            .count()
+            >= 2,
+        "both the initial and rebuilt runtime must authenticate to the remote server"
+    );
+    assert!(invoked
+        .iter()
+        .all(|call| call["params"]["arguments"]["text"] == "hello from mcp parity"));
+    client.shutdown().await;
+    remote.kill().await.expect("stop owned HTTP MCP server");
+    workspace.cleanup();
+}
+
+/// Injected stdio MCP survives a model switch by respawning with its config.
 #[tokio::test]
 async fn acp_session_new_mcp_survives_model_switch() {
     let server = MockAnthropicService::spawn()
