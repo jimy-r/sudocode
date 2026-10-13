@@ -23,9 +23,9 @@ use agent_client_protocol_schema::{
     AgentCapabilities, AvailableCommand, AvailableCommandInput, AvailableCommandsUpdate,
     CancelNotification, ClientRequest, CloseSessionRequest, CloseSessionResponse, ContentBlock,
     ContentChunk, ExtRequest, Implementation, InitializeRequest, InitializeResponse,
-    ListSessionsRequest, ListSessionsResponse, LoadSessionRequest, LoadSessionResponse, McpServer,
-    NewSessionRequest, NewSessionResponse, PermissionOption, PermissionOptionId,
-    PermissionOptionKind, PromptCapabilities, PromptRequest, PromptResponse,
+    ListSessionsRequest, ListSessionsResponse, LoadSessionRequest, LoadSessionResponse,
+    McpCapabilities, McpServer, NewSessionRequest, NewSessionResponse, PermissionOption,
+    PermissionOptionId, PermissionOptionKind, PromptCapabilities, PromptRequest, PromptResponse,
     RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
     SessionCapabilities, SessionCloseCapabilities, SessionInfo, SessionListCapabilities,
     SessionNotification, SessionUpdate, SetSessionModelRequest, SetSessionModelResponse,
@@ -35,7 +35,10 @@ use agent_client_protocol_schema::{
 use engine_core::{AuthMode, EngineDelegate, EngineEvent, ObserverAdapter, SubagentRelay};
 use engine_host::config::AllowedToolSet;
 use engine_host::{SessionEngine, SessionLifecycle};
-use runtime::config::{ConfigSource, McpServerConfig, McpStdioServerConfig, ScopedMcpServerConfig};
+use runtime::config::{
+    ConfigSource, McpRemoteServerConfig, McpServerConfig, McpStdioServerConfig,
+    ScopedMcpServerConfig,
+};
 use runtime::workspace_root::WorkspaceRootScope;
 use runtime::HookAbortSignal;
 use runtime::SystemPromptOverrides;
@@ -368,8 +371,9 @@ impl SessionSubagents {
 /// `cwd` becomes each stdio server's `current_dir` so relative `command`
 /// paths resolve against the session working directory.
 ///
-/// Only the `Stdio` variant is loaded. `Http`/`Sse` log a warning and are
-/// skipped; any future variant is silently skipped.
+/// Remote servers use the same runtime transports as configured CLI servers.
+/// This lets a managed session connect without spawning a host subprocess or
+/// requiring its virtual workspace to exist in the host filesystem.
 fn acp_mcp_servers_to_scoped(
     acp_servers: &[McpServer],
     cwd: &std::path::Path,
@@ -398,9 +402,40 @@ fn acp_mcp_servers_to_scoped(
                     },
                 );
             }
-            McpServer::Http(_) | McpServer::Sse(_) => {
-                eprintln!(
-                    "[acp] session mcp_servers: http/sse transport skipped (scode loads stdio MCP only)"
+            McpServer::Http(http) => {
+                out.insert(
+                    http.name.clone(),
+                    ScopedMcpServerConfig {
+                        scope: ConfigSource::Local,
+                        config: McpServerConfig::Http(McpRemoteServerConfig {
+                            url: http.url.clone(),
+                            headers: http
+                                .headers
+                                .iter()
+                                .map(|header| (header.name.clone(), header.value.clone()))
+                                .collect(),
+                            headers_helper: None,
+                            oauth: None,
+                        }),
+                    },
+                );
+            }
+            McpServer::Sse(sse) => {
+                out.insert(
+                    sse.name.clone(),
+                    ScopedMcpServerConfig {
+                        scope: ConfigSource::Local,
+                        config: McpServerConfig::Sse(McpRemoteServerConfig {
+                            url: sse.url.clone(),
+                            headers: sse
+                                .headers
+                                .iter()
+                                .map(|header| (header.name.clone(), header.value.clone()))
+                                .collect(),
+                            headers_helper: None,
+                            oauth: None,
+                        }),
+                    },
                 );
             }
             _ => {}
@@ -1376,21 +1411,26 @@ mod tests {
     }
 
     #[test]
-    fn acp_mcp_servers_skips_http_sse() {
+    fn acp_mcp_servers_preserves_http_sse() {
         let http = McpServer::Http(McpServerHttp::new("h", "https://e"));
         let sse = McpServer::Sse(McpServerSse::new("s", "https://e"));
         let out = acp_mcp_servers_to_scoped(&[http, sse], Path::new("/tmp"));
-        assert!(out.is_empty());
+        assert!(
+            matches!(&out["h"].config, McpServerConfig::Http(remote) if remote.url == "https://e")
+        );
+        assert!(
+            matches!(&out["s"].config, McpServerConfig::Sse(remote) if remote.url == "https://e")
+        );
     }
 
     #[test]
     fn acp_mcp_servers_mixed() {
         let stdio = McpServer::Stdio(McpServerStdio::new("keep", PathBuf::from("/bin/k")));
-        let http = McpServer::Http(McpServerHttp::new("drop", "https://e"));
+        let http = McpServer::Http(McpServerHttp::new("remote", "https://e"));
         let out = acp_mcp_servers_to_scoped(&[stdio, http], Path::new("/tmp"));
-        assert_eq!(out.len(), 1);
+        assert_eq!(out.len(), 2);
         assert!(out.contains_key("keep"));
-        assert!(!out.contains_key("drop"));
+        assert!(out.contains_key("remote"));
     }
 }
 
@@ -1949,6 +1989,7 @@ pub(crate) async fn run_acp_on_transport(
                         .agent_capabilities(
                             AgentCapabilities::new()
                                 .load_session(true)
+                                .mcp_capabilities(McpCapabilities::new().http(true).sse(true))
                                 .prompt_capabilities(PromptCapabilities::new().image(true))
                                 .session_capabilities(
                                     SessionCapabilities::new()

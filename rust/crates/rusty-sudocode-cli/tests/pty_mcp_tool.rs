@@ -157,6 +157,11 @@ fn mcp_echo_tool_round_trips_through_ndjson_stdio() {
         &["--permission-mode", "danger-full-access", &prompt],
         &[("SUDOCODE_ENABLE_MCP", "1")],
     );
+    if env.is_live() {
+        // A real gateway may spend longer than 30s in queue/tool discovery.
+        // Keep a bounded live deadline without slowing deterministic CI runs.
+        sess.set_default_timeout(std::time::Duration::from_secs(180));
+    }
 
     // Assert on the `echo:`-prefixed form, not the bare input text: the
     // `echo:` prefix is added only by the MCP server's response, so it
@@ -164,7 +169,12 @@ fn mcp_echo_tool_round_trips_through_ndjson_stdio() {
     // NDJSON transport and the nested-runtime bridge. Matching the bare
     // input would false-positive on the turn-1 tool-call arguments.
     sess.expect("echo:hello from mcp parity")
-        .expect("response should surface the echoed MCP tool output");
+        .unwrap_or_else(|error| {
+            panic!(
+                "MCP result was not displayed: {error:?}\n{}",
+                common::screen_tail(&sess, 5000)
+            );
+        });
 
     let exit = sess.expect_eof().expect("scode should exit");
     assert_eq!(exit, 0, "MCP tool turn should exit 0; got {exit}");
