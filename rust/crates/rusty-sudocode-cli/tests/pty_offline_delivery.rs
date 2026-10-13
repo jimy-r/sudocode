@@ -64,15 +64,17 @@ fn persisted_message_is_consumed_when_the_receiver_first_starts() {
         );
         std::thread::sleep(Duration::from_millis(100));
     }
-    let screen = receiver.render(|screen| screen.contents());
-    assert!(screen.contains("Message from offline-sender"), "{screen}");
-    assert!(
-        screen.contains(if env.is_mock() {
-            "4"
-        } else {
-            "OFFLINE_RECEIPT_7319"
-        }),
-        "{screen}"
+    let receipt = if env.is_mock() {
+        "The answer is 4"
+    } else {
+        "OFFLINE_RECEIPT_7319"
+    };
+    // The durable cursor can commit before the terminal renders its next frame.
+    common::expect_screen(
+        &receiver,
+        |screen| screen.contains("Message from offline-sender") && screen.contains(receipt),
+        common::DEFAULT_TIMEOUT,
+        "the persisted offline turn renders its receipt",
     );
     receiver.send("/exit\r").expect("exit receiver");
     assert_eq!(receiver.expect_eof().expect("receiver exits"), 0);
@@ -85,13 +87,8 @@ fn persisted_message_is_consumed_when_the_receiver_first_starts() {
                 matches!(block, ContentBlock::Text { text } if text.contains("OFFLINE_RECEIPT_7319"))
             })
     }));
-    let receipt = if env.is_mock() {
-        "The answer is 4"
-    } else {
-        "OFFLINE_RECEIPT_7319"
-    };
-    let persisted_reply = inbox
-        .poll_conversation(sender, 0, 0)
+    let persisted_reply = outbox
+        .poll_conversation("offline-recipient", 0, 0)
         .unwrap()
         .0
         .iter()
