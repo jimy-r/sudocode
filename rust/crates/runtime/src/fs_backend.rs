@@ -215,14 +215,14 @@ pub trait FsBackend: Send + Sync + 'static {
     /// * the VFS (`KernelFsBackend`, `NexusVfsFsBackend`) makes a real `DT_LINK`, the
     ///   destination in metadata — which a mount with no content store keeps, while it
     ///   drops bytes;
-    /// * a host FS makes a pointer FILE holding the target, because a real symlink on
-    ///   Windows needs Developer Mode or admin. A no-op would be the other option and is
-    ///   worse than it sounds: the name would not appear, so a receiver on a host FS
-    ///   could not enumerate its conversations at all.
+    /// * a host FS uses an unprivileged Unix symlink or Windows directory junction,
+    ///   with a pointer file fallback when the platform cannot create that link.
+    ///   The fallback supports indexes through `read_link`, not ordinary path
+    ///   traversal by shell or Git tools.
     ///
-    /// So `ls -l` on a host FS shows a small text file where the VFS shows a link. That
-    /// is deliberate. [`Self::read_link`] is the follow half and resolves both, which is
-    /// the only way production should ever ask where one points.
+    /// [`Self::read_link`] resolves both the native link and pointer-file shapes.
+    /// Removing an alias must leave its target intact. None of these link types
+    /// provides reference-counted reclamation of managed temporary objects.
     ///
     /// The default is a no-op so a backend with no namespace of its own stays silent —
     /// but a backend that serves a chat list MUST override it, or the index is empty and
@@ -732,6 +732,18 @@ impl FsBackend for StdFsBackend {
     }
 
     fn delete(&self, path: &str) -> io::Result<()> {
+        // A Windows directory junction is removed as a directory entry. Never
+        // traverse its target: removing a runtime alias must preserve the object.
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::FileTypeExt;
+            if std::fs::symlink_metadata(path)?
+                .file_type()
+                .is_symlink_dir()
+            {
+                return std::fs::remove_dir(path);
+            }
+        }
         std::fs::remove_file(path)
     }
 

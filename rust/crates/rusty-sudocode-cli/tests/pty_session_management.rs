@@ -152,6 +152,53 @@ fn session_auto_save_creates_jsonl() {
     );
 }
 
+/// Independent OS processes save distinct durable objects in one shared store.
+#[test]
+fn concurrent_processes_save_uuid_sessions_without_replacing_each_other() {
+    let env = common::TestEnv::new("session-process-ids");
+    let prompt = env.prompt("Reply with exactly 4.", "single_turn_text");
+    let mut processes: Vec<_> = (0..4)
+        .map(|_| env.spawn(&["--permission-mode", "read-only", &prompt]))
+        .collect();
+    for process in &mut processes {
+        assert_eq!(process.expect_eof().expect("process should exit"), 0);
+    }
+    let mut ids = std::collections::HashSet::new();
+    let root = env.workspace_root().join(".scode/sessions");
+    for workspace in fs::read_dir(root).unwrap() {
+        for entry in fs::read_dir(workspace.unwrap().path()).unwrap() {
+            let directory = entry.unwrap().path();
+            let transcript = directory.join("transcript.jsonl");
+            if !transcript.is_file() {
+                continue;
+            }
+            let content = fs::read_to_string(&transcript).unwrap();
+            let metadata: serde_json::Value = content
+                .lines()
+                .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+                .find(|value| value["type"] == "session_meta")
+                .expect("saved transcript metadata");
+            let id = metadata["session_id"].as_str().unwrap();
+            let uuid = id.strip_prefix("session-").expect("session prefix");
+            assert_eq!(uuid.len(), 36, "cross-process ID must use a UUID: {id}");
+            assert_eq!(
+                &uuid[14..15],
+                "4",
+                "UUID must use independent random allocation"
+            );
+            assert!(matches!(&uuid[19..20], "8" | "9" | "a" | "b"));
+            assert_eq!(directory.file_name().unwrap().to_str().unwrap(), id);
+            assert!(content.contains("Reply with exactly 4."));
+            assert!(ids.insert(id.to_string()), "duplicate durable ID: {id}");
+        }
+    }
+    assert_eq!(
+        ids.len(),
+        4,
+        "all four processes must keep their own transcript"
+    );
+}
+
 // ──────────────────────────────────────────────────────────────────────
 // 2. resume restores context
 // ──────────────────────────────────────────────────────────────────────

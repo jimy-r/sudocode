@@ -78,6 +78,9 @@ const RECEIVER: &str = UNIFIED_SEND_RECIPIENT;
 /// Long enough for a transport hop and a REPL turn under CI load, short enough
 /// that a genuine failure is not mistaken for slowness.
 const BUDGET: Duration = Duration::from_secs(30);
+// Both journeys use the harness's same signed Agent credentials and reader
+// registers. Independent fixture processes must not consume each other's mail.
+static DUET_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// How the two processes reach each other.
 enum Transport {
@@ -178,12 +181,21 @@ fn expect_on_screen(sess: &mut pty_expect::PtySession, needle: &str) {
 
 #[test]
 fn one_scode_sends_and_another_surfaces_it_on_every_transport() {
+    let _guard = DUET_SERIAL.lock().unwrap();
     for transport in Transport::available() {
-        run_duet(&transport);
+        run_duet(&transport, false);
     }
 }
 
-fn run_duet(transport: &Transport) {
+#[test]
+fn a_message_sent_before_the_receiver_starts_survives_on_every_transport() {
+    let _guard = DUET_SERIAL.lock().unwrap();
+    for transport in Transport::available() {
+        run_duet(&transport, true);
+    }
+}
+
+fn run_duet(transport: &Transport, offline: bool) {
     // Cert-only: the sender dials with its minted credential, so its A2A name -
     // the `from` the node stamps - is the credential's agent, not a name the
     // test invents. Reading it here keeps the assertion pinned to what shipped.
@@ -214,6 +226,7 @@ fn run_duet(transport: &Transport) {
     let (_history, tail) = inbox
         .poll_conversation(&sender_name, 0, 0)
         .expect("seek the transcript to its tail");
+    let initial_position = inbox.read_position(&sender_name).unwrap().unwrap_or(0);
 
     // Cert-only: the receiver dials with its minted credential; its A2A name
     // comes from the cert, so RECEIVER is the name that bundle must carry.
@@ -230,11 +243,20 @@ fn run_duet(transport: &Transport) {
         ("NEXUS_A2A_ENDPOINT", receiver_endpoint.as_str()),
         ("NEXUS_A2A_CREDENTIAL", receiver_credential.as_str()),
     ];
-    let mut receiver = env.spawn_with_env(&["--permission-mode", "read-only"], &receiver_env_vars);
-    receiver.set_default_timeout(BUDGET);
-    receiver
-        .expect("❯")
-        .expect("the receiver's REPL should start");
+    let start_receiver = || {
+        let mut receiver =
+            env.spawn_with_env(&["--permission-mode", "read-only"], &receiver_env_vars);
+        receiver.set_default_timeout(BUDGET);
+        receiver
+            .expect("❯")
+            .expect("the receiver's REPL should start");
+        receiver
+    };
+    let mut receiver = if offline {
+        None
+    } else {
+        Some(start_receiver())
+    };
     // No wait for a read position here. It used to block until the receiver
     // had written its cursor file, because a first-ever read seeked to the
     // tail and anything sent before that was skipped. A first read now starts
@@ -247,8 +269,9 @@ fn run_duet(transport: &Transport) {
     // local convention is keyed on. Over nexus it gets its own.
     let prompt = env.prompt(
         &format!(
-            "Send a message to {RECEIVER} saying hello from unified send. \
-             Use summary \"greeting test\".",
+            "Use send to message {RECEIVER}. The message body must be exactly \
+             \"hello from unified send\" (lowercase, without a period). \
+             Use summary exactly \"greeting test\".",
         ),
         transport.scenario(),
     );
@@ -297,9 +320,20 @@ fn run_duet(transport: &Transport) {
     assert_eq!(
         exit,
         0,
-        "[{}] the sender should exit 0 after sending",
-        transport.label()
+        "[{}] the sender should exit 0 after sending:\n{}",
+        transport.label(),
+        common::screen_tail(&sending, 1600)
     );
+    if offline {
+        assert_eq!(
+            inbox.read_position(&expected_from).unwrap().unwrap_or(0),
+            initial_position
+        );
+        let (stored, _) = inbox.poll_conversation(&expected_from, tail, 0).unwrap();
+        assert!(stored.iter().any(|message| message.from == expected_from));
+        receiver = Some(start_receiver());
+    }
+    let mut receiver = receiver.expect("receiver starts after durable delivery");
 
     // The sender is on nexus, so nothing may be written to the workspace: the
     // failure being guarded is the ambient fallback writing a local file while
