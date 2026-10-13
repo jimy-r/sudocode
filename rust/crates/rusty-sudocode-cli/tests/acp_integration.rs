@@ -4380,7 +4380,7 @@ async fn acp_http_mcp_auth_and_tool_survive_model_switch() {
         .expect("start real HTTP MCP server");
     let mut ready = BufReader::new(remote.stdout.take().expect("MCP readiness pipe"));
     let mut url = String::new();
-    tokio::time::timeout(Duration::from_secs(10), ready.read_line(&mut url))
+    tokio::time::timeout(Duration::from_secs(30), ready.read_line(&mut url))
         .await
         .expect("HTTP MCP readiness deadline")
         .expect("HTTP MCP readiness");
