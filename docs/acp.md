@@ -562,3 +562,73 @@ keys under the update's own `_meta.sudocode` tell them apart:
 - Sub-agents inherit the parent's permission mode. A child tool that requires
   approval sends `session/request_permission` through the parent's controller
   connection and waits for its answer. A missing approver denies the call.
+
+## Durable direct sub-agent completions (extension v1)
+
+A controller opts in on each connection with
+`initialize._meta.sudocode.subagentCompletions: {"version":1}`. The server
+advertises the same version only on runtimes that implement the journal and
+exact-context contract. Without negotiation, existing ACP behavior is unchanged.
+`subagentEvents` remains the display stream. This extension covers only children
+spawned directly by the top-level ACP session; nested children and background
+shell/Monitor jobs do not receive an automatic-continuation guarantee.
+
+Each opted-in `session/prompt` supplies `_meta.traceId`. Before starting a child,
+scode durably registers its agent ID, spawning tool call and trace in a journal
+beside the parent transcript. Shared CLI/ACP reduction requires actual
+`running`/`backgrounded` handoff, a persisted terminal manifest, and the committed
+parent turn. A canonical `pid_output` read suppresses an unpublished candidate.
+A synthetic abort without terminal evidence cannot publish a completion.
+If recording a terminal event fails temporarily, the existing delivery loop
+retains its bounded lifecycle data and retries the journal write. Delivery still
+waits for the parent commit and honors explicit result collection. A process
+restart recovers the terminal evidence from the persisted child manifest.
+
+The agent sends a JSON-RPC **request** `_sudocode/subagent/completed`:
+
+```json
+{"sessionId":"session-id","completionId":"64 lowercase SHA-256 hex characters",
+ "agentId":"agent-id","parentToolCallId":"tool-call-id","originTraceId":"run:prompt",
+ "status":"completed","message":"<task-notification>...</task-notification>"}
+```
+
+Status is `completed`, `failed`, or `cancelled`. The message uses the existing
+XML-escaped tool-result renderer, bounded to 64 KiB UTF-8 before delivery. It is
+untrusted tool output, not a system instruction. Completion identity is derived
+from version/session/tool/agent; payload freezes before the first send. Publication
+is the deduplication cutoff: a later explicit read cannot retract an in-flight
+receipt. This does not promise exactly-once model execution.
+
+The controller replies only after committing its durable receipt:
+`{"completionId":"…","disposition":"stored"}`. A previously verified binding
+whose session has been deleted may instead reply
+`{"completionId":"…","disposition":"discarded","reason":"session_deleted"}`.
+Delivery is sequential per session in durable publication order, outside
+engine/prompt locks. An earlier spawn finishing late cannot overtake an
+unacknowledged publication, including after restart. Transient errors
+and missing ACKs retry the identical payload with bounded exponential backoff;
+invalid requests or inconsistent ACKs quarantine that item. Method-not-found and
+authentication-required suspend delivery until a fresh binding. Replies from a
+retired binding cannot stop the replacement delivery. ACK persistence failure
+leaves the item pending. ACK tombstones retain identity, releasing result text;
+journals stop accepting additions at 10,000 registered children or 64 MiB and
+report `completion_journal_capacity` rather than silently dropping work.
+
+`_sudocode/subagent/replay {sessionId,cwd}` reads only the exact journal,
+transcript and registered child manifests. It does **not** load engines, MCP or
+plugins, restart children, scan unrelated cwd results, or run a model. It binds
+pending deliveries and returns `{watermark,waiting,pending,unresolved,settled,
+blocked,contextRef}`. Missing terminal evidence is `execution_unconfirmed`;
+uncommitted parent evidence is `source_context_unconfirmed`. After an interrupted
+parent, a new explicit human turn may proceed, but cannot retroactively publish
+that parent's unproven completions.
+
+An opted-in prompt's committed response and `session/load` expose
+`_meta.sudocode.contextRef = {sessionId,revision,digest,lastTraceId}`. The digest
+covers recoverable transcript bytes. Live load validates exact cwd and rebinds
+without replacing the engine; cold load opens the exact stored session. A
+controller sending an automatic input supplies `_meta.sudocode.expectedContext`.
+The agent checks it inside that session's prompt lane before any model work;
+mismatch returns `-32602` with `context_mismatch`. Transcript edits/compaction that
+invalidate the recorded digest cannot be presented as exact recovery. Hosted
+factories do not advertise this extension until they implement its storage contract.

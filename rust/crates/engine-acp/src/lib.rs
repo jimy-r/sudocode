@@ -16,6 +16,7 @@ pub mod managed_agent;
 /// (build/load/fork a `SessionEngine` per session, drive one `run_turn` per
 /// `session/prompt`, translate `EngineEvent`/`TurnComplete` onto the ACP wire).
 mod session_ops;
+mod subagent_completions;
 /// VLM image-describe side-call for text-only models handed an image.
 mod vlm_describe;
 

@@ -54,6 +54,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc as std_mpsc;
 
 use crate::session_ops;
+use crate::subagent_completions::{self, Delivery, ReplayRequest, ReplayResponse};
 
 /// Error type returned by ACP agent implementations.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -308,6 +309,7 @@ fn subagent_events_version(meta: Option<&agent_client_protocol_schema::Meta>) ->
 /// out on the connection that last prompted this session.
 pub struct SessionSubagents {
     relay: SubagentRelay,
+    completion: Option<Arc<Delivery>>,
     connection: Mutex<ConnectionTo<Client>>,
     /// Agents this session has reported `started` for: what
     /// `_sudocode/agent/cancel` may name.
@@ -317,10 +319,18 @@ pub struct SessionSubagents {
 impl SessionSubagents {
     /// Must run inside the ACP server's Tokio runtime (it spawns the task that
     /// writes background events to the connection).
-    fn start(session_id: String, connection: ConnectionTo<Client>) -> Arc<Self> {
+    fn start(
+        session_id: String,
+        connection: ConnectionTo<Client>,
+        completion: Option<Arc<Delivery>>,
+    ) -> Arc<Self> {
         let (relay, events) = SubagentRelay::new();
+        if let Some(delivery) = &completion {
+            relay.set_completion_journal(Arc::clone(&delivery.journal));
+        }
         let subagents = Arc::new(Self {
             relay,
+            completion,
             connection: Mutex::new(connection),
             agents: Mutex::new(HashSet::new()),
         });
@@ -375,6 +385,9 @@ impl SessionSubagents {
     }
 
     fn observe(&self, event: &EngineEvent) {
+        if let Some(delivery) = &self.completion {
+            delivery.observe(event);
+        }
         if let Some(agent_id) = session_ops::started_agent_id(event) {
             self.agents
                 .lock()
@@ -612,6 +625,25 @@ async fn drive_prompt(
     let subagents = registry.subagents(&sid);
     if let Some(subagents) = &subagents {
         subagents.set_connection(cx_inner.clone());
+    }
+    let completion = subagents
+        .as_ref()
+        .and_then(|route| route.completion.clone());
+    if let Some(delivery) = &completion {
+        let expected = req
+            .meta
+            .as_ref()
+            .and_then(|m| m.get("sudocode"))
+            .and_then(|m| m.get("expectedContext"))
+            .map(|value| {
+                serde_json::from_value::<runtime::subagent_completion::ContextRef>(value.clone())
+            })
+            .transpose()
+            .map_err(|e| AcpError::invalid_params(e.to_string()))?;
+        delivery
+            .begin(trace_id.as_deref().unwrap_or(""), expected.as_ref())
+            .map_err(AcpError::invalid_params)?;
+        delivery.bind(cx_inner.clone());
     }
     let is_slash_command = prompt_text.starts_with('/');
     let holds_cwd_lease =
@@ -919,6 +951,26 @@ async fn drive_prompt(
         let _ = cx_inner.send_notification(n);
     }
 
+    let context = match (&completion, &result) {
+        (Some(delivery), Ok(_)) => match delivery.commit(trace_id.as_deref().unwrap_or("")) {
+            Ok(context) => Some(context),
+            Err(error) => {
+                delivery
+                    .journal
+                    .fail_turn(trace_id.as_deref().unwrap_or(""))
+                    .map_err(AcpError::internal)?;
+                return Err(AcpError::internal(error));
+            }
+        },
+        (Some(delivery), Err(_)) => {
+            delivery
+                .journal
+                .fail_turn(trace_id.as_deref().unwrap_or(""))
+                .map_err(AcpError::internal)?;
+            None
+        }
+        _ => None,
+    };
     match result {
         Ok((stop_reason, prompt_usage)) => {
             let mut response = PromptResponse::new(stop_reason);
@@ -933,6 +985,13 @@ async fn drive_prompt(
                             .cached_write_tokens(u.cache_write_tokens),
                     )
                     .meta(Some(meta));
+            }
+            if let Some(context) = context {
+                let meta = response.meta.get_or_insert_with(Map::new);
+                let ns = meta
+                    .entry("sudocode".to_string())
+                    .or_insert_with(|| json!({}));
+                ns["contextRef"] = json!(context);
             }
             let text = assistant_text
                 .lock()
@@ -1347,6 +1406,54 @@ mod tests {
     use runtime::UsageCostCurrency;
     use std::path::{Path, PathBuf};
 
+    #[tokio::test]
+    async fn delegated_prompts_fail_closed_after_the_parent_turn_ends() {
+        use super::{AcpPermissionBridge, AcpQuestionBridge};
+        use runtime::{PermissionPrompter, QuestionPrompter};
+        use std::time::Duration;
+        let (permission_tx, permission_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (question_tx, question_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut permission = AcpPermissionBridge {
+            queue: runtime::PromptQueue::default(),
+            tx: permission_tx,
+        };
+        let mut question = AcpQuestionBridge {
+            queue: runtime::PromptQueue::default(),
+            tx: question_tx,
+        };
+        drop(permission_rx);
+        drop(question_rx);
+        let decision = tokio::time::timeout(
+            Duration::from_secs(1),
+            permission.begin_decision(&runtime::PermissionRequest {
+                tool_name: "Bash".into(),
+                input: "echo late".into(),
+                current_mode: runtime::PermissionMode::Prompt,
+                required_mode: runtime::PermissionMode::Prompt,
+                reason: None,
+            }),
+        )
+        .await
+        .expect("closed parent permission bridge must settle");
+        assert_eq!(
+            decision,
+            runtime::PermissionPromptDecision::Deny {
+                reason: "permission bridge closed".into()
+            }
+        );
+        let answer = tokio::time::timeout(
+            Duration::from_secs(1),
+            question.begin_question(&runtime::QuestionPromptRequest {
+                title: None,
+                description: None,
+                fields: vec![],
+            }),
+        )
+        .await
+        .expect("closed parent question bridge must settle");
+        assert_eq!(answer, Err("question bridge closed".into()));
+    }
+
     #[test]
     fn turn_error_classification_comes_from_typed_bits_not_strings() {
         // A context-window turn failure is recognized by the runtime's typed
@@ -1513,6 +1620,7 @@ pub fn new_session_registry() -> SharedSessionRegistry {
 #[derive(Default)]
 pub struct SessionRegistry {
     sessions: Mutex<HashMap<String, SessionEntry>>,
+    completion_routes: Mutex<HashMap<String, std::sync::Weak<Delivery>>>,
     cwd_lease: Arc<WorkspaceCwdLease>,
     hosted_factory: Option<Arc<dyn HostedSessionFactory>>,
     peer_receiver_started: AtomicBool,
@@ -1568,6 +1676,33 @@ impl SessionRegistry {
             hosted_factory: Some(factory),
             ..Self::default()
         }
+    }
+
+    fn completion_route(
+        &self,
+        session: &runtime::Session,
+        cwd: &std::path::Path,
+        create: bool,
+    ) -> Result<Arc<Delivery>, AcpError> {
+        let mut routes = self
+            .completion_routes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        routes.retain(|_, route| route.strong_count() > 0);
+        if let Some(route) = routes
+            .get(&session.session_id)
+            .and_then(std::sync::Weak::upgrade)
+        {
+            if !route.journal.matches_identity(session, cwd) {
+                return Err(AcpError::invalid_params(
+                    "completion journal identity mismatch",
+                ));
+            }
+            return Ok(route);
+        }
+        let route = Delivery::open(session, cwd, create).map_err(AcpError::internal)?;
+        routes.insert(session.session_id.clone(), Arc::downgrade(&route));
+        Ok(route)
     }
 
     pub fn cancel_all(&self) {
@@ -2037,6 +2172,7 @@ pub(crate) async fn run_acp_on_transport(
     // Per connection: whether this client opted into sub-agent events at
     // `initialize`. Sessions it creates or loads get a sub-agent route.
     let subagent_events = Arc::new(AtomicBool::new(false));
+    let subagent_completions = Arc::new(AtomicBool::new(false));
 
     Agent
         .builder()
@@ -2046,13 +2182,21 @@ pub(crate) async fn run_acp_on_transport(
             {
                 let version = agent_version.clone();
                 let subagent_events = Arc::clone(&subagent_events);
+                let subagent_completions = Arc::clone(&subagent_completions);
                 async move |req: InitializeRequest,
                             responder: Responder<InitializeResponse>,
                             _cx: ConnectionTo<Client>| {
                     let subagent_version =
                         subagent_events_version(req.client_capabilities.meta.as_ref());
                     subagent_events.store(subagent_version.is_some(), Ordering::SeqCst);
+                    let completion_version = !hosted
+                        && subagent_completions::negotiated(req.client_capabilities.meta.as_ref());
+                    subagent_completions.store(completion_version, Ordering::SeqCst);
                     let mut meta = initialize_meta(subagent_version);
+                    if completion_version {
+                        meta.get_mut("sudocode").unwrap()[subagent_completions::META_KEY] =
+                            json!({"version": 1});
+                    }
                     if hosted {
                         meta.get_mut("sudocode").unwrap()["sessionFork"] = json!(false);
                     }
@@ -2082,6 +2226,7 @@ pub(crate) async fn run_acp_on_transport(
                 let registry = Arc::clone(&registry);
                 let config = config.clone();
                 let subagent_events = Arc::clone(&subagent_events);
+                let subagent_completions = Arc::clone(&subagent_completions);
                 async move |req: NewSessionRequest,
                             responder: Responder<NewSessionResponse>,
                             cx: ConnectionTo<Client>| {
@@ -2112,7 +2257,9 @@ pub(crate) async fn run_acp_on_transport(
                     let commands = session_ops::available_commands();
                     let peer_config = config.clone();
                     let cx_notify = cx.clone();
-                    let subagent_events = subagent_events.load(Ordering::SeqCst);
+                    let completions_enabled = subagent_completions.load(Ordering::SeqCst);
+                    let subagent_events =
+                        subagent_events.load(Ordering::SeqCst) || completions_enabled;
                     cx.spawn(async move {
                         let lease = registry.cwd_lease();
                         let build_registry = Arc::clone(&registry);
@@ -2166,8 +2313,28 @@ pub(crate) async fn run_acp_on_transport(
 
                         match result {
                             Ok((engine, session_id, cwd)) => {
+                                let completion = if completions_enabled {
+                                    match registry.completion_route(
+                                        &engine.session_snapshot(),
+                                        &cwd,
+                                        true,
+                                    ) {
+                                        Ok(route) => Some(route),
+                                        Err(error) => {
+                                            responder
+                                                .respond_with_error(acp_error_to_sdk(&error))?;
+                                            return Ok(());
+                                        }
+                                    }
+                                } else {
+                                    None
+                                };
                                 let subagents = subagent_events.then(|| {
-                                    SessionSubagents::start(session_id.clone(), cx_notify.clone())
+                                    SessionSubagents::start(
+                                        session_id.clone(),
+                                        cx_notify.clone(),
+                                        completion,
+                                    )
                                 });
                                 if let Err(error) =
                                     registry.register(session_id.clone(), engine, cwd, subagents)
@@ -2350,6 +2517,7 @@ pub(crate) async fn run_acp_on_transport(
                 let registry = Arc::clone(&registry);
                 let config = config.clone();
                 let subagent_events = Arc::clone(&subagent_events);
+                let subagent_completions = Arc::clone(&subagent_completions);
                 async move |req: LoadSessionRequest,
                             responder: Responder<LoadSessionResponse>,
                             cx: ConnectionTo<Client>| {
@@ -2375,12 +2543,29 @@ pub(crate) async fn run_acp_on_transport(
                     let cx_notify = cx.clone();
                     let sid = req.session_id.to_string();
                     let cwd = req.cwd;
-                    let subagent_events = subagent_events.load(Ordering::SeqCst);
+                    let completions_enabled = subagent_completions.load(Ordering::SeqCst);
+                    let subagent_events =
+                        subagent_events.load(Ordering::SeqCst) || completions_enabled;
                     cx.spawn(async move {
                         let _lane = registry.enter_lane(&sid).await;
                         let lease = registry.cwd_lease();
                         let factory = registry.hosted_factory.clone();
+                        let live = if completions_enabled {
+                            registry.engine(&sid).zip(registry.cwd(&sid))
+                        } else {
+                            None
+                        };
                         let result = tokio::task::spawn_blocking(move || {
+                            if let Some((engine, live_cwd)) = live {
+                                let cwd = engine_host::session::canonical_session_cwd(&cwd)
+                                    .map_err(AcpError::invalid_params)?;
+                                if live_cwd != cwd {
+                                    return Err(AcpError::invalid_params("session cwd mismatch"));
+                                }
+                                // A live engine retains its prompt/memory snapshot and
+                                // children. New settings apply on a true cold rebuild.
+                                return Ok((engine, sid, cwd));
+                            }
                             if let Some(factory) = factory {
                                 let mcp_servers = acp_mcp_servers_to_scoped(&req.mcp_servers, &cwd);
                                 let (engine, cwd) = factory.open(
@@ -2417,21 +2602,61 @@ pub(crate) async fn run_acp_on_transport(
                                 // A reload of a live session keeps its route, so
                                 // background agents it already spawned still
                                 // reach the client.
+                                let completion = if completions_enabled {
+                                    match registry.completion_route(
+                                        &engine.session_snapshot(),
+                                        &cwd,
+                                        false,
+                                    ) {
+                                        Ok(route) => Some(route),
+                                        Err(error) => {
+                                            responder
+                                                .respond_with_error(acp_error_to_sdk(&error))?;
+                                            return Ok(());
+                                        }
+                                    }
+                                } else {
+                                    None
+                                };
+                                let context = match completion
+                                    .as_ref()
+                                    .map(|d| d.journal.context())
+                                    .transpose()
+                                {
+                                    Ok(context) => context.flatten(),
+                                    Err(error) => {
+                                        responder.respond_with_error(acp_error_to_sdk(
+                                            &AcpError::internal(error),
+                                        ))?;
+                                        return Ok(());
+                                    }
+                                };
                                 let subagents = subagent_events.then(|| {
                                     registry.subagents(&session_id).unwrap_or_else(|| {
                                         SessionSubagents::start(
                                             session_id.clone(),
                                             cx_notify.clone(),
+                                            completion,
                                         )
                                     })
                                 });
+                                if let Some(route) = &subagents {
+                                    route.set_connection(cx_notify.clone());
+                                }
                                 if let Err(error) =
                                     registry.register(session_id.clone(), engine, cwd, subagents)
                                 {
                                     responder.respond_with_error(acp_error_to_sdk(&error))?;
                                     return Ok(());
                                 }
-                                responder.respond(LoadSessionResponse::new())?;
+                                let mut response = LoadSessionResponse::new();
+                                if completions_enabled {
+                                    response = response.meta(Map::from_iter([(
+                                        "sudocode".into(),
+                                        json!({"contextRef":context}),
+                                    )]));
+                                }
+                                responder.respond(response)?;
                                 let _ = cx_notify.send_notification(
                                     available_commands_notification(&session_id, commands),
                                 );
@@ -2445,6 +2670,71 @@ pub(crate) async fn run_acp_on_transport(
                             Err(e) => {
                                 responder.respond_with_error(acp_error_to_sdk(&e))?;
                             }
+                        }
+                        Ok(())
+                    })?;
+                    Ok(())
+                }
+            },
+            on_receive_request!(),
+        )
+        // --- durable sub-agent journal replay (no engine construction) ---
+        .on_receive_request(
+            {
+                let registry = Arc::clone(&registry);
+                let enabled = Arc::clone(&subagent_completions);
+                async move |req: ReplayRequest,
+                            responder: Responder<ReplayResponse>,
+                            cx: ConnectionTo<Client>| {
+                    if !enabled.load(Ordering::SeqCst) {
+                        responder.respond_with_error(Error::method_not_found())?;
+                        return Ok(());
+                    }
+                    let registry = Arc::clone(&registry);
+                    let sender = cx.clone();
+                    cx.spawn(async move {
+                        let result = tokio::task::spawn_blocking(move || {
+                            if req.session_id.is_empty()
+                                || !req
+                                    .session_id
+                                    .bytes()
+                                    .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+                                || !req.cwd.is_absolute()
+                            {
+                                return Err(AcpError::invalid_params(
+                                    "replay requires exact sessionId and absolute cwd",
+                                ));
+                            }
+                            let cwd = engine_host::session::canonical_session_cwd(&req.cwd)
+                                .map_err(AcpError::invalid_params)?;
+                            let store = runtime::session_control::SessionStore::from_cwd(&cwd)
+                                .map_err(|e| AcpError::internal(e.to_string()))?;
+                            let path = store
+                                .resolve_managed_path(&req.session_id)
+                                .map_err(|e| AcpError::invalid_params(e.to_string()))?;
+                            let session = runtime::Session::load_from_path(path)
+                                .map_err(|e| AcpError::internal(e.to_string()))?;
+                            if session.session_id != req.session_id {
+                                return Err(AcpError::invalid_params(
+                                    "replay session identity mismatch",
+                                ));
+                            }
+                            let route = registry.completion_route(&session, &cwd, false)?;
+                            let status = if registry.engine(&req.session_id).is_some() {
+                                route.journal.status().into()
+                            } else {
+                                route.replay(&session).map_err(AcpError::internal)?
+                            };
+                            Ok((route, status))
+                        })
+                        .await
+                        .unwrap_or_else(|e| Err(AcpError::internal(e.to_string())));
+                        match result {
+                            Ok((route, status)) => {
+                                route.bind(sender);
+                                responder.respond(status)?;
+                            }
+                            Err(error) => responder.respond_with_error(acp_error_to_sdk(&error))?,
                         }
                         Ok(())
                     })?;
@@ -2659,32 +2949,22 @@ pub(crate) fn acp_error_to_sdk(e: &AcpError) -> Error {
         AcpError::InvalidParams(msg) => {
             Error::invalid_params().data(serde_json::Value::String(msg.clone()))
         }
-        AcpError::Internal(msg) => {
-            let mut error = Error::internal_error().data(serde_json::Value::String(msg.clone()));
-            if msg.contains(runtime::COMPACTION_FAILED) {
-                // Clients use the JSON-RPC `message` for the terminal run
-                // banner. Only compaction overrides it because only compaction
-                // ends the run on something the USER is expected to act on;
-                // every other Internal error keeps JSON-RPC's generic message
-                // and carries its detail in `data`, which clients render as a
-                // diagnostic. Blanket-applying `user_friendly_message()` here
-                // is not the alternative: its catch-all truncates the raw
-                // message to 100 chars, which would lose detail for every
-                // unclassified failure.
-                error.message = COMPACTION_FAILED_MESSAGE.to_string();
-            }
-            error
-        }
-        AcpError::Turn {
-            message,
-            context_window,
-        } => {
+        AcpError::Internal(message) | AcpError::Turn { message, .. } => {
             let mut error =
                 Error::internal_error().data(serde_json::Value::String(message.clone()));
-            // A context-window turn failure is user-actionable (compact/clear or
-            // switch model), so it overrides the generic JSON-RPC banner — the
-            // same treatment compaction gets, decided from the typed bucket.
-            if *context_window {
+            // Clients display the RPC message as the terminal banner. Both
+            // manual (Internal) and automatic (Turn) compaction failures need
+            // the same guidance. Preserve the typed context-window decision;
+            // other failures retain generic RPC text and full diagnostics.
+            if message.contains(runtime::COMPACTION_FAILED)
+                || matches!(
+                    e,
+                    AcpError::Turn {
+                        context_window: true,
+                        ..
+                    }
+                )
+            {
                 error.message = e.user_friendly_message();
             }
             error

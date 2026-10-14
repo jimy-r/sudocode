@@ -6107,3 +6107,221 @@ async fn acp_background_terminal_is_queryable_across_prompts() {
     client.shutdown().await;
     workspace.cleanup();
 }
+
+async fn initialize_with_completions(client: &mut AcpTestClient) {
+    let (_, response) = client
+        .send_request(
+            "initialize",
+            json!({
+                "protocolVersion": 1, "clientCapabilities": {"_meta":{"sudocode":{
+                    "subagentEvents":{"version":1}, "subagentCompletions":{"version":1}
+                }}}
+            }),
+        )
+        .await;
+    assert_eq!(
+        response["result"]["_meta"]["sudocode"]["subagentCompletions"],
+        json!({"version":1})
+    );
+}
+
+#[tokio::test]
+async fn acp_completions_retry_ack_and_exact_context() {
+    let server = MockAnthropicService::spawn().await.unwrap();
+    let workspace = subagent_events_workspace("completions", &server.base_url());
+    let mut client = spawn_stdio_client_danger(&workspace);
+    initialize_with_completions(&mut client).await;
+    let sid = scenario_session_new(&mut client, &workspace.root).await;
+    let (_, replay) = client
+        .send_request(
+            "_sudocode/subagent/replay",
+            json!({"sessionId":sid, "cwd":workspace.root}),
+        )
+        .await;
+    assert_eq!(replay["result"]["unresolved"], 0);
+    let (during, response) = client.send_request("session/prompt", json!({"sessionId":sid,
+        "prompt":[{"type":"text","text":format!("{SCENARIO_PREFIX}subagent_events_background")}],
+        "_meta":{"traceId":"run-1:1"}
+    })).await;
+    assert_eq!(response["result"]["stopReason"], "end_turn", "{response}");
+    let context = response["result"]["_meta"]["sudocode"]["contextRef"].clone();
+    assert_eq!(context["lastTraceId"], "run-1:1");
+    assert_eq!(context["sessionId"], sid);
+    assert!(during
+        .iter()
+        .all(|v| v["method"] != "_sudocode/subagent/completed"));
+    let (_, first) = client
+        .recv_until(SUBAGENT_EVENTS_WAIT, |v| {
+            v["method"] == "_sudocode/subagent/completed"
+        })
+        .await
+        .unwrap();
+    assert_eq!(first["params"]["originTraceId"], "run-1:1");
+    assert_eq!(first["params"]["sessionId"], sid);
+    assert!(first["params"]["message"]
+        .as_str()
+        .unwrap()
+        .contains(SUBAGENT_CHILD_ANSWER));
+    // Failure to durably receive must cause the exact payload to be retried.
+    client.send_raw(&json!({"jsonrpc":"2.0","id":first["id"],"error":{"code":-32603,"message":"database unavailable"}})).await;
+    let (_, retry) = client
+        .recv_until(SUBAGENT_EVENTS_WAIT, |v| {
+            v["method"] == "_sudocode/subagent/completed"
+        })
+        .await
+        .unwrap();
+    assert_eq!(retry["params"], first["params"]);
+    // Restart before receiving a durable ACK. Metadata replay must deliver
+    // the same frozen payload without constructing an execution engine.
+    client.shutdown().await;
+    let mut client = spawn_stdio_client_danger(&workspace);
+    initialize_with_completions(&mut client).await;
+    let (during, inventory) = client
+        .send_request(
+            "_sudocode/subagent/replay",
+            json!({"sessionId":sid,"cwd":workspace.root}),
+        )
+        .await;
+    assert!(inventory.get("result").is_some(), "{inventory}");
+    let retry = if let Some(request) = during
+        .into_iter()
+        .find(|v| v["method"] == "_sudocode/subagent/completed")
+    {
+        request
+    } else {
+        client
+            .recv_until(SUBAGENT_EVENTS_WAIT, |v| {
+                v["method"] == "_sudocode/subagent/completed"
+            })
+            .await
+            .unwrap()
+            .1
+    };
+    assert_eq!(
+        retry["params"], first["params"],
+        "restart must preserve the frozen delivery"
+    );
+
+    client.send_raw(&json!({"jsonrpc":"2.0","id":retry["id"],"result":{"completionId":retry["params"]["completionId"],"disposition":"stored"}})).await;
+    let (_, second) = client
+        .recv_until(SUBAGENT_EVENTS_WAIT, |v| {
+            v["method"] == "_sudocode/subagent/completed"
+        })
+        .await
+        .unwrap();
+    assert_ne!(
+        second["params"]["completionId"],
+        first["params"]["completionId"]
+    );
+    client.send_raw(&json!({"jsonrpc":"2.0","id":second["id"],"result":{"completionId":second["params"]["completionId"],"disposition":"stored"}})).await;
+    let (_, loaded) = client
+        .send_request(
+            "session/load",
+            json!({"sessionId":sid,"cwd":workspace.root,"mcpServers":[]}),
+        )
+        .await;
+    assert_eq!(
+        loaded["result"]["_meta"]["sudocode"]["contextRef"], context,
+        "{loaded}"
+    );
+    let mut wrong = context.clone();
+    wrong["digest"] = json!("wrong");
+    let (updates, rejected) = client
+        .send_request(
+            "session/prompt",
+            json!({"sessionId":sid,
+                "prompt":[{"type":"text","text":"must not reach the model"}],
+                "_meta":{"traceId":"run-2:1","sudocode":{"expectedContext":wrong}}
+            }),
+        )
+        .await;
+    assert_eq!(rejected["error"]["code"], -32602, "{rejected}");
+    assert!(updates.is_empty());
+    client.shutdown().await;
+    // Cold replay delivers metadata without loading even one historical engine.
+    let mut client = spawn_stdio_client_danger(&workspace);
+    initialize_with_completions(&mut client).await;
+    let (_, replay) = client
+        .send_request(
+            "_sudocode/subagent/replay",
+            json!({"sessionId":sid,"cwd":workspace.root}),
+        )
+        .await;
+    assert_eq!(replay["result"]["unresolved"], 0, "{replay}");
+    assert_eq!(replay["result"]["contextRef"], context);
+    let (_, listed) = client.send_request("session/list", json!({})).await;
+    assert_eq!(
+        listed["result"]["sessions"],
+        json!([]),
+        "replay must not construct engines: {listed}"
+    );
+    let (_, loaded) = client
+        .send_request(
+            "session/load",
+            json!({"sessionId":sid,"cwd":workspace.root,"mcpServers":[]}),
+        )
+        .await;
+    assert_eq!(
+        loaded["result"]["_meta"]["sudocode"]["contextRef"], context,
+        "{loaded}"
+    );
+    let (_, continued) = client
+        .send_request(
+            "session/prompt",
+            json!({"sessionId":sid,
+                "prompt":[{"type":"text","text":"Summarize the completed workers."}],
+                "_meta":{"traceId":"run-2:1","sudocode":{"expectedContext":context}}
+            }),
+        )
+        .await;
+    assert_eq!(continued["result"]["stopReason"], "end_turn", "{continued}");
+    assert_eq!(
+        continued["result"]["_meta"]["sudocode"]["contextRef"]["revision"],
+        2
+    );
+    client.shutdown().await;
+    workspace.cleanup();
+}
+
+#[tokio::test]
+async fn acp_completions_sync_and_nested_do_not_auto_publish() {
+    let server = MockAnthropicService::spawn().await.unwrap();
+    for scenario in ["subagent_events_sync", "subagent_events_nested"] {
+        let workspace = subagent_events_workspace("completions-sync", &server.base_url());
+        let mut client = spawn_stdio_client_danger(&workspace);
+        initialize_with_completions(&mut client).await;
+        let sid = scenario_session_new(&mut client, &workspace.root).await;
+        client
+            .send_request(
+                "_sudocode/subagent/replay",
+                json!({"sessionId":sid,"cwd":workspace.root}),
+            )
+            .await;
+        let (updates, response) = client
+            .send_request(
+                "session/prompt",
+                json!({"sessionId":sid,
+                    "prompt":[{"type":"text","text":format!("{SCENARIO_PREFIX}{scenario}")}],
+                    "_meta":{"traceId":"run-1:1"}
+                }),
+            )
+            .await;
+        assert_eq!(response["result"]["stopReason"], "end_turn", "{response}");
+        assert!(updates
+            .iter()
+            .all(|v| v["method"] != "_sudocode/subagent/completed"));
+        let (_, replay) = client
+            .send_request(
+                "_sudocode/subagent/replay",
+                json!({"sessionId":sid,"cwd":workspace.root}),
+            )
+            .await;
+        assert_eq!(replay["result"]["pending"], 0, "{replay}");
+        assert_eq!(
+            replay["result"]["settled"], 1,
+            "only the root's direct spawn is registered: {replay}"
+        );
+        client.shutdown().await;
+        workspace.cleanup();
+    }
+}

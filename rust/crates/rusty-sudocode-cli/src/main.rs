@@ -23,7 +23,7 @@ mod render;
 mod render_engine;
 mod repl_ui;
 mod startup;
-mod subagent_completion;
+use engine_core::subagent_completion;
 mod windows_console;
 
 use engine_acp::AcpError;

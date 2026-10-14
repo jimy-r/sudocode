@@ -77,6 +77,7 @@ pub mod cache_metrics;
 pub mod cache_report;
 mod engine_client;
 mod session;
+pub mod subagent_completion;
 pub use engine_client::EngineApiClient;
 pub use session::{
     EngineDelegate, EngineHandle, EngineSession, ObserverAdapter, SubagentRelay, SubagentTurnGuard,

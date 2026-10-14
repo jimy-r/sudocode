@@ -569,6 +569,7 @@ pub struct SubagentRelay {
 struct SubagentRoute {
     turn: Option<std_mpsc::Sender<EngineEvent>>,
     session: std_mpsc::Sender<EngineEvent>,
+    completion: Option<Arc<runtime::subagent_completion::CompletionJournal>>,
 }
 
 impl SubagentRelay {
@@ -585,8 +586,16 @@ impl SubagentRelay {
             route: Arc::new(Mutex::new(SubagentRoute {
                 turn: None,
                 session,
+                completion: None,
             })),
         }
+    }
+
+    pub fn set_completion_journal(
+        &self,
+        journal: Arc<runtime::subagent_completion::CompletionJournal>,
+    ) {
+        self.lock().completion = Some(journal);
     }
 
     /// Route events into `turn` until the returned guard drops. Drop the guard
@@ -747,7 +756,11 @@ impl RuntimeObserver for ObserverAdapter {
 
     fn subagent_sink(&self) -> Option<runtime::SubagentSink> {
         let relay = self.subagents.clone()?;
-        Some(runtime::SubagentSink::new(move |event| relay.emit(event)))
+        let journal = relay.lock().completion.clone();
+        Some(
+            runtime::SubagentSink::new(move |event| relay.emit(event))
+                .with_completion_journal(journal),
+        )
     }
 
     fn background_tasks(&self) -> Option<runtime::background_tasks::BackgroundTasks> {

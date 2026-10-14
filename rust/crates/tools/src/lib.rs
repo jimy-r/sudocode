@@ -2551,19 +2551,74 @@ fn is_terminal_agent_status(status: &str) -> bool {
 fn render_manifest_task_notification(manifest: &AgentOutput) -> String {
     let normalized_status =
         runtime::coordinator_mode::normalize_task_notification_status(&manifest.status);
-    let summary = build_notification_summary(manifest, normalized_status);
+    let summary = notification_excerpt(
+        &build_notification_summary(manifest, normalized_status),
+        1024,
+    );
+    // Bound source fields before the shared renderer escapes XML; never cut a
+    // rendered element. Keep the durable result reference when truncating.
+    let result = manifest.result.as_ref().map(|text| {
+        if text.len() <= 6144 {
+            return text.clone();
+        }
+        let path = manifest
+            .result_full_path
+            .as_deref()
+            .unwrap_or(&manifest.output_file);
+        format!(
+            "{}\n[Result truncated; full result: {}]",
+            notification_excerpt(text, 6144),
+            notification_excerpt(path, 1024)
+        )
+    });
     let duration_ms = compute_notification_duration_ms(manifest);
     let view = runtime::coordinator_mode::TaskNotificationView {
         agent_id: manifest.agent_id.as_str(),
         status: normalized_status,
         summary: summary.as_str(),
-        result: manifest.result.as_deref(),
+        result: result.as_deref(),
         color: manifest.color.as_deref(),
         duration_ms,
         tool_uses: manifest.tool_uses,
         total_tokens: manifest.total_tokens,
     };
     runtime::coordinator_mode::render_task_notification(&view)
+}
+
+fn notification_excerpt(text: &str, limit: usize) -> String {
+    let mut end = text.len().min(limit);
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    text[..end].to_owned()
+}
+
+/// Journal reconciliation only reads the manifest named in a durable source
+/// registration. No directory scan, child restart, or private schema leaks to
+/// the ACP controller.
+pub fn recover_subagent_completion(
+    fs: &dyn FsBackend,
+    path: &str,
+    source: &SubagentLifecycle,
+) -> Result<Option<SubagentLifecycle>, String> {
+    let manifest: AgentOutput =
+        serde_json::from_str(&fs.read_to_string(path).map_err(|e| e.to_string())?)
+            .map_err(|e| e.to_string())?;
+    if manifest.agent_id != source.agent.agent_id || manifest.manifest_file != path {
+        return Err("terminal manifest identity mismatch".into());
+    }
+    if !matches!(
+        manifest.status.as_str(),
+        "completed" | "failed" | "killed" | "cancelled"
+    ) {
+        return Ok(None);
+    }
+    let mut event = source.clone();
+    event.phase = SubagentPhase::Finished;
+    event.status = Some(manifest.status.clone());
+    event.completed_at = manifest.completed_at.clone();
+    event.completion_notification = Some(render_manifest_task_notification(&manifest));
+    Ok(Some(event))
 }
 
 /// Human-readable one-line summary for the notification's `<summary>`
@@ -4682,6 +4737,26 @@ impl SubagentLink {
         }
     }
 
+    fn register_completion(&self, manifest: &AgentOutput) -> Result<(), String> {
+        if let Some(spawner) = &self.spawner {
+            spawner.register_completion(
+                SubagentLifecycle {
+                    tool_call_id: self.scope.parent_tool_call_id().to_string(),
+                    phase: SubagentPhase::Started,
+                    seq: 0,
+                    agent: self.identity.clone(),
+                    status: None,
+                    started_at: manifest.started_at.clone(),
+                    completed_at: None,
+                    raw_output: None,
+                    completion_notification: None,
+                },
+                manifest.manifest_file.clone(),
+            )?;
+        }
+        Ok(())
+    }
+
     fn emit_started(&self, manifest: &AgentOutput, abort: HookAbortSignal) {
         if let Some(tasks) = &self.tasks {
             let mut task = runtime::background_tasks::BackgroundTask::new(
@@ -4723,11 +4798,16 @@ impl SubagentLink {
         // The manifest is in the store, so it is read on the store's filesystem —
         // a co-hosted agent's lifecycle event would otherwise report the fallback
         // status forever, having looked for the manifest on the daemon's disk.
-        let mut manifest = fs
+        let persisted = fs
             .read_to_string(&fallback.manifest_file)
             .ok()
-            .and_then(|text| serde_json::from_str::<AgentOutput>(&text).ok())
-            .unwrap_or_else(|| fallback.clone());
+            .and_then(|text| serde_json::from_str::<AgentOutput>(&text).ok());
+        // Display may report a cancellation fallback; durable delivery needs
+        // the actual terminal manifest, never a synthesized terminal status.
+        let terminal_persisted = persisted.as_ref().is_some_and(|m| {
+            m.agent_id == self.identity.agent_id && is_terminal_agent_status(&m.status)
+        });
+        let mut manifest = persisted.unwrap_or_else(|| fallback.clone());
         // A stop that races an already-persisted completion cannot change it.
         if aborted && !is_terminal_agent_status(&manifest.status) {
             manifest.status = "cancelled".into();
@@ -4760,7 +4840,8 @@ impl SubagentLink {
         let Some(spawner) = &self.spawner else {
             return;
         };
-        let completion_notification = render_manifest_task_notification(&manifest);
+        let completion_notification =
+            terminal_persisted.then(|| render_manifest_task_notification(&manifest));
         spawner.emit_lifecycle(
             &self.scope,
             SubagentLifecycle {
@@ -4772,7 +4853,7 @@ impl SubagentLink {
                 started_at: manifest.started_at.clone(),
                 completed_at: manifest.completed_at.clone(),
                 raw_output: serde_json::to_value(&manifest).ok(),
-                completion_notification: Some(completion_notification),
+                completion_notification,
             },
         );
     }
@@ -5826,6 +5907,7 @@ fn prepare_agent_job(
         permission_sink: ctx.and_then(|ctx| ctx.permission_sink.clone()),
     };
     if let Some(link) = &job.subagent {
+        link.register_completion(&manifest)?;
         link.emit_started(&manifest, job.abort_signal.clone());
     }
     Ok(PreparedAgent { manifest, job })
