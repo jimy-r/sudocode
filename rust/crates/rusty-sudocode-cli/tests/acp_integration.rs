@@ -24,7 +24,7 @@ use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use futures_util::{SinkExt, StreamExt};
+use futures_util::{FutureExt, SinkExt, StreamExt};
 use mock_anthropic_service::{
     MockAnthropicService, SCENARIO_PREFIX, SUBAGENT_CHILD_ANSWER, SUBAGENT_CHILD_READ_PATH,
     SUBAGENT_CHILD_TOOL_ID,
@@ -779,6 +779,139 @@ async fn scenario_unknown_method(client: &mut AcpTestClient) {
         error["code"], -32601,
         "unknown method should return -32601 Method not found"
     );
+}
+
+async fn scenario_tool_pause(client: &mut AcpTestClient, workspace: &TestWorkspace) {
+    scenario_initialize(client).await;
+    let session_id = scenario_session_new(client, &workspace.root).await;
+    let (_, paused) = client
+        .send_request(
+            "_sudocode/session/pause_tools",
+            json!({ "sessionId": session_id }),
+        )
+        .await;
+    assert_eq!(paused["result"]["isQuiescent"], true, "{paused}");
+    let epoch = paused["result"]["pauseEpoch"]
+        .as_u64()
+        .expect("pause epoch");
+    let (_, repeated) = client
+        .send_request(
+            "_sudocode/session/pause_tools",
+            json!({ "sessionId": session_id }),
+        )
+        .await;
+    assert_eq!(repeated["result"]["pauseEpoch"], epoch);
+    let prompt = json!({"sessionId": session_id,"prompt":[{"type":"text","text":"! printf unauthorized > pause-denied.txt"}]});
+    let (_, denied) = client.send_request("session/prompt", prompt.clone()).await;
+    assert!(denied.get("error").is_some(), "{denied}");
+    assert!(!workspace.root.join("pause-denied.txt").exists());
+    let (_, stale) = client
+        .send_request(
+            "_sudocode/session/resume_tools",
+            json!({"sessionId":session_id,"pauseEpoch":epoch+1}),
+        )
+        .await;
+    assert!(stale.get("error").is_some(), "{stale}");
+    let (_, still_denied) = client.send_request("session/prompt", prompt).await;
+    assert!(still_denied.get("error").is_some(), "{still_denied}");
+    let (_, reload) = client
+        .send_request(
+            "session/load",
+            json!({"sessionId":session_id,"cwd":workspace.root.to_string_lossy(),"mcpServers":[]}),
+        )
+        .await;
+    assert!(
+        reload.get("error").is_some(),
+        "reload must preserve human control: {reload}"
+    );
+    let (_, resumed) = client
+        .send_request(
+            "_sudocode/session/resume_tools",
+            json!({"sessionId":session_id,"pauseEpoch":epoch}),
+        )
+        .await;
+    assert!(resumed.get("error").is_none(), "{resumed}");
+    let (_, completed) = client.send_request("session/prompt", json!({"sessionId":session_id,"prompt":[{"type":"text","text":"! printf resumed > pause-resumed.txt"}]})).await;
+    assert!(completed.get("error").is_none(), "{completed}");
+    assert_eq!(
+        fs::read_to_string(workspace.root.join("pause-resumed.txt")).expect("actual shell receipt"),
+        "resumed"
+    );
+    let (_, unknown) = client
+        .send_request(
+            "_sudocode/session/pause_tools",
+            json!({"sessionId":"unknown-session"}),
+        )
+        .await;
+    assert!(unknown.get("error").is_some(), "{unknown}");
+}
+
+#[tokio::test]
+async fn acp_stdio_tool_pause_round_trip() {
+    let server = MockAnthropicService::spawn().await.expect("mock service");
+    let workspace = TestWorkspace::new("stdio-tool-pause");
+    workspace.create();
+    workspace.write_sudocode_json(&server.base_url());
+    let mut client = spawn_stdio_client(&workspace);
+    let outcome = std::panic::AssertUnwindSafe(scenario_tool_pause(&mut client, &workspace))
+        .catch_unwind()
+        .await;
+    client.shutdown().await;
+    if let Err(error) = outcome {
+        std::panic::resume_unwind(error);
+    }
+    workspace.cleanup();
+}
+
+#[tokio::test]
+async fn acp_websocket_tool_pause_round_trip() {
+    let server = MockAnthropicService::spawn().await.expect("mock service");
+    let workspace = TestWorkspace::new("ws-tool-pause");
+    workspace.create();
+    workspace.write_sudocode_json(&server.base_url());
+    let mut client = spawn_ws_client(&workspace).await;
+    let outcome = std::panic::AssertUnwindSafe(scenario_tool_pause(&mut client, &workspace))
+        .catch_unwind()
+        .await;
+    client.shutdown().await;
+    if let Err(error) = outcome {
+        std::panic::resume_unwind(error);
+    }
+    workspace.cleanup();
+}
+
+#[tokio::test]
+async fn acp_tool_pause_drains_a_running_child_shell() {
+    let server = MockAnthropicService::spawn().await.expect("mock service");
+    let workspace = subagent_events_workspace("tool-pause-child", &server.base_url());
+    let mut client = spawn_stdio_client_danger(&workspace);
+    let outcome = std::panic::AssertUnwindSafe(async {
+        initialize_with_subagent_events(&mut client).await;
+        let session = scenario_session_new(&mut client, &workspace.root).await;
+        let (during, _) = prompt_scenario(&mut client, &session, "subagent_events_cancel_tool").await;
+        let (agent, _) = during.iter().find_map(lifecycle_of).expect("child started");
+        let sleep_call = format!("{agent}:toolu_child_sleep");
+        let is_sleep_call = |message: &Value| message["params"]["update"]["toolCallId"] == sleep_call
+            && message["params"]["update"]["sessionUpdate"] == "tool_call";
+        if !during.iter().any(is_sleep_call) {
+            client.recv_until(Duration::from_secs(30), is_sleep_call).await.expect("child shell started");
+        }
+        let (_, paused) = client.send_request("_sudocode/session/pause_tools", json!({"sessionId":session})).await;
+        assert_eq!(paused["result"]["isQuiescent"], true, "{paused}");
+        let manifest = workspace.root.join(".sudocode-agents").join(format!("{agent}.json"));
+        let state: Value = serde_json::from_slice(&fs::read(manifest).expect("child manifest")).unwrap();
+        assert_eq!(state["status"], "cancelled", "pause must wait for child termination: {state}");
+        let (_, resumed) = client.send_request("_sudocode/session/resume_tools", json!({"sessionId":session,"pauseEpoch":paused["result"]["pauseEpoch"]})).await;
+        assert!(resumed.get("error").is_none(), "{resumed}");
+        let (_, finished) = client.send_request("session/prompt", json!({"sessionId":session,"prompt":[{"type":"text","text":"! printf returned > pause-returned.txt"}]})).await;
+        assert!(finished.get("error").is_none(), "{finished}");
+        assert_eq!(fs::read_to_string(workspace.root.join("pause-returned.txt")).expect("post-handoff shell"), "returned");
+    }).catch_unwind().await;
+    client.shutdown().await;
+    if let Err(error) = outcome {
+        std::panic::resume_unwind(error);
+    }
+    workspace.cleanup();
 }
 
 async fn scenario_slash_command_model(client: &mut AcpTestClient, session_id: &str) {

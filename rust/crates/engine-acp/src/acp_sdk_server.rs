@@ -253,6 +253,31 @@ pub(crate) struct CancelSubagentResponse {
     pub cancelled: bool,
 }
 
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, JsonRpcRequest)]
+#[request(method = "_sudocode/session/pause_tools", response = PauseToolsResponse)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct PauseToolsRequest {
+    pub session_id: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, JsonRpcResponse)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct PauseToolsResponse {
+    pub pause_epoch: u64,
+    pub is_quiescent: bool,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, JsonRpcRequest)]
+#[request(method = "_sudocode/session/resume_tools", response = ResumeToolsResponse)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ResumeToolsRequest {
+    pub session_id: String,
+    pub pause_epoch: u64,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, JsonRpcResponse)]
+pub(crate) struct ResumeToolsResponse {}
+
 /// `_meta.sudocode` key a client sets in `clientCapabilities` (and scode
 /// echoes in the `initialize` result) to opt into sub-agent events.
 pub const SUBAGENT_EVENTS_META_KEY: &str = "subagentEvents";
@@ -555,6 +580,15 @@ async fn drive_prompt(
         .as_ref()
         .and_then(|m| m.get("traceId").and_then(|v| v.as_str().map(String::from)));
     let sid = req.session_id.to_string();
+    let admitted_engine = registry
+        .engine(&sid)
+        .ok_or_else(|| AcpError::invalid_params(format!("unknown sessionId: {sid}")))?;
+    let (admitted_epoch, is_paused) = admitted_engine.tool_control();
+    if is_paused {
+        return Err(AcpError::invalid_params(
+            "Tool execution is paused by the user",
+        ));
+    }
     let cx_inner = cx.clone();
     let cx_perm = cx;
     // Same-session ordering: wait (asynchronously) for this
@@ -565,6 +599,12 @@ async fn drive_prompt(
             "unknown sessionId: {sid}"
         )));
     };
+    let (current_epoch, is_paused) = engine.tool_control();
+    if is_paused || current_epoch != admitted_epoch || !Arc::ptr_eq(&engine, &admitted_engine) {
+        return Err(AcpError::invalid_params(
+            "Session control changed while the prompt was queued",
+        ));
+    }
     registry.report_state(engine_core::EngineState::Running, None);
     let _turn_state = HostedTurnState(Arc::clone(&registry));
     let session_cwd = registry.cwd(&sid);
@@ -978,6 +1018,14 @@ fn ensure_a2a_receiver(
             let Some((message, ack)) = inbound else {
                 break;
             };
+            if registry
+                .engine(&session_id)
+                .is_some_and(|engine| engine.tool_control().1)
+            {
+                let _ = ack.send(false);
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                continue;
+            }
             let body = runtime::agent_mailbox::neutralize_untrusted_markup(&message.body);
             let text = format!("[message from {}]\n\n{body}", message.from);
             let mut meta = Map::new();
@@ -1077,6 +1125,7 @@ fn initialize_meta(subagent_events: Option<u64>) -> Map<String, serde_json::Valu
     // (see `system_prompt_overrides_from_meta`).
     sudocode_ns.insert("systemPromptOverride".to_string(), json!(true));
     sudocode_ns.insert("systemPromptAppend".to_string(), json!(true));
+    sudocode_ns.insert("toolPause".to_string(), json!({ "version": 1 }));
     // `session/new` accepts `_meta.sudocode.forkFrom` (see
     // `fork_source_from_meta`): a client that forks a conversation into a
     // new directory gates on this instead of probing.
@@ -1564,8 +1613,16 @@ impl SessionRegistry {
         engine: Arc<SessionEngine>,
         cwd: PathBuf,
         subagents: Option<Arc<SessionSubagents>>,
-    ) {
+    ) -> Result<(), AcpError> {
         let mut sessions = self.lock_sessions();
+        if sessions
+            .get(&session_id)
+            .is_some_and(|entry| entry.engine.tool_control().1)
+        {
+            return Err(AcpError::invalid_params(
+                "Return tool control before reloading the session",
+            ));
+        }
         // A reload of a session that is already live keeps its lane so that
         // requests already queued behind it stay ordered.
         let lane = sessions.get(&session_id).map_or_else(
@@ -1584,6 +1641,20 @@ impl SessionRegistry {
                 subagents,
             },
         );
+        Ok(())
+    }
+
+    fn pause_tools(&self, session_id: &str) -> Result<(Arc<SessionEngine>, u64), AcpError> {
+        let sessions = self.lock_sessions();
+        let entry = sessions
+            .get(session_id)
+            .ok_or_else(|| AcpError::invalid_params("Unknown session"))?;
+        let epoch = entry
+            .engine
+            .begin_tool_pause()
+            .map_err(AcpError::internal)?;
+        entry.abort.abort();
+        Ok((Arc::clone(&entry.engine), epoch))
     }
 
     /// The session's sub-agent event route, if its client opted in.
@@ -2097,7 +2168,12 @@ pub(crate) async fn run_acp_on_transport(
                                 let subagents = subagent_events.then(|| {
                                     SessionSubagents::start(session_id.clone(), cx_notify.clone())
                                 });
-                                registry.register(session_id.clone(), engine, cwd, subagents);
+                                if let Err(error) =
+                                    registry.register(session_id.clone(), engine, cwd, subagents)
+                                {
+                                    responder.respond_with_error(acp_error_to_sdk(&error))?;
+                                    return Ok(());
+                                }
                                 responder.respond(NewSessionResponse::new(session_id.clone()))?;
                                 let _ = cx_notify.send_notification(
                                     available_commands_notification(&session_id, commands),
@@ -2348,7 +2424,12 @@ pub(crate) async fn run_acp_on_transport(
                                         )
                                     })
                                 });
-                                registry.register(session_id.clone(), engine, cwd, subagents);
+                                if let Err(error) =
+                                    registry.register(session_id.clone(), engine, cwd, subagents)
+                                {
+                                    responder.respond_with_error(acp_error_to_sdk(&error))?;
+                                    return Ok(());
+                                }
                                 responder.respond(LoadSessionResponse::new())?;
                                 let _ = cx_notify.send_notification(
                                     available_commands_notification(&session_id, commands),
@@ -2412,6 +2493,96 @@ pub(crate) async fn run_acp_on_transport(
                         match result {
                             Ok(()) => responder.respond(SetPermissionModeResponse {})?,
                             Err(e) => responder.respond_with_error(acp_error_to_sdk(&e))?,
+                        }
+                        Ok(())
+                    })?;
+                    Ok(())
+                }
+            },
+            on_receive_request!(),
+        )
+        // Pause acknowledges only after the main lane and actual child/tool work drain.
+        .on_receive_request(
+            {
+                let registry = Arc::clone(&registry);
+                async move |req: PauseToolsRequest,
+                            responder: Responder<PauseToolsResponse>,
+                            cx: ConnectionTo<Client>| {
+                    let registry = Arc::clone(&registry);
+                    cx.spawn(async move {
+                        let (engine, epoch) = match registry.pause_tools(&req.session_id) {
+                            Ok(paused) => paused,
+                            Err(error) => {
+                                responder.respond_with_error(acp_error_to_sdk(&error))?;
+                                return Ok(());
+                            }
+                        };
+                        let duration = std::time::Duration::from_secs(30);
+                        let drained = tokio::time::timeout(duration, async {
+                            let _lane = registry.enter_lane(&req.session_id).await;
+                            if !registry
+                                .engine(&req.session_id)
+                                .is_some_and(|current| Arc::ptr_eq(&current, &engine))
+                            {
+                                return Err(
+                                    "Session closed or changed while tool operations were stopping"
+                                        .to_string(),
+                                );
+                            }
+                            let engine = Arc::clone(&engine);
+                            tokio::task::spawn_blocking(move || {
+                                engine.wait_tool_pause(epoch, duration)
+                            })
+                            .await
+                            .map_err(|error| error.to_string())?
+                        })
+                        .await;
+                        match drained {
+                            Ok(Ok(())) => responder.respond(PauseToolsResponse {
+                                pause_epoch: epoch,
+                                is_quiescent: true,
+                            })?,
+                            Ok(Err(error)) => responder
+                                .respond_with_error(acp_error_to_sdk(&AcpError::internal(error)))?,
+                            Err(_) => {
+                                responder
+                                    .respond_with_error(acp_error_to_sdk(&AcpError::internal(
+                                    "Tool operations are still stopping; control remains fenced",
+                                )))?;
+                            }
+                        }
+                        Ok(())
+                    })?;
+                    Ok(())
+                }
+            },
+            on_receive_request!(),
+        )
+        .on_receive_request(
+            {
+                let registry = Arc::clone(&registry);
+                async move |req: ResumeToolsRequest,
+                            responder: Responder<ResumeToolsResponse>,
+                            cx: ConnectionTo<Client>| {
+                    let registry = Arc::clone(&registry);
+                    cx.spawn(async move {
+                        let _lane = registry.enter_lane(&req.session_id).await;
+                        let Some(engine) = registry.engine(&req.session_id) else {
+                            responder.respond_with_error(acp_error_to_sdk(
+                                &AcpError::invalid_params("Unknown session"),
+                            ))?;
+                            return Ok(());
+                        };
+                        match engine.resume_tool_operations(req.pause_epoch) {
+                            Ok(()) => {
+                                if let Some(abort) = registry.abort_signal(&req.session_id) {
+                                    abort.reset();
+                                }
+                                responder.respond(ResumeToolsResponse {})?;
+                            }
+                            Err(error) => responder.respond_with_error(acp_error_to_sdk(
+                                &AcpError::invalid_params(error),
+                            ))?,
                         }
                         Ok(())
                     })?;

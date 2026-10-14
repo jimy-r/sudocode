@@ -8153,6 +8153,12 @@ impl ToolExecutor for SubagentToolExecutor {
         input: &str,
         ctx: &ToolDispatchContext,
     ) -> Result<String, ToolError> {
+        let operation = ctx
+            .background_tasks
+            .as_ref()
+            .map(runtime::background_tasks::BackgroundTasks::begin_operation)
+            .transpose()
+            .map_err(ToolError::new)?;
         if !self.allowed_tools.contains(tool_name)
             && !self
                 .allowed_tools
@@ -8174,7 +8180,9 @@ impl ToolExecutor for SubagentToolExecutor {
         // Like the parent executor, keep blocking tools off the async polling
         // thread. Otherwise a batch of sub-agent reads still executes serially
         // and prevents cancellation from being observed during a slow call.
+        let work_operation = operation.clone();
         tokio::task::spawn_blocking(move || {
+            let _operation = work_operation;
             let _workspace = workspace.enter();
             if abort.as_ref().is_some_and(HookAbortSignal::is_aborted) {
                 return Err(ToolError::new("tool cancelled before execution"));
