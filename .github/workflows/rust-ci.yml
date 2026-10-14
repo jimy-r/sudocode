@@ -230,6 +230,10 @@ jobs:
         env:
           SCODE_TEST_BACKEND: mock
         run: cargo test --workspace --test pty_subagent_workflow -- --nocapture
+      - name: PTY host takeover and explicit return of tool control
+        env:
+          SCODE_TEST_BACKEND: mock
+        run: cargo test -p rusty-sudocode-cli --test pty_tool_pause -- --nocapture
       - name: PTY default code colors match Codex
         env:
           SCODE_TEST_BACKEND: mock

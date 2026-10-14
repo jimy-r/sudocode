@@ -57,6 +57,61 @@ session and independent across sessions:
   Setup and legacy slash operations that use the process working directory
   acquire a directory lease while they run.
 
+### Human takeover of tools
+
+Hosts check `initialize.result._meta.sudocode.toolPause.version == 1` before
+offering takeover. Both transports expose the same session extension:
+
+1. Send `_sudocode/session/pause_tools` with `{ "sessionId": "..." }`.
+   Admission closes immediately, the current turn is cancelled, and all owned
+   background agents and shells receive cancellation. The response is
+   `{ "pauseEpoch": 1, "isQuiescent": true }` only after the main turn, child
+   producers and actual tool workers have drained. Cancelling a tool's caller
+   does not release its worker's operation lease.
+2. While the user owns control, new prompts and tools are refused. Reloading the
+   live session cannot replace its fence. Prompts queued before the takeover are
+   also refused after control changes. A repeated pause retains the same epoch.
+3. Send `_sudocode/session/resume_tools` with the same `sessionId` and
+   `pauseEpoch`. A stale epoch or unfinished work is refused. The response is
+   `{}`. Returning control permits a new turn; it does not restart cancelled work.
+4. The host starts a new turn that observes the user's changes before taking
+   further action. For browser takeover, retain the same browser/profile/tab and
+   use the browser service's own lease to fence browser-side operations.
+
+Pause has a 30-second response budget. A timeout preserves the fence and must
+remain a visible stopping state; it never acknowledges human control. The host
+can repeat the pause request once slow operations have ended. Closing a session
+remains available. This contract covers work owned by this agent session;
+external processes and independently connected clients need their own control
+lease.
+
+The native terminal regression runs in CI on all three platforms:
+
+```bash
+cd rust
+cargo test -p rusty-sudocode-cli --test pty_tool_pause -- --nocapture
+```
+
+With a configured provider account, the foreground shell journey also runs
+against the real model in the same native PTY:
+
+```bash
+SCODE_TEST_BACKEND=live SCODE_LIVE_MODEL=your-configured-model \
+cargo test -p rusty-sudocode-cli --test pty_tool_pause \
+  host_takeover_stops_a_foreground_shell_before_human_edit -- --nocapture
+```
+
+The real model journey starts main and background child shells, pauses them,
+checks their file writes stop, rejects stale return, and reads a human edit in a
+new turn. It requires explicit real API credentials and an empty evidence path:
+
+```bash
+SCODE_TOOL_PAUSE_LIVE=1 SCODE_TEST_BIN=/absolute/path/to/scode \
+OPENAI_API_KEY=... OPENAI_BASE_URL=https://your-provider.example/v1 \
+SCODE_LIVE_MODEL=your-model \
+python crates/rusty-sudocode-cli/tests/live/tool_pause.py --evidence /tmp/pause-evidence
+```
+
 ### Question descriptions and plan approval
 
 `_scode/ask_user_question` keeps `description` as a string and supplies optional

@@ -100,6 +100,31 @@ pub trait EngineDelegate: Send + Sync + 'static {
         None
     }
 
+    /// Fence every main and child tool before cancellation. The host waits for
+    /// the turn and actual workers before acknowledging human ownership.
+    fn begin_tool_pause(&self) -> Result<u64, String> {
+        self.background_tasks()
+            .map(|tasks| tasks.begin_pause())
+            .ok_or_else(|| "This engine does not support tool pause".to_string())
+    }
+
+    fn wait_tool_pause(&self, epoch: u64, timeout: std::time::Duration) -> Result<(), String> {
+        self.background_tasks()
+            .ok_or_else(|| "This engine does not support tool pause".to_string())?
+            .wait_paused(epoch, timeout)
+    }
+
+    fn resume_tool_operations(&self, epoch: u64) -> Result<(), String> {
+        self.background_tasks()
+            .ok_or_else(|| "This engine does not support tool pause".to_string())?
+            .resume_operations(epoch)
+    }
+
+    fn tool_control(&self) -> (u64, bool) {
+        self.background_tasks()
+            .map_or((0, false), |tasks| tasks.tool_control())
+    }
+
     /// Switch the active model. Returns `(display_model, available_models)`; the
     /// driver emits [`EngineEvent::ModelChanged`].
     fn set_model(&self, model: &str) -> Result<(String, Vec<String>), String>;
