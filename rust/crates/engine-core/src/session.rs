@@ -764,7 +764,11 @@ impl RuntimeObserver for ObserverAdapter {
     }
 
     fn background_tasks(&self) -> Option<runtime::background_tasks::BackgroundTasks> {
-        Some(self.tasks.clone())
+        let journal = self
+            .subagents
+            .as_ref()
+            .and_then(|relay| relay.lock().completion.clone());
+        Some(self.tasks.clone().with_completion(journal))
     }
 }
 

@@ -14,11 +14,13 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::Notify;
 
+pub const TASK_META_KEY: &str = "taskCompletions";
+
 pub const META_KEY: &str = "subagentCompletions";
 
-pub fn negotiated(meta: Option<&agent_client_protocol_schema::Meta>) -> bool {
+pub fn negotiated(meta: Option<&agent_client_protocol_schema::Meta>, key: &str) -> bool {
     meta.and_then(|m| m.get("sudocode"))
-        .and_then(|s| s.get(META_KEY))
+        .and_then(|s| s.get(key))
         .and_then(|c| c.get("version"))
         .and_then(Value::as_u64)
         .is_some_and(|v| v == 1)
@@ -58,27 +60,65 @@ impl From<ReplayStatus> for ReplayResponse {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, JsonRpcResponse)]
+pub struct TaskResponse {
+    #[serde(flatten)]
+    pub fields: serde_json::Map<String, Value>,
+}
+
+macro_rules! task_request {
+    ($name:ident, $method:tt $(, $field:ident: $ty:ty)*) => {
+        #[derive(Debug, Clone, Serialize, Deserialize, JsonRpcRequest)]
+        #[request(method = $method, response = TaskResponse)]
+        #[serde(rename_all = "camelCase", deny_unknown_fields)]
+        pub struct $name {
+            pub session_id: String,
+            pub cwd: std::path::PathBuf,
+            pub storage_ref: Option<String>,
+            $(pub $field: $ty,)*
+        }
+    };
+}
+task_request!(TaskReplayRequest, "_sudocode/task/replay", after_task_id: Option<String>);
+task_request!(TaskSuppressRequest, "_sudocode/task/suppress", origin_trace_id: String);
+task_request!(TaskPurgeRequest, "_sudocode/task/purge", cleanup_id: String);
+
+pub enum TaskOperation {
+    Replay(Option<String>),
+    Suppress(String),
+    Purge(String),
+}
+
 pub struct Delivery {
     pub journal: Arc<CompletionJournal>,
     connection: Mutex<Option<ConnectionTo<Client>>>,
     sending: AtomicBool,
     generation: AtomicU64,
     wake: Notify,
+    runtime: tokio::runtime::Handle,
     failure: Mutex<Option<String>>,
     terminal_retries: Mutex<BTreeMap<String, runtime::SubagentLifecycle>>,
 }
 
 impl Delivery {
     pub fn open(session: &runtime::Session, cwd: &Path, create: bool) -> Result<Arc<Self>, String> {
-        Ok(Arc::new(Self {
+        let delivery = Arc::new(Self {
             journal: CompletionJournal::open(session, cwd, create)?,
             connection: Mutex::new(None),
             sending: AtomicBool::new(false),
             generation: AtomicU64::new(0),
             wake: Notify::new(),
+            runtime: tokio::runtime::Handle::current(),
             failure: Mutex::new(None),
             terminal_retries: Mutex::new(BTreeMap::new()),
-        }))
+        });
+        let weak = Arc::downgrade(&delivery);
+        delivery.journal.set_wake(move || {
+            if let Some(delivery) = weak.upgrade() {
+                delivery.wake_sender();
+            }
+        });
+        Ok(delivery)
     }
 
     pub fn replay(&self, session: &runtime::Session) -> Result<ReplayResponse, String> {
@@ -190,7 +230,7 @@ impl Delivery {
         }
         drop(binding);
         let delivery = Arc::clone(self);
-        tokio::spawn(async move {
+        self.runtime.spawn(async move {
             delivery.send_loop().await;
         });
     }
@@ -213,7 +253,15 @@ impl Delivery {
                 }
                 continue;
             }
-            let pending = self.journal.pending();
+            let tasks = self.journal.tasks_enabled();
+            let pending: Vec<_> = self
+                .journal
+                .pending_tasks()
+                .into_iter()
+                .filter(|p| {
+                    tasks || matches!(p, runtime::subagent_completion::TaskCompletion::Subagent(_))
+                })
+                .collect();
             let Some(payload) = pending.first() else {
                 // Live routes are owned by their SessionSubagents; this task
                 // holds no engine. Cold replay with only blocked/settled facts
@@ -243,18 +291,21 @@ impl Delivery {
                 self.sending.store(false, Ordering::SeqCst);
                 return;
             };
-            let raw = match serde_json::value::to_raw_value(payload) {
-                Ok(raw) => raw,
-                Err(_) => {
-                    self.sending.store(false, Ordering::SeqCst);
-                    return;
-                }
+            let Ok(raw) = payload.wire_value(tasks).and_then(|value| {
+                serde_json::value::to_raw_value(&value).map_err(|e| e.to_string())
+            }) else {
+                self.sending.store(false, Ordering::SeqCst);
+                return;
             };
             let result = tokio::time::timeout(
                 Duration::from_secs(30),
                 connection
                     .send_request(ClientRequest::ExtMethodRequest(ExtRequest::new(
-                        "_sudocode/subagent/completed",
+                        if tasks {
+                            "_sudocode/task/completed"
+                        } else {
+                            "_sudocode/subagent/completed"
+                        },
                         Arc::from(raw),
                     )))
                     .block_task(),
@@ -281,9 +332,8 @@ impl Delivery {
                     }
                     agent_client_protocol_schema::ErrorCode::InvalidParams
                     | agent_client_protocol_schema::ErrorCode::InvalidRequest => {
-                        if let Err(error) = self
-                            .journal
-                            .quarantine(&payload.completion_id, "protocol_rejected")
+                        if let Err(error) =
+                            self.journal.quarantine(payload.id(), "protocol_rejected")
                         {
                             eprintln!("[acp-completion] quarantine persistence failed: {error}");
                         } else {
@@ -306,9 +356,9 @@ impl Delivery {
                     }
                     _ => None,
                 };
-                if id == Some(payload.completion_id.as_str()) {
+                if id == Some(payload.id()) {
                     if let Some(ack) = ack {
-                        match self.journal.acknowledge(&payload.completion_id, ack) {
+                        match self.journal.acknowledge(payload.id(), ack) {
                             Ok(()) => {
                                 backoff = 1;
                                 continue;
@@ -317,28 +367,20 @@ impl Delivery {
                                 eprintln!("[acp-completion] ACK persistence failed: {error}")
                             }
                         }
-                    } else {
-                        if self
-                            .journal
-                            .quarantine(&payload.completion_id, "invalid_ack")
-                            .is_ok()
-                        {
-                            continue;
-                        }
-                    }
-                } else {
-                    if self
-                        .journal
-                        .quarantine(&payload.completion_id, "ack_identity_mismatch")
-                        .is_ok()
-                    {
+                    } else if self.journal.quarantine(payload.id(), "invalid_ack").is_ok() {
                         continue;
                     }
+                } else if self
+                    .journal
+                    .quarantine(payload.id(), "ack_identity_mismatch")
+                    .is_ok()
+                {
+                    continue;
                 }
             }
             // A lost reply repeats only the frozen payload, never model work.
             tokio::select! { _ = wake => { backoff = 1; },
-            () = tokio::time::sleep(Duration::from_millis(backoff * 1000 + u64::from(payload.completion_id.as_bytes()[0]) * 3)) => { backoff = (backoff * 2).min(30); } }
+            () = tokio::time::sleep(Duration::from_millis(backoff * 1000 + u64::from(payload.id().as_bytes()[0]) * 3)) => { backoff = (backoff * 2).min(30); } }
         }
     }
 }

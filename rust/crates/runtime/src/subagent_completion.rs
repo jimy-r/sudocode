@@ -1,6 +1,6 @@
 //! Durable handoff of direct sub-agent results. This is delivery state only;
 //! the child's manifest remains the authority for its execution outcome.
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -9,6 +9,11 @@ use sha2::{Digest, Sha256};
 
 use crate::fs_backend::FsBackend;
 use crate::{ContentBlock, Session, SubagentLifecycle, SubagentPhase};
+
+mod control;
+mod terminal;
+use terminal::TerminalSource;
+pub use terminal::{ShellKind, TaskCompletion, TerminalCompletion, TerminalSnapshot};
 
 #[derive(Clone, Default, Serialize, Deserialize)]
 struct Worker {
@@ -143,12 +148,17 @@ pub struct Completion {
 #[derive(Clone, Serialize, Deserialize)]
 struct Source {
     ordinal: u64,
-    lifecycle: SubagentLifecycle,
+    #[serde(default)]
+    lifecycle: Option<SubagentLifecycle>,
+    #[serde(default)]
+    terminal: Option<TerminalSource>,
+    #[serde(default)]
+    suppressed: bool,
     trace_id: String,
     manifest_path: String,
     closed: bool,
     settled: bool,
-    payload: Option<Completion>,
+    payload: Option<TaskCompletion>,
     ack: Option<String>,
     blocked: Option<String>,
 }
@@ -156,9 +166,12 @@ struct Source {
 #[derive(Clone, Serialize, Deserialize)]
 struct Journal {
     version: u32,
+    #[serde(default)]
     storage_ref: String,
     #[serde(default)]
-    closed_traces: std::collections::BTreeSet<String>,
+    deleted: Option<String>,
+    #[serde(default)]
+    closed_traces: BTreeSet<String>,
     watermark: u64,
     session_id: String,
     cwd: PathBuf,
@@ -186,6 +199,12 @@ pub struct ReplayStatus {
     pub settled: usize,
     pub blocked: Vec<String>,
     pub context_ref: Option<ContextRef>,
+    pub storage_ref: String,
+    pub execution_unconfirmed: usize,
+    pub running: usize,
+    pub terminal_sources: Vec<serde_json::Value>,
+    pub task_set_hash: String,
+    pub next_task_id: Option<String>,
 }
 
 /// One storage-level writer per exact session, shared by transcript writes,
@@ -195,17 +214,52 @@ pub struct CompletionJournal {
     path: String,
     transcript: PathBuf,
     state: Mutex<Journal>,
+    wake: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    clear_cache: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    instance: String,
+    task_protocol: std::sync::atomic::AtomicBool,
     writer: Arc<crate::session_writer::SessionWriter>,
 }
 
 impl CompletionJournal {
+    pub fn set_task_protocol(&self, enabled: bool) {
+        self.task_protocol
+            .store(enabled, std::sync::atomic::Ordering::Release);
+    }
+
+    pub fn deleted(&self) -> bool {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .deleted
+            .is_some()
+    }
+
+    pub fn tasks_enabled(&self) -> bool {
+        self.task_protocol
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    pub fn set_cache_clear(&self, clear: impl Fn() + Send + Sync + 'static) {
+        *self
+            .clear_cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::new(clear));
+    }
+
+    pub fn set_wake(&self, wake: impl Fn() + Send + Sync + 'static) {
+        *self
+            .wake
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::new(wake));
+    }
+
     pub fn open(session: &Session, cwd: &Path, create: bool) -> Result<Arc<Self>, String> {
         let transcript = session
             .persistence_path()
             .ok_or("session has no transcript")?
             .to_path_buf();
         let fs = session.fs_handle();
-        // Claim ownership before reading or retiring another process's turn.
         let writer = session.completion_writer()?;
         let path = transcript
             .with_extension("completions.json")
@@ -229,7 +283,8 @@ impl CompletionJournal {
                     &serde_json::to_vec(&(1, &session.session_id, &transcript))
                         .map_err(|e| e.to_string())?,
                 ),
-                closed_traces: std::collections::BTreeSet::new(),
+                deleted: None,
+                closed_traces: BTreeSet::new(),
                 watermark: 0,
                 session_id: session.session_id.clone(),
                 cwd: cwd.to_path_buf(),
@@ -247,17 +302,31 @@ impl CompletionJournal {
             path,
             transcript,
             state: Mutex::new(state),
+            wake: Mutex::new(None),
+            clear_cache: Mutex::new(None),
+            instance: uuid::Uuid::new_v4().to_string(),
+            task_protocol: std::sync::atomic::AtomicBool::new(false),
             writer,
         });
-        // Storage ownership proves the previous process no longer owns this
+        // Opening a new writer means the previous process no longer owns this
         // journal. Its interrupted turn cannot publish, but must not prevent a
         // later explicit human turn from repairing the conversation.
         if let Some(trace) = interrupted {
             journal.fail_turn(&trace)?;
         }
-        if create {
-            journal.change(|_| Ok(()))?;
-        }
+        journal.change(|state| {
+            for source in state.sources.values_mut() {
+                if let Some(terminal) = &mut source.terminal {
+                    if terminal.snapshot.is_none() && terminal.state != "not_started" {
+                        terminal.state = "execution_unconfirmed".into();
+                        if !source.settled && source.blocked.is_none() {
+                            source.blocked = Some("execution_unconfirmed".into());
+                        }
+                    }
+                }
+            }
+            Ok(())
+        })?;
         Ok(journal)
     }
 
@@ -266,12 +335,21 @@ impl CompletionJournal {
             .state
             .lock()
             .map_err(|_| "completion journal poisoned")?;
-        let _write = self.writer.write()?;
+        let write = self.writer.write()?;
         // A failed write must not leave an in-memory ACK/publication that the
         // next mutation could silently treat as durable.
         let mut next = state.clone();
         next.watermark += 1;
         let result = f(&mut next)?;
+        let watermark = next.watermark;
+        next.watermark = state.watermark;
+        if serde_json::to_vec(&next).map_err(|e| e.to_string())?
+            == serde_json::to_vec(&*state).map_err(|e| e.to_string())?
+        {
+            return Ok(result);
+        }
+        next.watermark = watermark;
+        Self::check_reservation(&next)?;
         let bytes = serde_json::to_vec(&next).map_err(|e| e.to_string())?;
         if bytes.len() > 64 * 1024 * 1024 {
             return Err("completion_journal_capacity: exceeds 64 MiB".into());
@@ -280,6 +358,16 @@ impl CompletionJournal {
             .write_atomic(&self.path, &bytes)
             .map_err(|e| e.to_string())?;
         *state = next;
+        drop(state);
+        drop(write);
+        if let Some(wake) = self
+            .wake
+            .lock()
+            .map_err(|_| "completion wake poisoned")?
+            .as_ref()
+        {
+            wake();
+        }
         Ok(result)
     }
 
@@ -320,8 +408,14 @@ impl CompletionJournal {
             if state.active_trace.is_some() {
                 return Err("source_context_unconfirmed".into());
             }
+            if state.deleted.is_some() {
+                return Err("session_deleted".into());
+            }
             if state.closed_traces.contains(trace) {
                 return Err("completion trace already closed".into());
+            }
+            if trace.len() > 512 || state.closed_traces.len() >= 10000 {
+                return Err("completion_journal_capacity: trace limit".into());
             }
             state.active_trace = Some(trace.to_owned());
             state.reducer.begin();
@@ -336,6 +430,18 @@ impl CompletionJournal {
         lifecycle: SubagentLifecycle,
         manifest_path: String,
     ) -> Result<(), String> {
+        if lifecycle.tool_call_id.is_empty()
+            || lifecycle.tool_call_id.len() > 512
+            || lifecycle.agent.agent_id.is_empty()
+            || lifecycle.agent.agent_id.len() > 512
+            || serde_json::to_vec(&lifecycle)
+                .map_err(|e| e.to_string())?
+                .len()
+                > 16 * 1024
+            || manifest_path.len() > 4096
+        {
+            return Err("completion_registration_capacity".into());
+        }
         self.change(|state| {
             let trace_id = state
                 .active_trace
@@ -354,7 +460,9 @@ impl CompletionJournal {
                 lifecycle.tool_call_id.clone(),
                 Source {
                     ordinal: 0,
-                    lifecycle,
+                    lifecycle: Some(lifecycle),
+                    terminal: None,
+                    suppressed: false,
                     trace_id,
                     manifest_path,
                     closed: false,
@@ -398,8 +506,12 @@ impl CompletionJournal {
     }
 
     pub fn tool_result(&self, id: &str, name: &str, output: &str) -> Result<(), String> {
+        if self.deleted() {
+            return Ok(());
+        }
         self.change(|state| {
             state.reducer.tool_result(id, name, output);
+            Self::terminal_tool_result(state, id, name, output);
             Self::publish(state)
         })
     }
@@ -424,6 +536,14 @@ impl CompletionJournal {
             for source in state.sources.values_mut().filter(|s| s.trace_id == trace) {
                 source.closed = true;
             }
+            for source in state.sources.values_mut() {
+                if let Some(terminal) = &mut source.terminal {
+                    if terminal.collected_in.as_deref() == Some(trace) {
+                        terminal.collected = true;
+                        terminal.collected_in = None;
+                    }
+                }
+            }
             state.reducer.close();
             Self::publish(state)?;
             Ok(context)
@@ -434,8 +554,15 @@ impl CompletionJournal {
         self.change(|state| {
             if state.active_trace.as_deref() == Some(trace) {
                 state.active_trace = None;
-                state.closed_traces.insert(trace.to_owned());
                 state.context = None;
+                state.closed_traces.insert(trace.to_owned());
+                for source in state.sources.values_mut() {
+                    if let Some(terminal) = &mut source.terminal {
+                        if terminal.collected_in.as_deref() == Some(trace) {
+                            terminal.collected_in = None;
+                        }
+                    }
+                }
                 state.reducer.close();
                 for source in state.sources.values_mut().filter(|s| s.trace_id == trace) {
                     source.blocked = Some("source_context_unconfirmed".into());
@@ -460,6 +587,9 @@ impl CompletionJournal {
     }
 
     fn publish(state: &mut Journal) -> Result<(), String> {
+        if state.deleted.is_some() {
+            return Ok(());
+        }
         for event in state.reducer.drain() {
             let source = state
                 .sources
@@ -487,7 +617,7 @@ impl CompletionJournal {
             // late must not overtake a frozen delivery awaiting its durable ACK,
             // including when the sender restarts between attempts.
             source.ordinal = state.watermark;
-            source.payload = Some(Completion {
+            source.payload = Some(TaskCompletion::Subagent(Completion {
                 session_id: state.session_id.clone(),
                 completion_id: id,
                 agent_id: event.agent.agent_id,
@@ -500,10 +630,11 @@ impl CompletionJournal {
                 }
                 .into(),
                 message,
-            });
+            }));
         }
         for (tool, source) in &mut state.sources {
-            if source.closed
+            if source.terminal.is_none()
+                && source.closed
                 && source.blocked.is_none()
                 && source.payload.is_none()
                 && !state.reducer.workers.contains_key(tool)
@@ -511,7 +642,7 @@ impl CompletionJournal {
                 source.settled = true;
             }
         }
-        Ok(())
+        Self::publish_terminals(state)
     }
 
     fn digest(&self) -> Result<String, String> {
@@ -536,6 +667,16 @@ impl CompletionJournal {
     }
 
     pub fn pending(&self) -> Vec<Completion> {
+        self.pending_tasks()
+            .into_iter()
+            .filter_map(|p| match p {
+                TaskCompletion::Subagent(p) => Some(p),
+                TaskCompletion::Terminal(_) => None,
+            })
+            .collect()
+    }
+
+    pub fn pending_tasks(&self) -> Vec<TaskCompletion> {
         let state = self
             .state
             .lock()
@@ -543,7 +684,7 @@ impl CompletionJournal {
         let mut sources: Vec<_> = state
             .sources
             .values()
-            .filter(|s| s.ack.is_none() && s.blocked.is_none())
+            .filter(|s| !s.settled && s.ack.is_none() && s.blocked.is_none())
             .collect();
         sources.sort_by_key(|s| s.ordinal);
         sources
@@ -556,31 +697,39 @@ impl CompletionJournal {
         if !matches!(disposition, "stored" | "session_deleted") {
             return Err("invalid completion acknowledgement".into());
         }
+        if self.deleted() {
+            return Ok(());
+        }
         self.change(|state| {
             let source = state
                 .sources
                 .values_mut()
-                .find(|s| s.payload.as_ref().is_some_and(|p| p.completion_id == id))
+                .find(|s| s.payload.as_ref().is_some_and(|p| p.id() == id))
                 .ok_or("unknown completion acknowledgement")?;
             source.ack = Some(disposition.to_owned());
             source.settled = true;
             // Keep identity/ACK tombstones for duplicate suppression while
             // releasing the potentially large result after durable receipt.
             if let Some(payload) = &mut source.payload {
-                payload.message.clear();
+                payload.clear_message();
             }
-            source.lifecycle.raw_output = None;
-            source.lifecycle.completion_notification = None;
+            if let Some(lifecycle) = &mut source.lifecycle {
+                lifecycle.raw_output = None;
+                lifecycle.completion_notification = None;
+            }
             Ok(())
         })
     }
 
     pub fn quarantine(&self, id: &str, reason: &str) -> Result<(), String> {
+        if self.deleted() {
+            return Ok(());
+        }
         self.change(|state| {
             let source = state
                 .sources
                 .values_mut()
-                .find(|s| s.payload.as_ref().is_some_and(|p| p.completion_id == id))
+                .find(|s| s.payload.as_ref().is_some_and(|p| p.id() == id))
                 .ok_or("unknown completion")?;
             source.blocked = Some(reason.to_owned());
             Ok(())
@@ -629,7 +778,10 @@ impl CompletionJournal {
                     .values_mut()
                     .filter(|s| s.closed && !s.settled && s.payload.is_none())
                 {
-                    match terminal(&source.manifest_path, &source.lifecycle) {
+                    let Some(lifecycle) = &source.lifecycle else {
+                        continue;
+                    };
+                    match terminal(&source.manifest_path, lifecycle) {
                         Ok(Some(event)) => {
                             source.blocked = None;
                             state.reducer.lifecycle(&event);
@@ -644,8 +796,9 @@ impl CompletionJournal {
                 }
                 Self::publish(state)?;
             }
-            Ok(Self::status_inner(state))
-        })
+            Ok(())
+        })?;
+        Ok(self.status())
     }
 
     pub fn status(&self) -> ReplayStatus {
@@ -668,7 +821,9 @@ impl CompletionJournal {
             pending: state
                 .sources
                 .values()
-                .filter(|s| s.payload.is_some() && s.ack.is_none() && s.blocked.is_none())
+                .filter(|s| {
+                    !s.settled && s.payload.is_some() && s.ack.is_none() && s.blocked.is_none()
+                })
                 .count(),
             unresolved: state.sources.values().filter(|s| !s.settled).count(),
             settled: state.sources.values().filter(|s| s.settled).count(),
@@ -679,6 +834,60 @@ impl CompletionJournal {
                 .take(16)
                 .collect(),
             context_ref: state.context.clone(),
+            storage_ref: state.storage_ref.clone(),
+            execution_unconfirmed: state
+                .sources
+                .values()
+                .filter(|s| {
+                    s.terminal
+                        .as_ref()
+                        .is_some_and(|t| t.snapshot.is_none() && t.state == "execution_unconfirmed")
+                })
+                .count(),
+            running: state
+                .sources
+                .values()
+                .filter(|s| {
+                    s.terminal.as_ref().is_some_and(|t| {
+                        t.snapshot.is_none() && matches!(t.state.as_str(), "running" | "prepared")
+                    })
+                })
+                .count(),
+            terminal_sources: state
+                .sources
+                .values()
+                .filter_map(Self::terminal_view)
+                .take(50)
+                .collect(),
+            next_task_id: (state
+                .sources
+                .values()
+                .filter(|s| s.terminal.is_some())
+                .count()
+                > 50)
+                .then(|| {
+                    state
+                        .sources
+                        .iter()
+                        .filter(|(_, s)| s.terminal.is_some())
+                        .nth(49)
+                        .map(|(id, _)| id.clone())
+                        .unwrap_or_default()
+                }),
+            task_set_hash: checksum(
+                &serde_json::to_vec(
+                    &state
+                        .sources
+                        .iter()
+                        .filter_map(|(tool, s)| {
+                            s.terminal
+                                .as_ref()
+                                .map(|t| (tool, &t.state, s.suppressed, s.settled))
+                        })
+                        .collect::<Vec<_>>(),
+                )
+                .expect("serializable task identities"),
+            ),
         }
     }
 }

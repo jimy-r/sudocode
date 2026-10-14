@@ -725,6 +725,7 @@ fn launch_background_shell(
 ) -> io::Result<(String, String)> {
     launch_background_command(
         prepare_command(&input.command, cwd, sandbox, false),
+        crate::subagent_completion::ShellKind::Bash,
         &input.command,
         input.description.as_deref().unwrap_or(&input.command),
         tasks,
@@ -734,6 +735,7 @@ fn launch_background_shell(
 /// Spawn any terminal command under one output and cancellation owner.
 pub fn launch_background_command(
     mut command: Command,
+    shell: crate::subagent_completion::ShellKind,
     command_text: &str,
     title: &str,
     tasks: Option<&crate::background_tasks::BackgroundTasks>,
@@ -759,12 +761,49 @@ pub fn launch_background_command(
     }
     let output = options.open(&path)?;
     let reader = std::fs::File::open(&path)?;
+    let stdout = Stdio::from(output.try_clone()?);
+    let id = format!("shell-{nonce}");
+    let journal = tasks
+        .prepare_terminal(&id, shell)
+        .map_err(io::Error::other)?;
     let child = command
         .stdin(Stdio::null())
-        .stdout(Stdio::from(output.try_clone()?))
+        .stdout(stdout)
         .stderr(Stdio::from(output))
-        .group_spawn()?;
-    let id = format!("shell-{}-{nonce}", child.id());
+        .group_spawn();
+    let child = match child {
+        Ok(child) => child,
+        Err(error) => {
+            #[cfg(windows)]
+            {
+                // command-group may fail assigning a Job after spawning the child.
+                // Retain the identity: an error here is not proof it never ran.
+                if let Some(journal) = &journal {
+                    let _ = journal.terminal_unconfirmed(&id);
+                }
+                let mut task =
+                    BackgroundTask::new(id.clone(), BackgroundTaskKind::Terminal, title.into());
+                task.status = crate::background_tasks::BackgroundTaskStatus::ExecutionUnconfirmed;
+                task.activity = format!("Process ownership unconfirmed; do not rerun: {error}");
+                task.command = Some(command_text.into());
+                task.output_path = Some(path.to_string_lossy().into_owned());
+                tasks.register(task, HookAbortSignal::default());
+                return Ok((id, path.to_string_lossy().into_owned()));
+            }
+            #[cfg(not(windows))]
+            {
+                if let Some(journal) = &journal {
+                    let _ = journal.terminal_not_started(&id);
+                }
+                return Err(error);
+            }
+        }
+    };
+    if let Some(journal) = &journal {
+        if let Err(error) = journal.terminal_started(&id) {
+            eprintln!("[task-completion] start persistence pending: {error}");
+        }
+    }
     let mut task = BackgroundTask::new(id.clone(), BackgroundTaskKind::Terminal, title.to_string());
     task.command = Some(command_text.to_string());
     task.output_path = Some(path.to_string_lossy().into_owned());
@@ -774,10 +813,17 @@ pub fn launch_background_command(
         child: Some(child),
         tasks,
         id: id.clone(),
+        journal,
+        shell,
     };
-    std::thread::Builder::new()
+    let monitor = std::thread::Builder::new()
         .name(format!("background-{id}"))
-        .spawn(move || process.monitor(reader, &abort))?;
+        .spawn(move || process.monitor(reader, &abort));
+    if let Err(error) = monitor {
+        // The process already existed. Return its identity, never a retryable
+        // spawn error that invites the model to execute the command twice.
+        eprintln!("[task-completion] background monitor unavailable: {error}");
+    }
     Ok((id, path.to_string_lossy().into_owned()))
 }
 
@@ -785,6 +831,8 @@ struct BackgroundShell {
     child: Option<command_group::GroupChild>,
     tasks: crate::background_tasks::BackgroundTasks,
     id: String,
+    journal: Option<std::sync::Arc<crate::subagent_completion::CompletionJournal>>,
+    shell: crate::subagent_completion::ShellKind,
 }
 
 impl BackgroundShell {
@@ -792,13 +840,19 @@ impl BackgroundShell {
         use crate::background_tasks::{BackgroundTaskStatus, TASK_OUTPUT_TAIL_BYTES};
         use std::io::{Read, Seek, SeekFrom};
         let mut last_size = 0;
+        let mut final_output = String::new();
+        let mut output_truncated = false;
+        let mut kill_confirmed = false;
         loop {
             let child = self.child.as_mut().expect("live child");
-            let result = if abort.is_aborted() {
-                let _ = child.kill();
-                child.wait().map(Some)
+            let cancelling = abort.is_aborted();
+            let result = if cancelling {
+                let killed = child.kill().is_ok();
+                let result = child.wait().map(Some);
+                kill_confirmed = killed && process_group_gone(child.id());
+                result
             } else {
-                child.try_wait()
+                child.inner().try_wait()
             };
             let size = output.metadata().map_or(last_size, |m| m.len());
             if size != last_size {
@@ -810,16 +864,47 @@ impl BackgroundShell {
                         .read_to_end(&mut bytes)
                 });
                 if read.is_ok() {
+                    final_output = String::from_utf8_lossy(&bytes).into_owned();
+                    output_truncated = start > 0;
                     self.tasks.update(&self.id, |task| {
-                        task.output = String::from_utf8_lossy(&bytes).into_owned();
+                        task.output.clone_from(&final_output);
                     });
                     last_size = size;
                 }
             }
             match result {
                 Ok(Some(status)) => {
+                    self.child = None;
+                    if let Some(journal) = &self.journal {
+                        #[cfg(unix)]
+                        let signal = {
+                            use std::os::unix::process::ExitStatusExt;
+                            status.signal()
+                        };
+                        #[cfg(not(unix))]
+                        let signal = None;
+                        let snapshot = crate::subagent_completion::TerminalSnapshot {
+                            shell: self.shell,
+                            scope: "command".into(),
+                            exit_code: status.code(),
+                            signal,
+                            termination: if cancelling {
+                                "cancelled"
+                            } else if signal.is_some() {
+                                "signal"
+                            } else {
+                                "exit"
+                            }
+                            .into(),
+                            output_truncated,
+                            output: final_output,
+                        };
+                        self.persist_terminal(journal, &snapshot, cancelling && !kill_confirmed);
+                    }
                     self.tasks.update(&self.id, |task| {
-                        task.status = if abort.is_aborted() {
+                        task.status = if cancelling && !kill_confirmed {
+                            BackgroundTaskStatus::ExecutionUnconfirmed
+                        } else if cancelling {
                             BackgroundTaskStatus::Cancelled
                         } else if status.success() {
                             BackgroundTaskStatus::Completed
@@ -833,8 +918,11 @@ impl BackgroundShell {
                     return;
                 }
                 Err(error) => {
+                    if let Some(journal) = &self.journal {
+                        let _ = journal.terminal_unconfirmed(&self.id);
+                    }
                     self.tasks.update(&self.id, |task| {
-                        task.status = BackgroundTaskStatus::Failed;
+                        task.status = BackgroundTaskStatus::ExecutionUnconfirmed;
                         task.activity = error.to_string();
                     });
                     return;
@@ -843,20 +931,69 @@ impl BackgroundShell {
             }
         }
     }
+
+    fn persist_terminal(
+        &self,
+        journal: &crate::subagent_completion::CompletionJournal,
+        snapshot: &crate::subagent_completion::TerminalSnapshot,
+        unconfirmed: bool,
+    ) {
+        let mut backoff = 100;
+        loop {
+            let saved = if unconfirmed {
+                journal.terminal_unconfirmed(&self.id)
+            } else {
+                journal.terminal_finished(&self.id, snapshot.clone())
+            };
+            if saved.is_ok() || journal.deleted() {
+                break;
+            }
+            // The existing monitor retains exit evidence until the session
+            // store accepts it, even with ACP disconnected.
+            std::thread::sleep(Duration::from_millis(backoff));
+            backoff = (backoff * 2).min(30_000);
+        }
+    }
 }
 
 impl Drop for BackgroundShell {
     fn drop(&mut self) {
         if let Some(child) = &mut self.child {
+            if let Some(journal) = &self.journal {
+                let _ = journal.terminal_unconfirmed(&self.id);
+            }
             let _ = child.kill();
             let _ = child.wait();
             self.tasks.update(&self.id, |task| {
                 if task.status.is_active() {
-                    task.status = crate::background_tasks::BackgroundTaskStatus::Failed;
+                    task.status =
+                        crate::background_tasks::BackgroundTaskStatus::ExecutionUnconfirmed;
                     task.activity = "Background monitor stopped unexpectedly".into();
                 }
             });
         }
+    }
+}
+
+// waitpid only reaps our children, not all group members. Cancellation needs
+// an independent absence check; a failed probe is not a termination proof.
+fn process_group_gone(id: u32) -> bool {
+    #[cfg(unix)]
+    {
+        let Ok(id) = i32::try_from(id) else {
+            return false;
+        };
+        matches!(
+            nix::sys::signal::killpg(nix::unistd::Pid::from_raw(id), None),
+            Err(nix::errno::Errno::ESRCH)
+        )
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = id;
+        // command-group's completion port accepts any Job event, not just
+        // ACTIVE_PROCESS_ZERO. Until that proof is exposed, keep it unknown.
+        false
     }
 }
 

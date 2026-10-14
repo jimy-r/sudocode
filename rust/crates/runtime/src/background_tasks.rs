@@ -23,6 +23,7 @@ pub enum BackgroundTaskKind {
 pub enum BackgroundTaskStatus {
     Running,
     Stopping,
+    ExecutionUnconfirmed,
     Completed,
     Failed,
     Cancelled,
@@ -40,6 +41,7 @@ impl BackgroundTaskStatus {
         match self {
             Self::Running => "running",
             Self::Stopping => "stopping",
+            Self::ExecutionUnconfirmed => "execution_unconfirmed",
             Self::Completed => "completed",
             Self::Failed => "failed",
             Self::Cancelled => "cancelled",
@@ -140,6 +142,8 @@ impl Drop for ToolOperationLease {
 pub struct BackgroundTasks {
     registry: Arc<Mutex<Registry>>,
     parent_id: Option<String>,
+    completion: Arc<Mutex<Option<Arc<crate::subagent_completion::CompletionJournal>>>>,
+    tool_id: Option<String>,
 }
 
 impl std::fmt::Debug for BackgroundTasks {
@@ -262,6 +266,75 @@ impl BackgroundTasks {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         (registry.pause_epoch, registry.paused)
+    }
+
+    #[must_use]
+    pub fn with_completion(
+        self,
+        journal: Option<Arc<crate::subagent_completion::CompletionJournal>>,
+    ) -> Self {
+        if self.parent_id.is_none() {
+            if let Some(journal) = &journal {
+                let registry = Arc::downgrade(&self.registry);
+                journal.set_cache_clear(move || {
+                    if let Some(registry) = registry.upgrade() {
+                        let mut registry = registry
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        registry.tasks.clear();
+                        registry.changed.notify_all();
+                    }
+                });
+            }
+            *self
+                .completion
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = journal;
+        }
+        self
+    }
+
+    /// Per-invocation identity, never a mutable session-global current tool ID.
+    #[must_use]
+    pub fn for_tool(&self, tool: Option<&str>) -> Self {
+        let mut tasks = self.clone();
+        tasks.tool_id = tool.map(str::to_owned);
+        tasks
+    }
+
+    pub fn prepare_terminal(
+        &self,
+        task: &str,
+        shell: crate::subagent_completion::ShellKind,
+    ) -> Result<Option<Arc<crate::subagent_completion::CompletionJournal>>, String> {
+        if self.parent_id.is_some() {
+            return Ok(None);
+        }
+        let journal = self
+            .completion
+            .lock()
+            .map_err(|_| "completion binding poisoned")?
+            .clone();
+        let Some(journal) = journal.filter(|j| j.tasks_enabled()) else {
+            return Ok(None);
+        };
+        journal.register_terminal(
+            self.tool_id
+                .as_deref()
+                .ok_or("terminal tool identity missing")?,
+            task,
+            shell,
+        )?;
+        Ok(Some(journal))
+    }
+
+    pub fn durable_terminal(&self, task: &str) -> Result<Option<serde_json::Value>, String> {
+        let journal = self
+            .completion
+            .lock()
+            .map_err(|_| "completion binding poisoned")?
+            .clone();
+        journal.map_or(Ok(None), |j| j.terminal_result(task))
     }
 
     pub fn set_sink(&self, sink: impl Fn(BackgroundTaskEvent) + Send + Sync + 'static) {
@@ -418,6 +491,8 @@ impl BackgroundTasks {
         Self {
             registry: Arc::clone(&self.registry),
             parent_id: Some(id.to_string()),
+            completion: Arc::clone(&self.completion),
+            tool_id: None,
         }
     }
 

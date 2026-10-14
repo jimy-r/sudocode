@@ -54,7 +54,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc as std_mpsc;
 
 use crate::session_ops;
-use crate::subagent_completions::{self, Delivery, ReplayRequest, ReplayResponse};
+use crate::subagent_completions::{
+    self, Delivery, ReplayRequest, ReplayResponse, TaskOperation, TaskPurgeRequest,
+    TaskReplayRequest, TaskResponse, TaskSuppressRequest,
+};
 
 /// Error type returned by ACP agent implementations.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1676,6 +1679,102 @@ impl SessionRegistry {
         Ok(())
     }
 
+    fn task_control(
+        &self,
+        session_id: &str,
+        cwd: &std::path::Path,
+        storage_ref: Option<&str>,
+        operation: TaskOperation,
+    ) -> Result<(Option<Arc<Delivery>>, TaskResponse), AcpError> {
+        use runtime::subagent_completion::CompletionJournal;
+        if session_id.is_empty()
+            || !session_id
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+            || !cwd.is_absolute()
+        {
+            return Err(AcpError::invalid_params(
+                "task control requires exact sessionId and absolute cwd",
+            ));
+        }
+        let cwd =
+            engine_host::session::canonical_session_cwd(cwd).map_err(AcpError::invalid_params)?;
+        let store = runtime::session_control::SessionStore::from_cwd(&cwd)
+            .map_err(|e| AcpError::internal(e.to_string()))?;
+        let path = store
+            .resolve_completion_path(session_id)
+            .map_err(|e| AcpError::invalid_params(e.to_string()))?;
+        let fs = runtime::fs_backend::StdFsBackend;
+        let probe =
+            CompletionJournal::probe(&fs, &path, session_id, &cwd).map_err(AcpError::internal)?;
+        let response = |value| {
+            serde_json::from_value::<TaskResponse>(value)
+                .map_err(|e| AcpError::internal(e.to_string()))
+        };
+        let Some(storage_ref) = storage_ref else {
+            if !matches!(operation, TaskOperation::Replay(_)) {
+                return Err(AcpError::invalid_params("storageRef required"));
+            }
+            return Ok((None, response(probe)?));
+        };
+        if probe["storageRef"] != storage_ref {
+            return Err(AcpError::invalid_params("completion_storage_mismatch"));
+        }
+        let route = self
+            .completion_routes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(session_id)
+            .and_then(std::sync::Weak::upgrade);
+        if let TaskOperation::Purge(cleanup_id) = &operation {
+            let value = if let Some(route) = &route {
+                route.journal.purge(storage_ref, cleanup_id)
+            } else {
+                CompletionJournal::purge_stored(
+                    &fs,
+                    &path,
+                    session_id,
+                    &cwd,
+                    storage_ref,
+                    cleanup_id,
+                )
+            }
+            .map_err(AcpError::internal)?;
+            return Ok((None, response(value)?));
+        }
+        if probe["deleted"] == true {
+            return Err(AcpError::invalid_params("session_deleted"));
+        }
+        let session = runtime::Session::load_from_path(&path)
+            .map_err(|e| AcpError::internal(e.to_string()))?;
+        let route = match route {
+            Some(route) => route,
+            None => self.completion_route(&session, &cwd, false)?,
+        };
+        route.journal.set_task_protocol(true);
+        let value = match operation {
+            TaskOperation::Replay(after) => {
+                if self.engine(session_id).is_none() {
+                    route.replay(&session).map_err(AcpError::internal)?;
+                }
+                {
+                    let mut value = serde_json::to_value(route.journal.status())
+                        .map_err(|e| AcpError::internal(e.to_string()))?;
+                    let page = route.journal.terminal_page(after.as_deref());
+                    value["terminalSources"] = page["terminalSources"].clone();
+                    value["nextTaskId"] = page["nextTaskId"].clone();
+                    value
+                }
+            }
+            TaskOperation::Suppress(trace) => route
+                .journal
+                .suppress(storage_ref, &trace)
+                .map_err(AcpError::internal)?,
+            TaskOperation::Purge(_) => unreachable!(),
+        };
+        Ok((Some(route), response(value)?))
+    }
+
     pub fn cancel_all(&self) {
         self.peer_receiver_stop.abort();
         for entry in self.lock_sessions().values() {
@@ -2144,6 +2243,7 @@ pub(crate) async fn run_acp_on_transport(
     // `initialize`. Sessions it creates or loads get a sub-agent route.
     let subagent_events = Arc::new(AtomicBool::new(false));
     let subagent_completions = Arc::new(AtomicBool::new(false));
+    let task_completions = Arc::new(AtomicBool::new(false));
 
     Agent
         .builder()
@@ -2154,19 +2254,33 @@ pub(crate) async fn run_acp_on_transport(
                 let version = agent_version.clone();
                 let subagent_events = Arc::clone(&subagent_events);
                 let subagent_completions = Arc::clone(&subagent_completions);
+                let task_completions = Arc::clone(&task_completions);
                 async move |req: InitializeRequest,
                             responder: Responder<InitializeResponse>,
                             _cx: ConnectionTo<Client>| {
                     let subagent_version =
                         subagent_events_version(req.client_capabilities.meta.as_ref());
                     subagent_events.store(subagent_version.is_some(), Ordering::SeqCst);
-                    let completion_version = !hosted
-                        && subagent_completions::negotiated(req.client_capabilities.meta.as_ref());
+                    let tasks = !hosted
+                        && subagent_completions::negotiated(
+                            req.client_capabilities.meta.as_ref(),
+                            subagent_completions::TASK_META_KEY,
+                        );
+                    task_completions.store(tasks, Ordering::SeqCst);
+                    let completion_version = tasks
+                        || (!hosted
+                            && subagent_completions::negotiated(
+                                req.client_capabilities.meta.as_ref(),
+                                subagent_completions::META_KEY,
+                            ));
                     subagent_completions.store(completion_version, Ordering::SeqCst);
                     let mut meta = initialize_meta(subagent_version);
                     if completion_version {
-                        meta.get_mut("sudocode").unwrap()[subagent_completions::META_KEY] =
-                            json!({"version": 1});
+                        meta.get_mut("sudocode").unwrap()[if tasks {
+                            subagent_completions::TASK_META_KEY
+                        } else {
+                            subagent_completions::META_KEY
+                        }] = json!({"version": 1});
                     }
                     if hosted {
                         meta.get_mut("sudocode").unwrap()["sessionFork"] = json!(false);
@@ -2198,6 +2312,7 @@ pub(crate) async fn run_acp_on_transport(
                 let config = config.clone();
                 let subagent_events = Arc::clone(&subagent_events);
                 let subagent_completions = Arc::clone(&subagent_completions);
+                let task_completions = Arc::clone(&task_completions);
                 async move |req: NewSessionRequest,
                             responder: Responder<NewSessionResponse>,
                             cx: ConnectionTo<Client>| {
@@ -2229,6 +2344,7 @@ pub(crate) async fn run_acp_on_transport(
                     let peer_config = config.clone();
                     let cx_notify = cx.clone();
                     let completions_enabled = subagent_completions.load(Ordering::SeqCst);
+                    let tasks_enabled = task_completions.load(Ordering::SeqCst);
                     let subagent_events =
                         subagent_events.load(Ordering::SeqCst) || completions_enabled;
                     cx.spawn(async move {
@@ -2290,7 +2406,10 @@ pub(crate) async fn run_acp_on_transport(
                                         &cwd,
                                         true,
                                     ) {
-                                        Ok(route) => Some(route),
+                                        Ok(route) => {
+                                            route.journal.set_task_protocol(tasks_enabled);
+                                            Some(route)
+                                        }
                                         Err(error) => {
                                             responder
                                                 .respond_with_error(acp_error_to_sdk(&error))?;
@@ -2300,6 +2419,8 @@ pub(crate) async fn run_acp_on_transport(
                                 } else {
                                     None
                                 };
+                                let storage_ref =
+                                    completion.as_ref().map(|d| d.journal.storage_ref());
                                 let subagents = subagent_events.then(|| {
                                     SessionSubagents::start(
                                         session_id.clone(),
@@ -2313,7 +2434,14 @@ pub(crate) async fn run_acp_on_transport(
                                     responder.respond_with_error(acp_error_to_sdk(&error))?;
                                     return Ok(());
                                 }
-                                responder.respond(NewSessionResponse::new(session_id.clone()))?;
+                                let mut response = NewSessionResponse::new(session_id.clone());
+                                if tasks_enabled {
+                                    response = response.meta(Map::from_iter([(
+                                        "sudocode".into(),
+                                        json!({"storageRef": storage_ref}),
+                                    )]));
+                                }
+                                responder.respond(response)?;
                                 let _ = cx_notify.send_notification(
                                     available_commands_notification(&session_id, commands),
                                 );
@@ -2489,6 +2617,7 @@ pub(crate) async fn run_acp_on_transport(
                 let config = config.clone();
                 let subagent_events = Arc::clone(&subagent_events);
                 let subagent_completions = Arc::clone(&subagent_completions);
+                let task_completions = Arc::clone(&task_completions);
                 async move |req: LoadSessionRequest,
                             responder: Responder<LoadSessionResponse>,
                             cx: ConnectionTo<Client>| {
@@ -2515,6 +2644,7 @@ pub(crate) async fn run_acp_on_transport(
                     let sid = req.session_id.to_string();
                     let cwd = req.cwd;
                     let completions_enabled = subagent_completions.load(Ordering::SeqCst);
+                    let tasks_enabled = task_completions.load(Ordering::SeqCst);
                     let subagent_events =
                         subagent_events.load(Ordering::SeqCst) || completions_enabled;
                     cx.spawn(async move {
@@ -2581,7 +2711,10 @@ pub(crate) async fn run_acp_on_transport(
                                         &cwd,
                                         false,
                                     ) {
-                                        Ok(route) => Some(route),
+                                        Ok(route) => {
+                                            route.journal.set_task_protocol(tasks_enabled);
+                                            Some(route)
+                                        }
                                         Err(error) => {
                                             responder
                                                 .respond_with_error(acp_error_to_sdk(&error))?;
@@ -2604,6 +2737,8 @@ pub(crate) async fn run_acp_on_transport(
                                         return Ok(());
                                     }
                                 };
+                                let storage_ref =
+                                    completion.as_ref().map(|d| d.journal.storage_ref());
                                 let subagents = subagent_events.then(|| {
                                     registry.subagents(&session_id).unwrap_or_else(|| {
                                         SessionSubagents::start(
@@ -2626,7 +2761,7 @@ pub(crate) async fn run_acp_on_transport(
                                 if completions_enabled {
                                     response = response.meta(Map::from_iter([(
                                         "sudocode".into(),
-                                        json!({"contextRef":context}),
+                                        json!({"contextRef":context, "storageRef": storage_ref}),
                                     )]));
                                 }
                                 responder.respond(response)?;
@@ -2656,10 +2791,11 @@ pub(crate) async fn run_acp_on_transport(
             {
                 let registry = Arc::clone(&registry);
                 let enabled = Arc::clone(&subagent_completions);
+                let task_enabled = Arc::clone(&task_completions);
                 async move |req: ReplayRequest,
                             responder: Responder<ReplayResponse>,
                             cx: ConnectionTo<Client>| {
-                    if !enabled.load(Ordering::SeqCst) {
+                    if !enabled.load(Ordering::SeqCst) || task_enabled.load(Ordering::SeqCst) {
                         responder.respond_with_error(Error::method_not_found())?;
                         return Ok(());
                     }
@@ -2706,6 +2842,126 @@ pub(crate) async fn run_acp_on_transport(
                             Ok((route, status)) => {
                                 route.bind(sender);
                                 responder.respond(status)?;
+                            }
+                            Err(error) => responder.respond_with_error(acp_error_to_sdk(&error))?,
+                        }
+                        Ok(())
+                    })?;
+                    Ok(())
+                }
+            },
+            on_receive_request!(),
+        )
+        .on_receive_request(
+            {
+                let registry = Arc::clone(&registry);
+                let enabled = Arc::clone(&task_completions);
+                async move |req: TaskReplayRequest,
+                            responder: Responder<TaskResponse>,
+                            cx: ConnectionTo<Client>| {
+                    if !enabled.load(Ordering::SeqCst) {
+                        responder.respond_with_error(Error::method_not_found())?;
+                        return Ok(());
+                    }
+                    let registry = Arc::clone(&registry);
+                    let sender = cx.clone();
+                    cx.spawn(async move {
+                        let result = tokio::task::spawn_blocking(move || {
+                            registry.task_control(
+                                &req.session_id,
+                                &req.cwd,
+                                req.storage_ref.as_deref(),
+                                TaskOperation::Replay(req.after_task_id),
+                            )
+                        })
+                        .await
+                        .unwrap_or_else(|e| Err(AcpError::internal(e.to_string())));
+                        match result {
+                            Ok((route, response)) => {
+                                if let Some(route) = route {
+                                    route.bind(sender);
+                                }
+                                responder.respond(response)?;
+                            }
+                            Err(error) => responder.respond_with_error(acp_error_to_sdk(&error))?,
+                        }
+                        Ok(())
+                    })?;
+                    Ok(())
+                }
+            },
+            on_receive_request!(),
+        )
+        .on_receive_request(
+            {
+                let registry = Arc::clone(&registry);
+                let enabled = Arc::clone(&task_completions);
+                async move |req: TaskSuppressRequest,
+                            responder: Responder<TaskResponse>,
+                            cx: ConnectionTo<Client>| {
+                    if !enabled.load(Ordering::SeqCst) {
+                        responder.respond_with_error(Error::method_not_found())?;
+                        return Ok(());
+                    }
+                    let registry = Arc::clone(&registry);
+                    let sender = cx.clone();
+                    cx.spawn(async move {
+                        let result = tokio::task::spawn_blocking(move || {
+                            registry.task_control(
+                                &req.session_id,
+                                &req.cwd,
+                                req.storage_ref.as_deref(),
+                                TaskOperation::Suppress(req.origin_trace_id),
+                            )
+                        })
+                        .await
+                        .unwrap_or_else(|e| Err(AcpError::internal(e.to_string())));
+                        match result {
+                            Ok((route, response)) => {
+                                if let Some(route) = route {
+                                    route.bind(sender);
+                                }
+                                responder.respond(response)?;
+                            }
+                            Err(error) => responder.respond_with_error(acp_error_to_sdk(&error))?,
+                        }
+                        Ok(())
+                    })?;
+                    Ok(())
+                }
+            },
+            on_receive_request!(),
+        )
+        .on_receive_request(
+            {
+                let registry = Arc::clone(&registry);
+                let enabled = Arc::clone(&task_completions);
+                async move |req: TaskPurgeRequest,
+                            responder: Responder<TaskResponse>,
+                            cx: ConnectionTo<Client>| {
+                    if !enabled.load(Ordering::SeqCst) {
+                        responder.respond_with_error(Error::method_not_found())?;
+                        return Ok(());
+                    }
+                    let registry = Arc::clone(&registry);
+                    let sender = cx.clone();
+                    cx.spawn(async move {
+                        let result = tokio::task::spawn_blocking(move || {
+                            registry.task_control(
+                                &req.session_id,
+                                &req.cwd,
+                                req.storage_ref.as_deref(),
+                                TaskOperation::Purge(req.cleanup_id),
+                            )
+                        })
+                        .await
+                        .unwrap_or_else(|e| Err(AcpError::internal(e.to_string())));
+                        match result {
+                            Ok((route, response)) => {
+                                if let Some(route) = route {
+                                    route.bind(sender);
+                                }
+                                responder.respond(response)?;
                             }
                             Err(error) => responder.respond_with_error(acp_error_to_sdk(&error))?,
                         }

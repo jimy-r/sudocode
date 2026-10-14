@@ -1881,7 +1881,6 @@ async fn acp_stdio_long_history_is_compacted_instead_of_rejected() {
         seeded_bytes > 550_000,
         "seed should be well past the preflight budget, got {seeded_bytes} bytes"
     );
-
     // Release the fixture writer before Process B resumes and compacts.
     drop(session);
 
@@ -3284,7 +3283,11 @@ while True:
 /// Like `spawn_stdio_client` but with `--permission-mode danger-full-access`
 /// so MCP tool calls are not gated behind an interactive permission prompt.
 fn spawn_stdio_client_danger(workspace: &TestWorkspace) -> AcpTestClient {
-    let mut cmd = isolated_command(workspace, Path::new(env!("CARGO_BIN_EXE_scode")));
+    spawn_stdio_client_danger_binary(workspace, Path::new(env!("CARGO_BIN_EXE_scode")))
+}
+
+fn spawn_stdio_client_danger_binary(workspace: &TestWorkspace, binary: &Path) -> AcpTestClient {
+    let mut cmd = isolated_command(workspace, binary);
     cmd.args([
         "--auth",
         "api-key",
@@ -6295,6 +6298,309 @@ async fn acp_completions_sync_and_nested_do_not_auto_publish() {
     }
 }
 
+#[cfg(unix)]
+async fn initialize_task_completions(client: &mut AcpTestClient) {
+    let (_, response) = client.send_request("initialize", json!({"protocolVersion":1,"clientCapabilities":{"_meta":{"sudocode":{"taskCompletions":{"version":1},"subagentCompletions":{"version":1}}}}})).await;
+    assert_eq!(
+        response["result"]["_meta"]["sudocode"]["taskCompletions"],
+        json!({"version":1}),
+        "{response}"
+    );
+    assert!(response["result"]["_meta"]["sudocode"]
+        .get("subagentCompletions")
+        .is_none());
+}
+
+/// Real shell + ACP boundary: durable result, ACK retry, cold query, suppression
+/// and deletion all use one storage identity. The model transport is deterministic.
+#[cfg(unix)]
+#[tokio::test]
+async fn acp_task_completions_terminal_replay_and_purge() {
+    let server = MockAnthropicService::spawn().await.unwrap();
+    let workspace = TestWorkspace::new("task-completions");
+    workspace.create();
+    workspace.write_sudocode_json(&server.base_url());
+    let mut client = spawn_stdio_client_danger(&workspace);
+    initialize_task_completions(&mut client).await;
+    let sid = scenario_session_new(&mut client, &workspace.root).await;
+    let (_, probe) = client
+        .send_request(
+            "_sudocode/task/replay",
+            json!({"sessionId":sid,"cwd":workspace.root}),
+        )
+        .await;
+    let storage = probe["result"]["storageRef"]
+        .as_str()
+        .expect("storage identity")
+        .to_owned();
+    let mut competitor = spawn_stdio_client_danger(&workspace);
+    initialize_task_completions(&mut competitor).await;
+    let (_, busy) = competitor
+        .send_request(
+            "session/load",
+            json!({"sessionId":sid,"cwd":workspace.root,"mcpServers":[]}),
+        )
+        .await;
+    assert!(
+        busy["error"].to_string().contains("session_writer_busy"),
+        "{busy}"
+    );
+    competitor.shutdown().await;
+    let calls = json!([{"id":"background-1","name":"Bash","input":{"command":"while [ ! -f release-task ]; do sleep 0.05; done; printf 'TASK_DONE<&>'; exit 7","run_in_background":true}}]);
+    let (during, parent) = client.send_request("session/prompt", json!({"sessionId":sid,"_meta":{"traceId":"root:1"},"prompt":[{"type":"text","text":format!("{SCENARIO_PREFIX}tool_concurrency TOOL_BATCH:{calls}")}]})).await;
+    assert_eq!(parent["result"]["stopReason"], "end_turn", "{parent}");
+    assert!(during
+        .iter()
+        .all(|v| v["method"] != "_sudocode/task/completed"));
+    fs::write(workspace.root.join("release-task"), "go").unwrap();
+    let (_, first) = client
+        .recv_until(SUBAGENT_EVENTS_WAIT, |v| {
+            v["method"] == "_sudocode/task/completed"
+        })
+        .await
+        .unwrap();
+    assert_eq!(first["params"]["kind"], "terminal", "{first}");
+    assert_eq!(first["params"]["terminal"]["exitCode"], 7);
+    assert_eq!(first["params"]["terminal"]["scope"], "command");
+    assert_eq!(first["params"]["status"], "failed");
+    assert_eq!(first["params"]["originTraceId"], "root:1");
+    assert_eq!(first["params"]["parentToolCallId"], "background-1");
+    assert!(first["params"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("TASK_DONE&lt;&amp;&gt;"));
+    client.send_raw(&json!({"jsonrpc":"2.0","id":first["id"],"error":{"code":-32603,"message":"receipt unavailable"}})).await;
+    let (_, retry) = client
+        .recv_until(SUBAGENT_EVENTS_WAIT, |v| {
+            v["method"] == "_sudocode/task/completed"
+        })
+        .await
+        .unwrap();
+    assert_eq!(retry["params"], first["params"]);
+    // Leave the receipt pending across process exit. Cold replay owns the
+    // journal first; session/load must adopt that writer before engine writes.
+    client.shutdown().await;
+    let mut client = spawn_stdio_client_danger(&workspace);
+    initialize_task_completions(&mut client).await;
+    let (notifications, replay) = client
+        .send_request(
+            "_sudocode/task/replay",
+            json!({"sessionId":sid,"cwd":workspace.root,"storageRef":storage}),
+        )
+        .await;
+    assert_eq!(replay["result"]["pending"], 1, "{replay}");
+    let pending = if let Some(value) = notifications
+        .into_iter()
+        .find(|v| v["method"] == "_sudocode/task/completed")
+    {
+        value
+    } else {
+        client
+            .recv_until(SUBAGENT_EVENTS_WAIT, |v| {
+                v["method"] == "_sudocode/task/completed"
+            })
+            .await
+            .unwrap()
+            .1
+    };
+    assert_eq!(pending["params"], first["params"]);
+    let (_, loaded) = client
+        .send_request(
+            "session/load",
+            json!({"sessionId":sid,"cwd":workspace.root,"mcpServers":[]}),
+        )
+        .await;
+    assert!(
+        loaded.get("error").is_none(),
+        "pending replay must share its writer: {loaded}"
+    );
+    client.send_raw(&json!({"jsonrpc":"2.0","id":pending["id"],"result":{"completionId":pending["params"]["completionId"],"disposition":"stored"}})).await;
+    let (_, suppressed) = client.send_request("_sudocode/task/suppress", json!({"sessionId":sid,"cwd":workspace.root,"storageRef":storage,"originTraceId":"root:1"})).await;
+    assert_eq!(
+        suppressed["result"]["disposition"], "suppressed",
+        "{suppressed}"
+    );
+    let (_, repeated) = client.send_request("_sudocode/task/suppress", json!({"sessionId":sid,"cwd":workspace.root,"storageRef":storage,"originTraceId":"root:1"})).await;
+    assert_eq!(
+        repeated["result"], suppressed["result"],
+        "no-op suppression must keep the committed watermark"
+    );
+    let foreground =
+        json!([{"id":"foreground-1","name":"Bash","input":{"command":"printf FOREGROUND_DONE"}}]);
+    let (events, parent) = client.send_request("session/prompt", json!({"sessionId":sid,"_meta":{"traceId":"root:2"},"prompt":[{"type":"text","text":format!("{SCENARIO_PREFIX}tool_concurrency TOOL_BATCH:{foreground}")}]})).await;
+    assert_eq!(parent["result"]["stopReason"], "end_turn", "{parent}");
+    assert!(events
+        .iter()
+        .all(|v| v["method"] != "_sudocode/task/completed"));
+    client.shutdown().await;
+    let mut client = spawn_stdio_client_danger(&workspace);
+    initialize_task_completions(&mut client).await;
+    let (_, replay) = client
+        .send_request(
+            "_sudocode/task/replay",
+            json!({"sessionId":sid,"cwd":workspace.root,"storageRef":storage}),
+        )
+        .await;
+    assert_eq!(replay["result"]["unresolved"], 0, "{replay}");
+    assert_eq!(
+        replay["result"]["terminalSources"][0]["stdout"],
+        "TASK_DONE<&>"
+    );
+    assert_eq!(replay["result"]["terminalSources"][0]["exit_code"], 7);
+    let (_, rejected) = client.send_request("_sudocode/task/purge", json!({"sessionId":sid,"cwd":workspace.root,"storageRef":"wrong","cleanupId":"delete-1"})).await;
+    assert!(rejected.get("error").is_some());
+    let (_, purged) = client.send_request("_sudocode/task/purge", json!({"sessionId":sid,"cwd":workspace.root,"storageRef":storage,"cleanupId":"delete-1"})).await;
+    assert_eq!(purged["result"]["disposition"], "purged", "{purged}");
+    client.shutdown().await;
+    let mut client = spawn_stdio_client_danger(&workspace);
+    initialize_task_completions(&mut client).await;
+    let (_, duplicate) = client.send_request("_sudocode/task/purge", json!({"sessionId":sid,"cwd":workspace.root,"storageRef":storage,"cleanupId":"delete-1"})).await;
+    assert_eq!(duplicate["result"], purged["result"]);
+    let (_, loaded) = client
+        .send_request(
+            "session/load",
+            json!({"sessionId":sid,"cwd":workspace.root,"mcpServers":[]}),
+        )
+        .await;
+    assert!(
+        loaded.get("error").is_some(),
+        "deleted session must not reopen: {loaded}"
+    );
+    client.shutdown().await;
+    workspace.cleanup();
+}
+
+/// A real child outlives scode: replay preserves uncertainty and never reruns it.
+#[cfg(unix)]
+#[tokio::test]
+async fn acp_task_completions_interrupted_shell_and_encoded_budget() {
+    let server = MockAnthropicService::spawn().await.unwrap();
+    let workspace = TestWorkspace::new("task-interrupted");
+    workspace.create();
+    workspace.write_sudocode_json(&server.base_url());
+    let mut client = spawn_stdio_client_danger(&workspace);
+    initialize_task_completions(&mut client).await;
+    let sid = scenario_session_new(&mut client, &workspace.root).await;
+    let (_, probe) = client
+        .send_request(
+            "_sudocode/task/replay",
+            json!({"sessionId":sid,"cwd":workspace.root}),
+        )
+        .await;
+    let storage = probe["result"]["storageRef"].as_str().unwrap().to_owned();
+    let calls = json!([
+        {"id":"uncertain-tool","name":"Bash","input":{"command":"printf once >> executions; i=0; while [ ! -f release-unknown ] && [ $i -lt 1200 ]; do sleep 0.05; i=$((i+1)); done; printf exited > unknown-exited", "run_in_background":true}},
+        {"id":"large-tool","name":"Bash","input":{"command":"i=0; while [ $i -lt 8000 ]; do printf '&中'; i=$((i+1)); done; printf END", "run_in_background":true}}
+    ]);
+    let (events, parent) = client.send_request("session/prompt", json!({"sessionId":sid,"_meta":{"traceId":"root:1"},"prompt":[{"type":"text","text":format!("{SCENARIO_PREFIX}tool_concurrency TOOL_BATCH:{calls}")}]})).await;
+    assert_eq!(parent["result"]["stopReason"], "end_turn", "{parent}");
+    let completion = if let Some(value) = events
+        .into_iter()
+        .find(|v| v["method"] == "_sudocode/task/completed")
+    {
+        value
+    } else {
+        client
+            .recv_until(SUBAGENT_EVENTS_WAIT, |v| {
+                v["method"] == "_sudocode/task/completed"
+            })
+            .await
+            .unwrap()
+            .1
+    };
+    assert_eq!(completion["params"]["parentToolCallId"], "large-tool");
+    assert!(serde_json::to_vec(&completion["params"]).unwrap().len() <= 65536);
+    assert_eq!(completion["params"]["terminal"]["outputTruncated"], true);
+    assert!(completion["params"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("&amp;中"));
+    client.send_raw(&json!({"jsonrpc":"2.0","id":completion["id"],"result":{"completionId":completion["params"]["completionId"],"disposition":"stored"}})).await;
+    assert_eq!(
+        fs::read_to_string(workspace.root.join("executions")).unwrap(),
+        "once"
+    );
+    let (_, suppressed) = client.send_request("_sudocode/task/suppress", json!({"sessionId":sid,"cwd":workspace.root,"storageRef":storage,"originTraceId":"root:1"})).await;
+    assert_eq!(
+        suppressed["result"]["disposition"], "suppressed",
+        "{suppressed}"
+    );
+    let (_, live) = client
+        .send_request(
+            "_sudocode/task/replay",
+            json!({"sessionId":sid,"cwd":workspace.root,"storageRef":storage}),
+        )
+        .await;
+    assert_eq!(live["result"]["unresolved"], 0, "{live}");
+    assert_eq!(
+        live["result"]["running"], 1,
+        "suppress must leave the live shell running: {live}"
+    );
+    client.shutdown().await;
+    let mut client = spawn_stdio_client_danger(&workspace);
+    initialize_task_completions(&mut client).await;
+    let (_, replay) = client
+        .send_request(
+            "_sudocode/task/replay",
+            json!({"sessionId":sid,"cwd":workspace.root,"storageRef":storage}),
+        )
+        .await;
+    assert_eq!(replay["result"]["executionUnconfirmed"], 1, "{replay}");
+    let (_, suppressed) = client.send_request("_sudocode/task/suppress", json!({"sessionId":sid,"cwd":workspace.root,"storageRef":storage,"originTraceId":"root:1"})).await;
+    assert_eq!(
+        suppressed["result"]["disposition"], "suppressed",
+        "{suppressed}"
+    );
+    let (_, replay) = client
+        .send_request(
+            "_sudocode/task/replay",
+            json!({"sessionId":sid,"cwd":workspace.root,"storageRef":storage}),
+        )
+        .await;
+    assert_eq!(replay["result"]["unresolved"], 0, "{replay}");
+    assert_eq!(
+        replay["result"]["executionUnconfirmed"], 1,
+        "suppression is not termination: {replay}"
+    );
+    fs::write(workspace.root.join("release-unknown"), "go").unwrap();
+    timeout(Duration::from_secs(5), async {
+        while !workspace.root.join("unknown-exited").exists() {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("the original child must exit without being rerun");
+    assert_eq!(
+        fs::read_to_string(workspace.root.join("executions")).unwrap(),
+        "once"
+    );
+    client.shutdown().await;
+
+    // Acquiring a v2 lock does not prove an old v1 callback cannot overwrite it.
+    let journal = find_session_transcript(&workspace.root, &sid).with_extension("completions.json");
+    let mut legacy: Value = serde_json::from_slice(&fs::read(&journal).unwrap()).unwrap();
+    legacy["version"] = json!(1);
+    let bytes = serde_json::to_vec(&legacy).unwrap();
+    fs::write(&journal, &bytes).unwrap();
+    let mut client = spawn_stdio_client_danger(&workspace);
+    initialize_task_completions(&mut client).await;
+    let (_, rejected) = client
+        .send_request(
+            "_sudocode/task/replay",
+            json!({"sessionId":sid,"cwd":workspace.root}),
+        )
+        .await;
+    assert!(
+        rejected["error"]
+            .to_string()
+            .contains("legacy_writer_unconfirmed"),
+        "{rejected}"
+    );
+    assert_eq!(fs::read(&journal).unwrap(), bytes);
+    client.shutdown().await;
+    workspace.cleanup();
+}
+
 /// Competing ACP processes must not retire the live owner or overwrite its
 /// transcript/ACKs. Process death releases native ownership before takeover.
 #[tokio::test]
@@ -6429,5 +6735,223 @@ async fn acp_completions_exclude_live_writer_before_replay_or_load() {
     );
     assert_eq!(fs::read(&journal).unwrap(), bytes);
     reader.shutdown().await;
+    workspace.cleanup();
+}
+
+/// Run explicitly with SCODE_PREVIOUS_BIN pointing to the stage-one build.
+/// Both real executables use the same files; no synthetic format conversion.
+#[cfg(unix)]
+#[tokio::test]
+#[ignore = "requires a separately built stage-one binary in SCODE_PREVIOUS_BIN"]
+async fn acp_completion_upgrade_and_rollback_preserve_delivery() {
+    let previous = PathBuf::from(std::env::var_os("SCODE_PREVIOUS_BIN").expect("stage-one binary"));
+    let server = MockAnthropicService::spawn().await.unwrap();
+    let workspace = subagent_events_workspace("completion-upgrade", &server.base_url());
+    let mut old = spawn_stdio_client_danger_binary(&workspace, &previous);
+    initialize_with_completions(&mut old).await;
+    let sid = scenario_session_new(&mut old, &workspace.root).await;
+    let (_, parent) = old
+        .send_request(
+            "session/prompt",
+            json!({"sessionId":sid,
+        "prompt":[{"type":"text","text":format!("{SCENARIO_PREFIX}subagent_events_background")}],
+        "_meta":{"traceId":"upgrade:1"}}),
+        )
+        .await;
+    assert_eq!(parent["result"]["stopReason"], "end_turn", "{parent}");
+    let (_, first) = old
+        .recv_until(SUBAGENT_EVENTS_WAIT, |v| {
+            v["method"] == "_sudocode/subagent/completed"
+        })
+        .await
+        .unwrap();
+    let transcript = find_session_transcript(&workspace.root, &sid);
+    let path = transcript.with_extension("completions.json");
+    let before: Value = timeout(Duration::from_secs(15), async {
+        loop {
+            let saved: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+            let sources = saved["sources"].as_object().unwrap();
+            if sources.len() == 2 && sources.values().all(|source| source["payload"].is_object()) {
+                break saved;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("both stage-one deliveries frozen before upgrade");
+    old.shutdown().await;
+
+    let mut new = spawn_stdio_client_danger(&workspace);
+    initialize_with_completions(&mut new).await;
+    let (events, replay) = new
+        .send_request(
+            "_sudocode/subagent/replay",
+            json!({"sessionId":sid,"cwd":workspace.root}),
+        )
+        .await;
+    assert_eq!(replay["result"]["pending"], 2, "{replay}");
+    let retry = if let Some(v) = events
+        .into_iter()
+        .find(|v| v["method"] == "_sudocode/subagent/completed")
+    {
+        v
+    } else {
+        new.recv_until(SUBAGENT_EVENTS_WAIT, |v| {
+            v["method"] == "_sudocode/subagent/completed"
+        })
+        .await
+        .unwrap()
+        .1
+    };
+    assert_eq!(retry["params"], first["params"]);
+    let upgraded: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    for field in ["storage_ref", "context", "closed_traces"] {
+        assert_eq!(upgraded[field], before[field], "upgrade changed {field}");
+    }
+    for (id, source) in before["sources"].as_object().unwrap() {
+        for (field, value) in source.as_object().unwrap() {
+            assert_eq!(
+                &upgraded["sources"][id][field], value,
+                "upgrade changed source {id}.{field}"
+            );
+        }
+    }
+    new.send_raw(&json!({"jsonrpc":"2.0","id":retry["id"],"result":{"completionId":retry["params"]["completionId"],"disposition":"stored"}})).await;
+    let (_, second) = new
+        .recv_until(SUBAGENT_EVENTS_WAIT, |v| {
+            v["method"] == "_sudocode/subagent/completed"
+        })
+        .await
+        .unwrap();
+    let expected_second = before["sources"]
+        .as_object()
+        .unwrap()
+        .values()
+        .map(|source| &source["payload"])
+        .find(|payload| payload["completionId"] != first["params"]["completionId"])
+        .unwrap();
+    assert_eq!(&second["params"], expected_second);
+    new.send_raw(&json!({"jsonrpc":"2.0","id":second["id"],"result":{"completionId":second["params"]["completionId"],"disposition":"stored"}})).await;
+    timeout(Duration::from_secs(10), async {
+        loop {
+            let (_, replay) = new
+                .send_request(
+                    "_sudocode/subagent/replay",
+                    json!({"sessionId":sid,"cwd":workspace.root}),
+                )
+                .await;
+            if replay["result"]["pending"] == 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let acknowledged: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    new.shutdown().await;
+
+    let mut old = spawn_stdio_client_danger_binary(&workspace, &previous);
+    initialize_with_completions(&mut old).await;
+    let (_, replay) = old
+        .send_request(
+            "_sudocode/subagent/replay",
+            json!({"sessionId":sid,"cwd":workspace.root}),
+        )
+        .await;
+    assert_eq!(replay["result"]["pending"], 0, "{replay}");
+    assert_eq!(replay["result"]["settled"], 2, "{replay}");
+    let rolled_back: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    for (id, source) in before["sources"].as_object().unwrap() {
+        for field in source.as_object().unwrap().keys() {
+            assert_eq!(
+                rolled_back["sources"][id][field], acknowledged["sources"][id][field],
+                "rollback changed {id}.{field}"
+            );
+        }
+    }
+    assert_eq!(rolled_back["context"], acknowledged["context"]);
+    old.shutdown().await;
+
+    let mut new = spawn_stdio_client_danger(&workspace);
+    initialize_task_completions(&mut new).await;
+    let (_, loaded) = new
+        .send_request(
+            "session/load",
+            json!({"sessionId":sid,"cwd":workspace.root,"mcpServers":[]}),
+        )
+        .await;
+    assert!(loaded.get("result").is_some(), "{loaded}");
+    let calls = json!([{"id":"terminal-upgrade","name":"Bash","input":{"command":"while [ ! -f release-upgrade ]; do sleep 0.05; done; echo TERMINAL_UPGRADE","run_in_background":true}}]);
+    let (_, parent) = new.send_request("session/prompt", json!({"sessionId":sid,"_meta":{"traceId":"upgrade:2"},"prompt":[{"type":"text","text":format!("{SCENARIO_PREFIX}tool_concurrency TOOL_BATCH:{calls}")}]})).await;
+    assert_eq!(parent["result"]["stopReason"], "end_turn", "{parent}");
+    fs::write(workspace.root.join("release-upgrade"), "go").unwrap();
+    new.recv_until(SUBAGENT_EVENTS_WAIT, |v| {
+        v["method"] == "_sudocode/task/completed"
+    })
+    .await
+    .unwrap();
+    new.shutdown().await;
+    let journal_bytes = fs::read(&path).unwrap();
+    let transcript_bytes = fs::read(&transcript).unwrap();
+    // Once terminal records exist, stage one cannot represent them. Refuse
+    // both replay and transcript writes, even without completion negotiation.
+    for negotiated in [true, false] {
+        let mut old = spawn_stdio_client_danger_binary(&workspace, &previous);
+        if negotiated {
+            initialize_with_completions(&mut old).await;
+        } else {
+            scenario_initialize(&mut old).await;
+        }
+        if negotiated {
+            let (_, rejected) = old
+                .send_request(
+                    "_sudocode/subagent/replay",
+                    json!({"sessionId":sid,"cwd":workspace.root}),
+                )
+                .await;
+            assert!(
+                rejected["error"]
+                    .to_string()
+                    .contains("completion_journal_unsupported"),
+                "{rejected}"
+            );
+        }
+        let (_, rejected) = old
+            .send_request(
+                "session/load",
+                json!({"sessionId":sid,"cwd":workspace.root,"mcpServers":[]}),
+            )
+            .await;
+        let rejected = if negotiated {
+            rejected
+        } else {
+            // Unnegotiated load only reads the transcript. Its first attempted
+            // write must still reject the unsupported journal before mutation.
+            assert!(rejected.get("result").is_some(), "{rejected}");
+            old.send_request(
+                "session/prompt",
+                json!({"sessionId":sid,
+                "prompt":[{"type":"text","text":"Do not overwrite newer task state."}]}),
+            )
+            .await
+            .1
+        };
+        assert!(
+            rejected["error"]
+                .to_string()
+                .contains("completion_journal_unsupported"),
+            "{rejected}"
+        );
+        old.shutdown().await;
+        assert!(
+            fs::read(&path).unwrap() == journal_bytes,
+            "rollback changed unsupported journal"
+        );
+        assert!(
+            fs::read(&transcript).unwrap() == transcript_bytes,
+            "rollback changed unsupported transcript"
+        );
+    }
     workspace.cleanup();
 }

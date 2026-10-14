@@ -1824,7 +1824,12 @@ fn execute_tool_with_enforcer(
             run_bash(
                 bash_input,
                 abort_signal,
-                ctx.and_then(|ctx| ctx.background_tasks.as_ref()),
+                ctx.and_then(|ctx| {
+                    ctx.background_tasks
+                        .as_ref()
+                        .map(|tasks| tasks.for_tool(ctx.tool_use_id.as_deref()))
+                })
+                .as_ref(),
             )
         }
         "read_file" => {
@@ -1888,7 +1893,12 @@ fn execute_tool_with_enforcer(
             run_powershell(
                 ps_input,
                 abort_signal,
-                ctx.and_then(|ctx| ctx.background_tasks.as_ref()),
+                ctx.and_then(|ctx| {
+                    ctx.background_tasks
+                        .as_ref()
+                        .map(|tasks| tasks.for_tool(ctx.tool_use_id.as_deref()))
+                })
+                .as_ref(),
             )
         }
         "AskUserQuestion" => {
@@ -1918,6 +1928,11 @@ fn execute_tool_with_enforcer(
         "pid_status" => {
             let input = normalize_pid_input(input);
             if let Some(tasks) = ctx.and_then(|ctx| ctx.background_tasks.as_ref()) {
+                if let Some(id) = input.get("task_id").and_then(Value::as_str) {
+                    if let Some(result) = tasks.durable_terminal(id)? {
+                        return to_pretty_json(result);
+                    }
+                }
                 if let Some(task) = input
                     .get("task_id")
                     .and_then(Value::as_str)
@@ -1935,6 +1950,14 @@ fn execute_tool_with_enforcer(
             let parsed: TaskOutputInput = from_value(&input)?;
             if let Some(tasks) = ctx.and_then(|ctx| ctx.background_tasks.as_ref()) {
                 if let Some(id) = parsed.agent_id.as_deref().or(parsed.task_id.as_deref()) {
+                    if let Some(result) = tasks.durable_terminal(id)? {
+                        if result["retrieval_status"] == "success"
+                            || result["status"] == "execution_unconfirmed"
+                            || tasks.get(id).is_none()
+                        {
+                            return to_pretty_json(result);
+                        }
+                    }
                     if tasks.get(id).is_some_and(|t| {
                         t.kind == runtime::background_tasks::BackgroundTaskKind::Terminal
                     }) {
@@ -1948,6 +1971,9 @@ fn execute_tool_with_enforcer(
                         let task = tasks
                             .wait(id, timeout, abort_signal)
                             .ok_or_else(|| format!("pid not found: {id}"))?;
+                        if let Some(result) = tasks.durable_terminal(id)? {
+                            return to_pretty_json(result);
+                        }
                         return background_shell_result(&task, parsed.block);
                     }
                 }
@@ -9456,6 +9482,7 @@ fn launch_background_powershell(
 ) -> std::io::Result<runtime::BashCommandOutput> {
     let (id, path) = runtime::launch_background_command(
         powershell_command(shell, command),
+        runtime::subagent_completion::ShellKind::Powershell,
         command,
         title,
         tasks,

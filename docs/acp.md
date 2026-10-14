@@ -646,3 +646,76 @@ The agent checks it inside that session's prompt lane before any model work;
 mismatch returns `-32602` with `context_mismatch`. Transcript edits/compaction that
 invalidate the recorded digest cannot be presented as exact recovery. Hosted
 factories do not advertise this extension until they implement its storage contract.
+
+
+## Direct background terminal completions (task extension v1)
+
+Controllers negotiate `initialize._meta.sudocode.taskCompletions: {"version":1}`.
+When both completion extensions are offered, the server selects task completions
+only. This uses the same journal, sender and receipt reduction as sub-agent v1;
+sub-agent IDs, frozen messages, order and receipt hashes remain unchanged.
+Only native storage with session writer exclusion advertises the extension.
+
+`_sudocode/task/completed` is a JSON-RPC request. Sub-agent payloads replace
+`agentId` with `kind: "subagent"` and `taskId`. Terminal payloads are:
+
+```json
+{"sessionId":"session-id","completionId":"64 lowercase SHA-256 hex characters",
+ "kind":"terminal","taskId":"shell-random-id","parentToolCallId":"tool-id",
+ "originTraceId":"run:prompt","status":"failed",
+ "terminal":{"shell":"bash","scope":"command","exitCode":7,"signal":null,
+ "termination":"exit","outputTruncated":false},
+ "message":"<task-notification>...</task-notification>"}
+```
+
+`shell` is `bash` or `powershell`; `termination` is `exit`, `signal` or
+`cancelled`. A terminal source must have been registered before spawn, returned
+an actual background handle and supplied observed exit evidence. A parent turn
+must commit before delivery. Synchronous commands return their ordinary tool
+result and never enqueue a completion. Nested shells do not directly notify the
+top-level parent. Explicit result collection suppresses an unpublished result.
+The ACK contract is the same as sub-agent v1.
+
+The durable terminal snapshot keeps a UTF-8 output tail of at most 24 KiB. The
+entire encoded terminal completion is bounded to 64 KiB, including XML escaping,
+JSON escaping, identity and metadata. Rendering truncates only output text and
+sets `outputTruncated`; frozen payloads and IDs are stable on retry.
+
+All control operations require the original absolute `cwd` and `sessionId`.
+`_sudocode/task/replay {sessionId,cwd}` without `storageRef` is a read-only binding
+probe returning `{sessionId,storageRef,deleted}`. It neither starts a delivery nor
+creates a journal. Use that exact reference with subsequent operations:
+
+- `replay {sessionId,cwd,storageRef,afterTaskId?}` rebinds delivery without loading
+  an engine and returns the common counters and context plus `storageRef`,
+  `running`, `executionUnconfirmed`, `taskSetHash`, `terminalSources` (up to 50)
+  and `nextTaskId`. No PID attachment, process restart or command execution occurs.
+- `suppress {sessionId,cwd,storageRef,originTraceId}` requires a closed trace. Its
+  ACK is `{disposition:"suppressed",originTraceId,storageRef,watermark}`. Repeating
+  a no-op suppression preserves the committed watermark. Suppression closes
+  delivery eligibility, including sources without a result; it does not kill
+  execution or remove unknown execution facts.
+- `purge {sessionId,cwd,storageRef,cleanupId}` requires no active prompt. Its ACK
+  is `{disposition:"purged",cleanupId,storageRef}` after writing a minimal deleted
+  binding. It retires cached results and fences all late writes. It does not
+  remove the transcript, child manifests, project files or original full logs.
+  Native session deletion additionally removes its transcript and offloaded
+  tool results after committing the same tombstone.
+
+Transcript saves, compaction, journal writes, ACKs and deletion share one native
+writer lifetime and serialized write operations. A second process gets
+`session_writer_busy`; a cold delivery reused by `session/load` shares its writer.
+Deleting a result never removes the independent lock file. Deleted sessions
+cannot reopen. A temporary storage error retains the bounded exit snapshot for
+retry; a process loss before that snapshot was saved becomes
+`execution_unconfirmed`, even if its child later exits. Uncertain process creation
+or cancellation also cannot be presented as terminal evidence. Never rerun such
+a command automatically. Recovery covers reconnects and process restart, not
+power-loss durability.
+
+A v1 journal cannot prove that its old, non-locking writer exited. Current code
+rejects it with `legacy_writer_unconfirmed` without changing its bytes. Safe
+in-place v1 conversion and exclusion of old executables require a host-controlled
+maintenance workflow that is not implemented here yet. Rollout onto existing
+v1 stores is therefore blocked; acquiring the new lock alone cannot authorize
+conversion, and deleting the journal is not an upgrade path.
