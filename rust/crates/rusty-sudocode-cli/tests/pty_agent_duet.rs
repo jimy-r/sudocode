@@ -417,6 +417,16 @@ fn run_duet(transport: &Transport, offline: bool) {
         transport.label()
     );
 
+    // Both journeys reuse the signed identity. PtySession::drop kills the
+    // receiver, leaving its remote reader lease alive for 30 seconds — the
+    // next journey's entire delivery budget. Exit through the real REPL path
+    // so it joins the pollers and releases the seat before this fixture ends.
+    receiver.send("/exit\r").expect("exit receiver normally");
+    assert_eq!(
+        receiver.expect_eof().expect("receiver released its reader"),
+        0
+    );
+
     eprintln!(
         "[{}] {expected_from} -> {RECEIVER}, surfaced in the receiver's REPL [{}]",
         transport.label(),
