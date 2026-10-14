@@ -1022,8 +1022,10 @@ pub(crate) fn record_turn_usage(engine: &SessionEngine, complete: &TurnComplete)
         turn.output_tokens,
         turn.cache_creation_input_tokens,
         turn.cache_read_input_tokens,
-        turn.cost_units,
-        turn.cost_currency.map(runtime::UsageCostCurrency::as_str),
+        engine_core::UsageCost {
+            units: turn.cost_units,
+            currency: turn.cost_currency.map(runtime::UsageCostCurrency::as_str),
+        },
     );
     let cumulative = complete.session_usage;
     tracer.record_usage_with_cost(
@@ -1032,9 +1034,11 @@ pub(crate) fn record_turn_usage(engine: &SessionEngine, complete: &TurnComplete)
         cumulative.output_tokens,
         cumulative.cache_creation_input_tokens,
         cumulative.cache_read_input_tokens,
-        cumulative.cost_units,
-        cumulative
-            .cost_currency
-            .map(runtime::UsageCostCurrency::as_str),
+        engine_core::UsageCost {
+            units: cumulative.cost_units,
+            currency: cumulative
+                .cost_currency
+                .map(runtime::UsageCostCurrency::as_str),
+        },
     );
 }

@@ -160,3 +160,25 @@ fn multiple_events_in_sequence() {
 
     let _ = std::fs::remove_file(path);
 }
+
+#[test]
+fn structured_log_contract_preserves_event_fields() {
+    let cases: Vec<serde_json::Value> =
+        serde_json::from_str(include_str!("log-contract.json")).unwrap();
+    let path = temp_log_path("contract");
+    let sink = SudoclawLogSink::with_path(&path).unwrap();
+    for case in &cases {
+        sink.record(serde_json::from_value(case["input"].clone()).unwrap());
+    }
+    drop(sink);
+    let contents = std::fs::read_to_string(&path).unwrap();
+    std::fs::remove_file(path).unwrap();
+    let lines: Vec<_> = contents.lines().collect();
+    assert_eq!(lines.len(), cases.len());
+    for (line, case) in lines.into_iter().zip(cases) {
+        let mut entry: serde_json::Value = serde_json::from_str(line).unwrap();
+        let timestamp = entry.as_object_mut().unwrap().remove("timestamp").unwrap();
+        chrono::DateTime::parse_from_rfc3339(timestamp.as_str().unwrap()).unwrap();
+        assert_eq!(entry, case["expected"]);
+    }
+}

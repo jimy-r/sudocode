@@ -89,6 +89,8 @@ pub use session::{
 // along via `engine_events` (which re-exports them from `runtime`).
 pub use engine_events;
 pub use engine_events::{EngineCommand, EngineEvent, EngineState, RequestId, TurnComplete};
+// Cost fields accepted by the session tracer exposed through EngineApiClient.
+pub use telemetry::UsageCost;
 
 // --- Config / provider / error surface (the renderer's `api::` SSOT) ---------
 //

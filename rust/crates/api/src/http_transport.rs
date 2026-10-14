@@ -309,12 +309,14 @@ impl HttpTransport {
 
                             if let Some(tracer) = &self.session_tracer {
                                 tracer.record_http_request_succeeded(
-                                    &request_id,
-                                    attempts,
-                                    "POST",
-                                    &path,
+                                    telemetry::HttpRequestAttempt {
+                                        request_id: &request_id,
+                                        attempt: attempts,
+                                        method: "POST",
+                                        path: &path,
+                                        start_timestamp_ms,
+                                    },
                                     status,
-                                    start_timestamp_ms,
                                     request_id_from_headers(response.headers()),
                                     Map::new(),
                                 );
@@ -415,13 +417,15 @@ impl HttpTransport {
     ) {
         if let Some(tracer) = &self.session_tracer {
             tracer.record_http_request_failed(
-                request_id,
-                attempt,
-                "POST",
-                path,
+                telemetry::HttpRequestAttempt {
+                    request_id,
+                    attempt,
+                    method: "POST",
+                    path,
+                    start_timestamp_ms,
+                },
                 error.to_string(),
                 error.is_retryable(),
-                start_timestamp_ms,
                 Map::new(),
             );
         }

@@ -1304,8 +1304,10 @@ impl MessageStream {
                 usage.output_tokens,
                 usage.cache_creation_input_tokens,
                 usage.cache_read_input_tokens,
-                usage.cost_units,
-                usage.cost_currency.as_deref(),
+                telemetry::UsageCost {
+                    units: usage.cost_units,
+                    currency: usage.cost_currency.as_deref(),
+                },
             );
         }
         self.usage_recorded = true;
