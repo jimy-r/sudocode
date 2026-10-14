@@ -713,9 +713,9 @@ or cancellation also cannot be presented as terminal evidence. Never rerun such
 a command automatically. Recovery covers reconnects and process restart, not
 power-loss durability.
 
-A v1 journal cannot prove that its old, non-locking writer exited. Current code
-rejects it with `legacy_writer_unconfirmed` without changing its bytes. Safe
-in-place v1 conversion and exclusion of old executables require a host-controlled
-maintenance workflow that is not implemented here yet. Rollout onto existing
-v1 stores is therefore blocked; acquiring the new lock alone cannot authorize
-conversion, and deleting the journal is not an upgrade path.
+The first supported on-disk journal format is v2, introduced together with
+shared writer ownership in the sub-agent completion change. Both stages use
+that same format and writer. The earlier, non-locking v1 format existed only in
+development/test builds; it is rejected with `legacy_writer_unconfirmed` and
+its original bytes are preserved. Automatic conversion/deletion is not an
+upgrade path, and no production v1 migration workflow is required.

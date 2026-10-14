@@ -844,15 +844,17 @@ impl BackgroundShell {
         let mut output_truncated = false;
         let mut kill_confirmed = false;
         loop {
-            let child = self.child.as_mut().expect("live child");
             let cancelling = abort.is_aborted();
             let result = if cancelling {
-                let killed = child.kill().is_ok();
-                let result = child.wait().map(Some);
-                kill_confirmed = killed && process_group_gone(child.id());
-                result
+                // Consume ownership so error cleanup cannot signal this group
+                // again after the confirmation deadline (its PID may be reused).
+                let mut child = self.child.take().expect("live child");
+                terminate_background_group(&mut child).map(|(status, confirmed)| {
+                    kill_confirmed = confirmed;
+                    Some(status)
+                })
             } else {
-                child.inner().try_wait()
+                self.child.as_mut().expect("live child").inner().try_wait()
             };
             let size = output.metadata().map_or(last_size, |m| m.len());
             if size != last_size {
@@ -962,8 +964,7 @@ impl Drop for BackgroundShell {
             if let Some(journal) = &self.journal {
                 let _ = journal.terminal_unconfirmed(&self.id);
             }
-            let _ = child.kill();
-            let _ = child.wait();
+            let _ = terminate_background_group(child);
             self.tasks.update(&self.id, |task| {
                 if task.status.is_active() {
                     task.status =
@@ -972,6 +973,38 @@ impl Drop for BackgroundShell {
                 }
             });
         }
+    }
+}
+
+fn terminate_background_group(
+    child: &mut command_group::GroupChild,
+) -> io::Result<(std::process::ExitStatus, bool)> {
+    let id = child.id();
+    // Signal only once. Neither a successful kill nor reaping the leader proves
+    // the descendants have gone; orphan reaping can lag behind leader exit.
+    let _ = child.kill();
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let mut exit = None;
+    loop {
+        if exit.is_none() {
+            exit = child.inner().try_wait()?;
+        }
+        if let Some(status) = exit {
+            if process_group_gone(id) {
+                return Ok((status, true));
+            }
+            // command-group cannot expose Job emptiness on Windows. Waiting
+            // longer does not turn leader exit into that missing proof.
+            if !cfg!(unix) || std::time::Instant::now() >= deadline {
+                return Ok((status, false));
+            }
+        } else if std::time::Instant::now() >= deadline {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "Background process termination could not be confirmed",
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(20));
     }
 }
 
