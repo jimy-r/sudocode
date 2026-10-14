@@ -121,6 +121,7 @@ fn cohost_waits_for_permission_cancels_and_runs_the_next_turn() {
         let (approval, _) = until(&mailbox, |message| {
             message["method"] == "session/request_permission"
         });
+        assert_eq!(approval["params"]["toolCall"]["title"], "write_file");
         assert!(
             fs.read_to_string("generated/output.txt").is_err(),
             "tool must wait for approval"

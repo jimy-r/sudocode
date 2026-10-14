@@ -1955,6 +1955,7 @@ fn build_acp_permission_request(
     let tool_call = ToolCallUpdate::new(
         format!("perm-{}", uuid_v4()),
         ToolCallUpdateFields::new()
+            .title(request.tool_name.clone())
             .status(ToolCallStatus::InProgress)
             .raw_input(serde_json::Value::String(request.input.clone())),
     );
