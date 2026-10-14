@@ -122,6 +122,11 @@ const MEMORY_SEGMENT: &str = "/memory";
 /// Every method mirrors a common `std::fs` operation. Implementations must be
 /// thread-safe so a single backend can be shared across the runtime.
 pub trait FsBackend: Send + Sync + 'static {
+    /// True only for locks that exclude a previous writer until it exits.
+    /// Expiring advisory leases do not meet the completion-journal contract.
+    fn fenced_locks(&self) -> bool {
+        false
+    }
     /// Try an atomic exclusive claim. Unsupported backends must fail explicitly.
     fn try_lock(&self, _path: &str, _ttl_ms: u64) -> io::Result<Option<Arc<dyn FsLock>>> {
         Err(io::Error::new(
@@ -449,6 +454,9 @@ fn lexical_join(root: &str, path: &str) -> io::Result<String> {
 
 // Blanket impl: Arc<dyn FsBackend> delegates to the inner backend.
 impl FsBackend for Arc<dyn FsBackend> {
+    fn fenced_locks(&self) -> bool {
+        (**self).fenced_locks()
+    }
     fn try_lock(&self, path: &str, ttl_ms: u64) -> io::Result<Option<Arc<dyn FsLock>>> {
         (**self).try_lock(path, ttl_ms)
     }
@@ -607,6 +615,9 @@ fn platform_link(alias: &str, target: &str) -> io::Result<()> {
 }
 
 impl FsBackend for StdFsBackend {
+    fn fenced_locks(&self) -> bool {
+        true
+    }
     fn tail_read(
         &self,
         path: &str,

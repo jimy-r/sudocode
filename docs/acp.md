@@ -565,6 +565,20 @@ keys under the update's own `_meta.sudocode` tell them apart:
 
 ## Durable direct sub-agent completions (extension v1)
 
+The on-disk journal uses version 2 from its first supported release. Transcript
+mutations and journal registration, replay and ACKs share one native storage
+writer. A competing ACP process receives `session_writer_busy` without changing
+either file. Replay may retire an interrupted turn only after the previous
+process has released ownership. A cold replay reused by `session/load` shares
+that writer rather than acquiring a competing one. Backends with only expiring,
+unfenced leases cannot advertise this extension.
+
+Version 1 journals came only from unreleased development builds. They remain
+unchanged and return `legacy_writer_unconfirmed`: acquiring a new lock cannot
+prove that a non-locking old executable has stopped. Automatic conversion or
+deletion is not supported. Protocol negotiation remains extension version 1;
+it is independent of the journal format.
+
 A controller opts in on each connection with
 `initialize._meta.sudocode.subagentCompletions: {"version":1}`. The server
 advertises the same version only on runtimes that implement the journal and

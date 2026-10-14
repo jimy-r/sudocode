@@ -1910,6 +1910,9 @@ async fn acp_stdio_long_history_is_compacted_instead_of_rejected() {
         "seed should be well past the preflight budget, got {seeded_bytes} bytes"
     );
 
+    // Release the fixture writer before Process B resumes and compacts.
+    drop(session);
+
     // --- Process B: load the session and prompt once.
     let mut client = spawn_stdio_client(&workspace);
     scenario_initialize(&mut client).await;
@@ -6324,4 +6327,141 @@ async fn acp_completions_sync_and_nested_do_not_auto_publish() {
         client.shutdown().await;
         workspace.cleanup();
     }
+}
+
+/// Competing ACP processes must not retire the live owner or overwrite its
+/// transcript/ACKs. Process death releases native ownership before takeover.
+#[tokio::test]
+async fn acp_completions_exclude_live_writer_before_replay_or_load() {
+    let server = MockAnthropicService::spawn().await.unwrap();
+    let workspace = TestWorkspace::new("completion-writer");
+    workspace.create();
+    workspace.write_sudocode_json(&server.base_url());
+    let mut owner = spawn_stdio_client_danger(&workspace);
+    initialize_with_completions(&mut owner).await;
+    let sid = scenario_session_new(&mut owner, &workspace.root).await;
+    owner.send_request_no_wait("session/prompt", json!({
+        "sessionId":sid, "_meta":{"traceId":"live-owner"},
+        "prompt":[{"type":"text","text":format!("{SCENARIO_PREFIX}ask_user_question_roundtrip")}]
+    })).await;
+    owner
+        .recv_until(Duration::from_secs(30), |m| {
+            is_server_request(m, "_scode/ask_user_question")
+        })
+        .await
+        .unwrap();
+    let transcript = find_session_transcript(&workspace.root, &sid);
+    let journal = transcript.with_extension("completions.json");
+    // The question can reach ACP before the provider's final usage update is
+    // persisted. Wait for that durable boundary while the question keeps the
+    // turn open; otherwise the owner itself can change our byte snapshot.
+    timeout(Duration::from_secs(10), async {
+        loop {
+            let saved = fs::read_to_string(&transcript).unwrap();
+            if saved.lines().any(|line| {
+                serde_json::from_str::<Value>(line).is_ok_and(|record| {
+                    record["type"] == "assistant_update"
+                        && record["message"]["usage"]["output_tokens"]
+                            .as_u64()
+                            .is_some_and(|tokens| tokens > 0)
+                })
+            }) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("owner persisted the final provider response before waiting for the user");
+    let before_transcript = fs::read(&transcript).unwrap();
+    let before_journal = fs::read(&journal).unwrap();
+    let state: Value = serde_json::from_slice(&before_journal).unwrap();
+    assert_eq!(state["active_trace"], "live-owner");
+    assert_eq!(state["version"], 2);
+
+    let mut competitor = spawn_stdio_client_danger(&workspace);
+    initialize_with_completions(&mut competitor).await;
+    for method in ["_sudocode/subagent/replay", "session/load"] {
+        let mut params = json!({"sessionId":sid, "cwd":workspace.root});
+        if method == "session/load" {
+            params["mcpServers"] = json!([]);
+        }
+        let (_, response) = competitor.send_request(method, params).await;
+        assert!(
+            response["error"]
+                .to_string()
+                .contains("session_writer_busy"),
+            "{response}"
+        );
+        assert!(
+            fs::read(&journal).unwrap() == before_journal,
+            "competing {method} changed journal"
+        );
+        assert!(
+            fs::read(&transcript).unwrap() == before_transcript,
+            "competing {method} changed transcript"
+        );
+    }
+    // SIGKILL + wait is actual owner exit, not a timeout-based assumption.
+    owner.shutdown().await;
+    let (_, replay) = competitor
+        .send_request(
+            "_sudocode/subagent/replay",
+            json!({
+                "sessionId":sid, "cwd":workspace.root
+            }),
+        )
+        .await;
+    assert!(replay.get("result").is_some(), "{replay}");
+    assert!(
+        fs::read(&transcript).unwrap() == before_transcript,
+        "takeover changed transcript"
+    );
+    let state: Value = serde_json::from_slice(&fs::read(&journal).unwrap()).unwrap();
+    assert!(state["active_trace"].is_null());
+    let (_, loaded) = competitor
+        .send_request(
+            "session/load",
+            json!({
+                "sessionId":sid, "cwd":workspace.root, "mcpServers":[]
+            }),
+        )
+        .await;
+    assert!(loaded.get("result").is_some(), "{loaded}");
+    let (_, continued) = competitor
+        .send_request(
+            "session/prompt",
+            json!({
+                "sessionId":sid, "_meta":{"traceId":"new-owner"},
+                "prompt":[{"type":"text","text":format!("{SCENARIO_PREFIX}streaming_text")}]
+            }),
+        )
+        .await;
+    assert_eq!(continued["result"]["stopReason"], "end_turn", "{continued}");
+    competitor.shutdown().await;
+
+    // Unreleased, non-locking v1 records require explicit offline handling.
+    let mut legacy: Value = serde_json::from_slice(&fs::read(&journal).unwrap()).unwrap();
+    legacy["version"] = json!(1);
+    let bytes = serde_json::to_vec(&legacy).unwrap();
+    fs::write(&journal, &bytes).unwrap();
+    let mut reader = spawn_stdio_client_danger(&workspace);
+    initialize_with_completions(&mut reader).await;
+    let (_, response) = reader
+        .send_request(
+            "_sudocode/subagent/replay",
+            json!({
+                "sessionId":sid, "cwd":workspace.root
+            }),
+        )
+        .await;
+    assert!(
+        response["error"]
+            .to_string()
+            .contains("legacy_writer_unconfirmed"),
+        "{response}"
+    );
+    assert_eq!(fs::read(&journal).unwrap(), bytes);
+    reader.shutdown().await;
+    workspace.cleanup();
 }

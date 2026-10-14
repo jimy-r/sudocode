@@ -402,6 +402,7 @@ pub(crate) fn build_new_session(
 /// lease + scope.
 pub(crate) fn open_loaded_session(
     config: &SdkAcpConfig,
+    registry: &SessionRegistry,
     session_id: &str,
     cwd: PathBuf,
     mcp_servers: BTreeMap<String, runtime::ScopedMcpServerConfig>,
@@ -411,6 +412,7 @@ pub(crate) fn open_loaded_session(
     let cwd = canonical_session_cwd(&cwd).map_err(crate::AcpError::invalid_params)?;
     let (handle, session) = load_session_reference(session_id)
         .map_err(|e| crate::AcpError::internal(format!("failed to load session: {e}")))?;
+    registry.attach_completion_writer(&session, &cwd)?;
     let system_prompt = build_acp_system_prompt(&cwd, &prompt_overrides, memory)
         .map_err(crate::AcpError::internal)?;
     let engine = SessionEngine::open_persisted(

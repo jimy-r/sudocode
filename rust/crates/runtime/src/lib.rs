@@ -67,6 +67,7 @@ mod remote;
 pub mod sandbox;
 mod session;
 pub mod session_control;
+pub mod session_writer;
 pub mod test_support;
 pub mod verification_watcher;
 pub use session_control::SessionStore;

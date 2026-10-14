@@ -1693,16 +1693,35 @@ impl SessionRegistry {
             .get(&session.session_id)
             .and_then(std::sync::Weak::upgrade)
         {
-            if !route.journal.matches_identity(session, cwd) {
-                return Err(AcpError::invalid_params(
-                    "completion journal identity mismatch",
-                ));
-            }
+            route
+                .journal
+                .attach_session(session, cwd)
+                .map_err(AcpError::internal)?;
             return Ok(route);
         }
         let route = Delivery::open(session, cwd, create).map_err(AcpError::internal)?;
         routes.insert(session.session_id.clone(), Arc::downgrade(&route));
         Ok(route)
+    }
+
+    pub(crate) fn attach_completion_writer(
+        &self,
+        session: &runtime::Session,
+        cwd: &std::path::Path,
+    ) -> Result<(), AcpError> {
+        if let Some(route) = self
+            .completion_routes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&session.session_id)
+            .and_then(std::sync::Weak::upgrade)
+        {
+            route
+                .journal
+                .attach_session(session, cwd)
+                .map_err(AcpError::internal)?;
+        }
+        Ok(())
     }
 
     pub fn cancel_all(&self) {
@@ -2555,6 +2574,7 @@ pub(crate) async fn run_acp_on_transport(
                         } else {
                             None
                         };
+                        let load_registry = Arc::clone(&registry);
                         let result = tokio::task::spawn_blocking(move || {
                             if let Some((engine, live_cwd)) = live {
                                 let cwd = engine_host::session::canonical_session_cwd(&cwd)
@@ -2585,6 +2605,7 @@ pub(crate) async fn run_acp_on_transport(
                             let mcp_servers = acp_mcp_servers_to_scoped(&req.mcp_servers, &cwd);
                             let (engine, cwd) = session_ops::open_loaded_session(
                                 &config,
+                                &load_registry,
                                 &sid,
                                 cwd,
                                 mcp_servers,

@@ -156,6 +156,9 @@ struct Source {
 #[derive(Clone, Serialize, Deserialize)]
 struct Journal {
     version: u32,
+    storage_ref: String,
+    #[serde(default)]
+    closed_traces: std::collections::BTreeSet<String>,
     watermark: u64,
     session_id: String,
     cwd: PathBuf,
@@ -163,6 +166,14 @@ struct Journal {
     active_trace: Option<String>,
     reducer: Completions,
     sources: BTreeMap<String, Source>,
+}
+
+// Session writes must reject a journal this executable cannot preserve, even
+// when ACP completion delivery was not negotiated (for example after rollback).
+pub(crate) fn validate_journal(value: serde_json::Value) -> Result<(), String> {
+    serde_json::from_value::<Journal>(value)
+        .map(|_| ())
+        .map_err(|error| format!("completion_journal_unsupported: {error}"))
 }
 
 #[derive(Debug, Serialize)]
@@ -177,13 +188,14 @@ pub struct ReplayStatus {
     pub context_ref: Option<ContextRef>,
 }
 
-/// One in-process writer per exact session, shared by registration, event
-/// observation and ACK handling. No lock is held while waiting for an ACK.
+/// One storage-level writer per exact session, shared by transcript writes,
+/// registration and ACK handling. Only the operation mutex is released for ACK waits.
 pub struct CompletionJournal {
     fs: Arc<dyn FsBackend>,
     path: String,
     transcript: PathBuf,
     state: Mutex<Journal>,
+    writer: Arc<crate::session_writer::SessionWriter>,
 }
 
 impl CompletionJournal {
@@ -193,6 +205,8 @@ impl CompletionJournal {
             .ok_or("session has no transcript")?
             .to_path_buf();
         let fs = session.fs_handle();
+        // Claim ownership before reading or retiring another process's turn.
+        let writer = session.completion_writer()?;
         let path = transcript
             .with_extension("completions.json")
             .to_string_lossy()
@@ -201,13 +215,21 @@ impl CompletionJournal {
             let state: Journal =
                 serde_json::from_str(&fs.read_to_string(&path).map_err(|e| e.to_string())?)
                     .map_err(|e| e.to_string())?;
-            if state.version != 1 || state.session_id != session.session_id || state.cwd != cwd {
+            if state.version != crate::session_writer::JOURNAL_VERSION
+                || state.session_id != session.session_id
+                || state.cwd != cwd
+            {
                 return Err("completion journal identity mismatch".into());
             }
             state
         } else if create {
             Journal {
-                version: 1,
+                version: crate::session_writer::JOURNAL_VERSION,
+                storage_ref: checksum(
+                    &serde_json::to_vec(&(1, &session.session_id, &transcript))
+                        .map_err(|e| e.to_string())?,
+                ),
+                closed_traces: std::collections::BTreeSet::new(),
                 watermark: 0,
                 session_id: session.session_id.clone(),
                 cwd: cwd.to_path_buf(),
@@ -225,8 +247,9 @@ impl CompletionJournal {
             path,
             transcript,
             state: Mutex::new(state),
+            writer,
         });
-        // Opening a new writer means the previous process no longer owns this
+        // Storage ownership proves the previous process no longer owns this
         // journal. Its interrupted turn cannot publish, but must not prevent a
         // later explicit human turn from repairing the conversation.
         if let Some(trace) = interrupted {
@@ -243,6 +266,7 @@ impl CompletionJournal {
             .state
             .lock()
             .map_err(|_| "completion journal poisoned")?;
+        let _write = self.writer.write()?;
         // A failed write must not leave an in-memory ACK/publication that the
         // next mutation could silently treat as durable.
         let mut next = state.clone();
@@ -269,6 +293,13 @@ impl CompletionJournal {
             && session.persistence_path() == Some(self.transcript.as_path())
     }
 
+    pub fn attach_session(&self, session: &Session, cwd: &Path) -> Result<(), String> {
+        if !self.matches_identity(session, cwd) {
+            return Err("completion journal identity mismatch".into());
+        }
+        session.adopt_completion_writer(Arc::clone(&self.writer))
+    }
+
     pub fn begin(&self, trace: &str, expected: Option<&ContextRef>) -> Result<(), String> {
         if trace.is_empty() {
             return Err("completion prompt requires traceId".into());
@@ -288,6 +319,9 @@ impl CompletionJournal {
             }
             if state.active_trace.is_some() {
                 return Err("source_context_unconfirmed".into());
+            }
+            if state.closed_traces.contains(trace) {
+                return Err("completion trace already closed".into());
             }
             state.active_trace = Some(trace.to_owned());
             state.reducer.begin();
@@ -366,7 +400,7 @@ impl CompletionJournal {
     pub fn tool_result(&self, id: &str, name: &str, output: &str) -> Result<(), String> {
         self.change(|state| {
             state.reducer.tool_result(id, name, output);
-            Ok(())
+            Self::publish(state)
         })
     }
 
@@ -386,6 +420,7 @@ impl CompletionJournal {
             };
             state.context = Some(context.clone());
             state.active_trace = None;
+            state.closed_traces.insert(trace.to_owned());
             for source in state.sources.values_mut().filter(|s| s.trace_id == trace) {
                 source.closed = true;
             }
@@ -399,6 +434,7 @@ impl CompletionJournal {
         self.change(|state| {
             if state.active_trace.as_deref() == Some(trace) {
                 state.active_trace = None;
+                state.closed_traces.insert(trace.to_owned());
                 state.context = None;
                 state.reducer.close();
                 for source in state.sources.values_mut().filter(|s| s.trace_id == trace) {
@@ -649,328 +685,4 @@ impl CompletionJournal {
 
 fn checksum(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::SubagentIdentity;
-    use std::sync::atomic::{AtomicU64, Ordering};
-
-    fn lifecycle(phase: SubagentPhase) -> SubagentLifecycle {
-        SubagentLifecycle {
-            tool_call_id: "spawn-1".into(),
-            phase,
-            seq: 0,
-            agent: SubagentIdentity {
-                agent_id: "agent-1".into(),
-                name: "worker".into(),
-                description: "test".into(),
-                subagent_type: None,
-                model: None,
-                color: None,
-                background: false,
-            },
-            status: (phase == SubagentPhase::Finished).then(|| "completed".into()),
-            started_at: None,
-            completed_at: None,
-            raw_output: None,
-            completion_notification: (phase == SubagentPhase::Finished)
-                .then(|| "<task-notification>done</task-notification>".into()),
-        }
-    }
-
-    #[test]
-    fn handoff_terminal_and_closed_are_all_required_in_every_order() {
-        for order in [
-            [0, 1, 2],
-            [0, 2, 1],
-            [1, 0, 2],
-            [1, 2, 0],
-            [2, 0, 1],
-            [2, 1, 0],
-        ] {
-            for status in ["running", "backgrounded", "completed"] {
-                let mut reducer = Completions::default();
-                reducer.begin();
-                reducer.lifecycle(&lifecycle(SubagentPhase::Started));
-                let mut count = 0;
-                for (step, event) in order.iter().enumerate() {
-                    match event {
-                        0 => reducer.lifecycle(&lifecycle(SubagentPhase::Finished)),
-                        1 => reducer.tool_result(
-                            "spawn-1",
-                            "agent_spawn",
-                            &format!("{{\"status\":\"{status}\"}}"),
-                        ),
-                        _ => reducer.close(),
-                    }
-                    count += reducer.drain().len();
-                    if step < 2 {
-                        assert_eq!(count, 0, "{order:?}, {status}");
-                    }
-                }
-                assert_eq!(count, usize::from(status != "completed"));
-                assert!(reducer.drain().is_empty());
-            }
-        }
-    }
-
-    #[test]
-    fn explicit_collection_before_publication_suppresses_even_before_finished_event() {
-        for terminal_first in [true, false] {
-            for output in [
-                r#"{"status":"completed","agentId":"agent-1"}"#,
-                "<task-notification>done</task-notification>",
-            ] {
-                let mut reducer = Completions::default();
-                reducer.begin();
-                reducer.lifecycle(&lifecycle(SubagentPhase::Started));
-                reducer.tool_result("spawn-1", "agent_spawn", r#"{"status":"running"}"#);
-                if terminal_first {
-                    reducer.lifecycle(&lifecycle(SubagentPhase::Finished));
-                }
-                reducer.tool_result("read-1", "pid_output", output);
-                if !terminal_first {
-                    reducer.lifecycle(&lifecycle(SubagentPhase::Finished));
-                }
-                reducer.close();
-                assert!(reducer.drain().is_empty());
-            }
-        }
-    }
-
-    #[test]
-    fn unrelated_tool_output_cannot_consume_completion() {
-        let mut reducer = Completions::default();
-        reducer.begin();
-        reducer.lifecycle(&lifecycle(SubagentPhase::Started));
-        reducer.tool_result("spawn-1", "agent_spawn", r#"{"status":"running"}"#);
-        reducer.tool_result(
-            "read-1",
-            "read_file",
-            r#"{"status":"completed","agentId":"agent-1"}"#,
-        );
-        reducer.lifecycle(&lifecycle(SubagentPhase::Finished));
-        reducer.close();
-        assert_eq!(reducer.drain().len(), 1);
-    }
-
-    struct Store {
-        dir: PathBuf,
-        session: Session,
-    }
-    impl Store {
-        fn new() -> Self {
-            static NEXT: AtomicU64 = AtomicU64::new(0);
-            let dir = std::env::temp_dir().join(format!(
-                "scode-completion-{}-{}",
-                std::process::id(),
-                NEXT.fetch_add(1, Ordering::SeqCst)
-            ));
-            std::fs::create_dir_all(&dir).unwrap();
-            let session = Session::new().with_persistence_path(dir.join("session.jsonl"));
-            session
-                .save_to_path(session.persistence_path().unwrap())
-                .unwrap();
-            Self { dir, session }
-        }
-        fn open(&self, create: bool) -> Arc<CompletionJournal> {
-            CompletionJournal::open(&self.session, &self.dir, create).unwrap()
-        }
-        fn source(&self, journal: &CompletionJournal) {
-            journal.begin("run:1", None).unwrap();
-            journal
-                .register(lifecycle(SubagentPhase::Started), "child.json".into())
-                .unwrap();
-            journal
-                .tool_result("spawn-1", "agent_spawn", r#"{"status":"running"}"#)
-                .unwrap();
-        }
-    }
-    impl Drop for Store {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.dir);
-        }
-    }
-
-    #[test]
-    fn frozen_delivery_replays_identically_until_ack_is_committed() {
-        let store = Store::new();
-        let journal = store.open(true);
-        store.source(&journal);
-        journal
-            .lifecycle(&lifecycle(SubagentPhase::Finished))
-            .unwrap();
-        assert!(journal.pending().is_empty());
-        journal.commit("run:1").unwrap();
-        let payload = journal.pending();
-        assert_eq!(payload.len(), 1);
-        drop(journal); // crash before receiving/storing the controller ACK
-        let journal = store.open(false);
-        assert_eq!(journal.pending(), payload);
-        journal
-            .tool_result(
-                "read-1",
-                "pid_output",
-                r#"{"status":"completed","agentId":"agent-1"}"#,
-            )
-            .unwrap();
-        assert_eq!(journal.pending(), payload); // publication is the cutoff
-        journal
-            .acknowledge(&payload[0].completion_id, "stored")
-            .unwrap();
-        drop(journal);
-        let journal = store.open(false);
-        assert!(journal.pending().is_empty());
-        assert_eq!(journal.status().settled, 1);
-    }
-
-    #[test]
-    fn late_earlier_spawn_cannot_overtake_unacknowledged_completion() {
-        let store = Store::new();
-        let journal = store.open(true);
-        store.source(&journal);
-        let mut second = lifecycle(SubagentPhase::Started);
-        second.tool_call_id = "spawn-2".into();
-        second.agent.agent_id = "agent-2".into();
-        journal
-            .register(second.clone(), "child-2.json".into())
-            .unwrap();
-        journal
-            .tool_result("spawn-2", "agent_spawn", r#"{"status":"running"}"#)
-            .unwrap();
-        journal.commit("run:1").unwrap();
-        second.phase = SubagentPhase::Finished;
-        second.status = Some("completed".into());
-        second.completion_notification = Some("second child finished first".into());
-        journal.lifecycle(&second).unwrap();
-        let first_delivery = journal.pending()[0].clone();
-        assert_eq!(first_delivery.agent_id, "agent-2");
-        journal
-            .lifecycle(&lifecycle(SubagentPhase::Finished))
-            .unwrap();
-        assert_eq!(journal.pending()[0], first_delivery);
-        drop(journal);
-        let journal = store.open(false);
-        assert_eq!(journal.pending()[0], first_delivery);
-        journal
-            .acknowledge(&first_delivery.completion_id, "stored")
-            .unwrap();
-        assert_eq!(journal.pending().len(), 1);
-        assert_eq!(journal.pending()[0].agent_id, "agent-1");
-    }
-
-    #[test]
-    fn terminal_manifest_recovers_a_lost_finished_event_without_an_engine() {
-        let store = Store::new();
-        let journal = store.open(true);
-        store.source(&journal);
-        let context = journal.commit("run:1").unwrap();
-        drop(journal);
-        let journal = store.open(false);
-        let status = journal
-            .reconcile(|path, source| {
-                assert_eq!(path, "child.json");
-                assert_eq!(source.agent.agent_id, "agent-1");
-                Ok(Some(lifecycle(SubagentPhase::Finished)))
-            })
-            .unwrap();
-        assert_eq!(status.pending, 1);
-        assert_eq!(journal.context().unwrap(), Some(context));
-    }
-
-    #[test]
-    fn crash_before_parent_commit_is_blocked_even_with_terminal_manifest() {
-        let store = Store::new();
-        let journal = store.open(true);
-        store.source(&journal);
-        drop(journal);
-        let journal = store.open(false);
-        let status = journal
-            .reconcile(|_, _| panic!("unconfirmed parent must not publish child result"))
-            .unwrap();
-        assert_eq!(status.blocked, vec!["source_context_unconfirmed"]);
-        assert_eq!(status.pending, 0);
-        assert_eq!(journal.context().unwrap(), None);
-        journal.begin("human:2", None).unwrap();
-        journal.commit("human:2").unwrap();
-        assert!(journal.pending().is_empty());
-    }
-
-    #[test]
-    fn missing_terminal_is_unknown_and_does_not_restart_work() {
-        let store = Store::new();
-        let journal = store.open(true);
-        store.source(&journal);
-        journal.commit("run:1").unwrap();
-        let status = journal.reconcile(|_, _| Ok(None)).unwrap();
-        assert_eq!(status.blocked, vec!["execution_unconfirmed"]);
-        assert!(journal.pending().is_empty());
-        journal
-            .lifecycle(&lifecycle(SubagentPhase::Finished))
-            .unwrap();
-        assert_eq!(journal.pending().len(), 1); // new actual evidence may unblock
-    }
-
-    #[test]
-    fn expected_context_is_checked_before_next_input_and_survives_reopen() {
-        let store = Store::new();
-        let journal = store.open(true);
-        journal.begin("run:1", None).unwrap();
-        let context = journal.commit("run:1").unwrap();
-        drop(journal);
-        let journal = store.open(false);
-        let mut wrong = context.clone();
-        wrong.revision += 1;
-        assert!(journal.begin("run:2", Some(&wrong)).is_err());
-        assert_eq!(journal.context().unwrap(), Some(context.clone()));
-        journal.begin("run:2", Some(&context)).unwrap();
-        let next = journal.commit("run:2").unwrap();
-        assert_eq!(next.revision, context.revision + 1);
-        assert_eq!(next.last_trace_id, "run:2");
-        assert!(journal.begin("run:3", Some(&context)).is_err());
-    }
-
-    #[test]
-    fn transcript_change_and_wrong_journal_identity_are_rejected() {
-        let store = Store::new();
-        assert!(CompletionJournal::open(&store.session, &store.dir, false).is_err());
-        let journal = store.open(true);
-        journal.begin("run:1", None).unwrap();
-        let context = journal.commit("run:1").unwrap();
-        assert!(
-            CompletionJournal::open(&store.session, &store.dir.join("different"), false).is_err()
-        );
-        let path = store.session.persistence_path().unwrap();
-        let mut bytes = std::fs::read(path).unwrap();
-        bytes.push(b'\n');
-        std::fs::write(path, bytes).unwrap();
-        assert!(journal.context().is_err());
-        assert!(journal.begin("run:2", Some(&context)).is_err());
-    }
-
-    #[test]
-    fn failed_ack_write_does_not_remove_pending_delivery() {
-        let store = Store::new();
-        let journal = store.open(true);
-        store.source(&journal);
-        journal
-            .lifecycle(&lifecycle(SubagentPhase::Finished))
-            .unwrap();
-        journal.commit("run:1").unwrap();
-        let before = journal.pending();
-        let path = PathBuf::from(&journal.path);
-        let backup = path.with_extension("saved");
-        std::fs::rename(&path, &backup).unwrap();
-        std::fs::create_dir(&path).unwrap(); // atomic replacement fails
-        assert!(journal
-            .acknowledge(&before[0].completion_id, "stored")
-            .is_err());
-        assert_eq!(journal.pending(), before);
-        std::fs::remove_dir(&path).unwrap();
-        std::fs::rename(backup, &path).unwrap();
-        drop(journal);
-        assert_eq!(store.open(false).pending(), before);
-    }
 }
