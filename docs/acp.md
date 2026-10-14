@@ -719,3 +719,11 @@ that same format and writer. The earlier, non-locking v1 format existed only in
 development/test builds; it is rejected with `legacy_writer_unconfirmed` and
 its original bytes are preserved. Automatic conversion/deletion is not an
 upgrade path, and no production v1 migration workflow is required.
+
+Stage-one v2 sub-agent records can be replayed and acknowledged by the task
+extension without changing their source, frozen payload, publication ordinal,
+ACK or context. Rolling back remains supported for sub-agent-only records.
+Once terminal sources exist, the stage-one binary rejects completion replay
+and transcript mutations with `completion_journal_unsupported`; read-only
+transcript loading without completion negotiation does not grant write access.
+Both journal and transcript bytes remain intact.
