@@ -19,6 +19,7 @@ class ACP:
         self.next_id = 0
         self.pending = {}
         self.updates = []
+        self.permission_count = 0
 
     async def read(self):
         while line := await self.process.stdout.readline():
@@ -29,6 +30,54 @@ class ACP:
                     future.set_result(message)
             else:
                 self.updates.append(message)
+                if message.get("method") == "session/request_permission":
+                    request = message["params"]
+                    command = (
+                        request.get("toolCall", {}).get("rawInput", {}).get("command")
+                    )
+                    assert command in ("sh child-loop.sh", "sh main-loop.sh"), (
+                        "Live fixture approval is limited to its two prepared shell commands"
+                    )
+                    choice = next(
+                        option
+                        for option in request["options"]
+                        if option["kind"] == "allow_once"
+                    )
+                    self.process.stdin.write(
+                        (
+                            json.dumps(
+                                {
+                                    "jsonrpc": "2.0",
+                                    "id": message["id"],
+                                    "result": {
+                                        "outcome": {
+                                            "outcome": "selected",
+                                            "optionId": choice["optionId"],
+                                        }
+                                    },
+                                }
+                            )
+                            + "\n"
+                        ).encode()
+                    )
+                    await self.process.stdin.drain()
+                    self.permission_count += 1
+                update = message.get("params", {}).get("update", {})
+                if update.get("sessionUpdate") in ("tool_call", "tool_call_update"):
+                    print(
+                        json.dumps(
+                            {
+                                "tool": update.get("title"),
+                                "status": update.get("status"),
+                                "child": bool(
+                                    update.get("_meta", {})
+                                    .get("sudocode", {})
+                                    .get("subagent")
+                                ),
+                            }
+                        ),
+                        flush=True,
+                    )
         for future in self.pending.values():
             if not future.done():
                 future.set_exception(RuntimeError("Agent exited before its response"))
@@ -142,10 +191,11 @@ async def run(root):
                 {
                     "protocolVersion": 1,
                     "clientCapabilities": {
-                        "_meta": {"sudocode": {"subagentEvents": 1}}
+                        "_meta": {"sudocode": {"subagentEvents": {"version": 1}}}
                     },
                 },
             )
+            assert initialized["_meta"]["sudocode"]["subagentEvents"]["version"] == 1
             assert initialized["_meta"]["sudocode"]["toolPause"]["version"] == 1
             session = (
                 await acp.request(
@@ -163,6 +213,8 @@ async def run(root):
                 (workspace / name).exists()
                 for name in ("child-ticks.txt", "main-ticks.txt")
             ):
+                if reader.done():
+                    await reader
                 if prompt.done():
                     await prompt
                     raise AssertionError(
@@ -226,6 +278,7 @@ async def run(root):
                 "childStatuses": [value["status"] for value in manifests],
                 "resumedObservation": "HUMAN_EDIT_AFTER_PAUSE",
                 "updates": len(acp.updates),
+                "fixturePermissionApprovals": acp.permission_count,
             }
             (root / "evidence.json").write_text(json.dumps(receipt, indent=2))
             print(json.dumps(receipt))
