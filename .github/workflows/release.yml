@@ -221,11 +221,41 @@ jobs:
             -DestinationPath "dist/${{ matrix.archive_name }}" `
             -Force
 
+      - name: Build ARM64 bundle and Debian installers
+        if: matrix.name == 'linux-arm64'
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "$GITHUB_REF_TYPE" == "tag" && "$GITHUB_REF_NAME" == v* ]]; then
+            version="${GITHUB_REF_NAME#v}"
+          else
+            version="0.0.0.${GITHUB_RUN_NUMBER}"
+          fi
+          target/release/scode --version
+          ../packaging/linux/bundle/build-bundle.sh --arch arm64 \
+            --version "$version" --binary target/release/scode --output dist
+          ../packaging/linux/deb/build-deb.sh --arch arm64 \
+            --version "$version" --binary target/release/scode --output dist
+          mkdir -p dist/bundle-smoke
+          tar -xzf dist/scode-linux-arm64-bundle.tar.gz -C dist/bundle-smoke
+          (cd dist/bundle-smoke/scode-linux-arm64-bundle && sha256sum -c SHA256SUMS.txt && ./scode --version)
+          test "$(dpkg-deb -f dist/scode_*_arm64.deb Architecture)" = arm64
+
       - name: Upload workflow artifact
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.package_dir }}
           path: rust/dist/${{ matrix.archive_name }}
+
+      - name: Upload ARM64 installers
+        if: matrix.name == 'linux-arm64'
+        uses: actions/upload-artifact@v4
+        with:
+          name: scode-linux-arm64-installers
+          path: |
+            rust/dist/scode-linux-arm64-bundle.tar.gz
+            rust/dist/scode_*_arm64.deb
+          if-no-files-found: error
 
   publish-release:
     name: publish-release
