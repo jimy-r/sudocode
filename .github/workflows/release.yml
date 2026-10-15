@@ -213,6 +213,15 @@ jobs:
           tar -xzf dist/scode-linux-arm64-bundle.tar.gz -C dist/bundle-smoke
           (cd dist/bundle-smoke/scode-linux-arm64-bundle && sha256sum -c SHA256SUMS.txt && ./scode --version)
           test "$(dpkg-deb -f dist/scode_*_arm64.deb Architecture)" = arm64
+          dpkg-deb --extract dist/scode_*_arm64.deb dist/deb-smoke
+          dist/deb-smoke/usr/bin/scode --version
+          install_root="$RUNNER_TEMP/scode-arm64-install"
+          SCODE_INSTALL_ROOT="$install_root" SCODE_SKIP_CONFIG=1 \
+            dist/bundle-smoke/scode-linux-arm64-bundle/scode-setup install --bin-dir /usr/local/bin
+          "$install_root/usr/local/bin/scode" --version
+          SCODE_INSTALL_ROOT="$install_root" \
+            "$install_root/usr/local/bin/scode-setup" uninstall --yes
+          test ! -e "$install_root/usr/local/bin/scode"
 
       - name: Upload workflow artifact
         uses: actions/upload-artifact@v4
