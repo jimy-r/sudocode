@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Require current main, preserve base integrations, and reject conflict markers."""
+"""Require a linear PR rebased on current main and reject conflict markers."""
 
 import subprocess
 import sys
@@ -18,14 +18,12 @@ def main():
         ["git", "rev-parse", "--verify", head + "^{commit}"], text=True
     ).strip()
     if not is_ancestor(base, head):
-        sys.exit("PR is behind main. Fetch origin, merge origin/main, resolve conflicts, and push.")
+        sys.exit("PR is behind main. Fetch origin, rebase on origin/main, resolve conflicts, and push with --force-with-lease.")
     merges = subprocess.check_output(
         ["git", "rev-list", "--parents", "--min-parents=2", f"{base}..{head}"], text=True
     ).strip()
-    for merge in merges.splitlines():
-        parents = merge.split()
-        if len(parents) != 3 or not is_ancestor(parents[2], base):
-            sys.exit("PR merges a branch outside main's history. Only integrations of main are allowed:\n" + merge)
+    if merges:
+        sys.exit("PR contains merge commits, including integrations of main. Rebase on origin/main and push with --force-with-lease:\n" + merges)
     # Check Git's conflict markers without imposing new whitespace rules on docs.
     result = subprocess.run([
         "git", "-c", "core.whitespace=-blank-at-eol,-blank-at-eof,-space-before-tab",
@@ -33,7 +31,7 @@ def main():
     ])
     if result.returncode:
         sys.exit("Resolve the leftover conflict markers before merging.")
-    print("PR includes main, only integrates main's history, and has no new conflict markers.")
+    print("PR is rebased on current main, has no PR-only merge commits, and has no new conflict markers.")
 
 
 if __name__ == "__main__":
