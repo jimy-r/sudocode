@@ -626,10 +626,10 @@ or invalid referenced image produces an error rather than a text-only request.
 Repeated references to the same spelling of a path attach it once per prompt.
 
 Agents can inspect images using `Read` (`read_file`). For example, after the
-independently installed sudohand CLI saves a browser screenshot:
+browser skill uses the installed `ai-dev-browser` package to save a screenshot:
 
 ```sh
-suh browser page_screenshot --port <browser-port> --path screenshot.png
+python3 -m ai_dev_browser.tools.page_screenshot --session-id <browser-session-id> --path screenshot.png
 ```
 
 ask scode to **Read `screenshot.png` and inspect the screenshot**. The screenshot
@@ -653,14 +653,16 @@ the existing optimistic policy, so the provider may reject image input.
 
 Regression coverage lives in `pty_image_handling` (CLI references, image Read,
 parallel results, errors, text-only model rejection, and resume) and the API transport tests.
-With suh and Chrome installed, run the actual browser-to-model-payload test:
+With `ai-dev-browser` and Chrome installed, run the browser-to-model-payload test.
+Set `SCODE_BROWSER_PYTHON` to the interpreter containing the package if it is
+installed in a virtual environment:
 
 ```sh
 cd rust
 cargo test -p rusty-sudocode-cli --test pty_image_handling -- --include-ignored
 ```
 
-This last test scripts only model replies: scode executes Bash, suh captures
+This last test scripts only model replies: scode executes Bash, ai-dev-browser captures
 real Chrome pixels, and the test verifies those exact bytes in the next model
 request. A live model's visual accuracy is a separate check.
 
