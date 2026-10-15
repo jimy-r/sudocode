@@ -15,6 +15,7 @@ on:
         options:
           - all
           - linux-x64
+          - linux-arm64
       resume_tag:
         description: 'Resume a stable release using its existing GitHub assets (no rebuild)'
         required: false
@@ -144,41 +145,13 @@ jobs:
 
   build:
     name: build-${{ matrix.name }}
-    if: ${{ !inputs.resume_tag && (github.event_name != 'workflow_dispatch' || inputs.build_scope == 'all') }}
+    if: ${{ !inputs.resume_tag && (github.event_name != 'workflow_dispatch' || inputs.build_scope == 'all' || inputs.build_scope == 'linux-arm64') }}
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - name: linux-arm64
-            # Oldest hosted arm64 runner: the arm64 binary links glibc
-            # dynamically, so the build machine's glibc is the floor the
-            # binary demands at runtime — 22.04 = glibc 2.35. (linux-x64 is
-            # static musl; its runner version does not matter.)
-            os: ubuntu-22.04-arm
-            bin: scode
-            package_dir: scode-linux-arm64
-            archive_name: scode-linux-arm64.tar.gz
-          - name: macos-arm64
-            os: macos-15
-            bin: scode
-            package_dir: scode-macos-arm64
-            archive_name: scode-macos-arm64.tar.gz
-          - name: macos-x64
-            os: macos-15-intel
-            bin: scode
-            package_dir: scode-macos-x64
-            archive_name: scode-macos-x64.tar.gz
-          - name: windows-x64
-            os: windows-2022
-            bin: scode.exe
-            package_dir: scode-windows-x64
-            archive_name: scode-windows-x64.zip
-          - name: windows-arm64
-            os: windows-11-arm
-            bin: scode.exe
-            package_dir: scode-windows-arm64
-            archive_name: scode-windows-arm64.zip
+        # ARM64 remains on Ubuntu 22.04 to preserve the glibc 2.35 runtime floor.
+        include: ${{ fromJSON(inputs.build_scope == 'linux-arm64' && '[{"name":"linux-arm64","os":"ubuntu-22.04-arm","bin":"scode","package_dir":"scode-linux-arm64","archive_name":"scode-linux-arm64.tar.gz"}]' || '[{"name":"linux-arm64","os":"ubuntu-22.04-arm","bin":"scode","package_dir":"scode-linux-arm64","archive_name":"scode-linux-arm64.tar.gz"},{"name":"macos-arm64","os":"macos-15","bin":"scode","package_dir":"scode-macos-arm64","archive_name":"scode-macos-arm64.tar.gz"},{"name":"macos-x64","os":"macos-15-intel","bin":"scode","package_dir":"scode-macos-x64","archive_name":"scode-macos-x64.tar.gz"},{"name":"windows-x64","os":"windows-2022","bin":"scode.exe","package_dir":"scode-windows-x64","archive_name":"scode-windows-x64.zip"},{"name":"windows-arm64","os":"windows-11-arm","bin":"scode.exe","package_dir":"scode-windows-arm64","archive_name":"scode-windows-arm64.zip"}]') }}
     defaults:
       run:
         working-directory: rust
