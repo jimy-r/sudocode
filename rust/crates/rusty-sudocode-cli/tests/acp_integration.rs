@@ -367,10 +367,16 @@ fn isolate_env(cmd: &mut Command, workspace: &TestWorkspace) {
     }
 }
 
-fn base_command(workspace: &TestWorkspace) -> Command {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_scode"));
-    cmd.current_dir(&workspace.root);
+/// Own the CLI for the fixture lifetime, including assertion unwinding.
+fn isolated_command(workspace: &TestWorkspace, binary: &Path) -> Command {
+    let mut cmd = Command::new(binary);
+    cmd.current_dir(&workspace.root).kill_on_drop(true);
     isolate_env(&mut cmd, workspace);
+    cmd
+}
+
+fn base_command(workspace: &TestWorkspace) -> Command {
+    let mut cmd = isolated_command(workspace, Path::new(env!("CARGO_BIN_EXE_scode")));
     cmd.args([
         "--auth",
         "api-key",
@@ -3064,9 +3070,7 @@ async fn acp_wrong_model_vlm_full_roundtrip() {
         .seed_model_catalog(&anthropic_mock.base_url())
         .await;
 
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_scode"));
-    cmd.current_dir(&workspace.root);
-    isolate_env(&mut cmd, &workspace);
+    let mut cmd = isolated_command(&workspace, Path::new(env!("CARGO_BIN_EXE_scode")));
     cmd.args([
         "--auth",
         "api-key",
@@ -3280,9 +3284,7 @@ while True:
 /// Like `spawn_stdio_client` but with `--permission-mode danger-full-access`
 /// so MCP tool calls are not gated behind an interactive permission prompt.
 fn spawn_stdio_client_danger(workspace: &TestWorkspace) -> AcpTestClient {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_scode"));
-    cmd.current_dir(&workspace.root);
-    isolate_env(&mut cmd, workspace);
+    let mut cmd = isolated_command(workspace, Path::new(env!("CARGO_BIN_EXE_scode")));
     cmd.args([
         "--auth",
         "api-key",
@@ -3319,9 +3321,7 @@ fn spawn_stdio_client_danger_with_allowed(
     workspace: &TestWorkspace,
     allowed: &str,
 ) -> AcpTestClient {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_scode"));
-    cmd.current_dir(&workspace.root);
-    isolate_env(&mut cmd, workspace);
+    let mut cmd = isolated_command(workspace, Path::new(env!("CARGO_BIN_EXE_scode")));
     cmd.args([
         "--auth",
         "api-key",
