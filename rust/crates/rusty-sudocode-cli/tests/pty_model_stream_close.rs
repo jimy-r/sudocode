@@ -39,6 +39,7 @@ enum ResponseKind {
     ResponsesDoneKeepAlive,
     NativeHeartbeat,
     ChatHeartbeat,
+    ChatAnnotations,
     ResponsesHeartbeat,
     AlwaysHeartbeat,
     HeartbeatAfterOverload,
@@ -59,6 +60,7 @@ impl ResponseKind {
             | Self::ChatTotalOnly
             | Self::MissingModelCodeUnavailable
             | Self::ChatHeartbeat
+            | Self::ChatAnnotations
             | Self::HeartbeatAfterOverload
             | Self::ChatPartial
             | Self::ChatSlow => Some("openai-completions"),
@@ -936,6 +938,7 @@ fn liveness_response(
         kind,
         ResponseKind::NativeHeartbeat
             | ResponseKind::ChatHeartbeat
+            | ResponseKind::ChatAnnotations
             | ResponseKind::ResponsesHeartbeat
             | ResponseKind::AlwaysHeartbeat
             | ResponseKind::HeartbeatAfterOverload
@@ -976,6 +979,7 @@ fn liveness_response(
             kind,
             ResponseKind::NativeHeartbeat
                 | ResponseKind::ChatHeartbeat
+                | ResponseKind::ChatAnnotations
                 | ResponseKind::ResponsesHeartbeat
         ) && index == 0);
     let mut prefix = String::new();
@@ -1050,7 +1054,12 @@ fn liveness_response(
                 let _ = socket.write_all(body.as_bytes());
                 break;
             }
-            if socket.write_all(b": ping\n\n").is_err() {
+            let frame: &[u8] = if matches!(kind, ResponseKind::ChatAnnotations) {
+                b"data: {\"id\":\"\",\"model\":\"\",\"choices\":[{\"index\":0,\"finish_reason\":null,\"content_filter_results\":{}}]}\n\n"
+            } else {
+                b": ping\n\n"
+            };
+            if socket.write_all(frame).is_err() {
                 break;
             }
             thread::sleep(Duration::from_millis(50));
@@ -1074,6 +1083,7 @@ fn check_liveness(
         kind,
         ResponseKind::NativeHeartbeat
             | ResponseKind::ChatHeartbeat
+            | ResponseKind::ChatAnnotations
             | ResponseKind::ResponsesHeartbeat
             | ResponseKind::HeartbeatAfterOverload
             | ResponseKind::NativePartial
@@ -1183,6 +1193,7 @@ fn heartbeat_only_streams_replay_before_the_first_provider_event() {
     for kind in [
         ResponseKind::NativeHeartbeat,
         ResponseKind::ChatHeartbeat,
+        ResponseKind::ChatAnnotations,
         ResponseKind::ResponsesHeartbeat,
     ] {
         check_liveness(kind, "2", 2, true);

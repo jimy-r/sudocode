@@ -240,9 +240,12 @@ async fn stream_message_normalizes_text_and_multiple_tool_calls() {
 async fn openai_streaming_requests_opt_into_usage_chunks() {
     let state = Arc::new(Mutex::new(Vec::<CapturedRequest>::new()));
     let sse = concat!(
+        "data: {\"id\":\"\",\"model\":\"\",\"choices\":[{\"content_filter_result\":{\"error\":{\"code\":\"content_filter_error\",\"message\":\"The contents are not filtered\"}},\"content_filter_results\":{},\"finish_reason\":null,\"index\":0}]}\n\n",
         "data: {\"id\":\"chatcmpl_openai_stream\",\"model\":\"gpt-5\",\"choices\":[{\"delta\":{\"content\":\"Hi\"}}]}\n\n",
-        "data: {\"id\":\"chatcmpl_openai_stream\",\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+        "data: {\"id\":\"\",\"model\":\"\",\"choices\":[{\"index\":0,\"finish_reason\":null,\"content_filter_results\":{},\"content_filter_offsets\":{\"check_offset\":2,\"start_offset\":0,\"end_offset\":2}}]}\n\n",
+        "data: {\"id\":\"chatcmpl_openai_stream\",\"choices\":[{\"finish_reason\":\"stop\"}]}\n\n",
         "data: {\"id\":\"chatcmpl_openai_stream\",\"choices\":[],\"usage\":{\"prompt_tokens\":9,\"completion_tokens\":4}}\n\n",
+        "data: {\"id\":\"\",\"model\":\"\",\"choices\":[{\"delta\":null,\"finish_reason\":null,\"content_filter_results\":{}}]}\n\n",
         "data: [DONE]\n\n"
     );
     let server = spawn_server(
@@ -270,7 +273,12 @@ async fn openai_streaming_requests_opt_into_usage_chunks() {
         events.push(event);
     }
 
+    assert_eq!(events.len(), 6, "annotations must not emit provider events");
     assert!(matches!(events[0], StreamEvent::MessageStart(_)));
+    if let StreamEvent::MessageStart(event) = &events[0] {
+        assert_eq!(event.message.id, "chatcmpl_openai_stream");
+        assert_eq!(event.message.model, "gpt-5");
+    }
     assert!(matches!(
         events[1],
         StreamEvent::ContentBlockStart(ContentBlockStartEvent {
@@ -309,6 +317,41 @@ async fn openai_streaming_requests_opt_into_usage_chunks() {
     let body: serde_json::Value = serde_json::from_str(&request.body).expect("json body");
     assert_eq!(body["stream"], json!(true));
     assert_eq!(body["stream_options"], json!({"include_usage": true}));
+}
+
+#[tokio::test]
+async fn azure_annotation_terminal_preserves_content_filter_stop_reason() {
+    let partial = "data: {\"id\":\"filtered\",\"model\":\"gpt-5\",\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n";
+    for prefix in ["", partial] {
+        let state = Arc::new(Mutex::new(Vec::<CapturedRequest>::new()));
+        let terminal = concat!(
+        "data: {\"id\":\"\",\"model\":\"\",\"choices\":[{\"index\":0,\"finish_reason\":\"content_filter\",\"content_filter_results\":{\"violence\":{\"filtered\":true}}}]}\n\n",
+        "data: [DONE]\n\n"
+    );
+        let sse = format!("{prefix}{terminal}");
+        let server = spawn_server(
+            state,
+            vec![http_response("200 OK", "text/event-stream", &sse)],
+        )
+        .await;
+        let client = OpenAiCompatClient::new("openai-test-key", OpenAiCompatConfig::openai())
+            .with_base_url(server.base_url());
+        let mut stream = client
+            .stream_message(&sample_request(false), None)
+            .await
+            .expect("stream should start");
+        let mut stop_reason = None;
+        let mut stops = 0;
+        while let Some(event) = stream.next_event().await.expect("annotation should parse") {
+            match event {
+                StreamEvent::MessageDelta(event) => stop_reason = event.delta.stop_reason,
+                StreamEvent::MessageStop(_) => stops += 1,
+                _ => {}
+            }
+        }
+        assert_eq!(stop_reason.as_deref(), Some("content_filter"));
+        assert_eq!(stops, 1);
+    }
 }
 
 #[tokio::test]
