@@ -228,12 +228,30 @@ fn assert_file_frames(sess: &PtySession, expected: &BTreeMap<&str, usize>, final
 fn assert_transcript(sess: &PtySession, expected: &BTreeMap<&str, usize>) {
     assert_file_frames(sess, expected, "Spacing done.");
     let rows = rows(sess);
-    assert_gap(
-        &rows,
-        position(&rows, "CODE_START"),
-        position(&rows, "CODE_END"),
-        2,
+    let code_start = position(&rows, "CODE_START");
+    let code_end = position(&rows, "CODE_END");
+    assert!(
+        assistant_position(&rows, "Spacing done.") < code_start,
+        "the code block must be in the actual final answer: {rows:#?}"
     );
+    assert_gap(&rows, code_start, code_end, 2);
+}
+
+fn transcript_visible(screen: &str) -> bool {
+    // Wait for the blocks whose layout is asserted below. A model may omit an
+    // unrelated trailing paragraph without changing the rendering contract.
+    [
+        "Spacing intro.",
+        "ONE_START",
+        "ONE_END",
+        "TWO_START",
+        "TWO_END",
+        "Spacing done.",
+        "CODE_START",
+        "CODE_END",
+    ]
+    .into_iter()
+    .all(|marker| screen.contains(marker))
 }
 
 fn roundtrip(queue: bool, width: u16) {
@@ -309,7 +327,7 @@ fn roundtrip(queue: bool, width: u16) {
     );
     common::expect_screen_settled(
         &sess,
-        |s| s.contains("Spacing end."),
+        transcript_visible,
         common::DEFAULT_TIMEOUT,
         "completed transcript",
     );
@@ -319,7 +337,7 @@ fn roundtrip(queue: bool, width: u16) {
     let mut resumed = start(&env, true, queue, width);
     common::expect_screen_settled(
         &resumed,
-        |s| s.contains("Spacing end."),
+        transcript_visible,
         common::DEFAULT_TIMEOUT,
         "replayed transcript",
     );
