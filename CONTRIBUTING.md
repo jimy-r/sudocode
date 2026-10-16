@@ -26,6 +26,7 @@ your first contribution.
 - [Prerequisites](#prerequisites)
 - [Building](#building)
 - [Required checks](#required-checks)
+- [Company model routing in CI](#company-model-routing-in-ci)
 - [Measuring prompt-cache behaviour](#measuring-prompt-cache-behaviour)
 - [Running the CLI locally](#running-the-cli-locally)
 - [Working on a single crate](#working-on-a-single-crate)
@@ -428,6 +429,27 @@ cargo build -p mock-anthropic-service
 # Documentation build (catches broken intra-doc links)
 cargo doc --workspace --no-deps
 ```
+
+## Company model routing in CI
+
+CI uses the company `SUDOROUTER_CI_API_KEY` secret. Personal developer accounts
+belong only in local configuration and must never be copied into CI secrets.
+`SUDOROUTER_NATIVE_CHANNEL` optionally selects an existing company-accessible
+native Anthropic channel without replacing the credential. Both native ACP
+acceptance and model review read this repository variable. They also share
+`SUDOROUTER_NATIVE_MODEL` (default `claude-sonnet-4-6`). GPT protocol acceptance
+keeps its separate baseline and normal company routing. File/tool PTY journeys
+use a faster model verified with the original approval, report-read and replay
+assertions; changing a route or model does not raise their turn budgets.
+
+Verify a changed native route with the original real subagent/cache scenario,
+retaining its output/thinking budgets and assertions. A small successful request
+alone is insufficient. Channel selection does not prove another model or the
+rest of the catalog is usable.
+
+Review runs follow the current ready PR head and cancel superseded runs. They
+use the job-scoped read-only GitHub token so workflow edits can receive a real
+review. Missing execution records and incomplete model runs fail the job.
 
 ## Measuring prompt-cache behaviour
 

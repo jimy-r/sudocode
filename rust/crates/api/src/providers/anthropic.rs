@@ -12,7 +12,7 @@ use serde::Deserialize;
 use serde_json::{Map, Value};
 use telemetry::{AnalyticsEvent, AnthropicRequestProfile, ClientIdentity, SessionTracer};
 
-use crate::error::ApiError;
+use crate::error::{ApiError, ProviderErrorEnvelope};
 use crate::http_transport::{
     gateway_trace_from_headers, parse_retry_after, request_id_from_headers, HttpTransport,
     RetryPolicy,
@@ -22,6 +22,7 @@ use crate::prompt_cache::{PromptCache, PromptCacheRecord, PromptCacheStats};
 use super::registry::{self, model_token_limit};
 use super::{anthropic_missing_credentials, Provider, ProviderFuture};
 use crate::sse::SseParser;
+use crate::stream_diagnostics::StreamProgress;
 use crate::types::{
     MessageDeltaEvent, MessageRequest, MessageResponse, MessageStopEvent, StreamEvent, Usage,
 };
@@ -484,12 +485,12 @@ impl AnthropicClient {
                 .with_property("total_tokens", Value::from(response.total_tokens()))
                 .with_property(
                     "estimated_cost_usd",
-                    Value::String(format_usd(
-                        response
-                            .usage
-                            .estimated_cost_usd(&response.model)
-                            .total_cost_usd(),
-                    )),
+                    response
+                        .usage
+                        .estimated_cost_usd(&response.model)
+                        .map_or(Value::Null, |cost| {
+                            Value::String(format_usd(cost.total_cost_usd()))
+                        }),
                 ),
         );
         refusal.map_or(Ok(response), Err)
@@ -500,10 +501,16 @@ impl AnthropicClient {
         request: &MessageRequest,
         trace_id: Option<&str>,
     ) -> Result<MessageStream, ApiError> {
-        self.preflight_message_request(request).await?;
+        crate::request_scope::RequestScope::preflight(self.preflight_message_request(request))
+            .await?;
         let result = self
             .send_request(&request.clone().with_streaming(), trace_id)
             .await?;
+        let progress = StreamProgress::new(
+            self.session_tracer().cloned(),
+            Some(result.request_id.clone()),
+            request.model.clone(),
+        );
         Ok(MessageStream {
             request_id: request_id_from_headers(result.response.headers()),
             gateway_request_id: gateway_trace_from_headers(result.response.headers()),
@@ -524,6 +531,7 @@ impl AnthropicClient {
             last_prompt_cache_record: Arc::clone(&self.last_prompt_cache_record),
             session_tracer: self.session_tracer().cloned(),
             cache_diagnostics: cache_diagnostics_enabled().then(|| self.cache_diagnostics.clone()),
+            progress,
         })
     }
 
@@ -1080,6 +1088,7 @@ pub struct MessageStream {
     last_prompt_cache_record: Arc<Mutex<Option<PromptCacheRecord>>>,
     session_tracer: Option<SessionTracer>,
     cache_diagnostics: Option<CacheDiagnostics>,
+    progress: StreamProgress,
 }
 
 impl MessageStream {
@@ -1144,12 +1153,16 @@ impl MessageStream {
             };
             match chunk {
                 Ok(Some(chunk)) => {
+                    self.progress.observe_chunk(chunk.len());
                     let parsed = self.parser.push(&chunk);
                     self.observe_message_metadata();
                     let events = parsed.map_err(|error| self.record_refusal(error))?;
                     for event in &events {
                         crate::client::record_compaction_stream_event(event)?;
                     }
+                    self.progress.sse_events_read +=
+                        u64::try_from(events.len()).unwrap_or(u64::MAX);
+                    self.progress.parsed_chunk(self.parser.pending_bytes());
                     self.pending.extend(events);
                 }
                 Ok(None) => {
@@ -1210,9 +1223,17 @@ impl MessageStream {
     }
 
     fn observe_event(&mut self, event: &StreamEvent) {
+        self.progress.observe_event(event);
         match event {
+            StreamEvent::MessageStart(start) => {
+                self.latest_usage
+                    .get_or_insert_with(Usage::default)
+                    .merge_snapshot(start.message.usage.clone());
+            }
             StreamEvent::MessageDelta(MessageDeltaEvent { usage, delta, .. }) => {
-                self.latest_usage = Some(usage.clone());
+                self.latest_usage
+                    .get_or_insert_with(Usage::default)
+                    .merge_snapshot(usage.clone());
                 // Content is complete, but finish the protocol before releasing
                 // the response. Closing here made completion depend on packet
                 // boundaries and could drop a separately framed message_stop.
@@ -1281,12 +1302,15 @@ impl MessageStream {
                 .client_request_id
                 .clone()
                 .unwrap_or_else(|| "unknown".to_string());
-            tracer.record_usage_with_cost(
+            tracer.record_usage_snapshot(
                 request_id,
-                usage.input_tokens,
-                usage.output_tokens,
-                usage.cache_creation_input_tokens,
-                usage.cache_read_input_tokens,
+                telemetry::UsageTokens {
+                    input_tokens: usage.input_tokens,
+                    output_tokens: usage.output_tokens,
+                    cache_creation_input_tokens: usage.cache_creation_input_tokens,
+                    cache_read_input_tokens: usage.cache_read_input_tokens,
+                    reported_total_tokens: usage.reported_total_tokens,
+                },
                 telemetry::UsageCost {
                     units: usage.cost_units,
                     currency: usage.cost_currency.as_deref(),
@@ -1306,18 +1330,16 @@ async fn expect_success(response: reqwest::Response) -> Result<reqwest::Response
     let request_id = request_id_from_headers(response.headers());
     let retry_after = parse_retry_after(response.headers());
     let body = response.text().await.unwrap_or_else(|_| String::new());
-    let parsed_error = serde_json::from_str::<AnthropicErrorEnvelope>(&body).ok();
+    let parsed_error = serde_json::from_str::<ProviderErrorEnvelope>(&body).ok();
     let retryable = crate::error::is_retryable_http_status(status.as_u16())
         || crate::error::is_retryable_masked_400(status, &body);
 
     Err(ApiError::Api {
         status,
-        error_type: parsed_error
-            .as_ref()
-            .map(|error| error.error.error_type.clone()),
+        error_type: parsed_error.as_ref().and_then(|error| error.error.kind()),
         message: parsed_error
             .as_ref()
-            .map(|error| error.error.message.clone()),
+            .and_then(|error| error.error.message.clone()),
         request_id,
         body,
         retryable,
@@ -1729,18 +1751,6 @@ fn strip_thought_signatures(body: &mut Map<String, Value>) {
             }
         }
     }
-}
-
-#[derive(Debug, Deserialize)]
-struct AnthropicErrorEnvelope {
-    error: AnthropicErrorBody,
-}
-
-#[derive(Debug, Deserialize)]
-struct AnthropicErrorBody {
-    #[serde(rename = "type")]
-    error_type: String,
-    message: String,
 }
 
 #[cfg(test)]

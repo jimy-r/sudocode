@@ -3,9 +3,9 @@ mod common;
 
 use std::fmt::Write as _;
 use std::io::{BufRead, BufReader, Read, Write};
-use std::net::TcpListener;
+use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
@@ -25,13 +25,51 @@ enum ResponseKind {
     AlwaysEmptyThinking,
     InvalidRequestWithStatusDigits,
     MissingModel,
+    MissingModelUnavailable,
+    MissingModelCodeUnavailable,
+    MissingModelCodeOnlyUnavailable,
+    OverloadedThenComplete,
     RefusedStream,
     RefusedJson,
     RefusedAfterText,
     RefusedTail,
+    UsageAtStart,
+    ChatDoneKeepAlive,
+    ChatTotalOnly,
+    ResponsesDoneKeepAlive,
+    NativeHeartbeat,
+    ChatHeartbeat,
+    ResponsesHeartbeat,
+    AlwaysHeartbeat,
+    HeartbeatAfterOverload,
+    ToolThenHeartbeat,
+    NativePartial,
+    ChatPartial,
+    ResponsesPartial,
+    NativeSlow,
+    ChatSlow,
+    ResponsesSlow,
+    FiniteHeartbeat,
 }
 
 impl ResponseKind {
+    const fn api_format(self) -> Option<&'static str> {
+        match self {
+            Self::ChatDoneKeepAlive
+            | Self::ChatTotalOnly
+            | Self::MissingModelCodeUnavailable
+            | Self::ChatHeartbeat
+            | Self::HeartbeatAfterOverload
+            | Self::ChatPartial
+            | Self::ChatSlow => Some("openai-completions"),
+            Self::ResponsesDoneKeepAlive
+            | Self::ResponsesHeartbeat
+            | Self::ResponsesPartial
+            | Self::ResponsesSlow => Some("openai-responses"),
+            _ => None,
+        }
+    }
+
     const fn is_refused(self) -> bool {
         matches!(
             self,
@@ -45,7 +83,19 @@ struct StreamProvider {
     stopped: Arc<AtomicBool>,
     requests: Arc<AtomicUsize>,
     terminal_connection_state: Arc<AtomicUsize>,
+    bodies: Arc<Mutex<Vec<Value>>>,
     worker: Option<thread::JoinHandle<()>>,
+}
+
+fn peer_closed(socket: &TcpStream) -> bool {
+    match socket.peek(&mut [0]) {
+        Ok(0) => true,
+        Err(error) => !matches!(
+            error.kind(),
+            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+        ),
+        _ => false,
+    }
 }
 
 impl StreamProvider {
@@ -60,6 +110,8 @@ impl StreamProvider {
         let terminal_state = terminal_connection_state.clone();
         let stop = stopped.clone();
         let count = requests.clone();
+        let bodies = Arc::new(Mutex::new(Vec::new()));
+        let captured = bodies.clone();
         let worker = thread::spawn(move || {
             'connections: while !stop.load(Ordering::SeqCst) {
                 let Ok((mut socket, _)) = listener.accept() else {
@@ -92,14 +144,18 @@ impl StreamProvider {
                 }
                 let mut body = vec![0; length];
                 input.read_exact(&mut body).unwrap();
-                if !first.starts_with("POST /v1/messages ") {
+                if !first.starts_with("POST ") {
                     let _ = socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 11\r\nConnection: close\r\n\r\n{\"data\":[]}");
                     continue;
                 }
                 let index = count.fetch_add(1, Ordering::SeqCst);
                 let request: Value = serde_json::from_slice(&body).unwrap();
                 assert_eq!(request["stream"], true);
-                if let Some(response) = error_response(kind) {
+                captured.lock().unwrap().push(request.clone());
+                if liveness_response(&mut socket, kind, index, &stop) {
+                    continue;
+                }
+                if let Some(response) = error_response(kind, index) {
                     let _ = socket.write_all(response.as_bytes());
                     continue;
                 }
@@ -113,6 +169,43 @@ impl StreamProvider {
                 let mut body = refusal_body(kind).unwrap_or_else(|| {
                     response_body(!matches!(kind, ResponseKind::Interrupted), empty)
                 });
+                match kind {
+                    ResponseKind::UsageAtStart => {
+                        body = body.replace(
+                            "\"input_tokens\":12,\"output_tokens\":0",
+                            "\"input_tokens\":12,\"output_tokens\":7,\"cache_creation_input_tokens\":3,\"cache_read_input_tokens\":5,\"cost_units\":17,\"cost_currency\":\"sudo_point\"",
+                        ).replace("\"output_tokens\":8", "\"output_tokens\":0");
+                    }
+                    ResponseKind::ChatDoneKeepAlive | ResponseKind::ChatTotalOnly => {
+                        body = concat!(
+                            "data: {\"id\":\"chat\",\"choices\":[{\"delta\":{\"content\":\"STREAM_BODY_VERIFIED\"}}]}\n\n",
+                            "data: {\"id\":\"chat\",\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+                            "data: {\"id\":\"chat\",\"choices\":[],\"usage\":{\"prompt_tokens\":12,\"completion_tokens\":8}}\n\n",
+                            "data: [DONE]\n\n",
+                        ).into();
+                        if matches!(kind, ResponseKind::ChatTotalOnly) && index == 0 {
+                            body = body.replace(
+                                "\"prompt_tokens\":12,\"completion_tokens\":8",
+                                "\"prompt_tokens\":0,\"completion_tokens\":0,\"total_tokens\":25",
+                            );
+                        }
+                        if matches!(kind, ResponseKind::ChatDoneKeepAlive) {
+                            body = body.replace(
+                                "\"prompt_tokens\":12,\"completion_tokens\":8",
+                                "\"prompt_tokens\":12,\"completion_tokens\":8,\"total_tokens\":20,\"prompt_tokens_details\":{\"cached_tokens\":5}",
+                            );
+                        }
+                    }
+                    ResponseKind::ResponsesDoneKeepAlive => {
+                        body = concat!(
+                            "event: response.created\ndata: {\"id\":\"response\",\"model\":\"sonnet\"}\n\n",
+                            "event: response.output_text.delta\ndata: {\"delta\":\"STREAM_BODY_VERIFIED\"}\n\n",
+                            "event: response.output_text.done\ndata: {}\n\n",
+                            "event: response.completed\ndata: {\"response\":{\"usage\":{\"input_tokens\":12,\"output_tokens\":8,\"total_tokens\":20,\"input_tokens_details\":{\"cached_tokens\":5}}}}\n\n",
+                        ).into();
+                    }
+                    _ => {}
+                }
                 if empty
                     && matches!(
                         kind,
@@ -138,6 +231,9 @@ impl StreamProvider {
                     ResponseKind::Interrupted
                         | ResponseKind::Complete
                         | ResponseKind::StopReasonKeepAlive
+                        | ResponseKind::ChatDoneKeepAlive
+                        | ResponseKind::ChatTotalOnly
+                        | ResponseKind::ResponsesDoneKeepAlive
                 ) {
                     128
                 } else {
@@ -150,39 +246,42 @@ impl StreamProvider {
                     socket
                         .set_read_timeout(Some(Duration::from_millis(250)))
                         .unwrap();
-                    let closed = match socket.peek(&mut [0]) {
-                        Ok(0) => true,
-                        Err(error) => !matches!(
-                            error.kind(),
-                            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-                        ),
-                        _ => false,
-                    };
+                    let closed = peer_closed(&socket);
                     terminal_state.store(if closed { 2 } else { 1 }, Ordering::SeqCst);
                     let _ = socket.write_all(response[split..].as_bytes());
                     continue;
                 }
-                let _ = socket.write_all(response.as_bytes());
-                if matches!(kind, ResponseKind::StopReasonKeepAlive) {
-                    // No terminal event or HTTP EOF: only the client's bounded
-                    // logical-stop recovery can let the user finish this turn.
+                if matches!(
+                    kind,
+                    ResponseKind::ChatDoneKeepAlive | ResponseKind::ChatTotalOnly
+                ) {
+                    let split = response
+                        .find("data: {\"id\":\"chat\",\"choices\":[],\"usage\"")
+                        .unwrap();
+                    socket.write_all(response[..split].as_bytes()).unwrap();
+                    // Observe that the client stays connected after the
+                    // logical stop, before sending the separate usage tail.
+                    socket
+                        .set_read_timeout(Some(Duration::from_millis(250)))
+                        .unwrap();
+                    let closed = peer_closed(&socket);
+                    terminal_state.store(if closed { 2 } else { 1 }, Ordering::SeqCst);
+                    let _ = socket.write_all(response[split..].as_bytes());
+                } else {
+                    let _ = socket.write_all(response.as_bytes());
+                }
+                if matches!(
+                    kind,
+                    ResponseKind::StopReasonKeepAlive
+                        | ResponseKind::ChatDoneKeepAlive
+                        | ResponseKind::ChatTotalOnly
+                        | ResponseKind::ResponsesDoneKeepAlive
+                ) {
+                    // Keep the HTTP body open after a logical/protocol stop.
                     socket
                         .set_read_timeout(Some(Duration::from_millis(100)))
                         .unwrap();
-                    while !stop.load(Ordering::SeqCst) {
-                        match socket.peek(&mut [0]) {
-                            Ok(0) => break,
-                            Err(error)
-                                if !matches!(
-                                    error.kind(),
-                                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-                                ) =>
-                            {
-                                break
-                            }
-                            _ => {}
-                        }
-                    }
+                    while !stop.load(Ordering::SeqCst) && !peer_closed(&socket) {}
                 }
             }
         });
@@ -191,6 +290,7 @@ impl StreamProvider {
             stopped,
             requests,
             terminal_connection_state,
+            bodies,
             worker: Some(worker),
         }
     }
@@ -203,17 +303,36 @@ impl Drop for StreamProvider {
     }
 }
 
-fn error_response(kind: ResponseKind) -> Option<String> {
-    let (status, message) = match kind {
-        ResponseKind::MissingModel => ("404 Not Found", "selected deployment absent"),
+fn error_response(kind: ResponseKind, index: usize) -> Option<String> {
+    let (status, error) = match kind {
+        ResponseKind::MissingModel => (
+            "404 Not Found",
+            json!({"type":"invalid_request_error","message":"selected deployment absent"}),
+        ),
         ResponseKind::InvalidRequestWithStatusDigits => (
             "400 Bad Request",
-            "invalid max_tokens; diagnostic id: 404-429-502-503",
+            json!({"type":"invalid_request_error","message":"invalid max_tokens; diagnostic id: 404-429-502-503"}),
+        ),
+        ResponseKind::MissingModelUnavailable => (
+            "503 Service Unavailable",
+            json!({"type":"model_not_found","message":"selected model is not available"}),
+        ),
+        ResponseKind::MissingModelCodeUnavailable => (
+            "503 Service Unavailable",
+            json!({"type":"invalid_request_error","code":"model_not_found","message":"selected model is not available"}),
+        ),
+        ResponseKind::MissingModelCodeOnlyUnavailable => (
+            "503 Service Unavailable",
+            json!({"code":"model_not_found","message":"selected model is not available"}),
+        ),
+        ResponseKind::OverloadedThenComplete if index == 0 => (
+            "503 Service Unavailable",
+            json!({"type":"overloaded_error","message":"Please retry after a brief wait"}),
         ),
         _ => return None,
     };
-    let body = json!({"error":{"type":"invalid_request_error","message":message}}).to_string();
-    Some(format!("HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()))
+    let body = json!({"error":error}).to_string();
+    Some(format!("HTTP/1.1 {status}\r\nContent-Type: application/json\r\nRequest-Id: req_provider_error\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()))
 }
 
 fn response_body(terminal: bool, empty: bool) -> String {
@@ -264,6 +383,18 @@ fn refusal_body(kind: ResponseKind) -> Option<String> {
     Some(body)
 }
 
+fn configure_peer(env: &TestEnv, provider: &StreamProvider, kind: ResponseKind) {
+    let path = env.config_home().join("sudocode.json");
+    let mut config: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    config["auth_modes"]["api-key"]["anthropic"]["baseUrl"] = json!(provider.url);
+    if let Some(format) = kind.api_format() {
+        config["models"]["sonnet"] = json!({"alias":"sonnet", "providers":{"api-key":{
+            "provider":"anthropic", "model":"sonnet", "api":format
+        }}});
+    }
+    std::fs::write(path, config.to_string()).unwrap();
+}
+
 // render takes a closure over screens with different lifetimes.
 #[allow(clippy::redundant_closure_for_method_calls)]
 fn check_response(kind: ResponseKind) {
@@ -272,22 +403,47 @@ fn check_response(kind: ResponseKind) {
         return;
     } // the peer must produce the specified protocol fault
     let provider = StreamProvider::new(kind);
-    let path = env.config_home().join("sudocode.json");
-    let mut config: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
-    config["auth_modes"]["api-key"]["anthropic"]["baseUrl"] = json!(provider.url);
-    std::fs::write(path, config.to_string()).unwrap();
+    configure_peer(&env, &provider, kind);
     let log_path = env.workspace_root().join("provider-events.jsonl");
+    let mut args = vec!["--permission-mode", "read-only"];
+    if !matches!(kind, ResponseKind::OverloadedThenComplete) {
+        args.push("--print");
+    }
+    args.push("Report the stream result");
+    if matches!(
+        kind,
+        ResponseKind::ChatTotalOnly | ResponseKind::UsageAtStart
+    ) {
+        args.extend(["--output-format", "json"]);
+    }
     let mut cli = env.spawn_with_env(
+        &args,
         &[
-            "--permission-mode",
-            "read-only",
-            "--print",
-            "Report the stream result",
+            ("SCODE_LOG_PATH", log_path.to_str().unwrap()),
+            ("SUDOCODE_API_READ_TIMEOUT", "2"),
         ],
-        &[("SCODE_LOG_PATH", log_path.to_str().unwrap())],
     );
     cli.set_default_timeout(common::at_least(Duration::from_secs(45)));
-    let exit = cli.expect_eof().unwrap();
+    let is_missing_model = matches!(
+        kind,
+        ResponseKind::MissingModelUnavailable
+            | ResponseKind::MissingModelCodeUnavailable
+            | ResponseKind::MissingModelCodeOnlyUnavailable
+    );
+    if is_missing_model {
+        cli.set_default_timeout(common::at_least(Duration::from_secs(15)));
+    }
+    if matches!(kind, ResponseKind::OverloadedThenComplete) {
+        cli.expect(r"retry 1/8 .* 503")
+            .expect("a transient 503 must report its retry");
+    }
+    let exit = cli.expect_eof().unwrap_or_else(|error| {
+        panic!(
+            "stream did not complete: {error}; requests={}\n{}",
+            provider.requests.load(Ordering::SeqCst),
+            common::screen_tail(&cli, 12000)
+        )
+    });
     if matches!(
         kind,
         ResponseKind::AlwaysEmpty | ResponseKind::AlwaysEmptyThinking
@@ -308,6 +464,191 @@ fn check_response(kind: ResponseKind) {
         env.timeout(),
         "complete process output",
     );
+    if is_missing_model {
+        assert_ne!(exit, 0, "missing model must fail: {screen}");
+        assert_eq!(
+            provider.requests.load(Ordering::SeqCst),
+            1,
+            "never retry a configuration problem"
+        );
+        assert!(screen.contains("model_not_found"), "{screen}");
+        assert!(screen.contains("req_provider_error"), "{screen}");
+        assert!(
+            common::screen_contains(&screen, "selected model is not available"),
+            "{screen}"
+        );
+        assert!(!screen.contains("retry 1/8"), "{screen}");
+        return;
+    }
+    if matches!(
+        kind,
+        ResponseKind::UsageAtStart
+            | ResponseKind::ChatDoneKeepAlive
+            | ResponseKind::ChatTotalOnly
+            | ResponseKind::ResponsesDoneKeepAlive
+    ) {
+        assert_eq!(exit, 0, "{screen}");
+        assert_progress_trace(&log_path);
+        let store = runtime::SessionStore::from_cwd(env.workspace_root()).unwrap();
+        let path = store
+            .list_sessions()
+            .unwrap()
+            .into_iter()
+            .find(|session| session.message_count > 0)
+            .unwrap()
+            .path;
+        let session = runtime::Session::load_from_path(&path).unwrap();
+        let usage = session
+            .messages
+            .iter()
+            .rev()
+            .find(|message| message.role == runtime::MessageRole::Assistant)
+            .unwrap()
+            .usage
+            .expect("persist the provider's actual usage");
+        if matches!(kind, ResponseKind::ChatTotalOnly) {
+            assert_eq!(usage.input_tokens, 0, "never infer input allocation");
+            assert_eq!(usage.output_tokens, 0, "never infer output allocation");
+            assert_eq!(
+                usage.total_tokens(),
+                25,
+                "retain the provider's actual total"
+            );
+            assert_eq!(usage.reported_total_tokens, Some(25));
+            assert!(!usage.has_complete_token_breakdown());
+            assert!(runtime::UsageTracker::from_session(&session)
+                .current_context_usage()
+                .is_none());
+            assert!(usage
+                .estimate_cost_usd_with_pricing(runtime::ModelPricing::default_sonnet_tier())
+                .is_none());
+            assert!(
+                common::screen_contains(&screen, "\"total_tokens\":25"),
+                "{screen}"
+            );
+            assert!(
+                common::screen_contains(&screen, "\"token_breakdown_complete\":false"),
+                "{screen}"
+            );
+            assert!(
+                !common::screen_contains(&screen, "\"cost_units\":null"),
+                "unknown bills stay omitted"
+            );
+            assert!(
+                !common::screen_contains(&screen, "\"cost_currency\":null"),
+                "unknown currencies stay omitted"
+            );
+            assert_eq!(provider.requests.load(Ordering::SeqCst), 1);
+            let events: Vec<Value> = std::fs::read_to_string(&log_path)
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect();
+            assert!(events.iter().any(|event| event["event"] == "response_usage"
+                && event["attributes"]["reported_total_tokens"] == 25));
+
+            // A second real CLI process must restore the total-only receipt,
+            // add a fully allocated response, and recover its context anchor.
+            let mut resumed =
+                env.spawn_with_env(&["--permission-mode", "read-only", "--resume"], &[]);
+            common::expect_input_line_cleared(&resumed, env.timeout(), "resumed usage prompt");
+            resumed.send("Continue the stream result").unwrap();
+            common::expect_input_line(
+                &resumed,
+                "Continue the stream result",
+                env.timeout(),
+                "resume input",
+            );
+            resumed.send("\r").unwrap();
+            common::expect_screen(
+                &resumed,
+                |_| {
+                    runtime::Session::load_from_path(&path).is_ok_and(|session| {
+                        session
+                            .messages
+                            .iter()
+                            .filter(|message| message.role == runtime::MessageRole::Assistant)
+                            .count()
+                            == 2
+                    })
+                },
+                env.timeout(),
+                "persist the resumed response",
+            );
+            common::expect_input_line_cleared(&resumed, env.timeout(), "resumed turn complete");
+            resumed.send("/exit").unwrap();
+            common::expect_input_line(&resumed, "/exit", env.timeout(), "exit input");
+            resumed.send("\r").unwrap();
+            assert_eq!(resumed.expect_eof().unwrap(), 0);
+            let restored = runtime::Session::load_from_path(&path).unwrap();
+            assert_eq!(
+                restored
+                    .messages
+                    .iter()
+                    .filter(|message| message.role == runtime::MessageRole::Assistant)
+                    .count(),
+                2,
+                "resume must update the original transcript"
+            );
+            let tracker = runtime::UsageTracker::from_session(&restored);
+            assert_eq!(tracker.cumulative_usage().total_tokens(), 45);
+            assert_eq!(tracker.cumulative_usage().known_total_tokens(), 20);
+            assert!(!tracker.cumulative_usage().has_complete_token_breakdown());
+            assert_eq!(tracker.current_context_usage(), Some(12));
+            assert_eq!(provider.requests.load(Ordering::SeqCst), 2);
+            return;
+        }
+        if matches!(
+            kind,
+            ResponseKind::ChatDoneKeepAlive | ResponseKind::ResponsesDoneKeepAlive
+        ) {
+            assert_eq!(usage.input_tokens, 7, "cached input is counted separately");
+            assert_eq!(usage.cache_read_input_tokens, 5);
+            assert_eq!(usage.context_tokens(), Some(12));
+            assert_eq!(usage.total_tokens(), 20, "never double-count cached tokens");
+            assert!(usage.has_complete_token_breakdown());
+        } else {
+            assert_eq!(usage.input_tokens, 12);
+        }
+        assert_eq!(
+            usage.output_tokens,
+            if matches!(kind, ResponseKind::UsageAtStart) {
+                7
+            } else {
+                8
+            }
+        );
+        if matches!(kind, ResponseKind::UsageAtStart) {
+            assert!(
+                common::screen_contains(&screen, "\"cost_units\":17"),
+                "{screen}"
+            );
+            assert!(
+                common::screen_contains(&screen, "\"cost_currency\":\"sudo_point\""),
+                "{screen}"
+            );
+            assert_eq!(usage.cache_creation_input_tokens, 3);
+            assert_eq!(usage.cache_read_input_tokens, 5);
+            assert_eq!(usage.cost_units, Some(17));
+            assert_eq!(
+                usage.cost_currency,
+                Some(runtime::UsageCostCurrency::SudoPoint)
+            );
+        }
+        if matches!(kind, ResponseKind::ChatDoneKeepAlive) {
+            assert_eq!(
+                provider.terminal_connection_state.load(Ordering::SeqCst),
+                1,
+                "read the independently framed usage tail after finish_reason"
+            );
+        }
+        assert_eq!(
+            provider.requests.load(Ordering::SeqCst),
+            1,
+            "never regenerate a completed response"
+        );
+        return;
+    }
     if matches!(
         kind,
         ResponseKind::Complete
@@ -316,6 +657,7 @@ fn check_response(kind: ResponseKind) {
             | ResponseKind::StopReasonKeepAlive
             | ResponseKind::EmptyThenComplete
             | ResponseKind::EmptyThinkingThenComplete
+            | ResponseKind::OverloadedThenComplete
     ) {
         assert_eq!(exit, 0, "{screen}");
         assert!(screen.contains("STREAM_BODY_VERIFIED"), "{screen}");
@@ -327,7 +669,9 @@ fn check_response(kind: ResponseKind) {
             provider.requests.load(Ordering::SeqCst),
             if matches!(
                 kind,
-                ResponseKind::EmptyThenComplete | ResponseKind::EmptyThinkingThenComplete
+                ResponseKind::EmptyThenComplete
+                    | ResponseKind::EmptyThinkingThenComplete
+                    | ResponseKind::OverloadedThenComplete
             ) {
                 2
             } else {
@@ -384,6 +728,48 @@ fn check_response(kind: ResponseKind) {
             "{screen}"
         );
     }
+}
+
+fn assert_progress_trace(log_path: &std::path::Path) {
+    let events: Vec<Value> = std::fs::read_to_string(log_path)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let request_id = events
+        .iter()
+        .find(|event| event["event"] == "request_debug")
+        .unwrap()["attributes"]["request_id"]
+        .as_str()
+        .unwrap();
+    let rows: Vec<_> = events
+        .iter()
+        .filter(|event| event["event"] == "response_stream_progress")
+        .map(|event| &event["attributes"])
+        .collect();
+    assert!(
+        rows.len() >= 3,
+        "headers, bytes and completion must be observable"
+    );
+    assert_eq!(rows[0]["bytes_read"], 0);
+    assert_eq!(rows[0]["finished"], false);
+    let last = rows.last().unwrap();
+    assert_eq!(last["finished"], true);
+    assert!(last["bytes_read"].as_u64().unwrap() > 0);
+    assert!(last["normalized_events"].as_u64().unwrap() > 0);
+    for row in rows {
+        assert_eq!(
+            row["request_id"], request_id,
+            "transport, progress and usage share the client ID"
+        );
+        assert!(row.get("body").is_none() && row.get("content").is_none());
+        assert!(
+            !row.to_string().contains("STREAM_BODY_VERIFIED"),
+            "progress is metadata only"
+        );
+    }
+    assert!(events.iter().any(|event| event["event"] == "response_usage"
+        && event["attributes"]["request_id"] == request_id));
 }
 
 fn assert_refusal_screen(screen: &str) {
@@ -498,4 +884,349 @@ fn explicit_refusal_after_partial_text_cannot_succeed() {
 #[test]
 fn explicit_refusal_in_unterminated_tail_is_not_retried_as_truncation() {
     check_response(ResponseKind::RefusedTail);
+}
+
+#[test]
+fn initial_usage_survives_a_zero_filled_terminal_snapshot() {
+    check_response(ResponseKind::UsageAtStart);
+}
+
+#[test]
+fn chat_done_finishes_without_http_eof_and_preserves_usage() {
+    check_response(ResponseKind::ChatDoneKeepAlive);
+}
+
+#[test]
+fn responses_completed_finishes_without_http_eof_and_preserves_usage() {
+    check_response(ResponseKind::ResponsesDoneKeepAlive);
+}
+
+#[test]
+fn reported_total_survives_print_persistence_and_resume_without_inventing_a_breakdown() {
+    check_response(ResponseKind::ChatTotalOnly);
+}
+
+#[test]
+fn typed_missing_model_503_fails_once_with_the_provider_reason() {
+    check_response(ResponseKind::MissingModelUnavailable);
+}
+
+#[test]
+fn openai_missing_model_code_503_fails_once_with_the_provider_reason() {
+    check_response(ResponseKind::MissingModelCodeUnavailable);
+}
+
+#[test]
+fn code_only_missing_model_503_fails_once_with_the_provider_reason() {
+    check_response(ResponseKind::MissingModelCodeOnlyUnavailable);
+}
+
+#[test]
+fn ordinary_503_retries_visibly_and_completes() {
+    check_response(ResponseKind::OverloadedThenComplete);
+}
+
+fn liveness_response(
+    socket: &mut TcpStream,
+    kind: ResponseKind,
+    index: usize,
+    stop: &AtomicBool,
+) -> bool {
+    let is_live = matches!(
+        kind,
+        ResponseKind::NativeHeartbeat
+            | ResponseKind::ChatHeartbeat
+            | ResponseKind::ResponsesHeartbeat
+            | ResponseKind::AlwaysHeartbeat
+            | ResponseKind::HeartbeatAfterOverload
+            | ResponseKind::ToolThenHeartbeat
+            | ResponseKind::NativePartial
+            | ResponseKind::ChatPartial
+            | ResponseKind::ResponsesPartial
+            | ResponseKind::NativeSlow
+            | ResponseKind::ChatSlow
+            | ResponseKind::ResponsesSlow
+            | ResponseKind::FiniteHeartbeat
+    );
+    if !is_live {
+        return false;
+    }
+    if matches!(kind, ResponseKind::HeartbeatAfterOverload) && index == 0 {
+        let body = r#"{"error":{"type":"overloaded_error","message":"temporarily overloaded"}}"#;
+        let _ = write!(socket, "HTTP/1.1 503 Service Unavailable\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+        return true;
+    }
+    let tool_turn = matches!(kind, ResponseKind::ToolThenHeartbeat) && index == 0;
+    let partial = matches!(
+        kind,
+        ResponseKind::NativePartial | ResponseKind::ChatPartial | ResponseKind::ResponsesPartial
+    );
+    let slow = matches!(
+        kind,
+        ResponseKind::NativeSlow | ResponseKind::ChatSlow | ResponseKind::ResponsesSlow
+    );
+    let heartbeat = matches!(
+        kind,
+        ResponseKind::AlwaysHeartbeat | ResponseKind::FiniteHeartbeat
+    ) || (matches!(
+        kind,
+        ResponseKind::HeartbeatAfterOverload | ResponseKind::ToolThenHeartbeat
+    ) && index == 1)
+        || (matches!(
+            kind,
+            ResponseKind::NativeHeartbeat
+                | ResponseKind::ChatHeartbeat
+                | ResponseKind::ResponsesHeartbeat
+        ) && index == 0);
+    let mut prefix = String::new();
+    let mut tail: String;
+    let mut deltas = Vec::new();
+    match kind.api_format() {
+        Some("openai-completions") => {
+            for text in ["STREAM_", "BODY_", "VERIFIED"] {
+                deltas.push(format!(
+                    "data: {}\n\n",
+                    json!({"id":"chat","choices":[{"delta":{"content":text}}]})
+                ));
+            }
+            tail = "data: {\"id\":\"chat\",\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: {\"id\":\"chat\",\"choices\":[],\"usage\":{\"prompt_tokens\":12,\"completion_tokens\":8}}\n\ndata: [DONE]\n\n".into();
+        }
+        Some("openai-responses") => {
+            prefix =
+                "event: response.created\ndata: {\"id\":\"live\",\"model\":\"sonnet\"}\n\n".into();
+            for text in ["STREAM_", "BODY_", "VERIFIED"] {
+                deltas.push(format!(
+                    "event: response.output_text.delta\ndata: {}\n\n",
+                    json!({"delta":text})
+                ));
+            }
+            tail = "event: response.completed\ndata: {\"response\":{\"usage\":{\"input_tokens\":12,\"output_tokens\":8}}}\n\n".into();
+        }
+        _ => {
+            prefix = "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"live\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"sonnet\",\"content\":[],\"usage\":{\"input_tokens\":12,\"output_tokens\":0}}}\n\nevent: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n".into();
+            for text in ["STREAM_", "BODY_", "VERIFIED"] {
+                deltas.push(format!("event: content_block_delta\ndata: {}\n\n", json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":text}})));
+            }
+            tail = "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\nevent: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":8}}\n\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\n\n".into();
+        }
+    }
+    if tool_turn {
+        prefix = prefix[..prefix.find("event: content_block_start").unwrap()].to_owned();
+        prefix.push_str("event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"once\",\"name\":\"bash\",\"input\":{}}}\n\n");
+        prefix.push_str(&format!("event: content_block_delta\ndata: {}\n\n", json!({"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":json!({"command":"sleep 3; echo once >> once.txt"}).to_string()}})));
+        tail = tail.replace("end_turn", "tool_use");
+        deltas.clear();
+    }
+    let body = format!("{prefix}{}{tail}", deltas.join(""));
+    let length = if heartbeat || partial {
+        1_000_000
+    } else {
+        body.len()
+    };
+    if write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {length}\r\nConnection: close\r\n\r\n").is_err() { return true; }
+    if !heartbeat {
+        let _ = socket.write_all(prefix.as_bytes());
+        for delta in &deltas {
+            if slow {
+                thread::sleep(Duration::from_millis(900));
+            }
+            if socket.write_all(delta.as_bytes()).is_err() {
+                return true;
+            }
+        }
+        if !partial {
+            let _ = socket.write_all(tail.as_bytes());
+        }
+    }
+    if heartbeat || partial {
+        socket
+            .set_read_timeout(Some(Duration::from_millis(50)))
+            .unwrap();
+        let started = std::time::Instant::now();
+        while !stop.load(Ordering::SeqCst) && !peer_closed(socket) {
+            if matches!(kind, ResponseKind::FiniteHeartbeat)
+                && started.elapsed() >= Duration::from_secs(3)
+            {
+                let _ = socket.write_all(body.as_bytes());
+                break;
+            }
+            if socket.write_all(b": ping\n\n").is_err() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+    }
+    true
+}
+
+fn check_liveness(
+    kind: ResponseKind,
+    read_timeout: &str,
+    expected_requests: usize,
+    is_success: bool,
+) {
+    let env = TestEnv::new_mock("stream-liveness");
+    let provider = StreamProvider::new(kind);
+    configure_peer(&env, &provider, kind);
+    let log = env.workspace_root().join("stream-events.jsonl");
+    let is_tool = matches!(kind, ResponseKind::ToolThenHeartbeat);
+    let interactive = matches!(
+        kind,
+        ResponseKind::NativeHeartbeat
+            | ResponseKind::ChatHeartbeat
+            | ResponseKind::ResponsesHeartbeat
+            | ResponseKind::HeartbeatAfterOverload
+            | ResponseKind::NativePartial
+            | ResponseKind::ChatPartial
+            | ResponseKind::ResponsesPartial
+    );
+    let mut args = vec![
+        "--permission-mode",
+        if is_tool {
+            "danger-full-access"
+        } else {
+            "read-only"
+        },
+    ];
+    if !interactive {
+        args.push("--print");
+    }
+    args.push("Report the stream result");
+    let mut cli = env.spawn_with_env(
+        &args,
+        &[
+            ("SUDOCODE_API_READ_TIMEOUT", read_timeout),
+            ("SCODE_LOG_PATH", log.to_str().unwrap()),
+        ],
+    );
+    cli.set_default_timeout(common::at_least(Duration::from_secs(30)));
+    let code = cli.expect_eof().unwrap_or_else(|error| {
+        panic!(
+            "stream liveness: {error}; requests={}\n{}",
+            provider.requests.load(Ordering::SeqCst),
+            common::screen_tail(&cli, 6000)
+        )
+    });
+    assert_eq!(code == 0, is_success, "{}", common::screen_tail(&cli, 6000));
+    assert_eq!(provider.requests.load(Ordering::SeqCst), expected_requests);
+    let screen = common::expect_screen(
+        &cli,
+        |s| {
+            common::screen_contains(
+                s,
+                if is_success {
+                    "STREAM_BODY_VERIFIED"
+                } else if interactive {
+                    "automatic replay disabled"
+                } else {
+                    "runtime_error:"
+                },
+            )
+        },
+        common::DEFAULT_TIMEOUT,
+        "complete liveness result",
+    );
+    let bodies = provider.bodies.lock().unwrap();
+    if expected_requests > 1 {
+        let first = usize::from(is_tool);
+        assert!(
+            bodies[first..].iter().all(|body| body == &bodies[first]),
+            "safe replay must preserve the request bytes"
+        );
+    }
+    if is_tool {
+        assert_eq!(
+            std::fs::read_to_string(env.workspace_root().join("once.txt")).unwrap(),
+            "once\n",
+            "completed tools are never executed twice"
+        );
+        assert!(bodies[1]["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|m| m["content"]
+                .as_array()
+                .is_some_and(|blocks| blocks.iter().any(|b| b["type"] == "tool_result"))));
+    }
+    if matches!(
+        kind,
+        ResponseKind::NativePartial | ResponseKind::ChatPartial | ResponseKind::ResponsesPartial
+    ) {
+        assert!(common::screen_contains(
+            &screen,
+            "automatic replay disabled"
+        ));
+        assert_eq!(
+            screen.matches("STREAM_BODY_VERIFIED").count(),
+            1,
+            "partial output is not repeated"
+        );
+    }
+    if matches!(kind, ResponseKind::HeartbeatAfterOverload) {
+        assert!(
+            common::screen_contains(&screen, "retry 2/8"),
+            "one shared retry sequence: {screen}"
+        );
+        let attempts: Vec<_> = std::fs::read_to_string(log)
+            .unwrap()
+            .lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .filter(|event| event["event"] == "request_started")
+            .map(|event| event["attributes"]["attempt"].as_u64().unwrap())
+            .collect();
+        assert_eq!(attempts, [1, 2, 3]);
+    }
+}
+
+#[test]
+fn heartbeat_only_streams_replay_before_the_first_provider_event() {
+    for kind in [
+        ResponseKind::NativeHeartbeat,
+        ResponseKind::ChatHeartbeat,
+        ResponseKind::ResponsesHeartbeat,
+    ] {
+        check_liveness(kind, "2", 2, true);
+    }
+}
+
+#[test]
+fn partial_provider_output_is_not_replayed() {
+    for kind in [
+        ResponseKind::NativePartial,
+        ResponseKind::ChatPartial,
+        ResponseKind::ResponsesPartial,
+    ] {
+        check_liveness(kind, "2", 1, false);
+    }
+}
+
+#[test]
+fn active_provider_events_outlive_the_idle_timeout() {
+    for kind in [
+        ResponseKind::NativeSlow,
+        ResponseKind::ChatSlow,
+        ResponseKind::ResponsesSlow,
+    ] {
+        check_liveness(kind, "2", 1, true);
+    }
+}
+
+#[test]
+fn completed_tool_survives_an_empty_continuation_replay() {
+    check_liveness(ResponseKind::ToolThenHeartbeat, "2", 3, true);
+}
+
+#[test]
+fn http_retries_and_stream_replay_share_one_attempt_sequence() {
+    check_liveness(ResponseKind::HeartbeatAfterOverload, "2", 3, true);
+}
+
+#[test]
+fn empty_stream_replay_is_bounded_once() {
+    check_liveness(ResponseKind::AlwaysHeartbeat, "2", 2, false);
+}
+
+#[test]
+fn zero_read_timeout_preserves_a_long_empty_wait() {
+    check_liveness(ResponseKind::FiniteHeartbeat, "0", 1, true);
 }

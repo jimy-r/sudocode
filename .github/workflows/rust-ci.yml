@@ -69,6 +69,10 @@ on:
         description: 'Run release rendering calibration before enabling the required gate'
         type: boolean
         default: false
+      live_only:
+        description: 'Run genuine ACP and Linux/Windows model acceptance only; normal PR gates remain unchanged'
+        type: boolean
+        default: false
 
 concurrency:
   group: rust-ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
@@ -93,7 +97,7 @@ jobs:
       profile: core
 
   release-mirror:
-    if: &standard_ci ${{ !inputs.render_performance }}
+    if: &standard_ci ${{ !inputs.render_performance && !inputs.live_only }}
     name: release mirror recovery
     runs-on: ubuntu-latest
     defaults:
@@ -267,6 +271,12 @@ jobs:
           SCODE_TEST_BACKEND: mock
           SCODE_TERMINAL_LOG_DIR: ${{ runner.temp }}/scode-resize-logs
         run: cargo test -p rusty-sudocode-cli --test pty_chrome_resize -- --ignored --nocapture
+      - name: Answer palette queries through the ready Unix terminal peer
+        if: runner.os != 'Windows'
+        env:
+          SCODE_TEST_BACKEND: mock
+          SCODE_TERMINAL_LOG_DIR: ${{ runner.temp }}/scode-resize-logs
+        run: cargo test -p rusty-sudocode-cli --test pty_codex_colors -- --ignored --nocapture
       - name: Retain terminal buffer and wire traces
         if: always()
         uses: actions/upload-artifact@v4
@@ -511,12 +521,25 @@ jobs:
       (github.event_name == 'workflow_dispatch' ||
       (github.event_name == 'push' && github.ref == 'refs/heads/main'))
     runs-on: ubuntu-latest
+    env:
+      SUDOCODE_API_READ_TIMEOUT: &live_idle_seconds '90'
+      SCODE_LIVE_MODEL: &live_model gpt-6-luna
+      # The native credential selects a verified provider independently of GPT.
+      SCODE_NATIVE_MODEL: &native_model ${{ vars.SUDOROUTER_NATIVE_MODEL || 'claude-sonnet-4-6' }}
+      SCODE_LOG_PATH: ${{ github.workspace }}/scode-acp-live-trace.jsonl
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: rust -> target
+      - name: Inspect the provider's real usage contract
+        working-directory: .
+        env:
+          PROXY_AUTH_TOKEN: ${{ secrets.SUDOROUTER_CI_API_KEY }}
+          NATIVE_PROXY_AUTH_TOKEN: &native_key ${{ vars.SUDOROUTER_NATIVE_CHANNEL && format('{0}-{1}', secrets.SUDOROUTER_CI_API_KEY, vars.SUDOROUTER_NATIVE_CHANNEL) || secrets.SUDOROUTER_CI_API_KEY }}
+          PROXY_BASE_URL: https://api.sudorouter.ai/v1
+        run: node .github/scripts/probe_live_usage.cjs "${{ runner.temp }}/provider-usage-contract.json"
       - name: Run live API smoke tests
         working-directory: rust
         env:
@@ -525,22 +548,36 @@ jobs:
           # token that expires/gets suspended and takes this job red on main.
           PROXY_AUTH_TOKEN: ${{ secrets.SUDOROUTER_CI_API_KEY }}
           PROXY_BASE_URL: https://api.sudorouter.ai/v1
-          SCODE_LIVE_MODEL: gpt-6-luna
         run: cargo test -p rusty-sudocode-cli --test acp_live_smoke -- --test-threads=1
       - name: Claude native cache and subagent smoke
         working-directory: rust
         env:
-          PROXY_AUTH_TOKEN: ${{ secrets.SUDOROUTER_CI_API_KEY }}
+          PROXY_AUTH_TOKEN: *native_key
           PROXY_BASE_URL: https://api.sudorouter.ai/v1
-          SCODE_LIVE_MODEL: claude-sonnet-4-6
+          SCODE_LIVE_MODEL: *native_model
         run: cargo test -p rusty-sudocode-cli --test acp_live_smoke live_subagent_smoke_stdio -- --test-threads=1
       - name: Real model through the co-host controller mailbox
         working-directory: rust
         env:
           ANTHROPIC_API_KEY: ${{ secrets.SUDOROUTER_CI_API_KEY }}
           ANTHROPIC_BASE_URL: https://api.sudorouter.ai
-          SUDOCODE_TEST_MODEL: gpt-6-luna
+          SUDOCODE_TEST_MODEL: *live_model
         run: cargo test --locked -p engine-acp --features mailbox --test session_mailbox_live -- --ignored --nocapture
+      - name: Summarize ACP model routing and usage
+        if: always()
+        working-directory: .
+        env:
+          PROXY_AUTH_TOKEN: ${{ secrets.SUDOROUTER_CI_API_KEY }}
+          NATIVE_PROXY_AUTH_TOKEN: *native_key
+        run: node .github/scripts/summarize_live_model_trace.cjs "$SCODE_LOG_PATH" "${{ runner.temp }}/scode-acp-live-evidence.json"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: acp-live-model-evidence
+          path: |
+            ${{ runner.temp }}/scode-acp-live-evidence.json
+            ${{ runner.temp }}/provider-usage-contract.json
+          retention-days: 7
 
   live-bash-process-tree:
     name: Live Bash process tree (${{ matrix.os }})
@@ -569,7 +606,8 @@ jobs:
           SUDO_CODE_CONFIG_HOME: ${{ runner.temp }}/scode-process-tree-config
           PROXY_AUTH_TOKEN: ${{ secrets.SUDOROUTER_CI_API_KEY }}
           SCODE_TEST_BACKEND: live
-          SCODE_LIVE_MODEL: gpt-6-luna
+          SUDOCODE_API_READ_TIMEOUT: *live_idle_seconds
+          SCODE_LIVE_MODEL: gpt-5.4-mini
           SCODE_LIVE_AUTH_PROFILE: sudorouter
           SCODE_LOG_PATH: ${{ runner.temp }}/scode-live-model-trace.jsonl
           SCODE_LIVE_ARTIFACTS: ${{ runner.temp }}/scode-live-requests
@@ -586,8 +624,8 @@ jobs:
             models: {}
           }), { mode: 0o600 });
           NODE
-          # This client gate uses a route verified with correct workspace paths.
-          # Explicit local Sonnet runs retain the upstream environment incident.
+          # Keep file/tool interaction within its fixed turn budget. API and
+          # mailbox acceptance retain the independent GPT usage-contract model.
           cargo test -p rusty-sudocode-cli --test pty_headless -- --test-threads=1 --nocapture
           SCODE_LIVE_MODEL=deepseek-v3.2-azure cargo test -p rusty-sudocode-cli --test pty_azure_inline_reasoning azure_live_file_roundtrip_has_a_final_answer -- --test-threads=1 --nocapture
           cargo test -p rusty-sudocode-cli --test pty_model_flag_priority configured_model_reads_updated_file_after_resume -- --test-threads=1 --nocapture

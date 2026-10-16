@@ -288,6 +288,9 @@ fn base_command_with_mode(
     for (key, value) in isolated_env::inherited_env() {
         cmd.env(key, value);
     }
+    if let Some(path) = std::env::var_os("SCODE_LOG_PATH") {
+        cmd.env("SCODE_LOG_PATH", path);
+    }
     cmd.args([
         "--auth",
         "proxy",
@@ -483,7 +486,7 @@ async fn scenario_session_prompt(client: &mut AcpTestClient, session_id: &str) {
     );
     assert!(
         result.get("usage").is_some(),
-        "prompt response should include usage"
+        "prompt response should include usage; full response: {resp}"
     );
 }
 
@@ -651,7 +654,7 @@ async fn scenario_subagent_calculations(client: &mut AcpTestClient, session_id: 
     assert_eq!(
         agent_starts.len(),
         3,
-        "expected exactly 3 Agent tool_call starts, got {}",
+        "expected exactly 3 Agent tool_call starts, got {}; provider reply: {text_output}",
         agent_starts.len()
     );
     assert!(
