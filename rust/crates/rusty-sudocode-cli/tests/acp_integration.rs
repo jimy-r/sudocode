@@ -197,7 +197,20 @@ impl AcpTestClient {
         // it here so every session-creating test verifies the broadcast and
         // no test sees it as a stray notification on its next request.
         if matches!(method, "session/new" | "session/load") && response.get("error").is_none() {
-            let update = timeout(AVAILABLE_COMMANDS_TIMEOUT, self.recv_inner())
+            let update = timeout(AVAILABLE_COMMANDS_TIMEOUT, async {
+                loop {
+                    let message = self.recv_inner().await;
+                    // Durable delivery is independent of the load response;
+                    // retain its requests while awaiting command metadata.
+                    if is_server_request(&message, "_sudocode/task/completed")
+                        || is_server_request(&message, "_sudocode/subagent/completed")
+                    {
+                        notifications.push(message);
+                        continue;
+                    }
+                    break message;
+                }
+            })
                 .await
                 .unwrap_or_else(|_| {
                     panic!(
@@ -6080,6 +6093,24 @@ async fn acp_background_terminal_is_queryable_across_prompts() {
     workspace.cleanup();
 }
 
+async fn frozen_completion_sources(workspace: &TestWorkspace, sid: &str, count: usize) -> Value {
+    let path = find_session_transcript(&workspace.root, sid).with_extension("completions.json");
+    timeout(Duration::from_secs(15), async {
+        loop {
+            let saved: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+            let sources = saved["sources"].as_object().unwrap();
+            if sources.len() == count
+                && sources.values().all(|source| source["payload"].is_object())
+            {
+                break saved;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("all expected completion payloads must be frozen before process exit")
+}
+
 async fn initialize_with_completions(client: &mut AcpTestClient) {
     let (_, response) = client
         .send_request(
@@ -6143,6 +6174,7 @@ async fn acp_completions_retry_ack_and_exact_context() {
         .await
         .unwrap();
     assert_eq!(retry["params"], first["params"]);
+    frozen_completion_sources(&workspace, &sid, 2).await;
     // Restart before receiving a durable ACK. Metadata replay must deliver
     // the same frozen payload without constructing an execution engine.
     client.shutdown().await;
@@ -6767,18 +6799,7 @@ async fn acp_completion_upgrade_and_rollback_preserve_delivery() {
         .unwrap();
     let transcript = find_session_transcript(&workspace.root, &sid);
     let path = transcript.with_extension("completions.json");
-    let before: Value = timeout(Duration::from_secs(15), async {
-        loop {
-            let saved: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
-            let sources = saved["sources"].as_object().unwrap();
-            if sources.len() == 2 && sources.values().all(|source| source["payload"].is_object()) {
-                break saved;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-    })
-    .await
-    .expect("both stage-one deliveries frozen before upgrade");
+    let before = frozen_completion_sources(&workspace, &sid, 2).await;
     old.shutdown().await;
 
     let mut new = spawn_stdio_client_danger(&workspace);
