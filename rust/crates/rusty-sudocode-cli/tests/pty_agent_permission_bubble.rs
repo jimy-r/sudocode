@@ -15,6 +15,18 @@ const BUDGET: Duration = common::LIVE_TURN_BUDGET;
 const INVOICE_AGENT: &str = "invoice-bash-fixture";
 const INVOICE_SYSTEM_MARKER: &str = "InvoiceBashFixture";
 
+/// Keep execution and report agents on the parent route. Authentication is a
+/// fixture input, not a model-selected part of this permission/report journey.
+fn agent_input(model: &str, agent: &str, prompt: &str) -> Value {
+    serde_json::json!({
+        "agent": agent,
+        "model": model,
+        "auth_mode": null,
+        "run_in_background": false,
+        "prompt": prompt,
+    })
+}
+
 fn requests(directory: &Path) -> Vec<Value> {
     std::fs::read_dir(directory)
         .unwrap()
@@ -109,9 +121,15 @@ print(result)
     let command = format!("'{python}' '{script}'");
     let command_words = shell_words::split(&command).unwrap();
     let child_prompt = format!("Use the bash tool to run exactly this command once, with no other commands or retries: {command}. Report its actual output.");
-    let mut prompt = format!("Call one Agent with subagent_type={INVOICE_AGENT}, model={model}, run_in_background=false, and this exact child prompt: {}. Wait for the child and report its output.", serde_json::to_string(&child_prompt).unwrap());
+    let execution = agent_input(&model, INVOICE_AGENT, &child_prompt);
+    let mut prompt = format!("Call the Agent tool with exactly this input object, without adding or overriding fields: {execution}. Wait for the child and report its actual output.");
     if verify_report {
-        prompt.push_str(" The Agent tool already saves its report at the outputFile path in its returned result. After it completes, have a second read-only Explore Agent read that exact outputFile and return the actual invoice output. It must only read that report, without running commands or creating another report. Report that verified output.");
+        let verification = agent_input(
+            &model,
+            "Explore",
+            "Read exactly OUTPUT_FILE and return the actual invoice output. Only read this report: do not run commands or create another report.",
+        );
+        prompt.push_str(&format!(" The first Agent already saves its report at the outputFile path in its returned result. Then call Agent with this exact input object, replacing only OUTPUT_FILE with that actual outputFile path: {verification}. Report that verified output."));
     }
     let marker = common::turn_status_marker(&cli);
     cli.send(&prompt).unwrap();
@@ -124,7 +142,7 @@ print(result)
                 .contains(if verify_report {
                     "Report that verified output."
                 } else {
-                    "report its output."
+                    "report its actual output."
                 })
         },
         BUDGET,
@@ -200,6 +218,13 @@ print(result)
                 let name = tools::canonicalize_tool_name(block["name"].as_str().unwrap());
                 match name.as_str() {
                     "agent_spawn" => {
+                        assert_eq!(block["input"]["model"], model, "child model override");
+                        assert!(
+                            block["input"]["auth_mode"].is_null(),
+                            "child must inherit the parent credential path: {}",
+                            block["input"]
+                        );
+                        assert_eq!(block["input"]["run_in_background"], false);
                         agents.insert(block["id"].to_string());
                     }
                     "bash" => {
