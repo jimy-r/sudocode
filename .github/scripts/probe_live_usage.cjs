@@ -15,6 +15,10 @@ function numericFields(value) {
 async function main() {
   const token = process.env.PROXY_AUTH_TOKEN;
   if (!token) throw new Error('PROXY_AUTH_TOKEN is required');
+  const nativeToken = process.env.NATIVE_PROXY_AUTH_TOKEN;
+  if (process.env.SCODE_NATIVE_MODEL && !nativeToken) {
+    throw new Error('NATIVE_PROXY_AUTH_TOKEN is required when SCODE_NATIVE_MODEL is set');
+  }
   const base = process.env.PROXY_BASE_URL.replace(/\/$/, '');
   const models = [...new Set([process.env.SCODE_LIVE_MODEL, process.env.SCODE_NATIVE_MODEL].filter(Boolean))];
   const errorDetails = body => {
@@ -23,6 +27,7 @@ async function main() {
   };
   const report = [];
   for (const model of models) for (const route of ['chat/completions', 'messages']) {
+    const modelToken = model === process.env.SCODE_NATIVE_MODEL ? nativeToken : token;
     const item = { route, model, usage: [] };
     report.push(item);
     try {
@@ -31,7 +36,7 @@ async function main() {
       if (route === 'chat/completions') body.stream_options = { include_usage: true };
       const response = await fetch(`${base}/${route}`, {
         method: 'POST', signal: AbortSignal.timeout(60000),
-        headers: { authorization: `Bearer ${token}`, 'x-api-key': token,
+        headers: { authorization: `Bearer ${modelToken}`, 'x-api-key': modelToken,
           'anthropic-version': '2023-06-01', 'content-type': 'application/json' },
         body: JSON.stringify(body),
       });
