@@ -7461,69 +7461,9 @@ async fn acp_purged_background_terminal_is_still_reaped_on_close() {
     workspace.cleanup();
 }
 
-/// Native Windows Job accounting must confirm all generations before publishing cancellation.
+/// Query the original fixture identities without treating an absent PID as an error.
 #[cfg(windows)]
-#[tokio::test]
-async fn acp_powershell_cancellation_reaps_owned_job_before_replay() {
-    let server = MockAnthropicService::spawn().await.unwrap();
-    let workspace = TestWorkspace::new("windows-task-job");
-    workspace.create();
-    workspace.write_sudocode_json(&server.base_url());
-    let _release = CompletionFixtureRelease(workspace.root.join("release-native"));
-    for (name, next) in [
-        ("parent", Some("child")),
-        ("child", Some("grandchild")),
-        ("grandchild", None),
-    ] {
-        let stamp = format!(
-            r#"$ErrorActionPreference = 'Stop'
-'{{0}}:{{1}}' -f $PID, (Get-Process -Id $PID).StartTime.ToUniversalTime().Ticks | Set-Content -Encoding ascii -LiteralPath (Join-Path $PSScriptRoot '{name}.pid')
-"#
-        );
-        let body = next.map_or_else(
-            || "while (-not (Test-Path -LiteralPath (Join-Path $PSScriptRoot 'release-native'))) { Start-Sleep -Milliseconds 50 }\n".to_owned(),
-            |next| format!("$shell = (Get-Process -Id $PID).Path\n& $shell -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File (Join-Path $PSScriptRoot '{next}.ps1')\n"),
-        );
-        fs::write(workspace.root.join(format!("{name}.ps1")), stamp + &body).unwrap();
-    }
-    let mut client = spawn_stdio_client_danger(&workspace);
-    initialize_task_completions(&mut client).await;
-    let sid = scenario_session_new(&mut client, &workspace.root).await;
-    let (_, probe) = client
-        .send_request(
-            "_sudocode/task/replay",
-            json!({"sessionId":sid,"cwd":workspace.root}),
-        )
-        .await;
-    let storage = probe["result"]["storageRef"].clone();
-    let calls = json!([{"id":"windows-owned","name":"PowerShell","input":{"command":"Set-ExecutionPolicy -Scope Process Bypass -Force; & ./parent.ps1","run_in_background":true}}]);
-    let (_, parent) = client.send_request("session/prompt", json!({"sessionId":sid,"_meta":{"traceId":"windows-owned:1"},"prompt":[{"type":"text","text":format!("{SCENARIO_PREFIX}tool_concurrency TOOL_BATCH:{calls}")}]})).await;
-    assert_eq!(parent["result"]["stopReason"], "end_turn", "{parent}");
-    let identities = timeout(Duration::from_secs(15), async {
-        loop {
-            let mut identities = Vec::new();
-            for name in ["parent", "child", "grandchild"] {
-                if let Ok(value) = fs::read_to_string(workspace.root.join(format!("{name}.pid"))) {
-                    let value = value.trim();
-                    if value.split_once(':').is_some_and(|(pid, ticks)| {
-                        pid.parse::<u32>().is_ok() && ticks.parse::<u64>().is_ok()
-                    }) {
-                        identities.push(value.to_owned());
-                    }
-                }
-            }
-            if identities.len() == 3 {
-                break identities;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-    })
-    .await
-    .expect("all three native PowerShell processes must start");
-    let (_, closed) = client
-        .send_request("session/close", json!({"sessionId":sid}))
-        .await;
-    assert!(closed.get("result").is_some(), "{closed}");
+fn powershell_process_identities(identities: &[String]) -> Vec<String> {
     let ids = identities
         .iter()
         .map(|value| value.split_once(':').unwrap().0)
@@ -7547,12 +7487,96 @@ async fn acp_powershell_cancellation_reaps_owned_job_before_replay() {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
-    let present = String::from_utf8_lossy(&output.stdout);
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(|line| line.trim().to_owned())
+        .collect()
+}
+
+/// Native Windows Job accounting must confirm all generations before publishing cancellation.
+#[cfg(windows)]
+#[tokio::test]
+async fn acp_powershell_cancellation_reaps_owned_job_before_replay() {
+    let server = MockAnthropicService::spawn().await.unwrap();
+    let workspace = TestWorkspace::new("windows-task-job");
+    workspace.create();
+    workspace.write_sudocode_json(&server.base_url());
+    let _release = CompletionFixtureRelease(workspace.root.join("release-native"));
+    for (name, next) in [
+        ("parent", Some("child")),
+        ("child", Some("grandchild")),
+        ("grandchild", None),
+    ] {
+        let stamp = format!(
+            r#"$ErrorActionPreference = 'Stop'
+$stamp = '{{0}}:{{1}}' -f $PID, (Get-Process -Id $PID).StartTime.ToUniversalTime().Ticks
+[System.IO.File]::WriteAllText((Join-Path $PSScriptRoot '{name}.pid.tmp'), $stamp, [System.Text.Encoding]::ASCII)
+[System.IO.File]::Move((Join-Path $PSScriptRoot '{name}.pid.tmp'), (Join-Path $PSScriptRoot '{name}.pid'))
+"#
+        );
+        let body = next.map_or_else(
+            || "while (-not (Test-Path -LiteralPath (Join-Path $PSScriptRoot 'release-native'))) { Start-Sleep -Milliseconds 50 }\n".to_owned(),
+            |next| format!("$shell = (Get-Process -Id $PID).Path\n& $shell -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File (Join-Path $PSScriptRoot '{next}.ps1')\n"),
+        );
+        fs::write(workspace.root.join(format!("{name}.ps1")), stamp + &body).unwrap();
+    }
+    let mut client = spawn_stdio_client_danger(&workspace);
+    initialize_task_completions(&mut client).await;
+    let sid = scenario_session_new(&mut client, &workspace.root).await;
+    let (_, probe) = client
+        .send_request(
+            "_sudocode/task/replay",
+            json!({"sessionId":sid,"cwd":workspace.root}),
+        )
+        .await;
+    let storage = probe["result"]["storageRef"].clone();
+    let calls = json!([{"id":"windows-owned","name":"PowerShell","input":{"command":"Set-ExecutionPolicy -Scope Process Bypass -Force; & ./parent.ps1","run_in_background":true}}]);
+    let (started, parent) = client.send_request("session/prompt", json!({"sessionId":sid,"_meta":{"traceId":"windows-owned:1"},"prompt":[{"type":"text","text":format!("{SCENARIO_PREFIX}tool_concurrency TOOL_BATCH:{calls}")}]})).await;
+    assert_eq!(parent["result"]["stopReason"], "end_turn", "{parent}");
+    let mut last_stamps = Vec::new();
+    // Cold-starting three interpreters uses the same startup budget as the
+    // server fixture. This does not change the runtime's cancellation deadline.
+    let identities = timeout(SERVER_STARTUP_TIMEOUT, async {
+        loop {
+            let mut identities = Vec::new();
+            last_stamps.clear();
+            for name in ["parent", "child", "grandchild"] {
+                let stamp = fs::read_to_string(workspace.root.join(format!("{name}.pid")));
+                last_stamps.push(format!("{name}: {stamp:?}"));
+                if let Ok(value) = stamp {
+                    let value = value.trim();
+                    if value.split_once(':').is_some_and(|(pid, ticks)| {
+                        pid.parse::<u32>().is_ok() && ticks.parse::<u64>().is_ok()
+                    }) {
+                        identities.push(value.to_owned());
+                    }
+                }
+            }
+            if identities.len() == 3 {
+                break identities;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|error| {
+        panic!("all three native PowerShell processes must start: {error}; stamps={last_stamps:?}; updates={started:?}")
+    });
+    let running = powershell_process_identities(&identities);
+    assert!(
+        identities.iter().all(|identity| running.contains(identity)),
+        "all three original processes must be alive before close: expected={identities:?}, running={running:?}"
+    );
+    let (_, closed) = client
+        .send_request("session/close", json!({"sessionId":sid}))
+        .await;
+    assert!(closed.get("result").is_some(), "{closed}");
+    let present = powershell_process_identities(&identities);
     assert!(
         identities
             .iter()
-            .all(|identity| !present.lines().any(|line| line.trim() == identity.as_str())),
-        "close returned while original native processes were present: {present}"
+            .all(|identity| !present.contains(identity)),
+        "close returned while original native processes were present: {present:?}"
     );
     client.shutdown().await;
     let mut client = spawn_stdio_client_danger(&workspace);
