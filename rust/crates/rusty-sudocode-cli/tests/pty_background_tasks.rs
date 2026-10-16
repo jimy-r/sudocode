@@ -275,26 +275,63 @@ fn explicit_and_automatic_background_agents_share_the_task_browser() {
 #[test]
 fn stopping_one_background_task_keeps_its_sibling_running() {
     let (env, _release) = task_env("background-stop-one");
+    for name in ["one", "two"] {
+        for (level, next) in [("parent", "child"), ("child", "grandchild")] {
+            fs::write(
+                env.workspace_root().join(format!("{name}-{level}.sh")),
+                format!("echo $$ > {name}-{level}.pid\nsh {name}-{next}.sh &\nwait\n"),
+            )
+            .unwrap();
+        }
+        fs::write(
+            env.workspace_root().join(format!("{name}-grandchild.sh")),
+            format!("echo $$ > {name}-grandchild.pid\nwhile [ ! -f release-{name} ]; do sleep 0.1; done\necho {}_FINISHED > {name}-done\ncat {name}-done\n", name.to_uppercase()),
+        ).unwrap();
+    }
     let mut session = start(
         &env,
         &[
-            shell(
-                "one",
-                "while [ ! -f release-one ]; do sleep 0.1; done; echo ONE_FINISHED",
-                "Stop this task",
-            ),
-            shell(
-                "two",
-                "while [ ! -f release-two ]; do sleep 0.1; done; echo TWO_FINISHED",
-                "Keep this task",
-            ),
+            shell("one", "sh one-parent.sh", "Stop this task"),
+            shell("two", "sh two-parent.sh", "Keep this task"),
         ],
     );
     screen(&session, "2 terminals · ↓ to view");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    for name in ["one", "two"] {
+        while fs::read_to_string(env.workspace_root().join(format!("{name}-grandchild.pid")))
+            .map_or(true, |pid| pid.trim().is_empty())
+        {
+            assert!(
+                Instant::now() < deadline,
+                "{name} process tree did not start"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
     open(&mut session);
+    let details = screen(&session, "Esc task list");
+    let (stopped, survivor) = if details.contains("Stop this task") {
+        ("one", "two")
+    } else {
+        assert!(details.contains("Keep this task"), "{details}");
+        ("two", "one")
+    };
     session.send("k").unwrap();
     screen(&session, "cancelled");
     screen(&session, "1 terminal");
+    #[cfg(unix)]
+    for level in ["parent", "child", "grandchild"] {
+        let pid = fs::read_to_string(env.workspace_root().join(format!("{stopped}-{level}.pid")))
+            .unwrap()
+            .trim()
+            .parse::<i32>()
+            .unwrap();
+        assert_eq!(
+            nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None),
+            Err(nix::errno::Errno::ESRCH),
+            "cancelled was published while {stopped}'s {level} was still present"
+        );
+    }
     // Both scripts are released; only the task not stopped may finish normally.
     fs::write(env.workspace_root().join("release-one"), "go").unwrap();
     fs::write(env.workspace_root().join("release-two"), "go").unwrap();
@@ -308,7 +345,15 @@ fn stopping_one_background_task_keeps_its_sibling_running() {
         "surviving sibling output",
     );
     screen(&session, "exit 0");
-    assert!(result.contains("FINISHED"));
+    assert!(result.contains(&format!("{}_FINISHED", survivor.to_uppercase())));
+    assert!(!env
+        .workspace_root()
+        .join(format!("{stopped}-done"))
+        .exists());
+    assert!(env
+        .workspace_root()
+        .join(format!("{survivor}-done"))
+        .exists());
     close(session);
 }
 

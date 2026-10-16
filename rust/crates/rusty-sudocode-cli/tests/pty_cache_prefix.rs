@@ -268,6 +268,8 @@ fn thinking_blocks_survive_turns_and_resume_without_merging_or_dropping() {
         ]))
         .unwrap();
     legacy.save_to_path(&path).unwrap();
+    // The fixture writer must hand the session to the resumed CLI exclusively.
+    drop(legacy);
     let mut cli = spawn(&env, &path);
     turn(&mut cli, "First signed response.");
     turn(&mut cli, "Replay the signed response.");

@@ -896,6 +896,9 @@ fn exhausted_network_retries_do_not_restart_the_budget_in_the_fallback() {
     let mut original = Session::load_from_path(&path).unwrap();
     original.messages.last_mut().unwrap().usage = Some(old_usage);
     original.save_to_path(&path).unwrap();
+    // Retain a read-only snapshot after handing the writer to the CLI.
+    drop(original);
+    let original = Session::load_from_path(&path).unwrap();
     assert_eq!(
         runtime::UsageTracker::from_session(&original)
             .cumulative_usage()
@@ -1132,6 +1135,7 @@ fn pruning_below_the_request_budget_still_summarizes_until_the_ratio_is_met() {
         .unwrap();
     session.save_to_path(&path).unwrap();
     let before = estimate_session_tokens(&session);
+    drop(session);
     let mut cli = env.spawn(&["--resume", path.to_str().unwrap()]);
     common::expect_input_line_cleared(&cli, Duration::from_secs(30), "resume ready");
     cli.send("Continue PROJECT_ALPHA.").unwrap();
@@ -1239,6 +1243,10 @@ fn a_concurrent_durable_history_change_prevents_checkpoint_installation() {
             .push_user_text("EXTERNAL_WRITER_SENTINEL preserve this concurrent decision.")
             .unwrap();
         external.save_to_path(&path).unwrap();
+        // The external write is complete; the CLI must now be able to persist
+        // its source_changed report without a second active fixture writer.
+        drop(external);
+        let external = Session::load_from_path(&path).unwrap();
         let screen = if before_run {
             cli.send("/compact\r").unwrap();
             let screen = common::expect_screen(
@@ -1308,6 +1316,7 @@ fn compaction_preserves_external_billing_for_unchanged_history() {
     let mut external = Session::load_from_path(&path).unwrap();
     external.merge_maintenance_usage(std::slice::from_ref(&receipt));
     external.persist_maintenance_metadata().unwrap();
+    drop(external);
     cli.send("/compact\r").unwrap();
     common::expect_screen(
         &cli,
@@ -1698,6 +1707,8 @@ fn adaptive_compaction_keeps_its_output_ceiling_and_continues_the_task() {
             }
         }
         source.save_to_path(&path).unwrap();
+        let before = estimate_session_tokens(&source);
+        drop(source);
         let mut cli = env.spawn(&[
             "--resume",
             path.to_str().unwrap(),
@@ -1726,7 +1737,7 @@ fn adaptive_compaction_keeps_its_output_ceiling_and_continues_the_task() {
         );
         common::expect_input_line_cleared(&cli, wait, "adaptive compaction finished");
         let compacted = Session::load_from_path(&path).unwrap();
-        assert!(estimate_session_tokens(&compacted) <= estimate_session_tokens(&source) / 2);
+        assert!(estimate_session_tokens(&compacted) <= before / 2);
         let report = compacted.last_compaction_report.as_ref().unwrap();
         assert_eq!(report.attempts, 1);
         assert_eq!(report.completed_responses, 1);
@@ -1830,9 +1841,11 @@ fn compaction_uses_fixed_output_ceiling_and_summary_length_guidance() {
             }
         }
         source.save_to_path(&path).unwrap();
+        let before = estimate_session_tokens(&source);
+        drop(source);
         assert_eq!(compact(&workspace, &path, "Messages removed"), 0);
         let restored = Session::load_from_path(&path).unwrap();
-        assert!(estimate_session_tokens(&restored) <= estimate_session_tokens(&source) / 2);
+        assert!(estimate_session_tokens(&restored) <= before / 2);
         let summary = &restored.compaction.as_ref().unwrap().summary;
         assert!(summary.len() > 8_192 * 4);
         assert!(summary.ends_with("CHECKPOINT_COMPLETE</summary>"));
@@ -1913,6 +1926,7 @@ fn recompaction_rewrites_checkpoint_and_archives_original_history() {
             .unwrap();
     }
     next.save_to_path(&path).unwrap();
+    drop(next);
     assert_eq!(compact(&workspace, &path, "Messages removed"), 0);
     let second = Session::load_from_path(&path).unwrap();
     let summary = &second.compaction.as_ref().unwrap().summary;
@@ -2035,6 +2049,7 @@ fn automatic_compaction_continues_after_a_long_summary() {
     }
     session.save_to_path(&path).unwrap();
 
+    drop(session);
     let mut cli = resume(&workspace, &path);
     common::expect_input_line_cleared(&cli, Duration::from_secs(30), "resume ready");
     cli.send("Continue PROJECT_ALPHA using all earlier decisions.")
@@ -2143,6 +2158,8 @@ fn automatic_compaction_failure_never_sends_a_historyless_task_request() {
         ))
         .unwrap();
     original.save_to_path(&path).unwrap();
+    drop(original);
+    let original = Session::load_from_path(&path).unwrap();
     let mut cli = resume(&workspace, &path);
     common::expect_input_line_cleared(&cli, Duration::from_secs(30), "resume ready");
     cli.send("Continue PROJECT_ALPHA using all earlier decisions.")
@@ -2205,6 +2222,7 @@ fn pressure_prunes_large_tool_output_without_a_summary_call() {
         }]))
         .unwrap();
     original.save_to_path(&path).unwrap();
+    drop(original);
     let mut cli = resume(&workspace, &path);
     common::expect_input_line_cleared(&cli, Duration::from_secs(30), "resume ready");
     cli.send("Continue PROJECT_ALPHA.").unwrap();
@@ -2271,6 +2289,7 @@ fn empty_compacted_history_cannot_continue_a_task() {
     damaged.messages.clear();
     damaged.record_compaction("legacy checkpoint", 32);
     damaged.save_to_path(&path).unwrap();
+    drop(damaged);
     let mut cli = resume(&workspace, &path);
     common::expect_input_line_cleared(&cli, Duration::from_secs(30), "resume ready");
     cli.send("Continue PROJECT_ALPHA.").unwrap();
@@ -2521,6 +2540,7 @@ fn internal_model_alias_and_resumed_model_use_active_wire_identity() {
         let mut session = Session::load_from_path(&path).unwrap();
         session.model = Some(saved_model.into());
         session.save_to_path(&path).unwrap();
+        drop(session);
         assert_eq!(
             compact_with_model(&workspace, &path, "apeiron-alias", "Messages removed"),
             0

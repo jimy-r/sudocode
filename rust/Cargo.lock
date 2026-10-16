@@ -879,8 +879,6 @@ dependencies = [
 [[package]]
 name = "command-group"
 version = "5.0.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a68fa787550392a9d58f44c21a3022cfb3ea3e2458b7f85d3b399d0ceeccf409"
 dependencies = [
  "async-trait",
  "nix 0.27.1",
@@ -1552,11 +1550,9 @@ dependencies = [
  "managed-agent",
  "mock-anthropic-service",
  "nix 0.29.0",
- "reqwest 0.12.28",
  "runtime",
  "serde",
  "serde_json",
- "sha2 0.10.9",
  "tempfile",
  "tokio",
  "tokio-util",
@@ -1584,6 +1580,7 @@ name = "engine-events"
 version = "0.2.32"
 dependencies = [
  "runtime",
+ "serde_json",
 ]
 
 [[package]]
@@ -1599,9 +1596,11 @@ dependencies = [
  "mock-anthropic-service",
  "nexus-vfs-client",
  "plugins",
+ "reqwest 0.12.28",
  "runtime",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "telemetry",
  "tempfile",
  "tokio",

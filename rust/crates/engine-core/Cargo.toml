@@ -23,7 +23,7 @@ tools = { path = "../tools" }
 # The driver runs each turn on its own multi-thread runtime and bridges the
 # synchronous permission/question prompters to the async command pump via
 # `block_in_place` + oneshot (the proven ACP mechanism).
-tokio = { version = "1", features = ["rt", "rt-multi-thread", "sync", "macros"] }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "sync", "macros", "time"] }
 # `EngineApiClient` implements the async `runtime::ApiClient` trait and drives an
 # incremental provider stream (no rendering — that is the renderer's job).
 async-trait = "0.1"

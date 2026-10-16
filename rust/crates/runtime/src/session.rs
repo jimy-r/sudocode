@@ -160,6 +160,7 @@ impl SessionMode {
 struct SessionPersistence {
     path: PathBuf,
     fs: Arc<dyn FsBackend>,
+    writer: Arc<std::sync::Mutex<Option<Arc<crate::session_writer::SessionWriter>>>>,
 }
 
 impl fmt::Debug for SessionPersistence {
@@ -504,6 +505,7 @@ impl Session {
         self.persistence = Some(SessionPersistence {
             path: path.into(),
             fs: Arc::new(StdFsBackend),
+            writer: Arc::default(),
         });
         self
     }
@@ -560,6 +562,68 @@ impl Session {
     #[must_use]
     pub fn persistence_path(&self) -> Option<&Path> {
         self.persistence.as_ref().map(|value| value.path.as_path())
+    }
+
+    /// Shared by cloned session snapshots and their journal. A separately
+    /// loaded session cannot silently become a second writer in this process.
+    pub fn completion_writer(&self) -> Result<Arc<crate::session_writer::SessionWriter>, String> {
+        let path = self.persistence_path().ok_or("session has no transcript")?;
+        self.writer_for(path)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| "completion_storage_exclusion_unavailable".into())
+    }
+
+    pub(crate) fn adopt_completion_writer(
+        &self,
+        writer: Arc<crate::session_writer::SessionWriter>,
+    ) -> Result<(), String> {
+        writer.check()?;
+        let persistence = self
+            .persistence
+            .as_ref()
+            .ok_or("session has no transcript")?;
+        let mut current = persistence
+            .writer
+            .lock()
+            .map_err(|_| "session writer poisoned")?;
+        if let Some(existing) = current.as_ref() {
+            if !Arc::ptr_eq(existing, &writer) {
+                return Err("session_writer_busy".into());
+            }
+        } else {
+            *current = Some(writer);
+        }
+        Ok(())
+    }
+
+    fn writer_for(
+        &self,
+        path: &Path,
+    ) -> Result<Option<Arc<crate::session_writer::SessionWriter>>, SessionError> {
+        let backend = self.backend();
+        if !backend.fenced_locks() {
+            return Ok(None);
+        }
+        if let Some(persistence) = &self.persistence {
+            if persistence.path == path {
+                let mut guard = persistence
+                    .writer
+                    .lock()
+                    .map_err(|_| SessionError::Format("session writer poisoned".into()))?;
+                if guard.is_none() {
+                    *guard = Some(
+                        crate::session_writer::SessionWriter::acquire(backend, path)
+                            .map_err(SessionError::Format)?,
+                    );
+                }
+                let writer = guard.as_ref().expect("writer acquired");
+                writer.check().map_err(SessionError::Format)?;
+                return Ok(Some(Arc::clone(writer)));
+            }
+        }
+        crate::session_writer::SessionWriter::acquire(backend, path)
+            .map(Some)
+            .map_err(SessionError::Format)
     }
 
     /// Revision of the current durable transcript through its own backend.
@@ -717,6 +781,17 @@ impl Session {
         })?;
         let dir_str = dir.to_string_lossy().into_owned();
         let backend = self.backend();
+        let writer = self
+            .writer_for(
+                self.persistence_path()
+                    .ok_or_else(|| std::io::Error::other("session has no persistence"))?,
+            )
+            .map_err(std::io::Error::other)?;
+        let _write = writer
+            .as_ref()
+            .map(|w| w.write())
+            .transpose()
+            .map_err(std::io::Error::other)?;
         backend.create_dir_all(&dir_str)?;
         let path_str = dir
             .join(Self::sanitize_offload_id(id))
@@ -728,6 +803,17 @@ impl Session {
 
     pub fn save_to_path(&self, path: impl AsRef<Path>) -> Result<(), SessionError> {
         let path = path.as_ref();
+        let writer = self.writer_for(path)?;
+        let _write = writer
+            .as_ref()
+            .map(|w| w.write())
+            .transpose()
+            .map_err(SessionError::Format)?;
+        self.save_snapshot(path)
+    }
+
+    // Caller holds the writer operation guard, including bootstrap/compaction.
+    fn save_snapshot(&self, path: &Path) -> Result<(), SessionError> {
         let snapshot = self.render_jsonl_snapshot()?;
         let path_str = path.to_string_lossy();
         let backend = self.backend();
@@ -755,7 +841,7 @@ impl Session {
 
     /// Check the source revision before making either the archive or the
     /// replacement. This detects changes observed at commit preparation; it
-    /// does not impose a lock or compare-and-swap on other backend writers.
+    /// serializes native writes, but cannot fence remote backend writers.
     pub fn save_compacted_to_path_checked(
         &self,
         original: &Session,
@@ -763,6 +849,12 @@ impl Session {
         expected_revision: Option<&str>,
     ) -> Result<(), SessionError> {
         let path = path.as_ref();
+        let writer = self.writer_for(path)?;
+        let _write = writer
+            .as_ref()
+            .map(|w| w.write())
+            .transpose()
+            .map_err(SessionError::Format)?;
         let durable = match self.backend().read(&path.to_string_lossy()) {
             Ok(bytes) => Some(bytes),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
@@ -791,7 +883,7 @@ impl Session {
         };
         write_atomic_with(self.backend(), &archive, &snapshot)?;
         if self.backend().is_append_stream(&path.to_string_lossy())? {
-            return self.save_to_path(path);
+            return self.save_snapshot(path);
         }
         // Avoid rotation before the atomic replacement: failure must leave the
         // live transcript at its original path, rather than only in a backup.
@@ -1363,6 +1455,12 @@ impl Session {
         let Some(path) = self.persistence_path() else {
             return Ok(());
         };
+        let writer = self.writer_for(path)?;
+        let _write = writer
+            .as_ref()
+            .map(|w| w.write())
+            .transpose()
+            .map_err(SessionError::Format)?;
         let path_str = path.to_string_lossy();
         if self.backend().exists(&path_str)? && self.backend().stat(&path_str)?.len > 0 {
             return Err(SessionError::Format(
@@ -1380,6 +1478,7 @@ impl Session {
     /// (the stream's internal cold-spill subsumes rotation). On a regular-file
     /// backend it stays the atomic snapshot rewrite + rotation via
     /// [`Self::save_to_path`].
+    // Caller holds the writer operation guard.
     fn bootstrap_append_log(&self, path: &Path) -> Result<(), SessionError> {
         let backend = self.backend();
         let path_str = path.to_string_lossy();
@@ -1390,7 +1489,7 @@ impl Session {
             }
             return Ok(());
         }
-        self.save_to_path(path)
+        self.save_snapshot(path)
     }
 
     fn append_persisted_message(&self, message: &ConversationMessage) -> Result<(), SessionError> {
@@ -1416,6 +1515,12 @@ impl Session {
         let Some(path) = self.persistence_path() else {
             return Ok(());
         };
+        let writer = self.writer_for(path)?;
+        let _write = writer
+            .as_ref()
+            .map(|w| w.write())
+            .transpose()
+            .map_err(SessionError::Format)?;
         let path_str = path.to_string_lossy();
         let backend = self.backend();
         let needs_bootstrap = !backend.exists(&path_str)?
@@ -1545,6 +1650,16 @@ impl Session {
         &self,
         expected_revision: Option<&str>,
     ) -> Result<(), SessionError> {
+        let writer = self
+            .persistence_path()
+            .map(|path| self.writer_for(path))
+            .transpose()?
+            .flatten();
+        let _write = writer
+            .as_ref()
+            .map(|w| w.write())
+            .transpose()
+            .map_err(SessionError::Format)?;
         if let Some(expected) = expected_revision {
             if self.durable_revision()?.as_deref() != Some(expected) {
                 return Err(SessionError::SourceChanged);

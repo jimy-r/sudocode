@@ -562,3 +562,168 @@ keys under the update's own `_meta.sudocode` tell them apart:
 - Sub-agents inherit the parent's permission mode. A child tool that requires
   approval sends `session/request_permission` through the parent's controller
   connection and waits for its answer. A missing approver denies the call.
+
+## Durable direct sub-agent completions (extension v1)
+
+The on-disk journal uses version 2 from its first supported release. Transcript
+mutations and journal registration, replay and ACKs share one native storage
+writer. A competing ACP process receives `session_writer_busy` without changing
+either file. Replay may retire an interrupted turn only after the previous
+process has released ownership. A cold replay reused by `session/load` shares
+that writer rather than acquiring a competing one. Backends with only expiring,
+unfenced leases cannot advertise this extension.
+
+Version 1 journals came only from unreleased development builds. They remain
+unchanged and return `legacy_writer_unconfirmed`: acquiring a new lock cannot
+prove that a non-locking old executable has stopped. Automatic conversion or
+deletion is not supported. Protocol negotiation remains extension version 1;
+it is independent of the journal format.
+
+A controller opts in on each connection with
+`initialize._meta.sudocode.subagentCompletions: {"version":1}`. The server
+advertises the same version only on runtimes that implement the journal and
+exact-context contract. Without negotiation, existing ACP behavior is unchanged.
+`subagentEvents` remains the display stream. This extension covers only children
+spawned directly by the top-level ACP session; nested children and background
+shell/Monitor jobs do not receive an automatic-continuation guarantee.
+
+Each opted-in `session/prompt` supplies `_meta.traceId`. Before starting a child,
+scode durably registers its agent ID, spawning tool call and trace in a journal
+beside the parent transcript. Shared CLI/ACP reduction requires actual
+`running`/`backgrounded` handoff, a persisted terminal manifest, and the committed
+parent turn. A canonical `pid_output` read suppresses an unpublished candidate.
+A synthetic abort without terminal evidence cannot publish a completion.
+If recording a terminal event fails temporarily, the existing delivery loop
+retains its bounded lifecycle data and retries the journal write. Delivery still
+waits for the parent commit and honors explicit result collection. A process
+restart recovers the terminal evidence from the persisted child manifest.
+
+The agent sends a JSON-RPC **request** `_sudocode/subagent/completed`:
+
+```json
+{"sessionId":"session-id","completionId":"64 lowercase SHA-256 hex characters",
+ "agentId":"agent-id","parentToolCallId":"tool-call-id","originTraceId":"run:prompt",
+ "status":"completed","message":"<task-notification>...</task-notification>"}
+```
+
+Status is `completed`, `failed`, or `cancelled`. The message uses the existing
+XML-escaped tool-result renderer, bounded to 64 KiB UTF-8 before delivery. It is
+untrusted tool output, not a system instruction. Completion identity is derived
+from version/session/tool/agent; payload freezes before the first send. Publication
+is the deduplication cutoff: a later explicit read cannot retract an in-flight
+receipt. This does not promise exactly-once model execution.
+
+The controller replies only after committing its durable receipt:
+`{"completionId":"…","disposition":"stored"}`. A previously verified binding
+whose session has been deleted may instead reply
+`{"completionId":"…","disposition":"discarded","reason":"session_deleted"}`.
+Delivery is sequential per session in durable publication order, outside
+engine/prompt locks. An earlier spawn finishing late cannot overtake an
+unacknowledged publication, including after restart. Transient errors
+and missing ACKs retry the identical payload with bounded exponential backoff;
+invalid requests or inconsistent ACKs quarantine that item. Method-not-found and
+authentication-required suspend delivery until a fresh binding. Replies from a
+retired binding cannot stop the replacement delivery. ACK persistence failure
+leaves the item pending. ACK tombstones retain identity, releasing result text;
+journals stop accepting additions at 10,000 registered children or 64 MiB and
+report `completion_journal_capacity` rather than silently dropping work.
+
+`_sudocode/subagent/replay {sessionId,cwd}` reads only the exact journal,
+transcript and registered child manifests. It does **not** load engines, MCP or
+plugins, restart children, scan unrelated cwd results, or run a model. It binds
+pending deliveries and returns `{watermark,waiting,pending,unresolved,settled,
+blocked,contextRef}`. Missing terminal evidence is `execution_unconfirmed`;
+uncommitted parent evidence is `source_context_unconfirmed`. After an interrupted
+parent, a new explicit human turn may proceed, but cannot retroactively publish
+that parent's unproven completions.
+
+An opted-in prompt's committed response and `session/load` expose
+`_meta.sudocode.contextRef = {sessionId,revision,digest,lastTraceId}`. The digest
+covers recoverable transcript bytes. Live load validates exact cwd and rebinds
+without replacing the engine; cold load opens the exact stored session. A
+controller sending an automatic input supplies `_meta.sudocode.expectedContext`.
+The agent checks it inside that session's prompt lane before any model work;
+mismatch returns `-32602` with `context_mismatch`. Transcript edits/compaction that
+invalidate the recorded digest cannot be presented as exact recovery. Hosted
+factories do not advertise this extension until they implement its storage contract.
+
+
+## Direct background terminal completions (task extension v1)
+
+Controllers negotiate `initialize._meta.sudocode.taskCompletions: {"version":1}`.
+When both completion extensions are offered, the server selects task completions
+only. This uses the same journal, sender and receipt reduction as sub-agent v1;
+sub-agent IDs, frozen messages, order and receipt hashes remain unchanged.
+Only native storage with session writer exclusion advertises the extension.
+
+`_sudocode/task/completed` is a JSON-RPC request. Sub-agent payloads replace
+`agentId` with `kind: "subagent"` and `taskId`. Terminal payloads are:
+
+```json
+{"sessionId":"session-id","completionId":"64 lowercase SHA-256 hex characters",
+ "kind":"terminal","taskId":"shell-random-id","parentToolCallId":"tool-id",
+ "originTraceId":"run:prompt","status":"failed",
+ "terminal":{"shell":"bash","scope":"command","exitCode":7,"signal":null,
+ "termination":"exit","outputTruncated":false},
+ "message":"<task-notification>...</task-notification>"}
+```
+
+`shell` is `bash` or `powershell`; `termination` is `exit`, `signal` or
+`cancelled`. A terminal source must have been registered before spawn, returned
+an actual background handle and supplied observed exit evidence. A parent turn
+must commit before delivery. Synchronous commands return their ordinary tool
+result and never enqueue a completion. Nested shells do not directly notify the
+top-level parent. Explicit result collection suppresses an unpublished result.
+The ACK contract is the same as sub-agent v1.
+
+The durable terminal snapshot keeps a UTF-8 output tail of at most 24 KiB. The
+entire encoded terminal completion is bounded to 64 KiB, including XML escaping,
+JSON escaping, identity and metadata. Rendering truncates only output text and
+sets `outputTruncated`; frozen payloads and IDs are stable on retry.
+
+All control operations require the original absolute `cwd` and `sessionId`.
+`_sudocode/task/replay {sessionId,cwd}` without `storageRef` is a read-only binding
+probe returning `{sessionId,storageRef,deleted}`. It neither starts a delivery nor
+creates a journal. Use that exact reference with subsequent operations:
+
+- `replay {sessionId,cwd,storageRef,afterTaskId?}` rebinds delivery without loading
+  an engine and returns the common counters and context plus `storageRef`,
+  `running`, `executionUnconfirmed`, `taskSetHash`, `terminalSources` (up to 50)
+  and `nextTaskId`. No PID attachment, process restart or command execution occurs.
+- `suppress {sessionId,cwd,storageRef,originTraceId}` requires a closed trace. Its
+  ACK is `{disposition:"suppressed",originTraceId,storageRef,watermark}`. Repeating
+  a no-op suppression preserves the committed watermark. Suppression closes
+  delivery eligibility, including sources without a result; it does not kill
+  execution or remove unknown execution facts.
+- `purge {sessionId,cwd,storageRef,cleanupId}` requires no active prompt. Its ACK
+  is `{disposition:"purged",cleanupId,storageRef}` after writing a minimal deleted
+  binding. It retires cached results and fences all late writes. It does not
+  remove the transcript, child manifests, project files or original full logs.
+  Native session deletion additionally removes its transcript and offloaded
+  tool results after committing the same tombstone.
+
+Transcript saves, compaction, journal writes, ACKs and deletion share one native
+writer lifetime and serialized write operations. A second process gets
+`session_writer_busy`; a cold delivery reused by `session/load` shares its writer.
+Deleting a result never removes the independent lock file. Deleted sessions
+cannot reopen. A temporary storage error retains the bounded exit snapshot for
+retry; a process loss before that snapshot was saved becomes
+`execution_unconfirmed`, even if its child later exits. Uncertain process creation
+or cancellation also cannot be presented as terminal evidence. Never rerun such
+a command automatically. Recovery covers reconnects and process restart, not
+power-loss durability.
+
+The first supported on-disk journal format is v2, introduced together with
+shared writer ownership in the sub-agent completion change. Both stages use
+that same format and writer. The earlier, non-locking v1 format existed only in
+development/test builds; it is rejected with `legacy_writer_unconfirmed` and
+its original bytes are preserved. Automatic conversion/deletion is not an
+upgrade path, and no production v1 migration workflow is required.
+
+Stage-one v2 sub-agent records can be replayed and acknowledged by the task
+extension without changing their source, frozen payload, publication ordinal,
+ACK or context. Rolling back remains supported for sub-agent-only records.
+Once terminal sources exist, the stage-one binary rejects completion replay
+and transcript mutations with `completion_journal_unsupported`; read-only
+transcript loading without completion negotiation does not grant write access.
+Both journal and transcript bytes remain intact.

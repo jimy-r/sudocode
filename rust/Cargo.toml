@@ -1,5 +1,6 @@
 [workspace]
 members = ["crates/*"]
+exclude = ["vendor/command-group"]
 resolver = "2"
 
 [workspace.package]
@@ -9,6 +10,8 @@ license = "MIT"
 publish = false
 
 [workspace.dependencies]
+# Both tool launchers use the same backend; provenance is in vendor/command-group/UPSTREAM.
+command-group = { path = "vendor/command-group", version = "5.0.1" }
 # ── nexus-vfs: ONE pin for every crate sudocode takes from it ─────────
 #
 # Co-hosted agents exchange `Arc<Kernel>` and `SpawnTask<Kernel>` with the daemon.
