@@ -6093,6 +6093,13 @@ async fn acp_background_terminal_is_queryable_across_prompts() {
     workspace.cleanup();
 }
 
+struct CompletionFixtureRelease(PathBuf);
+impl Drop for CompletionFixtureRelease {
+    fn drop(&mut self) {
+        let _ = fs::write(&self.0, "release");
+    }
+}
+
 async fn frozen_completion_sources(workspace: &TestWorkspace, sid: &str, count: usize) -> Value {
     let path = find_session_transcript(&workspace.root, sid).with_extension("completions.json");
     timeout(Duration::from_secs(15), async {
@@ -6330,7 +6337,6 @@ async fn acp_completions_sync_and_nested_do_not_auto_publish() {
     }
 }
 
-#[cfg(unix)]
 async fn initialize_task_completions(client: &mut AcpTestClient) {
     let (_, response) = client.send_request("initialize", json!({"protocolVersion":1,"clientCapabilities":{"_meta":{"sudocode":{"taskCompletions":{"version":1},"subagentCompletions":{"version":1}}}}})).await;
     assert_eq!(
@@ -6985,13 +6991,7 @@ async fn acp_purged_background_terminal_is_still_reaped_on_close() {
     let workspace = TestWorkspace::new("purged-terminal-ownership");
     workspace.create();
     workspace.write_sudocode_json(&server.base_url());
-    struct ReleaseOnDrop(PathBuf);
-    impl Drop for ReleaseOnDrop {
-        fn drop(&mut self) {
-            let _ = fs::write(&self.0, "release");
-        }
-    }
-    let _release = ReleaseOnDrop(workspace.root.join("release-purged"));
+    let _release = CompletionFixtureRelease(workspace.root.join("release-purged"));
     let mut client = spawn_stdio_client_danger(&workspace);
     initialize_task_completions(&mut client).await;
     let sid = scenario_session_new(&mut client, &workspace.root).await;
@@ -7041,5 +7041,136 @@ async fn acp_purged_background_terminal_is_still_reaped_on_close() {
         reaped,
         "journal purge discarded ownership before the session could reap its shell"
     );
+    workspace.cleanup();
+}
+
+/// Native Windows Job accounting must confirm all generations before publishing cancellation.
+#[cfg(windows)]
+#[tokio::test]
+async fn acp_powershell_cancellation_reaps_owned_job_before_replay() {
+    let server = MockAnthropicService::spawn().await.unwrap();
+    let workspace = TestWorkspace::new("windows-task-job");
+    workspace.create();
+    workspace.write_sudocode_json(&server.base_url());
+    let _release = CompletionFixtureRelease(workspace.root.join("release-native"));
+    for (name, next) in [
+        ("parent", Some("child")),
+        ("child", Some("grandchild")),
+        ("grandchild", None),
+    ] {
+        let stamp = format!(
+            r#"$ErrorActionPreference = 'Stop'
+'{{0}}:{{1}}' -f $PID, (Get-Process -Id $PID).StartTime.ToUniversalTime().Ticks | Set-Content -Encoding ascii -LiteralPath (Join-Path $PSScriptRoot '{name}.pid')
+"#
+        );
+        let body = next.map_or_else(
+            || "while (-not (Test-Path -LiteralPath (Join-Path $PSScriptRoot 'release-native'))) { Start-Sleep -Milliseconds 50 }\n".to_owned(),
+            |next| format!("$shell = (Get-Process -Id $PID).Path\n& $shell -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File (Join-Path $PSScriptRoot '{next}.ps1')\n"),
+        );
+        fs::write(workspace.root.join(format!("{name}.ps1")), stamp + &body).unwrap();
+    }
+    let mut client = spawn_stdio_client_danger(&workspace);
+    initialize_task_completions(&mut client).await;
+    let sid = scenario_session_new(&mut client, &workspace.root).await;
+    let (_, probe) = client
+        .send_request(
+            "_sudocode/task/replay",
+            json!({"sessionId":sid,"cwd":workspace.root}),
+        )
+        .await;
+    let storage = probe["result"]["storageRef"].clone();
+    let calls = json!([{"id":"windows-owned","name":"PowerShell","input":{"command":"Set-ExecutionPolicy -Scope Process Bypass -Force; & ./parent.ps1","run_in_background":true}}]);
+    let (_, parent) = client.send_request("session/prompt", json!({"sessionId":sid,"_meta":{"traceId":"windows-owned:1"},"prompt":[{"type":"text","text":format!("{SCENARIO_PREFIX}tool_concurrency TOOL_BATCH:{calls}")}]})).await;
+    assert_eq!(parent["result"]["stopReason"], "end_turn", "{parent}");
+    let identities = timeout(Duration::from_secs(15), async {
+        loop {
+            let mut identities = Vec::new();
+            for name in ["parent", "child", "grandchild"] {
+                if let Ok(value) = fs::read_to_string(workspace.root.join(format!("{name}.pid"))) {
+                    let value = value.trim();
+                    if value.split_once(':').is_some_and(|(pid, ticks)| {
+                        pid.parse::<u32>().is_ok() && ticks.parse::<u64>().is_ok()
+                    }) {
+                        identities.push(value.to_owned());
+                    }
+                }
+            }
+            if identities.len() == 3 {
+                break identities;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("all three native PowerShell processes must start");
+    let (_, closed) = client
+        .send_request("session/close", json!({"sessionId":sid}))
+        .await;
+    assert!(closed.get("result").is_some(), "{closed}");
+    let ids = identities
+        .iter()
+        .map(|value| value.split_once(':').unwrap().0)
+        .collect::<Vec<_>>()
+        .join(",");
+    let check = "$ids = @(PROCESS_IDS); foreach ($processId in $ids) { $process = Get-Process -Id $processId -ErrorAction SilentlyContinue; if ($null -ne $process -and -not $process.HasExited) { '{0}:{1}' -f $process.Id, $process.StartTime.ToUniversalTime().Ticks } }".replace("PROCESS_IDS", &ids);
+    let output = std::process::Command::new("pwsh")
+        .args([
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            &check,
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "native process query failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let present = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        identities
+            .iter()
+            .all(|identity| !present.lines().any(|line| line.trim() == identity.as_str())),
+        "close returned while original native processes were present: {present}"
+    );
+    client.shutdown().await;
+    let mut client = spawn_stdio_client_danger(&workspace);
+    initialize_task_completions(&mut client).await;
+    let before = server.captured_requests().await.len();
+    let (during, replay) = client
+        .send_request(
+            "_sudocode/task/replay",
+            json!({"sessionId":sid,"cwd":workspace.root,"storageRef":storage}),
+        )
+        .await;
+    assert_eq!(replay["result"]["pending"], 1, "{replay}");
+    let completion = match during
+        .into_iter()
+        .find(|value| is_server_request(value, "_sudocode/task/completed"))
+    {
+        Some(value) => value,
+        None => {
+            client
+                .recv_until(SUBAGENT_EVENTS_WAIT, |value| {
+                    is_server_request(value, "_sudocode/task/completed")
+                })
+                .await
+                .unwrap()
+                .1
+        }
+    };
+    assert_eq!(completion["params"]["status"], "cancelled", "{completion}");
+    assert_eq!(completion["params"]["terminal"]["shell"], "powershell");
+    assert_eq!(completion["params"]["parentToolCallId"], "windows-owned");
+    assert_eq!(completion["params"]["originTraceId"], "windows-owned:1");
+    assert_eq!(
+        server.captured_requests().await.len(),
+        before,
+        "replay must not restart model or process work"
+    );
+    client.send_raw(&json!({"jsonrpc":"2.0","id":completion["id"],"result":{"completionId":completion["params"]["completionId"],"disposition":"stored"}})).await;
+    client.shutdown().await;
     workspace.cleanup();
 }

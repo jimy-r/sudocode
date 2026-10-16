@@ -979,7 +979,6 @@ impl Drop for BackgroundShell {
 fn terminate_background_group(
     child: &mut command_group::GroupChild,
 ) -> io::Result<(std::process::ExitStatus, bool)> {
-    let id = child.id();
     // Signal only once. Neither a successful kill nor reaping the leader proves
     // the descendants have gone; orphan reaping can lag behind leader exit.
     let _ = child.kill();
@@ -990,12 +989,16 @@ fn terminate_background_group(
             exit = child.inner().try_wait()?;
         }
         if let Some(status) = exit {
-            if process_group_gone(id) {
+            #[cfg(unix)]
+            let group_gone = process_group_gone(child.id());
+            #[cfg(windows)]
+            let group_gone = child.group_is_empty()?;
+            #[cfg(not(any(unix, windows)))]
+            let group_gone = false;
+            if group_gone {
                 return Ok((status, true));
             }
-            // command-group cannot expose Job emptiness on Windows. Waiting
-            // longer does not turn leader exit into that missing proof.
-            if !cfg!(unix) || std::time::Instant::now() >= deadline {
+            if std::time::Instant::now() >= deadline {
                 return Ok((status, false));
             }
         } else if std::time::Instant::now() >= deadline {
@@ -1010,24 +1013,15 @@ fn terminate_background_group(
 
 // waitpid only reaps our children, not all group members. Cancellation needs
 // an independent absence check; a failed probe is not a termination proof.
+#[cfg(unix)]
 fn process_group_gone(id: u32) -> bool {
-    #[cfg(unix)]
-    {
-        let Ok(id) = i32::try_from(id) else {
-            return false;
-        };
-        matches!(
-            nix::sys::signal::killpg(nix::unistd::Pid::from_raw(id), None),
-            Err(nix::errno::Errno::ESRCH)
-        )
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = id;
-        // command-group's completion port accepts any Job event, not just
-        // ACTIVE_PROCESS_ZERO. Until that proof is exposed, keep it unknown.
-        false
-    }
+    let Ok(id) = i32::try_from(id) else {
+        return false;
+    };
+    matches!(
+        nix::sys::signal::killpg(nix::unistd::Pid::from_raw(id), None),
+        Err(nix::errno::Errno::ESRCH)
+    )
 }
 
 fn prepare_command(
