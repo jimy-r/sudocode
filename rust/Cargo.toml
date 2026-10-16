@@ -26,11 +26,6 @@ command-group = { path = "vendor/command-group", version = "5.0.1" }
 # tagging nexus-vfs first — which the manifest now says, instead of leaving a
 # script to discover it.
 #
-# TEMPORARY branch form: the pin below rides `feat/contract-zone` while that
-# line waits for its v0.8.16 tag and published daemon. Switching the spelling
-# back to that tag (and re-digesting runtime-artifacts.json against it) is part
-# of the same change; do not add more pins in the branch form.
-#
 # `default-features = false` on all of them: the kernel's runtime defaults
 # (mimalloc, the connector stack, py-hook adapters) are daemon concerns that would
 # bloat a standalone CLI. Per-crate features that only one member needs live here
