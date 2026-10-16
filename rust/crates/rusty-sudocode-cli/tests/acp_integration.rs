@@ -1184,43 +1184,9 @@ async fn run_marked_turn(client: &mut AcpTestClient, session_id: &str, marker: &
     resp
 }
 
-/// The persisted transcript of `session_id` under `root`'s session store
-/// (`.scode/sessions/<workspace-fingerprint>/<session-id>/...`).
+/// Read message history from the transcript; sibling journals and locks are control data.
 fn read_session_transcript(root: &std::path::Path, session_id: &str) -> String {
-    fn walk(dir: &std::path::Path, session_id: &str, out: &mut Vec<PathBuf>) {
-        let Ok(entries) = fs::read_dir(dir) else {
-            return;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                if path.file_name().and_then(|n| n.to_str()) == Some(session_id) {
-                    for file in fs::read_dir(&path).into_iter().flatten().flatten() {
-                        if file.path().is_file() {
-                            out.push(file.path());
-                        }
-                    }
-                } else {
-                    walk(&path, session_id, out);
-                }
-            }
-        }
-    }
-    let mut files = Vec::new();
-    walk(
-        &root.join(".scode").join("sessions"),
-        session_id,
-        &mut files,
-    );
-    assert!(
-        !files.is_empty(),
-        "session {session_id} should be persisted under {}",
-        root.display()
-    );
-    files
-        .iter()
-        .map(|f| fs::read_to_string(f).expect("read transcript"))
-        .collect()
+    fs::read_to_string(find_session_transcript(root, session_id)).expect("read transcript")
 }
 
 /// `/compact`: after three turns the long oldest exchange is summarised (the
