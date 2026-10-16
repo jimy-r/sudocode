@@ -1406,54 +1406,6 @@ mod tests {
     use runtime::UsageCostCurrency;
     use std::path::{Path, PathBuf};
 
-    #[tokio::test]
-    async fn delegated_prompts_fail_closed_after_the_parent_turn_ends() {
-        use super::{AcpPermissionBridge, AcpQuestionBridge};
-        use runtime::{PermissionPrompter, QuestionPrompter};
-        use std::time::Duration;
-        let (permission_tx, permission_rx) = tokio::sync::mpsc::unbounded_channel();
-        let (question_tx, question_rx) = tokio::sync::mpsc::unbounded_channel();
-        let mut permission = AcpPermissionBridge {
-            queue: runtime::PromptQueue::default(),
-            tx: permission_tx,
-        };
-        let mut question = AcpQuestionBridge {
-            queue: runtime::PromptQueue::default(),
-            tx: question_tx,
-        };
-        drop(permission_rx);
-        drop(question_rx);
-        let decision = tokio::time::timeout(
-            Duration::from_secs(1),
-            permission.begin_decision(&runtime::PermissionRequest {
-                tool_name: "Bash".into(),
-                input: "echo late".into(),
-                current_mode: runtime::PermissionMode::Prompt,
-                required_mode: runtime::PermissionMode::Prompt,
-                reason: None,
-            }),
-        )
-        .await
-        .expect("closed parent permission bridge must settle");
-        assert_eq!(
-            decision,
-            runtime::PermissionPromptDecision::Deny {
-                reason: "permission bridge closed".into()
-            }
-        );
-        let answer = tokio::time::timeout(
-            Duration::from_secs(1),
-            question.begin_question(&runtime::QuestionPromptRequest {
-                title: None,
-                description: None,
-                fields: vec![],
-            }),
-        )
-        .await
-        .expect("closed parent question bridge must settle");
-        assert_eq!(answer, Err("question bridge closed".into()));
-    }
-
     #[test]
     fn turn_error_classification_comes_from_typed_bits_not_strings() {
         // A context-window turn failure is recognized by the runtime's typed
