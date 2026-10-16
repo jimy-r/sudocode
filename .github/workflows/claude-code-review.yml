@@ -2,13 +2,18 @@ name: Claude Code Review
 
 on:
   pull_request:
-    types: [opened, ready_for_review]
+    types: [opened, ready_for_review, synchronize, reopened]
     branches: [main]
     paths:
       - rust/**
 
+concurrency:
+  group: claude-review-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
 jobs:
   claude-review:
+    if: github.event.pull_request.draft == false
     # Optional: Filter by PR author
     # if: |
     #   github.event.pull_request.user.login == 'external-contributor' ||
@@ -44,16 +49,14 @@ jobs:
           # repository silently dead — the job failed in 23-36s having made zero
           # model calls. Same secret, same reason the 'Live API smoke test' job
           # went red on main; that one moved to this key and recovered.
-          anthropic_api_key: ${{ secrets.SUDOROUTER_CI_API_KEY }}
+          anthropic_api_key: ${{ vars.SUDOROUTER_NATIVE_CHANNEL && format('{0}-{1}', secrets.SUDOROUTER_CI_API_KEY, vars.SUDOROUTER_NATIVE_CHANNEL) || secrets.SUDOROUTER_CI_API_KEY }}
           plugin_marketplaces: 'https://github.com/anthropics/claude-code.git'
           plugins: 'code-review@claude-code-plugins'
           prompt: '/code-review:code-review ${{ github.repository }}/pull/${{ github.event.pull_request.number }}'
-          # Keep review on the gateway's available Haiku route. On 2026-10-14,
-          # the dated 4.5 route refused the CLI's prepayment reservation before
-          # its first model turn. The advertised 5.5 route returned a real reply
-          # with the same CLI version and CI credential entry. A tiny HTTP probe
-          # alone does not establish that the CLI's larger reservation can run.
-          claude_args: '--model claude-haiku-5-5'
+          # Use the same existing company native route as the ACP acceptance.
+          # This selects an upstream channel; the CI credential remains the
+          # company secret, never a developer's personal FujiToken key.
+          claude_args: '--model ${{ vars.SUDOROUTER_NATIVE_MODEL || ''claude-sonnet-4-6'' }}'
           # See https://github.com/anthropics/claude-code-action/blob/main/docs/usage.md
           # or https://code.claude.com/docs/en/cli-reference for available options
 
@@ -96,12 +99,12 @@ jobs:
       # Warning rather than failure, deliberately: a PR that changes this
       # workflow cannot make the check pass from inside the PR (the mismatch is
       # the change), so failing here would leave such PRs permanently red with no
-      # fixable cause. A stale branch, by contrast, is fixable — merge the
+      # fixable cause. A stale branch, by contrast, is fixable — rebase onto the
       # default branch — and the message says so.
       - name: Say when the review was skipped before it started
         if: success() && steps.claude-review.outputs.execution_file == ''
         run: |
-          echo "::warning::claude-review did not run: the action skipped before its first model call, so this green check is NOT a passing code review. Cause is almost always workflow validation — the copy of .github/workflows/claude-code-review.yml on this branch differs from the one on the default branch. If this PR does not edit that file, merge the default branch into this branch and the review will run. If it does edit it, the review can only run once the PR is merged."
+          echo "::warning::claude-review did not run: the action skipped before its first model call, so this green check is NOT a passing code review. Cause is almost always workflow validation — the copy of .github/workflows/claude-code-review.yml on this branch differs from the one on the default branch. If this PR does not edit that file, rebase this branch onto the default branch and the review will run. If it does edit it, the review can only run once the PR is merged."
           {
             echo "### :warning: No code review happened"
             echo

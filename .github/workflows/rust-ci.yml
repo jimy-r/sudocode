@@ -518,9 +518,9 @@ jobs:
     env:
       SUDOCODE_API_READ_TIMEOUT: &live_idle_seconds '90'
       SCODE_LIVE_MODEL: &live_model gpt-6-luna
-      # Keep protocol acceptance on a dated, verified native route. The model
-      # compatibility workflow independently records catalog-wide availability.
-      SCODE_NATIVE_MODEL: &native_model claude-sonnet-4-5-20250929
+      # Native protocol acceptance and review share the configured company route.
+      # Model compatibility independently measures the rest of the catalog.
+      SCODE_NATIVE_MODEL: &native_model ${{ vars.SUDOROUTER_NATIVE_MODEL || 'claude-sonnet-4-6' }}
       SCODE_LOG_PATH: ${{ github.workspace }}/scode-acp-live-trace.jsonl
     steps:
       - uses: actions/checkout@v4
@@ -546,7 +546,7 @@ jobs:
       - name: Claude native cache and subagent smoke
         working-directory: rust
         env:
-          PROXY_AUTH_TOKEN: ${{ secrets.SUDOROUTER_CI_API_KEY }}
+          PROXY_AUTH_TOKEN: ${{ vars.SUDOROUTER_NATIVE_CHANNEL && format('{0}-{1}', secrets.SUDOROUTER_CI_API_KEY, vars.SUDOROUTER_NATIVE_CHANNEL) || secrets.SUDOROUTER_CI_API_KEY }}
           PROXY_BASE_URL: https://api.sudorouter.ai/v1
           SCODE_LIVE_MODEL: *native_model
         run: cargo test -p rusty-sudocode-cli --test acp_live_smoke live_subagent_smoke_stdio -- --test-threads=1
