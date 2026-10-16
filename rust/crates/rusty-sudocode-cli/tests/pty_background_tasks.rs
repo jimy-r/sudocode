@@ -61,11 +61,29 @@ fn expect_parent_complete(session: &PtySession, before: &str) {
     expect_input_ready(session, common::DEFAULT_TIMEOUT, "parent returned to input");
 }
 
-fn start(env: &TestEnv, calls: &[Value]) -> PtySession {
-    let mut session = env.spawn_with_env(
-        &["--permission-mode", "danger-full-access"],
+fn spawn_for_calls(env: &TestEnv, calls: &[Value]) -> PtySession {
+    // The declared workflow is the source of truth for the offered tool pool.
+    // A POSIX Bash fixture must not silently become a PowerShell task on Windows.
+    let allowed = calls
+        .iter()
+        .map(|call| tools::canonicalize_tool_name(call["name"].as_str().unwrap()))
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>()
+        .join(",");
+    env.spawn_with_env(
+        &[
+            "--permission-mode",
+            "danger-full-access",
+            "--allowedTools",
+            &allowed,
+        ],
         &[("SUDOCODE_INTERRUPT_QUEUE_MODE", "queue")],
-    );
+    )
+}
+
+fn start(env: &TestEnv, calls: &[Value]) -> PtySession {
+    let mut session = spawn_for_calls(env, calls);
     session.resize(40, 100).unwrap();
     expect_input_ready(&session, Duration::from_secs(30), "ready");
     let before = common::turn_status_marker(&session);
@@ -200,22 +218,16 @@ fn failed_background_shell_exposes_unread_result_and_exit_code() {
 #[test]
 fn inspecting_running_task_does_not_acknowledge_its_future_result() {
     let (env, _release) = task_env("background-result-after-peek");
-    let mut session = env.spawn_with_env(
-        &["--permission-mode", "danger-full-access"],
-        &[("SUDOCODE_INTERRUPT_QUEUE_MODE", "queue")],
-    );
+    let calls = [shell(
+        "background",
+        "echo PEEK_RUNNING; while [ ! -f release ]; do sleep 0.1; done; echo PEEK_FINISHED",
+        "Inspect before completion",
+    )];
+    let mut session = spawn_for_calls(&env, &calls);
     expect_input_ready(&session, Duration::from_secs(30), "ready");
     assert!(!session.render(|s| s.contents()).contains("↓ to view"));
     let before = common::turn_status_marker(&session);
-    send_calls(
-        &env,
-        &mut session,
-        &[shell(
-            "background",
-            "echo PEEK_RUNNING; while [ ! -f release ]; do sleep 0.1; done; echo PEEK_FINISHED",
-            "Inspect before completion",
-        )],
-    );
+    send_calls(&env, &mut session, &calls);
     // This transition includes a complete model tool call, before any local UI action.
     screen_with_budget(&session, "1 terminal · ↓ to view", common::LIVE_TURN_BUDGET);
     expect_parent_complete(&session, &before);
