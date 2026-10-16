@@ -6955,3 +6955,70 @@ async fn acp_completion_upgrade_and_rollback_preserve_delivery() {
     }
     workspace.cleanup();
 }
+
+/// Purging notifications preserves process ownership until session teardown.
+#[cfg(unix)]
+#[tokio::test]
+async fn acp_purged_background_terminal_is_still_reaped_on_close() {
+    let server = MockAnthropicService::spawn().await.unwrap();
+    let workspace = TestWorkspace::new("purged-terminal-ownership");
+    workspace.create();
+    workspace.write_sudocode_json(&server.base_url());
+    struct ReleaseOnDrop(PathBuf);
+    impl Drop for ReleaseOnDrop {
+        fn drop(&mut self) {
+            let _ = fs::write(&self.0, "release");
+        }
+    }
+    let _release = ReleaseOnDrop(workspace.root.join("release-purged"));
+    let mut client = spawn_stdio_client_danger(&workspace);
+    initialize_task_completions(&mut client).await;
+    let sid = scenario_session_new(&mut client, &workspace.root).await;
+    let (_, probe) = client
+        .send_request(
+            "_sudocode/task/replay",
+            json!({"sessionId":sid,"cwd":workspace.root}),
+        )
+        .await;
+    let storage = probe["result"]["storageRef"].clone();
+    let calls = json!([{"id":"purged-worker","name":"Bash","input":{"command":"printf '%s' \"$$\" > purged-pid; while [ ! -f release-purged ]; do sleep 0.05; done","run_in_background":true}}]);
+    let (_, parent) = client.send_request("session/prompt", json!({"sessionId":sid,"_meta":{"traceId":"purged:1"},"prompt":[{"type":"text","text":format!("{SCENARIO_PREFIX}tool_concurrency TOOL_BATCH:{calls}")}]})).await;
+    assert_eq!(parent["result"]["stopReason"], "end_turn", "{parent}");
+    let pid = timeout(Duration::from_secs(10), async {
+        loop {
+            if let Ok(pid) = fs::read_to_string(workspace.root.join("purged-pid")) {
+                if let Ok(pid) = pid.parse::<i32>() {
+                    break nix::unistd::Pid::from_raw(pid);
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("real background shell PID");
+    let (_, purged) = client.send_request("_sudocode/task/purge", json!({"sessionId":sid,"cwd":workspace.root,"storageRef":storage,"cleanupId":"delete-purged-worker"})).await;
+    assert_eq!(purged["result"]["disposition"], "purged", "{purged}");
+    assert!(
+        nix::sys::signal::kill(pid, None).is_ok(),
+        "purge only retires notifications"
+    );
+    let (_, closed) = client
+        .send_request("session/close", json!({"sessionId":sid}))
+        .await;
+    assert!(closed.get("result").is_some(), "{closed}");
+    let reaped = timeout(Duration::from_secs(5), async {
+        while nix::sys::signal::kill(pid, None) != Err(nix::errno::Errno::ESRCH) {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .is_ok();
+    // Release even on a regression, so this acceptance never leaves its shell.
+    fs::write(workspace.root.join("release-purged"), "release").unwrap();
+    client.shutdown().await;
+    assert!(
+        reaped,
+        "journal purge discarded ownership before the session could reap its shell"
+    );
+    workspace.cleanup();
+}

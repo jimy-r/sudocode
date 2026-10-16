@@ -281,7 +281,12 @@ impl BackgroundTasks {
                         let mut registry = registry
                             .lock()
                             .unwrap_or_else(std::sync::PoisonError::into_inner);
-                        registry.tasks.clear();
+                        // This registry also owns cancellation. Purging stored
+                        // results must retain unfinished process ownership.
+                        registry.tasks.retain(|_, record| {
+                            record.task.status.is_active()
+                                || record.task.status == BackgroundTaskStatus::ExecutionUnconfirmed
+                        });
                         registry.changed.notify_all();
                     }
                 });
