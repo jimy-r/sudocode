@@ -181,60 +181,40 @@ fn colored_session(env: &TestEnv, light: bool) -> PtySession {
     )
 }
 
-// ConPTY consumes OSC queries instead of exposing them to the PTY peer.
-// Windows exercises unsupported-probe fallback and late input below.
+// The foreground test runner is not the startup terminal peer: it can be
+// descheduled beyond the production probe window. Keep these real journeys in
+// the pinned host gate, whose OSC handlers answer before foreground waits.
 #[cfg(unix)]
 #[test]
+#[ignore = "requires the pinned real terminal peer; CI runs this target explicitly"]
 fn palette_probe_preserves_early_keys_paste_and_ignores_late_replies() {
-    let env = TestEnv::new("palette-input");
-    let mut sess = colored_session(&env, false);
-    sess.resize(40, 100).unwrap();
-    sess.expect(r"\x1b\]11;\?")
-        .expect("one startup palette query");
-    // Fragment a reply across writes and place real input between replies.
-    sess.send("early-\x1b]10;rgb:ffff/").unwrap();
-    sess.send("ffff/ffff\x07\x1b[200~paste '$HOME' ~/.zshrc\x1b[201~")
-        .unwrap();
-    sess.send("\x1b]11;rgb:0000/0000/0000\x1b\\").unwrap();
-    common::expect_screen(
-        &sess,
-        |screen| common::input_line_of(screen) == "early-paste '$HOME' ~/.zshrc",
-        common::DEFAULT_TIMEOUT,
-        "queued input retained exactly",
-    );
-    let input = common::input_line_of(&sess.render(|s| s.contents()));
-    assert_eq!(input.trim(), "early-paste '$HOME' ~/.zshrc");
-    sess.send("\x15").unwrap();
-    common::expect_input_line_cleared(&sess, common::DEFAULT_TIMEOUT, "clear early draft");
-    // The startup window is now closed. Neither late nor malformed OSC
-    // payloads may leak into a command the user is composing.
-    sess.send("\x1b]11;rgb:ffff/ffff/ffff\x07\x1b]10;rgb:bad!\x07after")
-        .unwrap();
-    common::expect_input_line(
-        &sess,
-        "after",
-        common::DEFAULT_TIMEOUT,
-        "late reply ignored",
-    );
-    assert_eq!(
-        common::input_line_of(&sess.render(|s| s.contents())).trim(),
-        "after"
-    );
-    sess.send("\x15").unwrap();
-    common::expect_input_line_cleared(&sess, common::DEFAULT_TIMEOUT, "clear draft");
-    finish(&mut sess);
+    run_palette_peer("early-input");
 }
 
 #[cfg(unix)]
 #[test]
+#[ignore = "requires the pinned real terminal peer; CI runs this target explicitly"]
 fn detected_background_overrides_colorfgbg() {
-    let env = TestEnv::new("palette-override");
-    let mut sess = colored_session(&env, false);
-    sess.resize(100, 110).unwrap();
-    sess.expect(r"\x1b\]11;\?").expect("palette query");
-    sess.send("\x1b]10;rgb:0000/0000/0000\x07\x1b]11;rgb:ffff/ffff/ffff\x07")
-        .unwrap();
-    common::expect_input_line_cleared(&sess, common::DEFAULT_TIMEOUT, "prompt ready");
+    run_palette_peer("light-override");
+}
+
+#[cfg(unix)]
+fn run_palette_peer(scenario: &str) {
+    let env = TestEnv::new("palette-peer");
+    let log_root = std::env::var_os("SCODE_TERMINAL_LOG_DIR")
+        .map_or_else(|| env.workspace_root().join("terminal-logs"), Into::into)
+        .join(format!("unix-palette-{scenario}"));
+    let manifest = env.workspace_root().join("palette-terminal.json");
+    let auth = if env.is_live() {
+        std::env::var("SCODE_LIVE_AUTH_MODE").unwrap_or_else(|_| "proxy".into())
+    } else {
+        "api-key".into()
+    };
+    let model = if env.is_live() {
+        common::live_model()
+    } else {
+        "sonnet".into()
+    };
     let prompt = env.prompt(
         &format!(
             "Reply with exactly this Markdown:\n{}",
@@ -242,25 +222,37 @@ fn detected_background_overrides_colorfgbg() {
         ),
         "codex_colors_showcase",
     );
-    sess.send(&format!("\x1b[200~{prompt}\x1b[201~")).unwrap();
-    common::expect_screen(
-        &sess,
-        |screen| {
-            common::input_line_of(screen)
-                == format!("[Pasted text #1 +{} lines]", prompt.matches('\n').count())
-        },
-        common::DEFAULT_TIMEOUT,
-        "prompt pasted",
-    );
-    sess.send("\r").unwrap();
-    common::expect_screen(
-        &sess,
-        |s| s.contains("Color reference done.") && s.contains("ctx "),
-        common::LIVE_TURN_BUDGET,
-        "reference rendered",
-    );
-    assert_cell(&sess, "source ~/.zshrc", "Rgb(64, 160, 43)", "Default");
-    finish(&mut sess);
+    std::fs::write(
+        &manifest,
+        serde_json::to_vec(&serde_json::json!({
+            "binary": common::scode_bin(),
+            "args": ["--auth", auth, "--model", model, "--permission-mode", "read-only"],
+            "root": env.workspace_root(), "configHome": env.config_home(),
+            "todos": env.workspace_root().join("todos.json"), "logRoot": log_root,
+            "env": {"COLORFGBG": "15;0"}, "scenario": scenario, "prompt": prompt,
+            "defaultTimeoutMs": common::DEFAULT_TIMEOUT.as_millis(),
+            "turnTimeoutMs": common::LIVE_TURN_BUDGET.as_millis(),
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let script =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/unix_palette.cjs");
+    let output = std::process::Command::new(
+        std::env::var_os("SCODE_TERMINAL_HOST").unwrap_or_else(|| "node".into()),
+    )
+    .arg(script)
+    .arg(manifest)
+    .output()
+    .expect("start real palette terminal peer");
+    common::terminal_host::assert_success(&output);
+    if env.is_mock() {
+        assert_eq!(
+            env.captured_message_count(),
+            usize::from(scenario == "light-override"),
+            "only the explicit showcase turn may reach the provider"
+        );
+    }
 }
 
 #[test]
