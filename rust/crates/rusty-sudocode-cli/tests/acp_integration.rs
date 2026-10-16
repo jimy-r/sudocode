@@ -6276,7 +6276,7 @@ async fn acp_completions_retry_ack_and_exact_context() {
         .contains(SUBAGENT_CHILD_ANSWER));
     // Failure to durably receive must cause the exact payload to be retried.
     client.send_raw(&json!({"jsonrpc":"2.0","id":first["id"],"error":{"code":-32603,"message":"database unavailable"}})).await;
-    let (_, retry) = client
+    let (_, mut retry) = client
         .recv_until(SUBAGENT_EVENTS_WAIT, |v| {
             v["method"] == "_sudocode/subagent/completed"
         })
@@ -6284,36 +6284,40 @@ async fn acp_completions_retry_ack_and_exact_context() {
         .unwrap();
     assert_eq!(retry["params"], first["params"]);
     frozen_completion_sources(&workspace, &sid, 2).await;
-    // Restart before receiving a durable ACK. Metadata replay must deliver
-    // the same frozen payload without constructing an execution engine.
-    client.shutdown().await;
-    let mut client = spawn_stdio_client_danger(&workspace);
-    initialize_with_completions(&mut client).await;
-    let (during, inventory) = client
-        .send_request(
-            "_sudocode/subagent/replay",
-            json!({"sessionId":sid,"cwd":workspace.root}),
-        )
-        .await;
-    assert!(inventory.get("result").is_some(), "{inventory}");
-    let retry = if let Some(request) = during
-        .into_iter()
-        .find(|v| v["method"] == "_sudocode/subagent/completed")
-    {
-        request
-    } else {
-        client
-            .recv_until(SUBAGENT_EVENTS_WAIT, |v| {
-                v["method"] == "_sudocode/subagent/completed"
-            })
-            .await
-            .unwrap()
-            .1
-    };
-    assert_eq!(
-        retry["params"], first["params"],
-        "restart must preserve the frozen delivery"
-    );
+    // Repeated cold bindings must retain the same unacknowledged payload,
+    // including when an old idle event reaches the transport after binding.
+    for restart in 1..=3 {
+        client.shutdown().await;
+        client = spawn_stdio_client_danger(&workspace);
+        initialize_with_completions(&mut client).await;
+        let (during, inventory) = client
+            .send_request(
+                "_sudocode/subagent/replay",
+                json!({"sessionId":sid,"cwd":workspace.root}),
+            )
+            .await;
+        assert!(inventory.get("result").is_some(), "{inventory}");
+        retry = if let Some(request) = during
+            .into_iter()
+            .find(|v| v["method"] == "_sudocode/subagent/completed")
+        {
+            request
+        } else {
+            client
+                .recv_until(SUBAGENT_EVENTS_WAIT, |v| {
+                    v["method"] == "_sudocode/subagent/completed"
+                })
+                .await
+                .unwrap_or_else(|seen| {
+                    panic!("cold replay {restart} lost delivery: inventory={inventory}, messages={seen:?}")
+                })
+                .1
+        };
+        assert_eq!(
+            retry["params"], first["params"],
+            "restart {restart} must preserve the frozen delivery"
+        );
+    }
 
     client.send_raw(&json!({"jsonrpc":"2.0","id":retry["id"],"result":{"completionId":retry["params"]["completionId"],"disposition":"stored"}})).await;
     let (_, second) = client

@@ -855,11 +855,11 @@ impl ChatStreamState {
 
     fn ingest_chunk(&mut self, chunk: ChatCompletionChunk) -> Result<Vec<StreamEvent>, ApiError> {
         let mut events = Vec::new();
-        if self.message_id.is_none() {
+        if self.message_id.is_none() && !chunk.id.is_empty() {
             self.message_id = Some(chunk.id.clone());
         }
         if self.response_model.is_none() {
-            self.response_model = chunk.model.clone();
+            self.response_model = chunk.model.filter(|model| !model.is_empty());
         }
 
         if let Some(usage) = chunk.usage {
@@ -930,6 +930,9 @@ impl ChatStreamState {
             }
 
             if let Some(finish_reason) = choice.finish_reason {
+                if finish_reason == "content_filter" {
+                    self.ensure_message_started(&mut events);
+                }
                 self.stop_reason = Some(normalize_finish_reason(&finish_reason));
                 if finish_reason == "tool_calls" {
                     let tool_index_offset = self.tool_index_offset();
@@ -1747,6 +1750,8 @@ struct ChatCompletionChunk {
 
 #[derive(Debug, Deserialize)]
 struct ChunkChoice {
+    // Azure annotation and terminal frames may omit or null the delta.
+    #[serde(default, deserialize_with = "null_to_default")]
     delta: ChunkDelta,
     #[serde(default)]
     finish_reason: Option<String>,
