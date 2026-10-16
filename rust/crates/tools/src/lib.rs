@@ -1109,7 +1109,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "edit_file",
-            description: "Replace text in a workspace file.",
+            description: "Replace text in a workspace file. old_string must be nonempty and match exactly once; include surrounding context to disambiguate, or set replace_all to true to replace every occurrence.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -8044,7 +8044,24 @@ impl ApiClient for ProviderRuntimeClient {
             .await
     }
 
+    async fn stream_final_answer(
+        &mut self,
+        request: ApiRequest,
+    ) -> Result<AssistantEventStream, RuntimeError> {
+        self.stream_with_tool_availability(request, false).await
+    }
+
     async fn stream(&mut self, request: ApiRequest) -> Result<AssistantEventStream, RuntimeError> {
+        self.stream_with_tool_availability(request, true).await
+    }
+}
+
+impl ProviderRuntimeClient {
+    async fn stream_with_tool_availability(
+        &mut self,
+        request: ApiRequest,
+        allow_tools: bool,
+    ) -> Result<AssistantEventStream, RuntimeError> {
         let tools = self.definitions().to_vec();
         let first = self
             .chain
@@ -8055,7 +8072,7 @@ impl ApiClient for ProviderRuntimeClient {
             &request,
             runtime::TextCompletionOptions {
                 max_tokens: max_tokens_for_model(&first.model),
-                include_tools: !tools.is_empty(),
+                include_tools: allow_tools && !tools.is_empty(),
                 cache_prefix: true,
                 thinking_enabled: self.execution.thinking_enabled,
             },
@@ -8065,7 +8082,8 @@ impl ApiClient for ProviderRuntimeClient {
                 metadata: self.execution.request_metadata(),
             },
         );
-        message_request.tool_choice = (!self.allowed_tools.is_empty()).then_some(ToolChoice::Auto);
+        message_request.tool_choice =
+            (allow_tools && !self.allowed_tools.is_empty()).then_some(ToolChoice::Auto);
 
         let chain = &self.chain;
         let mut last_error: Option<ApiError> = None;

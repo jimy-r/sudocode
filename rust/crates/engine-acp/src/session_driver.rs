@@ -1,7 +1,7 @@
 //! ACP wire adaptation over one persistent engine command/event handle.
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
@@ -19,18 +19,39 @@ use crate::session_ops;
 
 type ControlWaiter = std::sync::mpsc::Sender<Result<Value, String>>;
 
+#[derive(Default)]
+struct ConnectionState {
+    connection: Option<ConnectionTo<Client>>,
+    transport: Option<tokio::task::JoinHandle<()>>,
+    keepalive: Option<Arc<SessionDriver>>,
+    pending_configuration: Option<u64>,
+    tasks: bool,
+}
+
+impl ConnectionState {
+    fn abort_transport(&mut self) {
+        if let Some(task) = self.transport.take() {
+            task.abort();
+        }
+    }
+
+    fn disconnect(&mut self) {
+        self.abort_transport();
+        self.connection = None;
+        self.keepalive = None;
+        self.pending_configuration = None;
+    }
+}
+
 pub(crate) struct SessionDriver {
     commands: std::sync::mpsc::Sender<EngineCommand>,
     handle: Mutex<Option<EngineHandle>>,
     attachment: EngineAttachment,
     listener: Mutex<Option<UnboundedSender<EngineEvent>>>,
-    connection: Mutex<Option<ConnectionTo<Client>>>,
+    connection: Mutex<ConnectionState>,
     subagents: Mutex<Option<Weak<SessionSubagents>>>,
     requests: Mutex<HashMap<u64, ControlWaiter>>,
     next_request: AtomicU64,
-    tasks: AtomicBool,
-    transport: Mutex<Option<tokio::task::JoinHandle<()>>>,
-    keepalive: Mutex<Option<Arc<Self>>>,
     bridge_stopped: Mutex<std::sync::mpsc::Receiver<()>>,
 }
 
@@ -47,13 +68,10 @@ impl SessionDriver {
             handle: Mutex::new(Some(handle)),
             attachment,
             listener: Mutex::new(None),
-            connection: Mutex::new(None),
+            connection: Mutex::new(ConnectionState::default()),
             subagents: Mutex::new(None),
             requests: Mutex::new(HashMap::new()),
             next_request: AtomicU64::new(1),
-            tasks: AtomicBool::new(false),
-            transport: Mutex::new(None),
-            keepalive: Mutex::new(None),
             bridge_stopped: Mutex::new(stopped_rx),
         });
         let (tx, mut rx) = unbounded_channel();
@@ -83,6 +101,18 @@ impl SessionDriver {
     fn on_event(self: &Arc<Self>, session_id: &str, event: EngineEvent) {
         match event {
             EngineEvent::CommandResult { id, result } => {
+                {
+                    let mut state = self
+                        .connection
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    if state.pending_configuration == Some(id) {
+                        state.pending_configuration = None;
+                        if result.is_err() {
+                            state.disconnect();
+                        }
+                    }
+                }
                 if let Some(waiter) = self
                     .requests
                     .lock()
@@ -102,11 +132,16 @@ impl SessionDriver {
                 return;
             }
             EngineEvent::CompletionIdle => {
-                self.abort_transport();
-                self.keepalive
+                let mut state = self
+                    .connection
                     .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .take();
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                // Previous connection/protocol events precede the configure
+                // command's result. They cannot retire the current binding.
+                if state.pending_configuration.is_none() {
+                    state.abort_transport();
+                    state.keepalive = None;
+                }
                 return;
             }
             _ => {}
@@ -137,6 +172,7 @@ impl SessionDriver {
                 .connection
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .connection
                 .clone();
             if let Some(connection) = connection {
                 let _ = connection.send_notification(notification);
@@ -255,66 +291,51 @@ impl SessionDriver {
         serde_json::from_value(value).map_err(|e| e.to_string())
     }
 
+    /// Publish connection/protocol state and its causal event barrier together.
+    fn configure_connection(&self, state: &mut ConnectionState) {
+        let id = self.next_request.fetch_add(1, Ordering::Relaxed);
+        state.abort_transport();
+        state.pending_configuration = Some(id);
+        if self
+            .send(EngineCommand::Completion {
+                id: Some(id),
+                action: CompletionAction::Configure {
+                    tasks: state.tasks,
+                    connected: state.connection.is_some(),
+                },
+            })
+            .is_err()
+        {
+            state.disconnect();
+        }
+    }
+
     pub(crate) fn set_task_protocol(&self, tasks: bool) {
-        self.tasks.store(tasks, Ordering::Release);
-        let connected = self
+        let mut state = self
             .connection
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .is_some();
-        let _ = self.send(EngineCommand::Completion {
-            id: None,
-            action: CompletionAction::Configure { tasks, connected },
-        });
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.tasks = tasks;
+        self.configure_connection(&mut state);
     }
 
     pub(crate) fn bind(self: &Arc<Self>, connection: ConnectionTo<Client>) {
-        self.abort_transport();
-        *self
+        let mut state = self
             .connection
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(connection);
-        *self
-            .keepalive
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::clone(self));
-        let _ = self.send(EngineCommand::Completion {
-            id: None,
-            action: CompletionAction::Configure {
-                tasks: self.tasks.load(Ordering::Acquire),
-                connected: true,
-            },
-        });
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.connection = Some(connection);
+        state.keepalive = Some(Arc::clone(self));
+        self.configure_connection(&mut state);
     }
 
     pub(crate) fn unbind(&self) {
-        self.connection
+        let mut state = self
+            .connection
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .take();
-        self.abort_transport();
-        self.keepalive
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .take();
-        let _ = self.send(EngineCommand::Completion {
-            id: None,
-            action: CompletionAction::Configure {
-                tasks: self.tasks.load(Ordering::Acquire),
-                connected: false,
-            },
-        });
-    }
-
-    fn abort_transport(&self) {
-        if let Some(task) = self
-            .transport
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .take()
-        {
-            task.abort();
-        }
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.disconnect();
+        self.configure_connection(&mut state);
     }
 
     fn deliver(
@@ -323,16 +344,16 @@ impl SessionDriver {
         tasks: bool,
         payload: engine_core::engine_events::TaskCompletion,
     ) {
-        self.abort_transport();
-        *self
-            .keepalive
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::clone(self));
-        let connection = self
+        let mut state = self
             .connection
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone();
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.pending_configuration.is_some() || state.connection.is_none() {
+            return;
+        }
+        state.abort_transport();
+        state.keepalive = Some(Arc::clone(self));
+        let connection = state.connection.clone();
         let driver = Arc::clone(self);
         let task = tokio::spawn(async move {
             let receipt = match (
@@ -388,20 +409,18 @@ impl SessionDriver {
                 action: CompletionAction::Receipt { attempt, receipt },
             });
         });
-        *self
-            .transport
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(task);
+        state.transport = Some(task);
     }
 
     pub(crate) fn listen(
         self: &Arc<Self>,
         connection: ConnectionTo<Client>,
     ) -> (TurnListener, UnboundedReceiver<EngineEvent>) {
-        *self
-            .connection
+        // Ordinary turn traffic must not opt a client into durable delivery.
+        self.connection
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(connection);
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .connection = Some(connection);
         let (tx, rx) = unbounded_channel();
         let mut listener = self
             .listener
@@ -442,7 +461,10 @@ impl SessionDriver {
 
 impl Drop for SessionDriver {
     fn drop(&mut self) {
-        self.abort_transport();
+        self.connection
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .abort_transport();
     }
 }
 
