@@ -23,7 +23,6 @@ mod render;
 mod render_engine;
 mod repl_ui;
 mod startup;
-use engine_core::subagent_completion;
 mod windows_console;
 
 use engine_acp::AcpError;
@@ -3355,7 +3354,6 @@ fn run_repl_iocraft_dispatch(
     thread::Builder::new()
         .name("repl-engine-events".into())
         .spawn(move || {
-            let mut completions = subagent_completion::Completions::default();
             while let Ok(event) = engine_events.recv() {
                 // Background work keeps publishing while the parent is idle.
                 // Its UI uses the same seam as every other engine consumer.
@@ -3370,8 +3368,8 @@ fn run_repl_iocraft_dispatch(
                     }
                     _ => {}
                 }
-                for finished in completions.observe(&event) {
-                    if let Some(prompt) = finished.completion_notification {
+                if let EngineEvent::SubagentCompletionReady(finished) = &event {
+                    if let Some(prompt) = finished.completion_notification.clone() {
                         let display = format!(
                             "Sub-agent {}: {}",
                             finished.agent.description,
@@ -3387,7 +3385,11 @@ fn run_repl_iocraft_dispatch(
                 }
                 // Child streams belong to their own context. Completion above is
                 // what the parent needs; do not accumulate child deltas while idle.
-                if !matches!(event, EngineEvent::Subagent(_)) && turn_tx.send(event).is_err() {
+                if !matches!(
+                    event,
+                    EngineEvent::Subagent(_) | EngineEvent::SubagentCompletionReady(_)
+                ) && turn_tx.send(event).is_err()
+                {
                     return;
                 }
             }
@@ -4565,9 +4567,10 @@ impl LiveCli {
             render.then(|| EngineEventRenderer::new(spinner_ref.cloned(), output.cloned()));
         let mut blocks = runtime::image_input::prompt_blocks(input, &runtime::StdFsBackend)?;
         blocks.append(&mut self.pending_images.borrow_mut());
-        self.engine_handle
-            .commands
-            .send(EngineCommand::Prompt { blocks })?;
+        self.engine_handle.commands.send(EngineCommand::Prompt {
+            blocks,
+            context: None,
+        })?;
 
         let mut outcome = TurnOutcome::default();
         let mut prompt_replies = Vec::new();
@@ -4582,7 +4585,9 @@ impl LiveCli {
             // last-assistant-message semantics the JSON output has always used.
             match &ev {
                 EngineEvent::TurnComplete(tc) => outcome.complete = Some(tc.clone()),
-                EngineEvent::Error { message } => outcome.error = Some(message.clone()),
+                EngineEvent::Error { message }
+                | EngineEvent::TurnFailed { message, .. }
+                | EngineEvent::PromptRejected { message } => outcome.error = Some(message.clone()),
                 EngineEvent::TextDelta { text } => outcome.final_text.push_str(text),
                 EngineEvent::ToolCall { id, name, input } => {
                     outcome.final_text.clear();
@@ -4674,7 +4679,10 @@ impl LiveCli {
             let action = match renderer.as_mut() {
                 Some(r) => r.render(ev),
                 None => match ev {
-                    EngineEvent::TurnComplete(_) | EngineEvent::Error { .. } => RenderOutcome::Done,
+                    EngineEvent::TurnComplete(_)
+                    | EngineEvent::Error { .. }
+                    | EngineEvent::TurnFailed { .. }
+                    | EngineEvent::PromptRejected { .. } => RenderOutcome::Done,
                     EngineEvent::PermissionRequest { id, request } => {
                         RenderOutcome::NeedPermission { id, request }
                     }
@@ -4752,7 +4760,7 @@ impl LiveCli {
 
     /// Async-REPL driver entrypoint: no interactive key monitor (the async
     /// iocraft REPL owns stdin and cancels via its own input path).
-    fn run_turn(&mut self, input: &str) -> Result<(), Box<dyn std::error::Error>> {
+    fn run_prompt(&mut self, input: &str) -> Result<(), Box<dyn std::error::Error>> {
         self.run_turn_impl(input, false)
     }
 
@@ -5275,7 +5283,7 @@ impl LiveCli {
                 )
                 .map_err(std::io::Error::other)?
                 {
-                    SkillSlashDispatch::Invoke(prompt) => self.run_turn(&prompt)?,
+                    SkillSlashDispatch::Invoke(prompt) => self.run_prompt(&prompt)?,
                     SkillSlashDispatch::Local => {
                         self.out_suspend(|| {
                             self.print_skills_with_plugins(args.as_deref(), CliOutputFormat::Text)

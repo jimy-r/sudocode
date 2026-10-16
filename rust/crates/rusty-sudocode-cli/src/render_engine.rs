@@ -405,7 +405,7 @@ impl EngineEventRenderer {
                 }
                 RenderOutcome::Continue
             }
-            EngineEvent::Error { message } => {
+            EngineEvent::Error { message } | EngineEvent::TurnFailed { message, .. } | EngineEvent::PromptRejected { message } => {
                 // Flush any partial assistant text first, then surface the error.
                 // `end_thinking` first so a turn that failed while still
                 // reasoning closes its dim block rather than letting the error
@@ -461,6 +461,11 @@ impl EngineEventRenderer {
             | EngineEvent::ModelChanged { .. }
             | EngineEvent::PermissionModeChanged { .. }
             // Background completions are scheduled by the REPL event bridge.
+            | EngineEvent::SubagentCompletionReady(_)
+            | EngineEvent::ContextCommitted(_)
+            | EngineEvent::CommandResult { .. }
+            | EngineEvent::CompletionRequest { .. }
+            | EngineEvent::CompletionIdle
             | EngineEvent::Subagent(_)
             | EngineEvent::BackgroundTask(_)
             | EngineEvent::BackgroundTaskError { .. } => RenderOutcome::Continue,

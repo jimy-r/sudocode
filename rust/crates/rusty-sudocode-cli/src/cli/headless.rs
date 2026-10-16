@@ -303,9 +303,10 @@ pub(crate) fn run(options: HeadlessOptions) -> Result<(), Error> {
                 )?;
             }
             let blocks = runtime::image_input::prompt_blocks(&prompt, &runtime::StdFsBackend)?;
-            cli.engine_handle
-                .commands
-                .send(EngineCommand::Prompt { blocks })?;
+            cli.engine_handle.commands.send(EngineCommand::Prompt {
+                blocks,
+                context: None,
+            })?;
             result["num_turns"] = json!(1);
             stage = "runtime_error";
             let mut messages = Messages::default();
@@ -439,7 +440,9 @@ pub(crate) fn run(options: HeadlessOptions) -> Result<(), Error> {
                         }
                         return Ok(());
                     }
-                    EngineEvent::Error { message } => return Err(message.into()),
+                    EngineEvent::Error { message }
+                    | EngineEvent::TurnFailed { message, .. }
+                    | EngineEvent::PromptRejected { message } => return Err(message.into()),
                     EngineEvent::Notice { text } if options.verbose => eprintln!("{text}"),
                     _ => {}
                 }

@@ -26,7 +26,7 @@ def main():
             path.parent.mkdir(parents=True, exist_ok=True)
         renderer.write_text('fn main() {}\n')
         adapter.write_text('// EngineEvent adapter\n')
-        backend.write_text('use runtime::RuntimeObserver;\n')
+        backend.write_text('use runtime::RuntimeObserver;\nObserverAdapter::new();\nCompletionJournal::open();\n')
         subprocess.run(['git', 'init', '-q'], cwd=root, env=env, check=True)
         subprocess.run(['git', 'add', '.'], cwd=root, env=env, check=True)
 
@@ -42,6 +42,15 @@ def main():
         expect('engine internals are allowed below the seam', True)
         for forbidden in ('runtime::RuntimeObserver', 'runtime::TurnSummary'):
             renderer.write_text('use ' + forbidden + ';\n')
+            expect('renderer rejects ' + forbidden, False, 'renderer bypasses')
+        for forbidden in (
+            'engine.run_turn(blocks)', 'engine.run_turn_with_blocks(blocks)',
+            'ObserverAdapter::new()', 'SubagentRelay::new()',
+            'abort_subagent(id)', 'abort_registered_agent(id)',
+            'CompletionJournal::open()', 'CompletionState::stored()',
+            'subagent_completion::Completions::default()',
+        ):
+            renderer.write_text(forbidden + ';\n')
             expect('renderer rejects ' + forbidden, False, 'renderer bypasses')
         renderer.write_text('fn main() {}\n')
         empty_tools = root / 'empty-tools'

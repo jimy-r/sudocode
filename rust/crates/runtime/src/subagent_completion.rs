@@ -22,8 +22,8 @@ struct Worker {
     finished: Option<SubagentLifecycle>,
 }
 
-/// Shared by the CLI turn pump and ACP's durable publisher. Starting and
-/// closing a turn are explicit: ACP does not receive the CLI pump's events.
+/// Shared qualification rules for volatile and durable engine sessions.
+/// The engine owns turn admission, event observation and closure.
 #[derive(Clone, Default, Serialize, Deserialize)]
 pub struct Completions {
     active: bool,

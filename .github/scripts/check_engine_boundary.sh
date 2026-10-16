@@ -26,3 +26,6 @@ reject_matches() {
 
 reject_matches 'runtime::(TurnSummary|RuntimeObserver)' \
   rust/crates/rusty-sudocode-cli rust/crates/engine-acp
+
+reject_matches '\.run_turn(_with_blocks)?[[:space:]]*\(|ObserverAdapter|SubagentRelay|abort_subagent|abort_registered_agent|(^|[^[:alnum:]_])Completion(Journal|State)([^[:alnum:]_]|$)|subagent_completion::Completions' \
+  rust/crates/rusty-sudocode-cli/src rust/crates/engine-acp/src

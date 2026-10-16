@@ -173,6 +173,10 @@ pub struct SessionEngine {
 }
 
 impl SessionEngine {
+    pub(crate) fn session_cwd(&self) -> PathBuf {
+        self.lock_session().cwd.clone()
+    }
+
     /// Adopt a session prepared by a host, retaining its filesystem and writer
     /// lease. This is the same engine used by the CLI and every ACP transport.
     #[allow(clippy::too_many_arguments)]
@@ -617,10 +621,15 @@ impl SessionEngine {
         &self,
         observer: &mut dyn runtime::RuntimeObserver,
     ) -> Result<CompactionOutcome, String> {
+        self.compaction_abort_signal.reset();
+        self.compact_admitted(observer)
+    }
+
+    pub(crate) fn compact_admitted(
+        &self,
+        observer: &mut dyn runtime::RuntimeObserver,
+    ) -> Result<CompactionOutcome, String> {
         let mut session = self.lock_session();
-        // Reset before publishing Started: a cancel in response to that event
-        // must not be cleared when the summarizer begins.
-        session.abort_signal.reset();
         session.runtime.set_compaction_pending_input_tokens(0);
         let before_tokens = estimate_session_tokens(session.runtime.session());
         let mut progress = runtime::CompactionProgress::started("manual", before_tokens);
@@ -937,10 +946,7 @@ impl SessionEngine {
             .set_trace_id(trace_id.to_string());
     }
 
-    /// Push each block as its own `User` message onto the live session before a
-    /// turn runs — the ACP image path pre-loads native / VLM-described image
-    /// blocks this way (the renderer prepares the blocks; the engine only
-    /// appends them). Ports the message-push half of `AcpSdkDelegate::push_images`.
+    /// Append user input prepared by a lifecycle operation or image preflight.
     pub fn push_user_blocks(&self, blocks: Vec<runtime::ContentBlock>) -> Result<(), String> {
         let mut session = self.lock_session();
         for block in blocks {
@@ -978,6 +984,38 @@ impl Drop for SessionEngine {
 }
 
 impl engine_core::EngineDelegate for SessionEngine {
+    fn prepare_prompt(
+        &self,
+        blocks: Vec<runtime::ContentBlock>,
+        image_policy: engine_core::engine_events::ImageInputPolicy,
+    ) -> Result<Vec<runtime::ContentBlock>, runtime::RuntimeError> {
+        if image_policy == engine_core::engine_events::ImageInputPolicy::Native
+            || !blocks
+                .iter()
+                .any(|block| matches!(block, runtime::ContentBlock::Image { .. }))
+        {
+            return Ok(blocks);
+        }
+        let mut images = Vec::new();
+        let mut remaining = Vec::new();
+        for block in blocks {
+            match block {
+                runtime::ContentBlock::Image { data, mime_type } => images.push((data, mime_type)),
+                block => remaining.push(block),
+            }
+        }
+        if !images.is_empty() {
+            let cwd = self.lock_session().cwd.clone();
+            crate::prompt_images::prepare_and_push_images(self, &images, &cwd)
+                .map_err(runtime::RuntimeError::new)?;
+        }
+        Ok(remaining)
+    }
+
+    fn set_trace_id(&self, trace_id: &str) {
+        SessionEngine::set_trace_id(self, trace_id);
+    }
+
     fn run_turn(
         &self,
         blocks: Vec<runtime::ContentBlock>,
@@ -986,7 +1024,6 @@ impl engine_core::EngineDelegate for SessionEngine {
     ) -> Result<engine_core::TurnComplete, runtime::RuntimeError> {
         let mut session = self.lock_session();
         Self::ensure_fresh_session_source(&mut session)?;
-        session.abort_signal.reset();
         let previous_compaction_run_id = session
             .runtime
             .last_compaction_report()
@@ -1114,7 +1151,7 @@ impl engine_core::EngineDelegate for SessionEngine {
     }
 
     fn abort_signal(&self) -> runtime::HookAbortSignal {
-        self.lock_session().abort_signal.clone()
+        self.compaction_abort_signal.clone()
     }
 
     fn set_model(&self, new_model: &str) -> Result<(String, Vec<String>), String> {
@@ -1148,6 +1185,23 @@ impl engine_core::EngineDelegate for SessionEngine {
             return Ok(format!("switched model to {resolved}"));
         }
         Ok(String::new())
+    }
+
+    fn run_management(
+        &self,
+        line: &str,
+        build: &engine_core::engine_events::ManagementContext,
+        observer: &mut dyn runtime::RuntimeObserver,
+    ) -> Result<bool, runtime::RuntimeError> {
+        crate::management::execute(self, line, build, observer).map_err(runtime::RuntimeError::new)
+    }
+
+    fn attach_completions(
+        &self,
+        state: &engine_core::subagent_completion::CompletionState,
+    ) -> Result<(), String> {
+        let session = self.lock_session();
+        state.attach_session(session.runtime.session(), &session.cwd)
     }
 
     fn background_tasks(&self) -> Option<runtime::background_tasks::BackgroundTasks> {

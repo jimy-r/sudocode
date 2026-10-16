@@ -234,3 +234,24 @@ mod tests {
         let _ = fs::remove_dir_all(&sessions_dir);
     }
 }
+
+/// Compose a durable control session without constructing a model runtime.
+pub fn completion_engine(
+    session: &runtime::Session,
+    cwd: &Path,
+    create: bool,
+) -> Result<(engine_core::EngineHandle, engine_core::EngineAttachment), String> {
+    Ok(engine_core::EngineSession::deferred(
+        engine_core::subagent_completion::CompletionState::open(session, cwd, create)?,
+    ))
+}
+
+/// Compose a read-only storage probe; journal ownership is acquired on replay.
+pub fn stored_completion_engine(
+    session_id: &str,
+    cwd: &Path,
+) -> Result<(engine_core::EngineHandle, engine_core::EngineAttachment), String> {
+    Ok(engine_core::EngineSession::deferred(
+        engine_core::subagent_completion::CompletionState::stored(session_id, cwd)?,
+    ))
+}
