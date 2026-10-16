@@ -7112,7 +7112,7 @@ async fn acp_powershell_cancellation_reaps_owned_job_before_replay() {
         .map(|value| value.split_once(':').unwrap().0)
         .collect::<Vec<_>>()
         .join(",");
-    let check = "$ids = @(PROCESS_IDS); foreach ($processId in $ids) { $process = Get-Process -Id $processId -ErrorAction SilentlyContinue; if ($null -ne $process -and -not $process.HasExited) { '{0}:{1}' -f $process.Id, $process.StartTime.ToUniversalTime().Ticks } }".replace("PROCESS_IDS", &ids);
+    let check = "$ErrorActionPreference = 'Stop'; $ids = @(PROCESS_IDS); Get-Process -ErrorAction Stop | Where-Object { $ids -contains $_.Id -and -not $_.HasExited } | ForEach-Object { '{0}:{1}' -f $_.Id, $_.StartTime.ToUniversalTime().Ticks }".replace("PROCESS_IDS", &ids);
     let output = std::process::Command::new("pwsh")
         .args([
             "-NoLogo",
@@ -7125,7 +7125,9 @@ async fn acp_powershell_cancellation_reaps_owned_job_before_replay() {
         .unwrap();
     assert!(
         output.status.success(),
-        "native process query failed: {}",
+        "native process query failed ({}): stdout={} stderr={}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
     let present = String::from_utf8_lossy(&output.stdout);
