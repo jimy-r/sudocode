@@ -17,6 +17,7 @@ function tool(name, id, fields = {}) {
     agentType: clean(fields.subagent_type, 256),
     model: clean(fields.model, 256),
     description: clean(fields.description, 1024),
+    runInBackground: fields.run_in_background === true,
   };
 }
 
@@ -44,6 +45,11 @@ const result = results.at(-1);
 const denials = (Array.isArray(result?.permission_denials) ? result.permission_denials : [])
   .map(value => tool(value.tool_name, value.tool_use_id, value.tool_input));
 const text = clean(result?.result, 200000);
+const subagents = Object.fromEntries(
+  ['spawned', 'started_in_background', 'completed', 'failed']
+    .filter(key => Number.isSafeInteger(result?.subagent_stats?.[key]))
+    .map(key => [key, result.subagent_stats[key]]),
+);
 const report = {
   head: clean(process.env.REVIEW_HEAD_SHA, 64),
   nativeChannel: clean(process.env.REVIEW_NATIVE_CHANNEL, 64),
@@ -52,12 +58,17 @@ const report = {
     subtype: clean(result.subtype, 128), isError: result.is_error,
     turns: result.num_turns, reportedCliCostUsd: result.total_cost_usd,
     models: Object.keys(result.modelUsage ?? {}).map(value => clean(value, 256)),
+    subagents,
     text,
   },
   tools,
   permissionDenials: denials,
 };
 writeEvidence(output, report);
+if (subagents.started_in_background > 0 || tools.some(value =>
+  ['Agent', 'Task'].includes(value.name) && value.runInBackground)) {
+  throw new Error('Review launched background agents; the action can exit before their results. Require synchronous review');
+}
 if (inputError || !result || result.is_error !== false || !Number.isSafeInteger(result.num_turns)
     || result.num_turns <= 1 || !text?.trim()) {
   throw new Error('Review has no successful multi-turn execution and final result; inspect retained evidence');
