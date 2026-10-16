@@ -41,7 +41,7 @@ jobs:
         id: claude-review
         uses: anthropics/claude-code-action@v1
         with:
-          anthropic_api_key: ${{ vars.SUDOROUTER_NATIVE_CHANNEL && format('{0}-{1}', secrets.SUDOROUTER_CI_API_KEY, vars.SUDOROUTER_NATIVE_CHANNEL) || secrets.SUDOROUTER_CI_API_KEY }}
+          anthropic_api_key: &native_key ${{ vars.SUDOROUTER_NATIVE_CHANNEL && format('{0}-{1}', secrets.SUDOROUTER_CI_API_KEY, vars.SUDOROUTER_NATIVE_CHANNEL) || secrets.SUDOROUTER_CI_API_KEY }}
           # The job's read-only token also works when this workflow is edited;
           # App-token exchange otherwise skips those PRs before reviewing them.
           github_token: ${{ github.token }}
@@ -77,15 +77,22 @@ jobs:
           fi
 
       # A successful composite step without an execution record is not a review.
-      - name: Require an actual completed review
-        if: success()
+      - name: Validate review execution and retain evidence
+        if: always()
         env:
           EXECUTION_FILE: ${{ steps.claude-review.outputs.execution_file }}
+          PROXY_AUTH_TOKEN: ${{ secrets.SUDOROUTER_CI_API_KEY }}
+          NATIVE_PROXY_AUTH_TOKEN: *native_key
+          GITHUB_TOKEN: ${{ github.token }}
+          REVIEW_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          REVIEW_NATIVE_CHANNEL: ${{ vars.SUDOROUTER_NATIVE_CHANNEL }}
         run: |
-          set -euo pipefail
-          if [ -z "$EXECUTION_FILE" ] || [ ! -s "$EXECUTION_FILE" ]; then
-            echo "::error::Claude review produced no execution record"
-            exit 1
-          fi
-          jq -e '[.. | objects | select(.type? == "result")]
-            | last | .is_error == false and .num_turns > 1' "$EXECUTION_FILE" > /dev/null
+          node .github/scripts/summarize_claude_review.cjs "$EXECUTION_FILE" "${{ runner.temp }}/scode-review-evidence.json"
+      - name: Upload review evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: claude-review-evidence
+          path: ${{ runner.temp }}/scode-review-evidence.json
+          if-no-files-found: error
+          retention-days: 7

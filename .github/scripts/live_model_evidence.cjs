@@ -1,7 +1,7 @@
 const fs = require('node:fs');
 const path = require('node:path');
 
-const secrets = ['PROXY_AUTH_TOKEN', 'NATIVE_PROXY_AUTH_TOKEN', 'ANTHROPIC_API_KEY', 'OPENAI_API_KEY']
+const secrets = ['PROXY_AUTH_TOKEN', 'NATIVE_PROXY_AUTH_TOKEN', 'ANTHROPIC_API_KEY', 'OPENAI_API_KEY', 'GH_TOKEN', 'GITHUB_TOKEN']
   .map(key => process.env[key]).filter(Boolean);
 
 function clean(value, limit = 2048) {
