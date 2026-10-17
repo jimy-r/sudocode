@@ -1201,6 +1201,7 @@ impl<K: KernelConvenience + KernelFsAccess + Send + Sync + 'static> FsBackend
             .kernel
             .sys_setattr(
                 path,
+                &self.ctx,
                 DT_STREAM as i32,
                 "",    // backend_name
                 None,  // backend
@@ -1306,6 +1307,7 @@ impl<K: KernelConvenience + KernelFsAccess + Send + Sync + 'static> FsBackend
         self.kernel
             .sys_setattr(
                 alias,
+                &self.ctx,
                 DT_LINK as i32,
                 "",   // backend_name
                 None, // backend
@@ -1444,6 +1446,7 @@ impl<K: KernelConvenience + KernelFsAccess + Send + Sync + 'static> FsBackend
             self.kernel
                 .sys_setattr(
                     &prefix,
+                    &self.ctx,
                     1, // DT_DIR
                     "",
                     None,
