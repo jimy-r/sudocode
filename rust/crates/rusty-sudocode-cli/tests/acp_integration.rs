@@ -6243,7 +6243,19 @@ async fn acp_completions_retry_ack_and_exact_context() {
     let workspace = subagent_events_workspace("completions", &server.base_url());
     let mut client = spawn_stdio_client_danger(&workspace);
     initialize_with_completions(&mut client).await;
-    let sid = scenario_session_new(&mut client, &workspace.root).await;
+    let (_, created) = client
+        .send_request("session/new", json!({"cwd":workspace.root,"mcpServers":[]}))
+        .await;
+    let sid = created["result"]["sessionId"].as_str().unwrap().to_owned();
+    let metadata = &created["result"]["_meta"]["sudocode"];
+    assert!(
+        metadata["workspace"]["fileRoot"].as_str().is_some(),
+        "{created}"
+    );
+    assert!(
+        metadata["workspace"]["shellRoot"].as_str().is_some(),
+        "{created}"
+    );
     let (_, replay) = client
         .send_request(
             "_sudocode/subagent/replay",
@@ -6339,6 +6351,16 @@ async fn acp_completions_retry_ack_and_exact_context() {
         .await;
     assert_eq!(
         loaded["result"]["_meta"]["sudocode"]["contextRef"], context,
+        "{loaded}"
+    );
+    let metadata = &loaded["result"]["_meta"]["sudocode"];
+    assert!(metadata["storageRef"].as_str().is_some(), "{loaded}");
+    assert!(
+        metadata["workspace"]["fileRoot"].as_str().is_some(),
+        "{loaded}"
+    );
+    assert!(
+        metadata["workspace"]["shellRoot"].as_str().is_some(),
         "{loaded}"
     );
     let transcript = find_session_transcript(&workspace.root, &sid);
@@ -6770,6 +6792,55 @@ async fn initialize_task_completions(client: &mut AcpTestClient) {
         .is_none());
 }
 
+#[tokio::test]
+async fn acp_task_storage_and_workspace_metadata_coexist() {
+    let server = MockAnthropicService::spawn().await.unwrap();
+    let workspace = TestWorkspace::new("task-workspace-metadata");
+    workspace.create();
+    workspace.write_sudocode_json(&server.base_url());
+    let mut client = spawn_stdio_client_danger(&workspace);
+    initialize_task_completions(&mut client).await;
+    let (_, created) = client
+        .send_request("session/new", json!({"cwd":workspace.root,"mcpServers":[]}))
+        .await;
+    let sid = created["result"]["sessionId"].as_str().unwrap();
+    let metadata = &created["result"]["_meta"]["sudocode"];
+    let storage = metadata["storageRef"]
+        .as_str()
+        .expect("task storage identity");
+    let paths = metadata["workspace"].clone();
+    assert!(paths["fileRoot"].as_str().is_some(), "{created}");
+    assert!(paths["shellRoot"].as_str().is_some(), "{created}");
+    let (_, closed) = client
+        .send_request("session/close", json!({"sessionId":sid}))
+        .await;
+    assert!(closed.get("result").is_some(), "{closed}");
+    client.shutdown().await;
+    let mut client = spawn_stdio_client_danger(&workspace);
+    initialize_task_completions(&mut client).await;
+    let (_, loaded) = client
+        .send_request(
+            "session/load",
+            json!({"sessionId":sid,"cwd":workspace.root,"mcpServers":[]}),
+        )
+        .await;
+    assert_eq!(
+        loaded["result"]["_meta"]["sudocode"]["workspace"], paths,
+        "{loaded}"
+    );
+    let (_, replay) = client
+        .send_request(
+            "_sudocode/task/replay",
+            json!({"sessionId":sid,"cwd":workspace.root,"storageRef":storage}),
+        )
+        .await;
+    assert_eq!(replay["result"]["storageRef"], storage, "{replay}");
+    assert_eq!(replay["result"]["pending"], 0, "{replay}");
+    assert!(server.captured_requests().await.is_empty());
+    client.shutdown().await;
+    workspace.cleanup();
+}
+
 /// Real shell + ACP boundary: durable result, ACK retry, cold query, suppression
 /// and deletion all use one storage identity. The model transport is deterministic.
 #[cfg(unix)]
@@ -7159,6 +7230,11 @@ async fn acp_completions_exclude_live_writer_before_replay_or_load() {
         )
         .await;
     assert!(loaded.get("result").is_some(), "{loaded}");
+    assert_eq!(
+        fs::read(&transcript).unwrap(),
+        before_transcript,
+        "loading must project the interrupted result without rewriting history"
+    );
     let (_, continued) = competitor
         .send_request(
             "session/prompt",
@@ -7169,6 +7245,37 @@ async fn acp_completions_exclude_live_writer_before_replay_or_load() {
         )
         .await;
     assert_eq!(continued["result"]["stopReason"], "end_turn", "{continued}");
+    let repaired_transcript = fs::read(&transcript).unwrap();
+    assert!(
+        String::from_utf8_lossy(&repaired_transcript)
+            .contains("Side effects may already have occurred"),
+        "the new owner must persist the interrupted tool's uncertain outcome"
+    );
+    assert!(
+        server
+            .captured_requests()
+            .await
+            .last()
+            .unwrap()
+            .raw_body
+            .contains("Side effects may already have occurred"),
+        "the resumed model must receive the persisted uncertainty about prior effects"
+    );
+    competitor.shutdown().await;
+    let mut competitor = spawn_stdio_client_danger(&workspace);
+    initialize_with_completions(&mut competitor).await;
+    let (_, loaded_again) = competitor
+        .send_request(
+            "session/load",
+            json!({"sessionId":sid, "cwd":workspace.root, "mcpServers":[]}),
+        )
+        .await;
+    assert!(loaded_again.get("result").is_some(), "{loaded_again}");
+    assert_eq!(
+        fs::read(&transcript).unwrap(),
+        repaired_transcript,
+        "a further process restart must retain the repair without rewriting history"
+    );
     competitor.shutdown().await;
 
     // Unreleased, non-locking v1 records require explicit offline handling.

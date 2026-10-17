@@ -173,6 +173,130 @@ fn relative_paths_resolve_against_the_agent_workspace() {
     assert_eq!(read.file.content, "- ship it");
 }
 
+fn canonical_workspace_mount() -> std::path::PathBuf {
+    let directory = runtime::test_support::temp_dir_path("scode-canonical-workspace");
+    std::fs::create_dir_all(&directory).unwrap();
+    directory.canonicalize().unwrap()
+}
+
+#[test]
+fn local_workspace_paths_and_virtual_paths_share_one_authorized_object() {
+    let kernel = kernel_with_root_backend();
+    let mount = canonical_workspace_mount();
+    let fs = vfs_backend(&kernel).with_local_workspace(&mount).unwrap();
+    let path = mount.join("project.txt").to_string_lossy().into_owned();
+    assert_eq!(fs.working_root().unwrap(), mount.to_string_lossy());
+    assert_eq!(fs.normalize("project.txt").unwrap(), path);
+    assert_eq!(fs.normalize(&path).unwrap(), path);
+    write_file(&fs, "project.txt", "shared bytes").unwrap();
+    assert_eq!(fs.read(&path).unwrap(), b"shared bytes");
+    assert_eq!(
+        vfs_backend(&kernel).read("/ws/project.txt").unwrap(),
+        b"shared bytes"
+    );
+    edit_file(&fs, &path, "shared", "same", false).unwrap();
+    assert_eq!(fs.read("/ws/project.txt").unwrap(), b"same bytes");
+    let glob = glob_search(&fs, "**/*.txt", None).unwrap();
+    assert_eq!(glob.filenames.len(), 1);
+    assert_eq!(fs.normalize(&glob.filenames[0]).unwrap(), path);
+    let mut input = grep_input("same bytes", "");
+    input.path = None;
+    let grep = grep_search(&fs, &input).unwrap();
+    assert_eq!(grep.filenames.len(), 1);
+    assert_eq!(fs.normalize(&grep.filenames[0]).unwrap(), path);
+    fs.rename(&path, "renamed.txt").unwrap();
+    assert!(!fs.exists(&path).unwrap());
+    assert_eq!(fs.read("renamed.txt").unwrap(), b"same bytes");
+    std::fs::remove_dir(mount).unwrap();
+}
+
+#[test]
+fn local_workspace_keeps_managed_state_in_its_durable_namespace() {
+    use runtime::ManagedRoot;
+    let kernel = kernel_with_root_backend();
+    let mount = canonical_workspace_mount();
+    let fs = vfs_backend(&kernel).with_local_workspace(&mount).unwrap();
+    let memory = fs.managed_root(ManagedRoot::Memory).unwrap();
+    assert_eq!(memory, "/agents/agent-x/memory");
+    fs.create_dir_all(&memory).unwrap();
+    fs.write(&fs.join_path(&memory, "MEMORY.md"), b"agent memory")
+        .unwrap();
+    assert_eq!(
+        vfs_backend(&kernel)
+            .read("/agents/agent-x/memory/MEMORY.md")
+            .unwrap(),
+        b"agent memory"
+    );
+    assert_eq!(fs.managed_root(ManagedRoot::Sessions).unwrap(), "/sessions");
+    fs.create_dir_all("/sessions/original-id").unwrap();
+    let index = "/agents/agent-x/sessions/original-id".to_string();
+    let target = "/sessions/original-id".to_string();
+    fs.link(&index, &target).unwrap();
+    assert_eq!(fs.read_link(&index).unwrap(), target);
+    assert_eq!(
+        vfs_backend(&kernel)
+            .read_link("/agents/agent-x/sessions/original-id")
+            .unwrap(),
+        "/sessions/original-id"
+    );
+    std::fs::remove_dir(mount).unwrap();
+}
+
+#[test]
+fn local_workspace_spelling_preserves_authorization_and_rejects_path_escape() {
+    let kernel = kernel_with_root_backend();
+    let policy = install_file_policy(&kernel);
+    let mount = canonical_workspace_mount();
+    let fs = vfs_backend(&kernel).with_local_workspace(&mount).unwrap();
+    fs.write("secret.txt", b"private").unwrap();
+    policy.deny("/ws/secret.txt");
+    let mounts = vec![mount.to_string_lossy().into_owned()];
+    #[cfg(windows)]
+    let mounts = {
+        let ordinary = mounts[0]
+            .strip_prefix(r"\\?\")
+            .expect("canonicalized Windows workspace")
+            .to_string();
+        vec![
+            mounts[0].clone(),
+            ordinary.clone(),
+            ordinary.replace('\\', "/"),
+        ]
+    };
+    for native_mount in mounts {
+        let secret = format!("{native_mount}/secret.txt");
+        assert_eq!(
+            fs.read(&secret).unwrap_err().kind(),
+            io::ErrorKind::PermissionDenied,
+            "authorization must survive native path spelling: {secret}"
+        );
+        let escape = format!("{native_mount}/../outside.txt");
+        assert_eq!(
+            fs.write(&escape, b"refused").unwrap_err().kind(),
+            io::ErrorKind::PermissionDenied,
+            "lexical escape must fail: {escape}"
+        );
+    }
+    let secret = mount.join("secret.txt").to_string_lossy().into_owned();
+    assert_eq!(
+        fs.read(&secret).unwrap_err().kind(),
+        io::ErrorKind::PermissionDenied
+    );
+    assert_eq!(
+        fs.read("secret.txt").unwrap_err().kind(),
+        io::ErrorKind::PermissionDenied
+    );
+    let escape = format!("{}/../outside.txt", mount.display());
+    assert_eq!(
+        fs.write(&escape, b"refused").unwrap_err().kind(),
+        io::ErrorKind::PermissionDenied
+    );
+    assert!(vfs_backend(&kernel)
+        .with_local_workspace("relative/project")
+        .is_err());
+    std::fs::remove_dir(mount).unwrap();
+}
+
 #[test]
 fn oversized_tool_output_offloads_onto_the_vfs() {
     // Proof that the offload path is fully backend-agnostic and needs NOTHING

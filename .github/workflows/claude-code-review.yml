@@ -8,7 +8,8 @@ on:
       - rust/**
 
 concurrency:
-  group: claude-review-${{ github.event.pull_request.number }}
+  # A delayed draft update must not cancel a ready-for-review execution.
+  group: claude-review-${{ github.event.pull_request.number }}-${{ github.event.pull_request.draft }}
   cancel-in-progress: true
 
 jobs:

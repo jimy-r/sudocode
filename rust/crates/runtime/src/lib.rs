@@ -96,8 +96,8 @@ pub mod workspace_root;
 pub use bash::{
     clear_bash_progress_callback, execute_bash, execute_bash_with_abort,
     execute_bash_with_progress, execute_bash_with_tasks, launch_background_command,
-    set_bash_progress_callback, BashCommandInput, BashCommandOutput, BashProgress,
-    BashProgressCallback, DEFAULT_TOOL_SUBPROCESS_TIMEOUT_MS,
+    set_bash_progress_callback, shell_process_group, BashCommandInput, BashCommandOutput,
+    BashProgress, BashProgressCallback, DEFAULT_TOOL_SUBPROCESS_TIMEOUT_MS,
 };
 pub use bootstrap::{BootstrapPhase, BootstrapPlan};
 pub use branch_lock::{detect_branch_lock_collisions, BranchLockCollision, BranchLockIntent};
@@ -215,7 +215,8 @@ pub use prompt::{
     load_system_prompt, load_system_prompt_for_agent, load_system_prompt_for_agent_with,
     load_system_prompt_with, load_system_prompt_with_fs_and_memory, load_system_prompt_with_memory,
     prepend_bullets, ContextFile, ProjectContext, PromptBuildError, SessionPromptSnapshot,
-    SystemPrompt, SystemPromptBuilder, SystemPromptOverrides, SYSTEM_PROMPT_DYNAMIC_BOUNDARY,
+    SystemPrompt, SystemPromptBuilder, SystemPromptOverrides, NEXUS_FILESYSTEM_PLATFORM,
+    SYSTEM_PROMPT_DYNAMIC_BOUNDARY,
 };
 pub use recovery_recipes::{
     attempt_recovery, recipe_for, EscalationPolicy, FailureScenario, RecoveryContext,
