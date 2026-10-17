@@ -9,7 +9,8 @@ fn main() {
         .unwrap();
     println!(
         "cargo:rustc-env=NEXUS_RUNTIME_VERSION={}",
-        tag.strip_prefix('v').expect("versioned Nexus workspace dependency")
+        tag.strip_prefix('v')
+            .expect("versioned Nexus workspace dependency")
     );
     std::env::set_var("PROTOC", protoc_bin_vendored::protoc_bin_path().unwrap());
     let artifacts: serde_json::Value = serde_json::from_str(
