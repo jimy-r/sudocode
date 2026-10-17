@@ -753,37 +753,35 @@ fn live_ensure_inbox() {
     println!("ensured the {inbox}<->{peer} conversation");
 }
 
-/// Spawn a co-host responder agent in a running `nexusd-cluster-cohost` daemon
+/// Spawn a co-host responder agent in a running `nexusd-cohost` daemon
 /// (the control-plane `managed_agent.start_session_v1`), so a standalone
 /// `scode` has a REAL LLM partner to converse with over A2A. The responder
 /// binds its replicated inbox `/agents/<name>/chat-with-me` and auto-replies to
 /// whoever messages it. Drives the full duet:
 ///
 /// ```text
-/// NEXUS_A2A_TEST_ENDPOINT=127.0.0.1:2126 NEXUS_A2A_TEST_SPAWN=mac-ai \
-///   cargo test -p runtime --test nexus_mailbox_live live_spawn_cohost -- --ignored --nocapture
+/// NEXUS_A2A_TEST_ENDPOINT=https://127.0.0.1:2126 NEXUS_A2A_TEST_SPAWN=mac-ai \
+/// NEXUS_A2A_MODEL_TLS_DIR=<operator TLS directory> \
+///   cargo test -p runtime --test mailbox_nexus_live live_spawn_cohost -- --ignored --nocapture
 /// ```
 #[test]
-#[ignore = "requires a running nexusd-cluster-cohost daemon + funded key; set NEXUS_A2A_TEST_ENDPOINT + NEXUS_A2A_TEST_SPAWN"]
+#[ignore = "requires a running cohost daemon, funded model and operator TLS credential"]
 fn live_spawn_cohost() {
-    let endpoint =
-        std::env::var("NEXUS_A2A_TEST_ENDPOINT").expect("set NEXUS_A2A_TEST_ENDPOINT=host:port");
     let agent = std::env::var("NEXUS_A2A_TEST_SPAWN").expect("set NEXUS_A2A_TEST_SPAWN=<agent>");
     let model =
         std::env::var("NEXUS_A2A_TEST_MODEL").unwrap_or_else(|_| "claude-sonnet-4-6".to_string());
-    let auth = std::env::var("NEXUS_API_KEY").unwrap_or_default();
-    let client = dial(&endpoint);
+    let client = Arc::new(model_operator());
 
     // String-only params -> rpc_codec is plain JSON, so a raw JSON payload works.
     let payload =
         format!(r#"{{"agent_id":"{agent}","model":"{model}","owner_id":"root","zone_id":"root"}}"#);
     let resp = client
-        .call("managed_agent.start_session_v1", payload.as_bytes(), &auth)
+        .call("managed_agent.start_session_v1", payload.as_bytes(), "")
         .expect("start_session_v1 call");
     let body = String::from_utf8_lossy(&resp);
     println!("start_session_v1 -> {body}");
     let started = serde_json::from_slice(&resp).unwrap();
-    let _controller = Controller::attach(&client, &started, &auth);
+    let _controller = Controller::attach(&client, &started, "");
     assert!(
         body.contains("session_id"),
         "expected a session_id in the spawn response, got {body}"
