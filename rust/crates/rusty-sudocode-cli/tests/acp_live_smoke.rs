@@ -21,11 +21,12 @@ use std::fs;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
 use tokio::process::{Child, Command};
 use tokio::time::timeout;
@@ -290,6 +291,11 @@ fn base_command_with_mode(
     }
     if let Some(path) = std::env::var_os("SCODE_LOG_PATH") {
         cmd.env("SCODE_LOG_PATH", path);
+    }
+    // The live job's stream budget must survive environment isolation; otherwise
+    // the default 300s budget outlives the harness's 120s receive bound.
+    if let Some(budget) = std::env::var_os("SUDOCODE_API_READ_TIMEOUT") {
+        cmd.env("SUDOCODE_API_READ_TIMEOUT", budget);
     }
     cmd.args([
         "--auth",
@@ -852,6 +858,122 @@ async fn live_anthropic_smoke_ws() {
     run_live_scenarios(&mut client, &workspace).await;
     client.shutdown().await;
     workspace.cleanup();
+}
+
+/// Run the live harness under an explicit parent budget without mutating this
+/// test process's environment. The peer sends heartbeats until the production
+/// stream reader recovers, then answers the identical request.
+#[tokio::test]
+async fn inherited_idle_budget_recovers_a_heartbeat_only_stream() {
+    const TEST: &str = "inherited_idle_budget_recovers_a_heartbeat_only_stream";
+    const FIXTURE_CHILD: &str = "SCODE_ACP_IDLE_BUDGET_FIXTURE";
+    if std::env::var_os(FIXTURE_CHILD).is_some() {
+        let workspace = TestWorkspace::new("idle-budget");
+        workspace.create();
+        workspace.write_sudocode_json();
+        let mut client = spawn_stdio_client(&workspace, "test-idle-budget");
+        run_live_scenarios(&mut client, &workspace).await;
+        client.shutdown().await;
+        workspace.cleanup();
+        return;
+    }
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}/v1", listener.local_addr().unwrap());
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let captured = requests.clone();
+    let peer = tokio::spawn(async move {
+        let mut connections = tokio::task::JoinSet::new();
+        loop {
+            let (socket, _) = listener.accept().await.unwrap();
+            connections.spawn(answer_idle_budget_request(socket, captured.clone()));
+        }
+    });
+    let output = timeout(
+        Duration::from_secs(30),
+        Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", TEST, "--nocapture"])
+            .env(FIXTURE_CHILD, "1")
+            .env("PROXY_AUTH_TOKEN", "test-idle-budget")
+            .env("PROXY_BASE_URL", endpoint)
+            .env("SCODE_LIVE_MODEL", "grok")
+            .env("SUDOCODE_API_READ_TIMEOUT", "2")
+            .env_remove("SCODE_LOG_PATH")
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await;
+    peer.abort();
+    let output = output
+        .expect("the live harness must preserve the parent's idle budget")
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let requests = requests.lock().unwrap();
+    assert_eq!(
+        requests.len(),
+        2,
+        "one empty-stream recovery, no harness retry"
+    );
+    assert_eq!(
+        requests[0], requests[1],
+        "recovery must preserve the request"
+    );
+}
+
+async fn answer_idle_budget_request(
+    socket: tokio::net::TcpStream,
+    captured: Arc<Mutex<Vec<Value>>>,
+) {
+    let mut socket = BufReader::new(socket);
+    let mut line = String::new();
+    socket.read_line(&mut line).await.unwrap();
+    let is_query = line.starts_with("POST /v1/chat/completions ");
+    let is_catalog = line.starts_with("GET /v1/models ");
+    let mut length = 0;
+    loop {
+        line.clear();
+        if socket.read_line(&mut line).await.unwrap() == 0 || line == "\r\n" {
+            break;
+        }
+        if let Some((name, value)) = line.split_once(':') {
+            if name.eq_ignore_ascii_case("content-length") {
+                length = value.trim().parse::<usize>().unwrap();
+            }
+        }
+    }
+    let mut body = vec![0; length];
+    socket.read_exact(&mut body).await.unwrap();
+    let mut socket = socket.into_inner();
+    if is_catalog {
+        let body = r#"{"data":[{"id":"grok-3"}]}"#;
+        socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+        return;
+    }
+    assert!(is_query, "unexpected fixture route");
+    let index = {
+        let mut requests = captured.lock().unwrap();
+        requests.push(serde_json::from_slice::<Value>(&body).unwrap());
+        requests.len()
+    };
+    if index == 1 {
+        socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: 1000000\r\nConnection: close\r\n\r\n").await.unwrap();
+        while socket.write_all(b": ping\n\n").await.is_ok() {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    } else {
+        let body = concat!(
+            "data: {\"id\":\"idle-budget\",\"choices\":[{\"delta\":{\"content\":\"pong\"}}]}\n\n",
+            "data: {\"id\":\"idle-budget\",\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+            "data: {\"id\":\"idle-budget\",\"choices\":[],\"usage\":{\"prompt_tokens\":12,\"completion_tokens\":1}}\n\n",
+            "data: [DONE]\n\n",
+        );
+        socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+    }
 }
 
 // ---------------------------------------------------------------------------
