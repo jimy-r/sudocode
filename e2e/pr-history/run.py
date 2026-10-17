@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Exercise the PR history gate with real rebases, merges and conflicts."""
+"""Exercise current-main and preserved-history checks against actual Git repos."""
 
 import os
 from pathlib import Path
@@ -7,11 +7,11 @@ import subprocess
 import sys
 import tempfile
 
-GATE = Path(__file__).resolve().parents[2] / ".github/scripts/check_pr_rebase.py"
+GATE = Path(__file__).resolve().parents[2] / ".github/scripts/check_pr_history.py"
 
 
 def main():
-    with tempfile.TemporaryDirectory(prefix="pr-rebase-") as directory:
+    with tempfile.TemporaryDirectory(prefix="pr-history-") as directory:
         root = Path(directory)
         env = {**os.environ, "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1", "GIT_EDITOR": "true"}
 
@@ -41,7 +41,7 @@ def main():
         git("merge", "--no-ff", "previous-feature", "-m", "Merge previous feature")
         git("switch", "-c", "feature")
         commit("shared.txt", "feature change\n")
-        expect("PR accepts existing main merge commits", True)
+        expect("existing main merge history accepted", True)
         feature_commit = git("rev-parse", "HEAD").stdout.strip()
         feature_author = git("show", "-s", "--format=%an <%ae>", "HEAD").stdout.strip()
 
@@ -50,56 +50,39 @@ def main():
         git("switch", "feature")
         expect("stale PR rejected", False, "PR is behind main")
         main_commit = git("rev-parse", "main").stdout.strip()
-        result = git("merge", "main", "-m", "Merge current main", check=False)
-        assert result.returncode != 0, "expected a real merge conflict"
-        (root / "shared.txt").write_text("resolved merge\n")
+        assert git("merge", "main", "-m", "Merge main", check=False).returncode != 0
+        (root / "shared.txt").write_text("feature change\nmain change\n")
         git("add", "shared.txt")
-        git("commit", "-m", "Resolve merge with main")
-        expect("resolved merge with main rejected", False, "PR contains merge commits")
+        git("commit", "-m", "Resolve current main")
+        expect("resolved merge with current main accepted", True)
         git("merge-base", "--is-ancestor", feature_commit, "HEAD")
         git("merge-base", "--is-ancestor", main_commit, "HEAD")
-        result = git("rebase", "main", check=False)
-        assert result.returncode != 0, "expected a real rebase conflict"
-        (root / "shared.txt").write_text("resolved rebase\n")
-        git("add", "shared.txt")
-        git("rebase", "--continue")
-        expect("resolved linear rebase accepted", True)
-        git("merge-base", "--is-ancestor", main_commit, "HEAD")
-        assert git("rev-list", "--count", "main..HEAD").stdout.strip() == "1"
-        assert git("show", "-s", "--format=%s", "HEAD").stdout.strip() == "Change shared.txt"
-        assert git("show", "-s", "--format=%an <%ae>", "HEAD").stdout.strip() == feature_author
-        assert (root / "shared.txt").read_text() == "resolved rebase\n"
-        print("PASS: rebase preserves the feature commit, author and resolved content")
+        assert git("show", "-s", "--format=%an <%ae>", feature_commit).stdout.strip() == feature_author
+        print("PASS: original feature commit, author and both parent histories remain intact")
 
-        for marker in ("<<<<<<< HEAD\n", "||||||| base\n", "=======\n", ">>>>>>> branch\n"):
+        for index, marker in enumerate(("<<<<<<< HEAD\n", "||||||| base\n", "=======\n", ">>>>>>> branch\n")):
+            git("switch", "-c", f"marker-{index}", "feature")
             commit("conflict.txt", marker)
             expect("leftover marker rejected: " + marker.strip(), False, "Resolve the leftover conflict markers")
-            git("reset", "--hard", "HEAD~1")
+        git("switch", "feature")
         commit("notes.md", "Markdown hard break  \nnext line\n")
         expect("intentional Markdown whitespace accepted", True)
 
         git("switch", "main")
         commit("next-main.txt", "main advances again\n")
         git("switch", "feature")
-        expect("PR becomes stale when main advances again", False, "PR is behind main")
+        expect("new main changes require integration", False, "PR is behind main")
         git("merge", "main", "-m", "Merge main again")
-        expect("main integration after another advance rejected", False, "PR contains merge commits")
-        git("rebase", "main")
-        expect("rebase after another main advance accepted", True)
+        expect("another main integration accepted", True)
+        git("merge-base", "--is-ancestor", feature_commit, "HEAD")
 
-        git("switch", "-c", "unrelated", "main")
-        commit("unrelated.txt", "another feature\n")
+        git("switch", "-c", "additional-feature", "main")
+        commit("additional.txt", "another change\n")
+        additional_commit = git("rev-parse", "HEAD").stdout.strip()
         git("switch", "feature")
-        git("merge", "--no-ff", "unrelated", "-m", "Merge unrelated feature")
-        expect("unrelated branch merge rejected", False, "PR contains merge commits")
-
-        git("switch", "-c", "octopus", "main")
-        commit("octopus.txt", "feature\n")
-        git("switch", "-c", "second-unrelated", "main")
-        commit("second-unrelated.txt", "another feature\n")
-        git("switch", "octopus")
-        git("merge", "unrelated", "second-unrelated", "-m", "Merge multiple branches")
-        expect("octopus merge rejected", False, "PR contains merge commits")
+        git("merge", "--no-ff", "additional-feature", "-m", "Merge additional feature")
+        expect("additional preserved branch history accepted", True)
+        git("merge-base", "--is-ancestor", additional_commit, "HEAD")
 
 
 if __name__ == "__main__":

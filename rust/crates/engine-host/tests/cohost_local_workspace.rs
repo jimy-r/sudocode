@@ -34,7 +34,7 @@ fn hosted_sessions_share_native_files_and_skills_while_retaining_durable_agent_s
     let project = storage.path().join("projects/first");
     let skill = project.join(".nexus/sudocode/skills/shared-workspace");
     std::fs::create_dir_all(skill.join("scripts")).unwrap();
-    std::fs::write(skill.join("SKILL.md"), "---\nname: shared-workspace\ndescription: Check the shared project\n---\nRun scripts/run.sh from this skill directory.\n").unwrap();
+    std::fs::write(skill.join("SKILL.md"), "---\nname: shared-workspace\ndescription: Check the shared project\n---\nRun sh scripts/run.sh from this skill directory.\n").unwrap();
     std::fs::write(skill.join("scripts/run.sh"), "printf skill-script-ok").unwrap();
     let descriptor = |pid: &str, path: &str| {
         let mut desc = AgentDescriptor {
@@ -81,20 +81,13 @@ fn hosted_sessions_share_native_files_and_skills_while_retaining_durable_agent_s
         b"#!/bin/sh\nprintf skill-script-ok\n",
     )
     .unwrap();
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(
-            skill.join("scripts/run.sh"),
-            std::fs::Permissions::from_mode(0o700),
-        )
+    // A concurrent spawn can inherit a writable descriptor until its exec.
+    // Model that window; the skill's interpreter must still read these bytes.
+    let _skill_writer = std::fs::OpenOptions::new()
+        .write(true)
+        .open(skill.join("scripts/run.sh"))
         .unwrap();
-    }
-    let execute_skill = if cfg!(unix) {
-        "./.nexus/sudocode/skills/shared-workspace/scripts/run.sh"
-    } else {
-        "sh .nexus/sudocode/skills/shared-workspace/scripts/run.sh"
-    };
+    let execute_skill = "sh .nexus/sudocode/skills/shared-workspace/scripts/run.sh";
     let _scope = WorkspaceRootScope::enter(&cwd);
     let result = runtime::execute_bash(serde_json::from_value(serde_json::json!({
         "command": format!("cat from-file-tool.txt; printf shell-bytes > from-shell.txt; {execute_skill}"),

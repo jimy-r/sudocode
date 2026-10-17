@@ -87,10 +87,24 @@ fn platform() -> Result<(&'static str, &'static str)> {
 }
 
 fn manifest() -> Result<Manifest> {
-    let manifest: Manifest = serde_json::from_str(
+    let mut manifest: Manifest = serde_json::from_str(
         include_str!("../runtime-artifacts.json").trim_start_matches('\u{feff}'),
     )?;
+    manifest.versions.insert(
+        "nexusd-cluster".into(),
+        env!("NEXUS_RUNTIME_VERSION").into(),
+    );
     Ok(manifest)
+}
+
+fn release_tag(prefix: &str, version: &str) -> Result<String> {
+    Ok(match prefix {
+        "nexusd-cluster" => format!("v{version}"),
+        "nexus-vault" => format!("vault-v{version}"),
+        "nexus-local-connector" => format!("local-connector-v{version}"),
+        "nexus-fuse-plugin" => format!("fuse-v{version}"),
+        _ => return Err("unknown runtime component".into()),
+    })
 }
 
 pub fn expected_plugins() -> Result<Vec<String>> {
@@ -205,16 +219,11 @@ pub fn install(root: &Path) -> Result<()> {
         .build()?;
     for (prefix, archive, files) in selected(staged_root)? {
         let version = &manifest.versions[&prefix];
-        let checksum = manifest.sha256.get(&archive).ok_or_else(|| {
-            format!("service artifact is unavailable for this platform: {archive}")
+        let release_tag = release_tag(&prefix, version)?;
+        let checksum_key = format!("{release_tag}/{archive}");
+        let checksum = manifest.sha256.get(&checksum_key).ok_or_else(|| {
+            format!("service artifact is unavailable for this release and platform: {checksum_key}")
         })?;
-        let release_tag = match prefix.as_str() {
-            "nexusd-cluster" => format!("v{version}"),
-            "nexus-vault" => format!("vault-v{version}"),
-            "nexus-local-connector" => format!("local-connector-v{version}"),
-            "nexus-fuse-plugin" => format!("fuse-v{version}"),
-            _ => return Err("unknown runtime component".into()),
-        };
         let cos_prefix = if prefix == "nexusd-cluster" {
             "nexus-vfs"
         } else {
@@ -322,4 +331,35 @@ pub(crate) fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
     temp.as_file().sync_all()?;
     temp.persist(path)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn checksums_are_bound_to_the_selected_component_releases() {
+        let manifest = manifest().unwrap();
+        for (key, digest) in &manifest.sha256 {
+            let (tag, archive) = key.split_once('/').expect("versioned artifact checksum");
+            let prefix = manifest
+                .versions
+                .keys()
+                .find(|prefix| archive.starts_with(&format!("{prefix}-")))
+                .expect("known runtime component");
+            assert_eq!(
+                tag,
+                release_tag(prefix, &manifest.versions[prefix]).unwrap()
+            );
+            assert_eq!(digest.len(), 64);
+            assert!(digest
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase()));
+        }
+        for (prefix, archive, _) in selected(Path::new("")).unwrap() {
+            let tag = release_tag(&prefix, &manifest.versions[&prefix]).unwrap();
+            assert!(manifest.sha256.contains_key(&format!("{tag}/{archive}")));
+            assert!(!manifest.sha256.contains_key(&archive));
+        }
+    }
 }

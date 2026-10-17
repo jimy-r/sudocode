@@ -305,7 +305,7 @@ fn live_cohost_reads_its_inbox_and_replies() {
     let client = dial(&endpoint);
 
     let model = std::env::var("NEXUS_A2A_TEST_MODEL").unwrap();
-    let started = client
+    let denied = client
         .call(
             "managed_agent.start_session_v1",
             serde_json::json!({"agent_id":agent,"model":model})
@@ -313,9 +313,20 @@ fn live_cohost_reads_its_inbox_and_replies() {
                 .as_bytes(),
             &auth,
         )
+        .expect_err("a mailbox identity must not create a managed session");
+    assert_eq!(denied.kind(), std::io::ErrorKind::PermissionDenied);
+    let operator = Arc::new(model_operator());
+    let started = operator
+        .call(
+            "managed_agent.start_session_v1",
+            serde_json::json!({"agent_id":agent,"model":model,"owner_id":"root","zone_id":"root"})
+                .to_string()
+                .as_bytes(),
+            "",
+        )
         .unwrap();
     let started = serde_json::from_slice(&started).unwrap();
-    let _controller = Controller::attach(&client, &started, &auth);
+    let _controller = Controller::attach(&operator, &started, "");
 
     // From where the operator's inbox is NOW, so the reply found below is this
     // run's rather than a previous one's.
@@ -742,37 +753,35 @@ fn live_ensure_inbox() {
     println!("ensured the {inbox}<->{peer} conversation");
 }
 
-/// Spawn a co-host responder agent in a running `nexusd-cluster-cohost` daemon
+/// Spawn a co-host responder agent in a running `nexusd-cohost` daemon
 /// (the control-plane `managed_agent.start_session_v1`), so a standalone
 /// `scode` has a REAL LLM partner to converse with over A2A. The responder
 /// binds its replicated inbox `/agents/<name>/chat-with-me` and auto-replies to
 /// whoever messages it. Drives the full duet:
 ///
 /// ```text
-/// NEXUS_A2A_TEST_ENDPOINT=127.0.0.1:2126 NEXUS_A2A_TEST_SPAWN=mac-ai \
-///   cargo test -p runtime --test nexus_mailbox_live live_spawn_cohost -- --ignored --nocapture
+/// NEXUS_A2A_TEST_ENDPOINT=https://127.0.0.1:2126 NEXUS_A2A_TEST_SPAWN=mac-ai \
+/// NEXUS_A2A_MODEL_TLS_DIR=<operator TLS directory> \
+///   cargo test -p runtime --test mailbox_nexus_live live_spawn_cohost -- --ignored --nocapture
 /// ```
 #[test]
-#[ignore = "requires a running nexusd-cluster-cohost daemon + funded key; set NEXUS_A2A_TEST_ENDPOINT + NEXUS_A2A_TEST_SPAWN"]
+#[ignore = "requires a running cohost daemon, funded model and operator TLS credential"]
 fn live_spawn_cohost() {
-    let endpoint =
-        std::env::var("NEXUS_A2A_TEST_ENDPOINT").expect("set NEXUS_A2A_TEST_ENDPOINT=host:port");
     let agent = std::env::var("NEXUS_A2A_TEST_SPAWN").expect("set NEXUS_A2A_TEST_SPAWN=<agent>");
     let model =
         std::env::var("NEXUS_A2A_TEST_MODEL").unwrap_or_else(|_| "claude-sonnet-4-6".to_string());
-    let auth = std::env::var("NEXUS_API_KEY").unwrap_or_default();
-    let client = dial(&endpoint);
+    let client = Arc::new(model_operator());
 
     // String-only params -> rpc_codec is plain JSON, so a raw JSON payload works.
     let payload =
         format!(r#"{{"agent_id":"{agent}","model":"{model}","owner_id":"root","zone_id":"root"}}"#);
     let resp = client
-        .call("managed_agent.start_session_v1", payload.as_bytes(), &auth)
+        .call("managed_agent.start_session_v1", payload.as_bytes(), "")
         .expect("start_session_v1 call");
     let body = String::from_utf8_lossy(&resp);
     println!("start_session_v1 -> {body}");
     let started = serde_json::from_slice(&resp).unwrap();
-    let _controller = Controller::attach(&client, &started, &auth);
+    let _controller = Controller::attach(&client, &started, "");
     assert!(
         body.contains("session_id"),
         "expected a session_id in the spawn response, got {body}"
@@ -1317,7 +1326,7 @@ fn live_cohost_subagent_context() {
     let user = std::env::var("NEXUS_A2A_TEST_REPLY_TO").unwrap();
     let model = std::env::var("NEXUS_A2A_TEST_MODEL").unwrap();
     let client = dial(&endpoint);
-    let operator = model_operator();
+    let operator = Arc::new(model_operator());
     let mb = mailbox(&client, &user, "");
     mb.ensure_conversation(&agent).unwrap();
 
@@ -1345,7 +1354,7 @@ fn live_cohost_subagent_context() {
 
     let payload = json!({"agent_id":agent,"model":model,"owner_id":"root","zone_id":"root"});
     let started: Value = serde_json::from_slice(
-        &client
+        &operator
             .call(
                 "managed_agent.start_session_v1",
                 payload.to_string().as_bytes(),
@@ -1354,7 +1363,7 @@ fn live_cohost_subagent_context() {
             .unwrap(),
     )
     .unwrap();
-    let _controller = Controller::attach(&client, &started, "");
+    let _controller = Controller::attach(&operator, &started, "");
     let (_, mut cursor) = mb.poll_conversation(&agent, 0, 0).unwrap();
     send_to(
         &client,
@@ -1414,7 +1423,7 @@ fn live_cohost_subagent_context() {
     assert_eq!(child["nexus_http"]["path"], "v1/messages");
 
     let cancel = json!({"session_id":started["session_id"],"mode":"session"});
-    client
+    operator
         .call("managed_agent.cancel_v1", cancel.to_string().as_bytes(), "")
         .unwrap();
     println!("COHOST CONTEXT: delegated result, VFS memory, workspace and host isolation verified");
@@ -1433,7 +1442,7 @@ fn live_cohost_model_workflow() {
     let model = std::env::var("NEXUS_A2A_TEST_MODEL").unwrap();
     println!("LIVE COHOST: connecting agent and operator");
     let client = dial(&endpoint);
-    let operator = model_operator();
+    let operator = Arc::new(model_operator());
     let mb = mailbox(&client, &user, "");
     println!("LIVE COHOST: ensuring conversation");
     mb.ensure_conversation(&agent).unwrap();
@@ -1454,7 +1463,7 @@ fn live_cohost_model_workflow() {
     let payload = json!({"agent_id":agent,"model":model,"owner_id":"root","zone_id":"root"});
     println!("LIVE COHOST: starting managed session");
     let started: Value = serde_json::from_slice(
-        &client
+        &operator
             .call(
                 "managed_agent.start_session_v1",
                 payload.to_string().as_bytes(),
@@ -1463,7 +1472,7 @@ fn live_cohost_model_workflow() {
             .unwrap(),
     )
     .unwrap();
-    let _controller = Controller::attach(&client, &started, "");
+    let _controller = Controller::attach(&operator, &started, "");
     let workspace = &data;
     println!("LIVE COHOST: fresh quote mounted at {workspace}");
     let (_, mut cursor) = mb.poll_conversation(&agent, 0, 0).unwrap();
@@ -1490,7 +1499,7 @@ fn live_cohost_model_workflow() {
     verify_live_child(&operator, &agent, &model, &code, total);
     verify_live_model_requests(&operator);
     let cancel = json!({"session_id":started["session_id"],"mode":"session"});
-    client
+    operator
         .call("managed_agent.cancel_v1", cancel.to_string().as_bytes(), "")
         .unwrap();
 }
@@ -1603,7 +1612,7 @@ fn live_cohost_session_resume() {
     let user = std::env::var("NEXUS_A2A_TEST_REPLY_TO").unwrap();
     let model = std::env::var("NEXUS_A2A_TEST_MODEL").unwrap();
     let client = dial(&endpoint);
-    let operator = model_operator();
+    let operator = Arc::new(model_operator());
     let read_transcript = |path: &str| {
         let mut contents = Vec::new();
         let mut offset = 0;
@@ -1632,7 +1641,7 @@ fn live_cohost_session_resume() {
     mb.ensure_conversation(&agent).unwrap();
     let mut request = json!({"agent_id":agent,"owner_id":"root","zone_id":"root","model":model});
     let rpc = |method: &str, payload: &Value| -> Result<Value, String> {
-        let bytes = client
+        let bytes = operator
             .call(method, payload.to_string().as_bytes(), "")
             .map_err(|e| e.to_string())?;
         serde_json::from_slice(&bytes).map_err(|e| e.to_string())
@@ -1652,7 +1661,7 @@ fn live_cohost_session_resume() {
         }
     };
     let first = rpc("managed_agent.start_session_v1", &request).unwrap();
-    let controller = Controller::attach(&client, &first, "");
+    let controller = Controller::attach(&operator, &first, "");
     let sid = first["durable_session_id"]
         .as_str()
         .expect("co-host durable ID");
@@ -1714,7 +1723,7 @@ fn live_cohost_session_resume() {
             Err(error) => panic!("restore failed: {error}"),
         }
     };
-    let _controller = Controller::attach(&client, &second, "");
+    let _controller = Controller::attach(&operator, &second, "");
     assert_ne!(second["session_id"], first["session_id"]);
     assert_eq!(second["durable_session_id"], sid);
     let snapshot = rpc(

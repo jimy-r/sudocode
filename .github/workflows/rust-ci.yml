@@ -312,6 +312,7 @@ jobs:
 
   a2a-live:
     if: *standard_ci
+    needs: one-nexus-vfs-pin
     name: nexus-A2A live (real daemon)
     runs-on: ubuntu-latest
     # The workflow default is `rust`; the harness lives at the repo root.
@@ -380,6 +381,23 @@ jobs:
       - name: Co-host duet against a daemon built from this checkout
         run: e2e/nexus-a2a/run-cohost.sh
 
+      - name: Checkout the VFS contract used by the co-host
+        uses: actions/checkout@v4
+        with:
+          repository: nexi-lab/nexus-vfs
+          ref: ${{ needs.one-nexus-vfs-pin.outputs.commit }}
+          path: .native-vfs
+
+      - name: Search authorization and restart under the confined co-host owner
+        env:
+          CARGO_TARGET_DIR: ${{ github.workspace }}/rust/target
+          NEXUS_SEARCH_USER_RUNTIME_BINARY: ${{ github.workspace }}/rust/target/debug/nexusd-cohost
+        run: |
+          test -x "$NEXUS_SEARCH_USER_RUNTIME_BINARY"
+          cargo test --locked --manifest-path .native-vfs/Cargo.toml \
+            -p nexus-cluster --all-features --test user_runtime \
+            signed_search_keeps_the_owner_boundary_and_reopens_committed_indexes -- --nocapture
+
       # The one feature combination nothing else builds. `driver-ai` forwards to
       # nexus-cluster so a co-host can carry `llm_mount` — the co-host has to be a
       # superset of the daemon it replaces — and a feature combination no job
@@ -403,6 +421,8 @@ jobs:
     if: *standard_ci
     name: one nexus-vfs pin
     runs-on: ubuntu-latest
+    outputs:
+      commit: ${{ steps.pin.outputs.commit }}
     defaults:
       run:
         working-directory: .
