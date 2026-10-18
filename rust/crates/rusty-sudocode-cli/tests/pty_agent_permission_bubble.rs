@@ -82,7 +82,8 @@ fn completed_child_report(directory: &Path, workspace: &Path) -> String {
         .strip_prefix(&root)
         .expect("completed report must belong to the fixture workspace");
     assert_eq!(relative.parent(), Some(Path::new(".sudocode-agents")));
-    relative.to_string_lossy().replace('\\', "/")
+    // The returned absolute path is the producer's tool contract. Preserve it.
+    report
 }
 
 fn offered_tools(request: &Value) -> BTreeSet<String> {
@@ -186,7 +187,8 @@ print(result)
     // Parent and child share the workspace; fixture commands use that namespace.
     let command = format!("'{python}' 'invoice.py'");
     let command_words = shell_words::split(&command).unwrap();
-    let child_prompt = format!("Use the bash tool to run exactly this command once, with no other commands or retries: {command}. Report its actual output.");
+    let bash_input = serde_json::json!({ "command": command });
+    let child_prompt = format!("Call the bash tool exactly once with this input object: {bash_input}. Run no other commands or retries. Report its actual output.");
     let execution = agent_input(&model, INVOICE_AGENT, &child_prompt);
     let prompt = format!("Call the Agent tool with exactly this input object, without adding or overriding fields: {execution}. Wait for the child and report its actual output.");
     let marker = common::turn_status_marker(&cli);
@@ -229,10 +231,11 @@ print(result)
         // child result owns the report path; no model has to infer a second
         // task or locate a report from a placeholder inside a long request.
         let report = completed_child_report(&captured, env.workspace_root());
+        let read_input = serde_json::json!({ "path": report });
         let verification = agent_input(
             &model,
             REPORT_AGENT,
-            &format!("Read exactly {report} with read_file and return the actual invoice output. Only read this report: do not run commands or create another report."),
+            &format!("Call read_file exactly once with this input object: {read_input}. Return the actual invoice output. Only read this report: do not run commands or create another report."),
         );
         let prompt = format!("Call the Agent tool with exactly this input object, without adding or overriding fields: {verification}. Wait for this report verification child and report its actual output.");
         let marker = common::turn_status_marker(&cli);
@@ -319,7 +322,9 @@ print(result)
                         } else {
                             env.workspace_root().join(path)
                         };
-                        let actual = path.canonicalize().expect("report file must exist");
+                        let actual = path.canonicalize().unwrap_or_else(|error| {
+                            panic!("observed read path {path:?} must exist in the fixture: {error}")
+                        });
                         let reports = env
                             .workspace_root()
                             .join(".sudocode-agents")
