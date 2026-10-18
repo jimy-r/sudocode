@@ -155,11 +155,40 @@ fn is_serving(http: &reqwest::blocking::Client, discovery: &Discovery) -> bool {
     })
 }
 
+fn wait_for_launch(
+    root: &Path,
+    http: &reqwest::blocking::Client,
+    deadline: Instant,
+) -> Result<Option<Discovery>> {
+    let lock = lock_file(root, "service.lock")?;
+    loop {
+        if let Some(discovery) =
+            read_discovery(root).filter(|discovery| is_serving(http, discovery))
+        {
+            return Ok(Some(discovery));
+        }
+        // A draining owner cannot serve discovery, but still excludes a replacement.
+        match lock.try_lock_exclusive() {
+            Ok(()) => return Ok(None),
+            Err(error) if is_lock_contention(&error) => {}
+            Err(error) => return Err(error.into()),
+        }
+        if Instant::now() >= deadline {
+            return Err("Sudocode service is still draining requests".into());
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
 fn ensure_runtime(root: &Path, http: &reqwest::blocking::Client) -> Result<Discovery> {
     if let Some(discovery) = read_discovery(root).filter(|discovery| is_serving(http, discovery)) {
         return Ok(discovery);
     }
     install(root)?;
+    let deadline = Instant::now() + Duration::from_secs(40);
+    if let Some(discovery) = wait_for_launch(root, http, deadline)? {
+        return Ok(discovery);
+    }
     let mut command = Command::new(std::env::current_exe()?);
     command
         .args(["service", "daemon"])
@@ -174,7 +203,6 @@ fn ensure_runtime(root: &Path, http: &reqwest::blocking::Client) -> Result<Disco
         command.process_group(0);
     }
     let mut child = command.spawn()?;
-    let deadline = Instant::now() + Duration::from_secs(40);
     loop {
         if let Some(discovery) =
             read_discovery(root).filter(|discovery| is_serving(http, discovery))
@@ -656,3 +684,6 @@ async fn shutdown_signal() -> std::io::Result<()> {
     #[cfg(not(unix))]
     tokio::signal::ctrl_c().await
 }
+
+#[cfg(test)]
+mod tests;
