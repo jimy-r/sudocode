@@ -289,13 +289,26 @@ instructions. Standalone CLI subagents use their local project context.
 
 ### `reasoning_effort` values
 
-`--reasoning-effort` accepts `none`, `minimal`, `low`, `medium`, `high`.
+`--effort` (alias of `--reasoning-effort`) accepts `none`, `minimal`, `low`,
+`medium`, `high`, `xhigh`, and `max`.
 `none` / `minimal` are part of OpenAI's own ladder and are what several
 OpenAI-compatible backends accept to switch reasoning off; on DashScope
 they are the only accepted values that do (`low` still reasons). The
 flag reaches the wire on ACP, REPL, `--print` and explicit `--resume` paths,
 including resumed `/compact`. For a backend that wants a body field instead,
 use `extraBody`.
+
+Claude uses `low`, `medium`, `high`, `xhigh`, and `max`. Opus/Sonnet 4.6
+map a saved `xhigh` preference to `high`; switching back to a model that
+supports `xhigh` restores it. Unsupported older models receive no effort field.
+Opus 4.8 defaults to `high`; Opus 5.5 defaults to `medium`. Effort is sent
+under `output_config.effort`, including when optional thinking is disabled.
+
+Use `/effort` to open the picker, `/effort xhigh` to set a level, or
+`/effort auto` to restore the model default. `/model` offers effort selection
+after the model; Escape cancels both choices. Named levels persist in
+`settings.json` as `effortLevel`. `max` applies only to the current process,
+so resume restores the saved preference. A CLI flag overrides the saved level.
 
 ### Anthropic thinking and prompt-cache continuity
 
@@ -308,8 +321,8 @@ on this model. See the [thinking configuration table](https://platform.claude.co
 Opus 5.5
 requires adaptive thinking; scode sends `thinking.type: "adaptive"` and maps
 the session's reasoning effort to `output_config.effort`, not the OpenAI
-top-level `reasoning_effort` field. An unset effort uses the provider's
-default; it is never derived from a request's output-token cap. Existing
+top-level `reasoning_effort` field. An unset effort uses the model default
+above; it is never derived from a request's output-token cap. Existing
 budgeted models retain their model-level `budget_tokens` policy.
 
 For Opus 5.5, `thinking: true` requests readable summaries with
@@ -325,6 +338,12 @@ not silently change them. History preserves each signed thinking block,
 including empty text, separate adjacent blocks and split signature deltas,
 plus `redacted_thinking` ciphertext. Compaction keeps the preserved tail's
 blocks unchanged, and saving/resuming does not strip them.
+
+Tool arguments are journaled as JSON objects. Legacy string records remain
+readable; fractions, unsigned 64-bit integers, and Unicode survive restart.
+Whitespace normalization inside a tool argument does not count as an external
+history edit during compaction. Changes to the durable transcript still fail
+the revision check.
 
 Cache acceptance compares actual provider-converted requests and real
 per-request `cache_read_input_tokens` / `cache_creation_input_tokens`.

@@ -246,9 +246,9 @@ pub fn config_max_output_tokens(model_id: &str) -> Option<u32> {
 /// The `max_tokens` a chat request for this model is sent with.
 ///
 /// An explicit `models.<alias>.maxOutputTokens` is the user's own number and
-/// is taken as written. Otherwise a heuristic default (32K for opus, 64K for
-/// everything else) capped by the model's registered `max_output_tokens`
-/// when the model is known.
+/// is taken as written. Opus 4.8 and 5.5 follow the measured CC request caps
+/// (64K and 128K); older models retain the existing heuristic. Every default
+/// is capped by the routed model's registered output limit.
 ///
 /// This is the number the provider — and the API client's local preflight —
 /// adds to the input when deciding whether a request fits the context
@@ -262,7 +262,11 @@ pub fn request_max_output_tokens(model_id: &str) -> u32 {
     if let Some(configured) = config_max_output_tokens(model_id) {
         return configured;
     }
-    let heuristic = if model_id.contains("opus") {
+    let heuristic = if model_id.contains("opus-5-5") {
+        128_000
+    } else if model_id.contains("opus-4-8") {
+        64_000
+    } else if model_id.contains("opus") {
         32_000
     } else {
         64_000

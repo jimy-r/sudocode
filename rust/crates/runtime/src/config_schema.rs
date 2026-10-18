@@ -343,6 +343,11 @@ pub const SETTINGS_SCHEMA: &[FieldSchema] = &[
         "Always request extended thinking",
     ),
     FieldSchema::enumerated(
+        "effortLevel",
+        &["auto", "low", "medium", "high", "xhigh", "max"],
+        "Reasoning effort (max applies only to the current session)",
+    ),
+    FieldSchema::enumerated(
         "teammateMode",
         TEAMMATE_MODE_OPTIONS,
         "How a teammate agent is run",
