@@ -18,6 +18,9 @@ use kernel::kernel::{Kernel, KernelError, OperationContext};
 use kernel::meta_store::{DT_LINK, DT_STREAM};
 use kernel::Permission;
 
+mod record_log;
+pub use record_log::{RecordLog, RecordLogMode};
+
 /// An exclusive backend lock. Dropping the handle releases ownership.
 /// Renewal returning false means ownership was lost and writes must stop.
 pub trait FsLock: Send + Sync {
@@ -122,6 +125,15 @@ const MEMORY_SEGMENT: &str = "/memory";
 /// Every method mirrors a common `std::fs` operation. Implementations must be
 /// thread-safe so a single backend can be shared across the runtime.
 pub trait FsBackend: Send + Sync + 'static {
+    /// Open an atomic, durable JSONL record log. Existing Nexus logs require a
+    /// trusted initialization binding to a fresh WAL/keep-forever path. Generic
+    /// append and a `DT_STREAM` type check cannot establish this contract.
+    fn record_log(&self, _path: &str, _mode: RecordLogMode) -> io::Result<Arc<dyn RecordLog>> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "backend has no durable atomic record log",
+        ))
+    }
     /// True only for locks that exclude a previous writer until it exits.
     /// Expiring advisory leases do not meet the completion-journal contract.
     fn fenced_locks(&self) -> bool {
@@ -451,6 +463,9 @@ fn lexical_join(root: &str, path: &str) -> io::Result<String> {
 
 // Blanket impl: Arc<dyn FsBackend> delegates to the inner backend.
 impl FsBackend for Arc<dyn FsBackend> {
+    fn record_log(&self, path: &str, mode: RecordLogMode) -> io::Result<Arc<dyn RecordLog>> {
+        (**self).record_log(path, mode)
+    }
     fn fenced_locks(&self) -> bool {
         (**self).fenced_locks()
     }
@@ -612,6 +627,9 @@ fn platform_link(alias: &str, target: &str) -> io::Result<()> {
 }
 
 impl FsBackend for StdFsBackend {
+    fn record_log(&self, path: &str, mode: RecordLogMode) -> io::Result<Arc<dyn RecordLog>> {
+        Ok(Arc::new(record_log::NativeRecordLog::open(path, mode)?))
+    }
     fn fenced_locks(&self) -> bool {
         true
     }
@@ -1188,6 +1206,9 @@ fn kernel_err(error: KernelError) -> io::Error {
 impl<K: KernelConvenience + KernelFsAccess + Send + Sync + 'static> FsBackend
     for KernelFsBackend<K>
 {
+    fn record_log(&self, path: &str, mode: RecordLogMode) -> io::Result<Arc<dyn RecordLog>> {
+        record_log::open_kernel(self, path, mode)
+    }
     fn try_lock(&self, path: &str, ttl_ms: u64) -> io::Result<Option<Arc<dyn FsLock>>> {
         let path = self.to_kernel(path)?;
         self.kernel
@@ -1718,6 +1739,9 @@ impl NexusVfsFsBackend {
 }
 
 impl FsBackend for NexusVfsFsBackend {
+    fn record_log(&self, path: &str, mode: RecordLogMode) -> io::Result<Arc<dyn RecordLog>> {
+        record_log::open_remote(self, path, mode)
+    }
     fn try_lock(&self, path: &str, ttl_ms: u64) -> io::Result<Option<Arc<dyn FsLock>>> {
         let Some(id) = self.client.lock(path, "", ttl_ms, &self.auth_token)? else {
             return Ok(None);

@@ -87,28 +87,48 @@ echo "== waiting for a writable single-voter leader =="
 # reachable lands in this loop and used to read as "daemon never became
 # writable": a panic on a missing `NEXUS_A2A_TEST_CERT_DIR`, and a build that
 # never produced the test binary at all (`failed to find tool "cl.exe"`).
-ready=
-probe=
-for i in $(seq 1 30); do
-  if probe=$(NEXUS_A2A_TEST_ENDPOINT="$ENDPOINT" NEXUS_A2A_TEST_CERT_DIR="$CLIENT_BUNDLE" \
-      "${CARGO_TEST[@]}" live_inbox_roundtrip -- --ignored 2>&1) \
-      && printf '%s' "$probe" | grep -q "1 passed"; then
-    echo "   writable on attempt $i"
-    ready=1
-    break
+wait_for_writable_leader() {
+  local ready= probe= i
+  for i in $(seq 1 30); do
+    if probe=$(NEXUS_A2A_TEST_ENDPOINT="$ENDPOINT" NEXUS_A2A_TEST_CERT_DIR="$CLIENT_BUNDLE" \
+        "${CARGO_TEST[@]}" live_inbox_roundtrip -- --ignored 2>&1) \
+        && printf '%s' "$probe" | grep -q "1 passed"; then
+      echo "   writable on attempt $i"
+      ready=1
+      break
+    fi
+    sleep 4
+  done
+  if [ -z "$ready" ]; then
+    echo "!! daemon never became writable - the last probe said:" >&2
+    printf '%s\n' "$probe" >&2
+    daemon_logs
+    exit 1
   fi
-  sleep 4
-done
-if [ -z "$ready" ]; then
-  echo "!! daemon never became writable - the last probe said:" >&2
-  printf '%s\n' "$probe" >&2
-  daemon_logs
-  exit 1
-fi
+}
+wait_for_writable_leader
 
 echo "== [deterministic] standalone A2A client round-trip =="
 NEXUS_A2A_TEST_ENDPOINT="$ENDPOINT" NEXUS_A2A_TEST_CERT_DIR="$CLIENT_BUNDLE" \
   "${CARGO_TEST[@]}" live_inbox_roundtrip -- --ignored --nocapture
+
+echo "== [deterministic] independent clients commit complete durable WAL records =="
+RECORD_TEST=(cargo test --manifest-path "$RUST_DIR/Cargo.toml" -q -p runtime --test fs_record_log)
+RECORD_RECEIPT="$AUTHON_DATA_DIR/record-log.json"
+NEXUS_A2A_TEST_ENDPOINT="$ENDPOINT" NEXUS_A2A_TEST_CERT_DIR="$CLIENT_BUNDLE" \
+  NEXUS_RECORD_LOG_RECEIPT="$(native_path "$RECORD_RECEIPT")" \
+  "${RECORD_TEST[@]}" live_record_log_commits_large_frames_from_independent_clients -- --ignored --nocapture
+
+echo "== [deterministic] restart the owned daemon and retain WAL history/cursors =="
+kill -KILL "$AUTHON_DAEMON_PID"
+wait "$AUTHON_DAEMON_PID" 2>/dev/null || true
+AUTHON_DAEMON_PID=
+authon_boot
+authon_wait_log "Zone '$AUTHON_ZONE' registered" 45
+wait_for_writable_leader
+NEXUS_A2A_TEST_ENDPOINT="$ENDPOINT" NEXUS_A2A_TEST_CERT_DIR="$CLIENT_BUNDLE" \
+  NEXUS_RECORD_LOG_RECEIPT="$(native_path "$RECORD_RECEIPT")" \
+  "${RECORD_TEST[@]}" live_record_log_recovers_after_daemon_restart -- --ignored --nocapture
 
 # One session on BOTH a local same-machine pair and this nexus daemon sees every
 # peer from both in ONE listing, each tagged with where it was found. The union

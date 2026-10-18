@@ -22,6 +22,13 @@ test) is the piece unit tests can't cover: it drives `Mailbox::ensure_inbox` +
 DT_STREAM. `run.sh` brings the daemon up, waits for a writable single-voter
 leader, and runs it; it is deterministic and always safe to run.
 
+The same harness runs `fs_record_log` against four independent mTLS clients,
+appends 32 large JSON records to a new WAL with unlimited retention, restarts
+its owned daemon, and checks every record and the next committed cursor. It
+rejects a regular-file path instead of falling back to read/concatenate/write.
+Native record locking and interrupted-write recovery use real subprocesses in
+the regular `cargo test --workspace` suite on all three operating systems.
+
 The cross-node harness boots two authenticated daemons. It checks an idle tail,
 a peer write that wakes it, four concurrent tails receiving all 128 ordered
 messages, and a reverse acknowledgement. It then runs two real scode processes
