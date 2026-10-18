@@ -19,15 +19,22 @@ async function main() {
   if (process.env.SCODE_NATIVE_MODEL && !nativeToken) {
     throw new Error('NATIVE_PROXY_AUTH_TOKEN is required when SCODE_NATIVE_MODEL is set');
   }
+  const azureToken = process.env.AZURE_PROXY_AUTH_TOKEN;
+  if (process.env.SCODE_AZURE_MODEL && !azureToken) {
+    throw new Error('AZURE_PROXY_AUTH_TOKEN is required when SCODE_AZURE_MODEL is set');
+  }
   const base = process.env.PROXY_BASE_URL.replace(/\/$/, '');
-  const models = [...new Set([process.env.SCODE_LIVE_MODEL, process.env.SCODE_NATIVE_MODEL,
-    process.env.SCODE_AZURE_MODEL].filter(Boolean))];
+  const targets = [
+    { model: process.env.SCODE_LIVE_MODEL, token, profile: 'default' },
+    { model: process.env.SCODE_NATIVE_MODEL, token: nativeToken, profile: 'native' },
+    { model: process.env.SCODE_AZURE_MODEL, token: azureToken, profile: 'azure' },
+  ].filter(target => target.model);
   const errorDetails = body => {
     const error = body?.error ?? body;
     return { type: clean(error?.type), code: typeof error?.code === 'number' ? error.code : clean(error?.code), message: clean(error?.message ?? error?.msg) };
   };
   const report = [];
-  const catalog = { route: 'models' };
+  const catalog = { route: 'models', profile: 'default' };
   report.push(catalog);
   try {
     const response = await fetch(`${base}/models`, {
@@ -44,9 +51,8 @@ async function main() {
   } catch (error) {
     catalog.error = error.name;
   }
-  for (const model of models) for (const route of ['chat/completions', 'messages']) {
-    const modelToken = model === process.env.SCODE_NATIVE_MODEL ? nativeToken : token;
-    const item = { route, model, usage: [] };
+  for (const { model, token: modelToken, profile } of targets) for (const route of ['chat/completions', 'messages']) {
+    const item = { route, model, profile, usage: [] };
     report.push(item);
     try {
       const body = { model, messages: [{ role: 'user', content: 'Reply exactly: pong' }],

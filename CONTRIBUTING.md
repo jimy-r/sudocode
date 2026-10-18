@@ -446,6 +446,9 @@ assertions; changing a route or model does not raise their turn budgets.
 reasoning/file-tool journey. That journey uses its own copied auth profile with
 the same company credential and a channel suffix. Other PTYs keep normal routing.
 Validate this route with the complete file-read scenario on Linux and Windows.
+The provider probe and CLI profile share `AZURE_PROXY_AUTH_TOKEN`. Evidence names
+the auth profile separately from the model, so the same model can be checked on
+different provider channels without silently reusing another credential.
 
 Verify a changed native route with the original real subagent/cache scenario,
 retaining its output/thinking budgets and assertions. A small successful request

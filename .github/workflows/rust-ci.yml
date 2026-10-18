@@ -585,6 +585,7 @@ jobs:
         env:
           PROXY_AUTH_TOKEN: ${{ secrets.SUDOROUTER_CI_API_KEY }}
           NATIVE_PROXY_AUTH_TOKEN: &native_key ${{ vars.SUDOROUTER_NATIVE_CHANNEL && format('{0}-{1}', secrets.SUDOROUTER_CI_API_KEY, vars.SUDOROUTER_NATIVE_CHANNEL) || secrets.SUDOROUTER_CI_API_KEY }}
+          AZURE_PROXY_AUTH_TOKEN: &azure_key ${{ vars.SUDOROUTER_AZURE_CHANNEL && format('{0}-{1}', secrets.SUDOROUTER_CI_API_KEY, vars.SUDOROUTER_AZURE_CHANNEL) || '' }}
           PROXY_BASE_URL: https://api.sudorouter.ai/v1
         run: node .github/scripts/probe_live_usage.cjs "${{ runner.temp }}/provider-usage-contract.json"
       - name: Save provider evidence before model acceptance
@@ -622,6 +623,7 @@ jobs:
         env:
           PROXY_AUTH_TOKEN: ${{ secrets.SUDOROUTER_CI_API_KEY }}
           NATIVE_PROXY_AUTH_TOKEN: *native_key
+          AZURE_PROXY_AUTH_TOKEN: *azure_key
         run: node .github/scripts/summarize_live_model_trace.cjs "$SCODE_LOG_PATH" "${{ runner.temp }}/scode-acp-live-evidence.json"
       - uses: actions/upload-artifact@v4
         if: always()
@@ -678,6 +680,7 @@ jobs:
           SCODE_AZURE_MODEL: *azure_model
           SCODE_LIVE_AUTH_PROFILE: sudorouter
           SCODE_AZURE_CHANNEL: ${{ vars.SUDOROUTER_AZURE_CHANNEL }}
+          AZURE_PROXY_AUTH_TOKEN: *azure_key
           SCODE_LOG_PATH: ${{ runner.temp }}/scode-live-model-trace.jsonl
           SCODE_LIVE_ARTIFACTS: ${{ runner.temp }}/scode-live-requests
         run: |
@@ -690,13 +693,15 @@ jobs:
           if (!/^[1-9][0-9]*$/.test(azureChannel || '')) {
             throw new Error('SUDOROUTER_AZURE_CHANNEL must identify the Azure acceptance channel');
           }
+          const azureKey = process.env.AZURE_PROXY_AUTH_TOKEN;
+          if (!azureKey) throw new Error('AZURE_PROXY_AUTH_TOKEN is required for Azure acceptance');
           const baseUrl = 'https://api.sudorouter.ai/v1';
           const dir = process.env.SUDO_CODE_CONFIG_HOME;
           fs.mkdirSync(dir, { recursive: true });
           fs.writeFileSync(path.join(dir, 'sudocode.json'), JSON.stringify({
             auth_modes: { proxy: {
               sudorouter: { apiKey: key, baseUrl },
-              'sudorouter-azure': { apiKey: `${key}-${azureChannel}`, baseUrl }
+              'sudorouter-azure': { apiKey: azureKey, baseUrl }
             } },
             models: {}
           }), { mode: 0o600 });
@@ -724,6 +729,7 @@ jobs:
         working-directory: .
         env:
           PROXY_AUTH_TOKEN: ${{ secrets.SUDOROUTER_CI_API_KEY }}
+          AZURE_PROXY_AUTH_TOKEN: *azure_key
         run: node .github/scripts/summarize_live_model_trace.cjs "${{ runner.temp }}/scode-live-model-trace.jsonl" "${{ runner.temp }}/scode-live-model-evidence.json"
       - uses: actions/upload-artifact@v4
         if: always()
