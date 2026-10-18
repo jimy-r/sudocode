@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::io;
 use std::sync::Arc;
 
@@ -566,11 +566,14 @@ impl HistoryGraph {
         ))
     }
 
+    /// Bind each candidate message to its retained source ID, or `None` for new
+    /// content. Identical payloads cannot establish which source message survived.
     pub fn prepare_projection(
         &self,
         context: &str,
         source_revision: &str,
         session: &Session,
+        retained_ids: &[Option<&str>],
     ) -> io::Result<HistoryRecord> {
         let current = self
             .contexts
@@ -579,27 +582,36 @@ impl HistoryGraph {
         if current.revision != source_revision {
             return Err(invalid("compaction source context changed"));
         }
-        let mut retained: HashMap<[u8; 32], VecDeque<String>> = HashMap::new();
-        for id in current.projection.chain.ids() {
-            let message = &self.messages.get(&id).expect("source message").message;
-            retained
-                .entry(Sha256::digest(message.to_json().render().as_bytes()).into())
-                .or_default()
-                .push_back(id);
+        if retained_ids.len() != session.messages.len() {
+            return Err(invalid("projection message identity count differs"));
         }
+        let source: HashSet<_> = current.projection.chain.ids().into_iter().collect();
+        let mut used = HashSet::new();
         let messages = session
             .messages
             .iter()
-            .map(|message| {
-                let fingerprint: [u8; 32] =
-                    Sha256::digest(message.to_json().render().as_bytes()).into();
-                match retained.get_mut(&fingerprint).and_then(VecDeque::pop_front) {
-                    Some(id) => Ok(ProjectionMessage { id, message: None }),
-                    None => Ok(ProjectionMessage {
-                        id: uuid::Uuid::new_v4().to_string(),
-                        message: Some(to_value(message)?),
-                    }),
+            .zip(retained_ids)
+            .map(|(message, retained)| match retained {
+                Some(id)
+                    if source.contains(*id)
+                        && used.insert(*id)
+                        && self
+                            .messages
+                            .get(*id)
+                            .is_some_and(|node| node.message == *message) =>
+                {
+                    Ok(ProjectionMessage {
+                        id: (*id).into(),
+                        message: None,
+                    })
                 }
+                Some(_) => Err(invalid(
+                    "retained projection message changed or is not a source",
+                )),
+                None => Ok(ProjectionMessage {
+                    id: uuid::Uuid::new_v4().to_string(),
+                    message: Some(to_value(message)?),
+                }),
             })
             .collect::<io::Result<_>>()?;
         let mut metadata: Value =

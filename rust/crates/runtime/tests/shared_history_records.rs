@@ -240,6 +240,7 @@ fn completed_forks_survive_live_tools_compaction_and_restart() {
         context,
         &ConversationMessage::user_text("B_PRIVATE_TURN"),
     );
+    let discarded_answer = append(&mut b, context, &text("B_FINISHED"));
     let b_answer = append(&mut b, context, &text("B_FINISHED"));
     let mut compacted = b.graph().context_session(context).unwrap();
     compacted.messages = vec![
@@ -249,13 +250,23 @@ fn completed_forks_survive_live_tools_compaction_and_restart() {
     compacted.record_compaction("B summary", 3);
     let candidate = b
         .graph()
-        .prepare_projection(context, b.graph().revision(context).unwrap(), &compacted)
+        .prepare_projection(
+            context,
+            b.graph().revision(context).unwrap(),
+            &compacted,
+            &[None, Some(&b_answer)],
+        )
         .unwrap();
     commit(&mut b, &candidate);
     assert_eq!(
         b.graph().message_ids(context).unwrap().last(),
         Some(&b_answer)
     );
+    assert!(!b
+        .graph()
+        .message_ids(context)
+        .unwrap()
+        .contains(&discarded_answer));
     let b_commit = finish_turn(&mut b, context, "trace-b");
     assert!(
         !fixture.0.join("actual-tool-result").exists(),

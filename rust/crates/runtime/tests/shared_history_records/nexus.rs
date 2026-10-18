@@ -82,6 +82,7 @@ fn live_shared_history_preserves_contexts_while_sibling_tool_runs() {
         context_b,
         &ConversationMessage::user_text("NEXUS_B_PRIVATE"),
     );
+    let discarded = append(&mut b, context_b, &text("NEXUS_B_FINISHED"));
     let answer = append(&mut b, context_b, &text("NEXUS_B_FINISHED"));
     let mut compacted = b.graph().context_session(context_b).unwrap();
     compacted.messages = vec![
@@ -95,6 +96,7 @@ fn live_shared_history_preserves_contexts_while_sibling_tool_runs() {
             context_b,
             b.graph().revision(context_b).unwrap(),
             &compacted,
+            &[None, Some(&answer)],
         )
         .unwrap();
     commit(&mut b, &candidate);
@@ -102,6 +104,11 @@ fn live_shared_history_preserves_contexts_while_sibling_tool_runs() {
         b.graph().message_ids(context_b).unwrap().last(),
         Some(&answer)
     );
+    assert!(!b
+        .graph()
+        .message_ids(context_b)
+        .unwrap()
+        .contains(&discarded));
     let b_commit = finish_turn(&mut b, context_b, "nexus-b-trace");
     assert!(!fixture.0.join("actual-tool-result").exists());
     std::fs::write(fixture.0.join("tool-release"), b"continue").unwrap();
