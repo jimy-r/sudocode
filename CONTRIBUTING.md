@@ -442,6 +442,11 @@ keeps its separate baseline and normal company routing. File/tool PTY journeys
 use a faster model verified with the original approval, report-read and replay
 assertions; changing a route or model does not raise their turn budgets.
 
+`SUDOROUTER_AZURE_CHANNEL` selects the existing Azure channel for the DeepSeek
+reasoning/file-tool journey. That journey uses its own copied auth profile with
+the same company credential and a channel suffix. Other PTYs keep normal routing.
+Validate this route with the complete file-read scenario on Linux and Windows.
+
 Verify a changed native route with the original real subagent/cache scenario,
 retaining its output/thinking budgets and assertions. A small successful request
 alone is insufficient. Channel selection does not prove another model or the
@@ -449,7 +454,11 @@ rest of the catalog is usable.
 
 Review runs follow the current ready PR head and cancel superseded runs. They
 use the job-scoped read-only GitHub token so workflow edits can receive a real
-review. Missing execution records and incomplete model runs fail the job.
+review. The workflow checks the live PR and checkout before and after execution;
+the repository-owned [review instructions](.github/prompts/code-review.md) define
+the independent reviews to run. Prior comments never substitute for reviewing
+the current commit. Missing execution records, skipped fan-out and incomplete
+model runs fail the job, with the sanitized execution evidence retained.
 
 ## Measuring prompt-cache behaviour
 
