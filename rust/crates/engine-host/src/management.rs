@@ -82,6 +82,17 @@ fn handle_slash_command(
     let mut stop = false;
     let response = match &command {
         SlashCommand::Model { model } => model_report(engine, cwd, model.as_deref())?,
+        SlashCommand::Effort { level } => {
+            if let Some(level) = level {
+                engine.set_effort(level)?;
+            }
+            let (preference, effective) = engine.current_effort();
+            format!(
+                "Effort: {} · Effective: {}",
+                preference.as_deref().unwrap_or("auto"),
+                effective.as_deref().unwrap_or("model default")
+            )
+        }
         SlashCommand::Help => render_acp_slash_command_help(),
         SlashCommand::Compact => {
             let outcome = engine.compact_admitted(observer)?;

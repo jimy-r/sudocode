@@ -162,8 +162,8 @@ pub struct SessionEngine {
     /// keeps a copy). Resolved once at build from the CLI override / default;
     /// `/permissions` mutates it in place and every runtime rebuild reads it.
     permission_mode: std::sync::Mutex<PermissionMode>,
-    /// Reasoning effort — immutable for now (no `/effort` verb yet).
-    reasoning_effort: Option<String>,
+    /// Session override; a model switch keeps the user's effort preference.
+    reasoning_effort: std::sync::Mutex<Option<String>>,
     /// Auth-mode override — the engine's SSOT. `None` = auto-resolve from the
     /// model + config; `/auth` pins a concrete mode. Every rebuild reads it.
     auth_mode: std::sync::Mutex<Option<AuthMode>>,
@@ -245,7 +245,7 @@ impl SessionEngine {
             tokio_runtime: Some(Self::build_async_runtime()?),
             allowed_tools,
             permission_mode: std::sync::Mutex::new(permission_mode),
-            reasoning_effort: None,
+            reasoning_effort: std::sync::Mutex::new(None),
             auth_mode: std::sync::Mutex::new(Some(auth_mode)),
             host_prompt_sections,
             _host_resources: Some(std::sync::Mutex::new(Some(resources))),
@@ -331,7 +331,7 @@ impl SessionEngine {
             tokio_runtime: Some(Self::build_async_runtime()?),
             allowed_tools,
             permission_mode: std::sync::Mutex::new(permission_mode),
-            reasoning_effort,
+            reasoning_effort: std::sync::Mutex::new(reasoning_effort),
             auth_mode: std::sync::Mutex::new(auth_mode),
             host_prompt_sections: Vec::new(),
             _host_resources: None,
@@ -414,7 +414,7 @@ impl SessionEngine {
             tokio_runtime: Some(Self::build_async_runtime()?),
             allowed_tools,
             permission_mode: std::sync::Mutex::new(permission_mode),
-            reasoning_effort,
+            reasoning_effort: std::sync::Mutex::new(reasoning_effort),
             auth_mode: std::sync::Mutex::new(auth_mode),
             host_prompt_sections: Vec::new(),
             _host_resources: None,
@@ -493,7 +493,10 @@ impl SessionEngine {
             },
             &session.session_mcp_servers,
             session.abort_signal.clone(),
-            self.reasoning_effort.clone(),
+            self.reasoning_effort
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone(),
         )
         .map_err(|e| e.to_string())?;
         let runtime = match inherited_known_date {
@@ -1407,6 +1410,12 @@ pub trait SessionLifecycle: Send + Sync + 'static {
     /// `changed` / counts / `available`); the renderer formats it. Shares the
     /// one impl with [`engine_core::EngineDelegate::set_model`].
     fn set_model(&self, new_model: &str) -> Result<ModelSwitchReport, String>;
+    /// User preference and model-specific effective value for the effort picker.
+    fn current_effort(&self) -> (Option<String>, Option<String>);
+    /// Resolve aliases through the active provider before offering model levels.
+    fn effort_options(&self, model: &str) -> Result<(String, Vec<String>), String>;
+    /// Apply effort without rebuilding the prompt or changing signed history.
+    fn set_effort(&self, level: &str) -> Result<(), String>;
     /// Pin the auth mode (engine SSOT) and rebuild so it takes effect.
     fn set_auth(&self, mode: AuthMode) -> Result<(), String>;
     /// Switch the active permission mode (engine SSOT) in place.
@@ -1585,6 +1594,64 @@ impl SessionLifecycle for SessionEngine {
 
     fn set_model(&self, new_model: &str) -> Result<ModelSwitchReport, String> {
         self.set_model_impl(new_model)
+    }
+
+    fn current_effort(&self) -> (Option<String>, Option<String>) {
+        let session = self.lock_session();
+        let preference = session
+            .runtime
+            .api_client()
+            .reasoning_effort()
+            .map(str::to_string);
+        let effective = runtime::effort::claude_effort(
+            session
+                .runtime
+                .api_client()
+                .wire_model_id()
+                .unwrap_or_default(),
+            preference.as_deref(),
+        )
+        .map(str::to_string);
+        (preference, effective)
+    }
+
+    fn effort_options(&self, model: &str) -> Result<(String, Vec<String>), String> {
+        let cwd = self.session_cwd();
+        let _scope = runtime::WorkspaceRootScope::enter(&cwd);
+        let config = load_sudocode_config_for_current_dir();
+        let model = resolve_model_alias_with_config(model);
+        let mode = resolve_model_switch_auth_mode(&model, self.auth_override(), &config)?;
+        let resolved = engine_core::resolve_provider_from_config(&model, Some(mode), &config)
+            .map_err(|error| error.to_string())?;
+        let levels = runtime::effort::claude_levels(&resolved.model_id)
+            .iter()
+            .map(|level| (*level).to_string())
+            .collect();
+        Ok((resolved.model_id, levels))
+    }
+
+    fn set_effort(&self, level: &str) -> Result<(), String> {
+        if level != "auto" && !runtime::effort::CLAUDE_LEVELS.contains(&level) {
+            return Err("Effort must be auto, low, medium, high, xhigh, or max".into());
+        }
+        let mut session = self.lock_session();
+        session
+            .runtime
+            .ensure_session_persistence_allowed()
+            .map_err(|e| e.to_string())?;
+        let _scope = runtime::WorkspaceRootScope::enter(&session.cwd);
+        if level != "max" {
+            tools::set_config_setting("effortLevel", level)?;
+        }
+        let preference = (level != "auto").then(|| level.to_string());
+        if let Some(rt) = session.runtime.runtime_mut() {
+            rt.api_client_mut().set_reasoning_effort(preference.clone());
+        }
+        *self
+            .reasoning_effort
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = preference;
+        Ok(())
     }
 
     fn set_auth(&self, mode: AuthMode) -> Result<(), String> {

@@ -1165,6 +1165,14 @@ impl RuntimeConfig {
         self.feature_config.thinking
     }
 
+    /// Persisted effort preference. Max is deliberately session scoped, as in CC.
+    #[must_use]
+    pub fn effort_level(&self) -> Option<&str> {
+        self.get("effortLevel")
+            .and_then(JsonValue::as_str)
+            .filter(|level| crate::effort::CLAUDE_LEVELS.contains(level) && *level != "max")
+    }
+
     #[must_use]
     pub fn aliases(&self) -> &BTreeMap<String, String> {
         &self.feature_config.aliases

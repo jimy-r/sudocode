@@ -2733,6 +2733,76 @@ fn show_slash_selection(
     }))
 }
 
+/// Stage the model choice until effort is confirmed so Escape leaves it intact.
+fn show_effort_selection(
+    ui: &repl_ui::UiCommandSender,
+    cli: &Arc<Mutex<LiveCli>>,
+    model: Option<String>,
+) -> Option<SlashSelectionHandler> {
+    let current = cli.lock().expect("LiveCli mutex poisoned");
+    let selected_model = model
+        .clone()
+        .unwrap_or_else(|| current.lifecycle.current_model());
+    let (resolved, levels) = current.lifecycle.effort_options(&selected_model).ok()?;
+    let (preference, effective) = current.lifecycle.current_effort();
+    drop(current);
+    if levels.is_empty() {
+        return None;
+    }
+    let items: Vec<String> = std::iter::once("auto")
+        .chain(levels.iter().map(String::as_str))
+        .map(str::to_string)
+        .collect();
+    let options = items
+        .iter()
+        .map(|level| repl_ui::QuestionOptionView {
+            label: level.clone(),
+            value: level.clone(),
+            description: (level == "max").then(|| "Current session only".to_string()),
+            recommended: preference.as_deref().unwrap_or("auto") == level,
+            is_navigable: false,
+        })
+        .collect();
+    Some(show_slash_selection(
+        ui,
+        repl_ui::QuestionPromptView {
+            title: Some("Reasoning effort".to_string()),
+            description: Some(
+                format!(
+                    "Model: {resolved} · Current: {}",
+                    effective.as_deref().unwrap_or("auto")
+                )
+                .into(),
+            ),
+            index: usize::from(model.is_some()),
+            total: if model.is_some() { 2 } else { 1 },
+            prompt: "Select effort".to_string(),
+            options,
+            allow_custom_input: false,
+            custom_input_hint: None,
+            force_fuzzy_select: true,
+            back_value: None,
+        },
+        items,
+        move |level, cli, out| {
+            let mut current = cli.lock().expect("LiveCli mutex poisoned");
+            let result = (|| -> Result<(), Box<dyn std::error::Error>> {
+                if let Some(model) = model {
+                    current.set_model(Some(model))?;
+                }
+                current.lifecycle.set_effort(&level)?;
+                current.print_effort();
+                current.persist_session()?;
+                Ok(())
+            })();
+            if let Err(error) = result {
+                out.println(&format!("{}{error}{}", ansi_fg(theme().error), RESET));
+            }
+            None
+        },
+    ))
+}
+
 /// Keep the event pump draining while the existing input owner awaits a reply.
 /// The engine serializes interactions, so at most one reply worker is parked.
 fn relay_prompt_reply<T: Send + 'static>(
@@ -3678,6 +3748,7 @@ fn run_repl_iocraft_dispatch(
                                     is_navigable: false,
                                 })
                                 .collect();
+                            let effort_ui = repl_ui_cmd.clone();
                             pending_slash_selection = Some(show_slash_selection(
                                 &repl_ui_cmd,
                                 repl_ui::QuestionPromptView {
@@ -3693,7 +3764,14 @@ fn run_repl_iocraft_dispatch(
                                     back_value: None,
                                 },
                                 models,
-                                |model_name, cli, out| {
+                                move |model_name, cli, out| {
+                                    if let Some(selection) = show_effort_selection(
+                                        &effort_ui,
+                                        cli,
+                                        Some(model_name.clone()),
+                                    ) {
+                                        return Some(selection);
+                                    }
                                     let mut cli_lock = cli.lock().expect("LiveCli mutex poisoned");
                                     match cli_lock.set_model(Some(model_name)) {
                                         Ok(true) => {
@@ -3715,6 +3793,17 @@ fn run_repl_iocraft_dispatch(
                                     None
                                 },
                             ));
+                            true
+                        }
+                        Ok(Some(SlashCommand::Effort { level: None })) => {
+                            pending_slash_selection =
+                                show_effort_selection(&repl_ui_cmd, &cli_shared, None);
+                            if pending_slash_selection.is_none() {
+                                cli_shared
+                                    .lock()
+                                    .expect("LiveCli mutex poisoned")
+                                    .print_effort();
+                            }
                             true
                         }
                         Ok(Some(SlashCommand::Resume { session_path: None })) => {
@@ -5165,6 +5254,17 @@ impl LiveCli {
                 false
             }
             SlashCommand::Model { model } => self.set_model(model)?,
+            SlashCommand::Effort { level } => {
+                let level = match level {
+                    Some(level) => Some(level),
+                    None => self.select_effort(&self.lifecycle.current_model())?,
+                };
+                if let Some(level) = level {
+                    self.lifecycle.set_effort(&level)?;
+                }
+                self.print_effort();
+                false
+            }
             SlashCommand::Permissions { mode } => self.set_permissions(mode)?,
             SlashCommand::Auth { mode } => self.set_auth(mode)?,
             SlashCommand::Account { account } => self.set_billing_account(account)?,
@@ -5334,7 +5434,6 @@ impl LiveCli {
             | SlashCommand::Copy { .. }
             | SlashCommand::Hooks { .. }
             | SlashCommand::Color { .. }
-            | SlashCommand::Effort { .. }
             | SlashCommand::Branch { .. }
             | SlashCommand::Rewind { .. }
             | SlashCommand::Ide { .. }
@@ -5496,6 +5595,41 @@ impl LiveCli {
         )));
     }
 
+    fn select_effort(&self, model: &str) -> Result<Option<String>, Box<dyn std::error::Error>> {
+        let (wire_model, levels) = self.lifecycle.effort_options(model)?;
+        if levels.is_empty() {
+            return Ok(None);
+        }
+        let items: Vec<String> = std::iter::once("auto".to_string()).chain(levels).collect();
+        let (preference, _) = self.lifecycle.current_effort();
+        let index = items
+            .iter()
+            .position(|level| Some(level) == preference.as_ref())
+            .unwrap_or(0);
+        let selected = self.out_suspend(|| {
+            FuzzySelect::new()
+                .with_prompt(format!("Select effort for {wire_model} (type to filter)"))
+                .items(&items)
+                .default(index)
+                .interact_opt()
+        })??;
+        Ok(selected.map(|index| items[index].clone()))
+    }
+
+    fn print_effort(&self) {
+        let (preference, effective) = self.lifecycle.current_effort();
+        let scope = if preference.as_deref() == Some("max") {
+            " (this session only)"
+        } else {
+            ""
+        };
+        self.out_println(format!(
+            "Effort: {} · Effective: {}{scope}",
+            preference.as_deref().unwrap_or("auto"),
+            effective.as_deref().unwrap_or("model default")
+        ));
+    }
+
     fn set_model(&mut self, model: Option<String>) -> Result<bool, Box<dyn std::error::Error>> {
         let Some(model) = model else {
             let models = self.lifecycle.available_models();
@@ -5509,7 +5643,20 @@ impl LiveCli {
                     .interact_opt()
             })??;
             return match selection {
-                Some(idx) => self.set_model(Some(models[idx].clone())),
+                Some(idx) => {
+                    let model = models[idx].clone();
+                    let (_, levels) = self.lifecycle.effort_options(&model)?;
+                    if levels.is_empty() {
+                        return self.set_model(Some(model));
+                    }
+                    let Some(effort) = self.select_effort(&model)? else {
+                        return Ok(false);
+                    };
+                    let changed = self.set_model(Some(model))?;
+                    self.lifecycle.set_effort(&effort)?;
+                    self.print_effort();
+                    Ok(changed)
+                }
                 None => Ok(false),
             };
         };
@@ -6721,7 +6868,6 @@ pub(crate) const STUB_COMMANDS: &[&str] = &[
     "copy",
     "hooks",
     "color",
-    "effort",
     "branch",
     "rewind",
     "ide",
