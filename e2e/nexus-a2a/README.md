@@ -29,6 +29,12 @@ rejects a regular-file path instead of falling back to read/concatenate/write.
 Native record locking and interrupted-write recovery use real subprocesses in
 the regular `cargo test --workspace` suite on all three operating systems.
 
+`shared_history_records` uses the same restart to verify two contexts of one
+durable SID. A runs a real child tool while B restores the completed prefix and
+compacts its own continuation. Restart preserves both completed branches and A's
+real tool-result association. These are storage integration checks; concurrent
+CLI/cohost admission still requires its own product acceptance.
+
 The cross-node harness boots two authenticated daemons. It checks an idle tail,
 a peer write that wakes it, four concurrent tails receiving all 128 ordered
 messages, and a reverse acknowledgement. It then runs two real scode processes

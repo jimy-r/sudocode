@@ -119,6 +119,13 @@ NEXUS_A2A_TEST_ENDPOINT="$ENDPOINT" NEXUS_A2A_TEST_CERT_DIR="$CLIENT_BUNDLE" \
   NEXUS_RECORD_LOG_RECEIPT="$(native_path "$RECORD_RECEIPT")" \
   "${RECORD_TEST[@]}" live_record_log_commits_large_frames_from_independent_clients -- --ignored --nocapture
 
+echo "== [deterministic] completed context forks while a sibling tool is live =="
+HISTORY_TEST=(cargo test --manifest-path "$RUST_DIR/Cargo.toml" -q -p runtime --test shared_history_records)
+HISTORY_RECEIPT="$AUTHON_DATA_DIR/shared-history.json"
+NEXUS_A2A_TEST_ENDPOINT="$ENDPOINT" NEXUS_A2A_TEST_CERT_DIR="$CLIENT_BUNDLE" \
+  NEXUS_HISTORY_RECEIPT="$(native_path "$HISTORY_RECEIPT")" \
+  "${HISTORY_TEST[@]}" live_shared_history_preserves_contexts_while_sibling_tool_runs -- --ignored --nocapture
+
 echo "== [deterministic] restart the owned daemon and retain WAL history/cursors =="
 kill -KILL "$AUTHON_DAEMON_PID"
 wait "$AUTHON_DAEMON_PID" 2>/dev/null || true
@@ -129,6 +136,10 @@ wait_for_writable_leader
 NEXUS_A2A_TEST_ENDPOINT="$ENDPOINT" NEXUS_A2A_TEST_CERT_DIR="$CLIENT_BUNDLE" \
   NEXUS_RECORD_LOG_RECEIPT="$(native_path "$RECORD_RECEIPT")" \
   "${RECORD_TEST[@]}" live_record_log_recovers_after_daemon_restart -- --ignored --nocapture
+
+NEXUS_A2A_TEST_ENDPOINT="$ENDPOINT" NEXUS_A2A_TEST_CERT_DIR="$CLIENT_BUNDLE" \
+  NEXUS_HISTORY_RECEIPT="$(native_path "$HISTORY_RECEIPT")" \
+  "${HISTORY_TEST[@]}" live_shared_history_restores_both_contexts_after_restart -- --ignored --nocapture
 
 # One session on BOTH a local same-machine pair and this nexus daemon sees every
 # peer from both in ONE listing, each tagged with where it was found. The union

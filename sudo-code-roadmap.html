@@ -2223,9 +2223,22 @@ propagate committed cursors and reject regular-file fallback. Existing streams
 require a trusted initialization binding; a stream type alone cannot verify its
 profile or retention. Real native subprocesses and four independent mTLS clients
 have exercised large records, process death and official-daemon restart. The
-native suite and the real-daemon restart journey are included in CI. Session
-records, replay, completion ownership and admission still need to adopt this
-transport; existing lifetime exclusions remain in place.</p>
+native suite and the real-daemon restart journey are included in CI.</p>
+
+<p><b>Record/replay implementation in progress.</b> The history interpreter assigns
+stable message identities and parents, retains tool-result origins, and commits
+context revisions independently. Opening a context selects the latest completed
+turn at that open record's committed position. Streaming updates can change only
+that context's uncommitted assistant; compaction retains unchanged message IDs.
+Real native writer processes and independent mTLS clients against official Nexus
+0.8.22 have exercised a live child tool while a sibling opens and compacts its
+own context. Both branches and the real tool result survive daemon restart.
+An ambiguous durable append retry retains its record identity, and an invalid
+tool association is rejected without blocking later valid records. These storage
+journeys are included in CI. The product's Session persistence, completion
+ownership, legacy-format admission and host adapters still need to adopt this
+layer; existing lifetime exclusions remain in place. Concurrent CLI/cohost use
+has not yet shipped.</p>
 
 <ol>
 <li>Implement and accept the shared record/replay layer and backend append

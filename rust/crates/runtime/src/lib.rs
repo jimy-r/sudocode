@@ -66,6 +66,7 @@ pub mod recovery_recipes;
 mod remote;
 pub mod sandbox;
 mod session;
+pub use session::history;
 pub mod session_control;
 pub mod session_writer;
 pub mod test_support;

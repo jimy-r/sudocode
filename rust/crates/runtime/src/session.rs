@@ -13,6 +13,8 @@ use crate::json::{JsonError, JsonValue};
 use crate::prompt::SessionPromptSnapshot;
 use crate::usage::{parse_usage_cost_currency, TokenUsage};
 
+pub mod history;
+
 const SESSION_VERSION: u32 = 1;
 const ROTATE_AFTER_BYTES: u64 = 256 * 1024;
 const MAX_ROTATED_FILES: usize = 3;
