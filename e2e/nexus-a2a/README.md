@@ -35,6 +35,10 @@ compacts its own continuation. Restart preserves both completed branches and A's
 real tool-result association. These are storage integration checks; concurrent
 CLI/cohost admission still requires its own product acceptance.
 
+On Linux the harness also uses `strace` to fail the actual native append's
+`fdatasync`. Replay must successfully sync that same file before allowing a
+real file effect. CI installs the injector; local Linux runs need `strace`.
+
 The cross-node harness boots two authenticated daemons. It checks an idle tail,
 a peer write that wakes it, four concurrent tails receiving all 128 ordered
 messages, and a reverse acknowledgement. It then runs two real scode processes

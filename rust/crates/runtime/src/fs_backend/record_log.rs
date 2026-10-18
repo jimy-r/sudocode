@@ -33,7 +33,7 @@ pub trait RecordLog: Send + Sync {
     /// Commit one UTF-8 JSON object followed by LF; return the cursor after it.
     fn append(&self, record: &[u8]) -> io::Result<u64>;
 
-    /// Read committed complete records from an adapter cursor without waiting.
+    /// Read durable complete records from an adapter cursor without waiting.
     /// An empty result retains the cursor. After an append, a follower may lag;
     /// callers must observe their event before acknowledging its application.
     fn read(&self, cursor: u64) -> io::Result<(Vec<u8>, u64)>;
@@ -165,6 +165,10 @@ impl RecordLog for NativeRecordLog {
             return Ok((Vec::new(), cursor));
         };
         bytes.truncate(last + 1);
+        // A previous writer can fail its flush after writing a complete LF.
+        // Visibility alone then proves no durability. Sync every newly read
+        // complete prefix under the lock before replay may authorize effects.
+        file.sync_data()?;
         let next = cursor
             .checked_add(bytes.len() as u64)
             .ok_or_else(|| invalid("session record cursor overflow"))?;

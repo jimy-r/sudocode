@@ -341,8 +341,21 @@ jobs:
       # which does not vary by host — platform-specific daemon behaviour is
       # nexus-vfs's own CI. Adding runners would multiply the daemon-boot flake
       # surface for signal already covered.
+      - name: Install native durability fault injector
+        run: |
+          if ! command -v strace >/dev/null; then
+            sudo apt-get update -qq
+            sudo apt-get install -y --no-install-recommends strace
+          fi
       - name: A2A round-trip against the pinned daemon
         run: e2e/nexus-a2a/run.sh
+      - name: Retain native syscall fault evidence
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-session-durability
+          path: /tmp/scode-shared-records-*
+          if-no-files-found: ignore
 
       # One daemon can only show that a client and a server agree. What A2A
       # actually rests on is a mechanism that does not exist until there are

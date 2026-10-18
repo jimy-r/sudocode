@@ -22,6 +22,10 @@ const WAIT: Duration = Duration::from_secs(20);
 #[path = "shared_history_records/nexus.rs"]
 mod nexus;
 
+#[cfg(target_os = "linux")]
+#[path = "shared_history_records/flush.rs"]
+mod flush;
+
 struct Fixture(PathBuf);
 impl Fixture {
     fn new() -> Self {
@@ -38,6 +42,13 @@ impl Fixture {
 }
 impl Drop for Fixture {
     fn drop(&mut self) {
+        if std::thread::panicking() {
+            eprintln!(
+                "Retained shared history failure evidence: {}",
+                self.0.display()
+            );
+            return;
+        }
         let _ = std::fs::remove_dir_all(&self.0);
     }
 }

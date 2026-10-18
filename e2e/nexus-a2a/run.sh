@@ -126,6 +126,11 @@ NEXUS_A2A_TEST_ENDPOINT="$ENDPOINT" NEXUS_A2A_TEST_CERT_DIR="$CLIENT_BUNDLE" \
   NEXUS_HISTORY_RECEIPT="$(native_path "$HISTORY_RECEIPT")" \
   "${HISTORY_TEST[@]}" live_shared_history_preserves_contexts_while_sibling_tool_runs -- --ignored --nocapture
 
+if [ "$(uname -s)" = Linux ]; then
+  echo "== [deterministic] native failed flush requires a durable read barrier =="
+  "${HISTORY_TEST[@]}" flush::native_history_resynchronizes_after_failed_flush -- --ignored --exact --nocapture
+fi
+
 echo "== [deterministic] restart the owned daemon and retain WAL history/cursors =="
 kill -KILL "$AUTHON_DAEMON_PID"
 wait "$AUTHON_DAEMON_PID" 2>/dev/null || true
