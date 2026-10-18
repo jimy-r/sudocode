@@ -484,6 +484,14 @@ fn resumed_unanswered_turns_end_before_new_requests_without_rewriting_history() 
         turn(&mut cli, "Continue NEW_TASK with the previous answer.");
         exit(&mut cli);
         let mut cli = spawn_with_env(&env, &path, &[("SUDOCODE_INTERRUPT_QUEUE_MODE", mode)]);
+        common::expect_screen_settled(
+            &cli,
+            |screen| {
+                screen.contains("Continue NEW_TASK") && !screen.contains("No response requested.")
+            },
+            WAIT,
+            "internal turn marker stays out of replay",
+        );
         turn(&mut cli, "Recall NEW_TASK after restarting.");
         exit(&mut cli);
         let requests = capture.bodies();

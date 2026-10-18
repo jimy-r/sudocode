@@ -76,6 +76,38 @@ This runner is a funded manual acceptance test and is excluded from default CI.
 
 ## Diagnose a resumed history
 
+### Recover a real interrupted tool turn
+
+This journey creates fresh data and needs no personal session fixture:
+
+```powershell
+python e2e/thinking/run.py C:/path/to/scode.exe --model claude-opus-4-8 --preserve-thinking --thinking-display summarized --effort high --check-context --crash-after-read --artifacts C:/path/to/artifacts
+```
+
+The model actually reads an old-task file. The recording proxy pauses its next
+request after the tool result is durable, without forwarding that final-answer
+request upstream. The runner forcefully stops only its own CLI process, resumes
+the session with a new file task, checks the exact fresh answer, exits normally,
+makes the new file unavailable, and restarts again to check persisted recall.
+It also verifies the old signed history, system, tools, thinking, effort and
+routing identity before funding the new task's first request. The first new
+turn must close the unanswered tool turn. Four real inference requests are
+expected; no tool output is fabricated. Existing history and compaction flags
+cannot be combined with this fresh crash fixture.
+
+The pre-crash response supplies the signed thinking being tested: adaptive
+thinking may skip a later simple Read. The native Opus 4.8 journey passed with
+four HTTP 200 responses, exact answers, the original signature after both
+restarts, and cache reads on all three later requests. The executable preceding
+the boundary fix failed after its first real Read, before the proxy funded the
+new task. A cheaper Sonnet 4.6 run also passed under the runner's explicit
+adaptive profile; it does not certify Sonnet's native CLI thinking defaults.
+
+Windows crash simulation sends one terminating signal to the runner's owned
+CLI process and waits for observed exit before reopening the durable session.
+
+### Replay a private history
+
 `--history-fixture <session.jsonl>` copies saved message rows into the isolated
 session. The original file stays unchanged and its SHA-256 is recorded and
 checked. `--history-messages 8` limits the copy to the first eight messages.
@@ -109,6 +141,12 @@ resumes a tool tail in both renderers, starts and continues a new task, exits,
 resumes again, and verifies the exact old history and stable wire prefix. It
 also covers a plain unanswered user prompt and a completed turn that needs no
 sentinel. It runs in the ordinary workspace CI suite.
+
+The shared CLI replay formatter omits this internal marker, as CC's
+`AssistantTextMessage` does. Its model/usage provenance distinguishes it from
+model output; the durable record and API message remain present. The PTY
+journey checks the restored task text on screen in both renderers while the
+internal marker stays absent from scrollback.
 
 The fixed executable passed this funded Read/answer/restart workflow with the
 same old history on Opus 4.8, both through a controlled route and through normal

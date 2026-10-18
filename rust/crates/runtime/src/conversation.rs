@@ -1925,9 +1925,7 @@ where
             .is_some_and(|message| matches!(message.role, MessageRole::User | MessageRole::Tool))
         {
             self.session
-                .push_message(ConversationMessage::assistant(vec![ContentBlock::Text {
-                    text: "No response requested.".into(),
-                }]))
+                .push_message(ConversationMessage::unanswered_turn_boundary())
                 .map_err(|error| RuntimeError::new(error.to_string()))?;
         }
         self.session

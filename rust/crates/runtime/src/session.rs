@@ -14,6 +14,7 @@ use crate::prompt::SessionPromptSnapshot;
 use crate::usage::{parse_usage_cost_currency, TokenUsage};
 
 const SESSION_VERSION: u32 = 1;
+const UNANSWERED_TURN_TEXT: &str = "No response requested.";
 const ROTATE_AFTER_BYTES: u64 = 256 * 1024;
 const MAX_ROTATED_FILES: usize = 3;
 /// Cold-storage retention budget (bytes) for a transcript backed by a native
@@ -1762,6 +1763,23 @@ impl ConversationMessage {
             model: None,
             duration_ms: None,
         }
+    }
+
+    /// Close an unanswered turn before a new external request, matching CC.
+    #[must_use]
+    pub(crate) fn unanswered_turn_boundary() -> Self {
+        Self::assistant(vec![ContentBlock::Text {
+            text: UNANSWERED_TURN_TEXT.into(),
+        }])
+    }
+
+    /// An internal turn marker belongs in API history, not transcript display.
+    #[must_use]
+    pub fn is_unanswered_turn_boundary(&self) -> bool {
+        self.role == MessageRole::Assistant
+            && self.model.is_none()
+            && self.usage.is_none()
+            && matches!(self.blocks.as_slice(), [ContentBlock::Text { text }] if text == UNANSWERED_TURN_TEXT)
     }
 
     #[must_use]
