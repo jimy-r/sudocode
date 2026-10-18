@@ -450,6 +450,12 @@ The provider probe and CLI profile share `AZURE_PROXY_AUTH_TOKEN`. Evidence name
 the auth profile separately from the model, so the same model can be checked on
 different provider channels without silently reusing another credential.
 
+The child approval journey executes the invoice once, then requests report
+verification in a separate user turn. It takes the report path from the completed
+child's actual tool result and gives the verification child only `read_file`.
+The gate still requires both children, the approved Bash command exactly once,
+the real report contents, inherited model credentials, and the follow-up total.
+
 Verify a changed native route with the original real subagent/cache scenario,
 retaining its output/thinking budgets and assertions. A small successful request
 alone is insufficient. Channel selection does not prove another model or the
