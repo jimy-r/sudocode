@@ -442,6 +442,11 @@ keeps its separate baseline and normal company routing. File/tool PTY journeys
 use a faster model verified with the original approval, report-read and replay
 assertions; changing a route or model does not raise their turn budgets.
 
+`SUDOROUTER_AZURE_CHANNEL` selects the existing Azure channel for the DeepSeek
+reasoning/file-tool journey. That journey uses its own copied auth profile with
+the same company credential and a channel suffix. Other PTYs keep normal routing.
+Validate this route with the complete file-read scenario on Linux and Windows.
+
 Verify a changed native route with the original real subagent/cache scenario,
 retaining its output/thinking budgets and assertions. A small successful request
 alone is insufficient. Channel selection does not prove another model or the
