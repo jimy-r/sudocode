@@ -113,7 +113,11 @@ fn pre_tool_use_hook_progress_reaches_the_terminal() {
         let screen = sess.render(|s| s.contents());
         panic!("exit: {e}\nPTY screen:\n{screen}");
     });
-    assert_eq!(exit, 0, "a hooked turn should exit 0; got {exit}");
+    let screen = sess.render(|s| s.contents());
+    assert_eq!(
+        exit, 0,
+        "a hooked turn should exit 0; got {exit}\nPTY screen:\n{screen}"
+    );
 }
 
 /// With no hook configured, none of that output appears.
@@ -142,9 +146,11 @@ fn no_hook_configured_prints_no_hook_progress() {
         let screen = sess.render(|s| s.contents());
         panic!("exit: {e}\nPTY screen:\n{screen}");
     });
-    assert_eq!(exit, 0, "an unhooked turn should exit 0; got {exit}");
-
     let screen = sess.render(|s| s.contents());
+    assert_eq!(
+        exit, 0,
+        "an unhooked turn should exit 0; got {exit}\nPTY screen:\n{screen}"
+    );
     assert!(
         !screen.contains("[hook "),
         "no hook is configured, so no hook progress should be printed; PTY screen:\n{screen}"
