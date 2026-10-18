@@ -80,6 +80,11 @@ waits, runtime ownership and durable recovery after restart and installation
 repair. A controlled real OS-lock handoff also checks that concurrent frontend
 start requests recover after a retiring owner releases its lifetime lock.
 
+On failure, the harness copies `run/runtime*.log` into the optional `--artifacts`
+directory before removing its temporary root. CI retains the per-platform
+`shared-services-<runner>` artifacts for seven days. To retain local evidence,
+add `--artifacts ./shared-services-evidence` to the command below.
+
 ```sh
 cargo build --manifest-path rust/Cargo.toml -p rusty-sudocode-cli
 python e2e/shared-services/run.py --scode rust/target/debug/scode
