@@ -453,6 +453,8 @@ different provider channels without silently reusing another credential.
 The child approval journey executes the invoice once, then requests report
 verification in a separate user turn. It takes the report path from the completed
 child's actual tool result and gives the verification child only `read_file`.
+Both tasks use paths relative to the shared workspace, and a missing persisted
+invoice result fails immediately after the child completes.
 The gate still requires both children, the approved Bash command exactly once,
 the real report contents, inherited model credentials, and the follow-up total.
 

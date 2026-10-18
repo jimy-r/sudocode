@@ -50,7 +50,7 @@ fn submit_agent_request(cli: &mut PtySession, prompt: &str) {
     cli.send("\r").unwrap();
 }
 
-fn completed_child_report(directory: &Path) -> String {
+fn completed_child_report(directory: &Path, workspace: &Path) -> String {
     let mut reports = BTreeSet::new();
     for request in requests(directory) {
         for block in wire_requests::request_tool_blocks(&request) {
@@ -75,7 +75,14 @@ fn completed_child_report(directory: &Path) -> String {
         }
     }
     assert_eq!(reports.len(), 1, "exactly one invoice child must complete");
-    reports.pop_first().unwrap()
+    let report = reports.pop_first().unwrap();
+    let actual = Path::new(&report).canonicalize().unwrap();
+    let root = workspace.canonicalize().unwrap();
+    let relative = actual
+        .strip_prefix(&root)
+        .expect("completed report must belong to the fixture workspace");
+    assert_eq!(relative.parent(), Some(Path::new(".sudocode-agents")));
+    relative.to_string_lossy().replace('\\', "/")
 }
 
 fn offered_tools(request: &Value) -> BTreeSet<String> {
@@ -176,12 +183,8 @@ print(result)
     );
     cli.resize(48, 260).unwrap();
     common::expect_screen(&cli, |s| s.contains("❯"), BUDGET, "interactive prompt");
-    let script = env
-        .workspace_root()
-        .join("invoice.py")
-        .to_string_lossy()
-        .replace('\\', "/");
-    let command = format!("'{python}' '{script}'");
+    // Parent and child share the workspace; fixture commands use that namespace.
+    let command = format!("'{python}' 'invoice.py'");
     let command_words = shell_words::split(&command).unwrap();
     let child_prompt = format!("Use the bash tool to run exactly this command once, with no other commands or retries: {command}. Report its actual output.");
     let execution = agent_input(&model, INVOICE_AGENT, &child_prompt);
@@ -204,22 +207,28 @@ print(result)
     );
     cli.send("1\r").unwrap();
     common::expect_turn_complete_after(&cli, &marker, BUDGET, "approved child completed");
+    let saved =
+        std::fs::read_to_string(env.workspace_root().join("result.txt")).unwrap_or_else(|error| {
+            panic!(
+                "approved child did not persist its result: {error}\n{}",
+                common::screen_tail(&cli, 6000)
+            )
+        });
+    assert!(
+        saved.contains(&nonce) && saved.contains(&subtotal.to_string()),
+        "approved child did not persist the actual result: {saved}"
+    );
     common::expect_screen(
         &cli,
         |s| s.contains(&nonce) && s.contains(&subtotal.to_string()),
         BUDGET,
         "actual child data in the parent reply",
     );
-    let saved = std::fs::read_to_string(env.workspace_root().join("result.txt")).unwrap();
-    assert!(
-        saved.contains(&nonce) && saved.contains(&subtotal.to_string()),
-        "approved child did not persist the actual result: {saved}"
-    );
     if verify_report {
         // Make report verification its own user turn. The actual completed
         // child result owns the report path; no model has to infer a second
         // task or locate a report from a placeholder inside a long request.
-        let report = completed_child_report(&captured);
+        let report = completed_child_report(&captured, env.workspace_root());
         let verification = agent_input(
             &model,
             REPORT_AGENT,
