@@ -243,7 +243,7 @@ fn independent_cli_processes_append_to_the_same_sid_while_both_turns_are_open() 
 }
 
 #[test]
-fn resuming_during_another_turn_forks_the_last_completed_turn() {
+fn resuming_during_another_turn_inherits_its_written_prefix() {
     run_two_cli_contexts(true);
 }
 
@@ -298,7 +298,7 @@ fn run_two_cli_contexts(is_second_started_late: bool) {
         common::expect_input_line_cleared(
             second,
             env.timeout(),
-            "late runtime restored completed context",
+            "late runtime restored the written prefix",
         );
     }
     // The first response remains blocked while a separate process submits the
@@ -376,8 +376,8 @@ fn run_two_cli_contexts(is_second_started_late: bool) {
         let messages = request["messages"].to_string();
         if is_second_started_late && messages.contains("SECOND_CONTEXT_PROMPT") {
             assert!(
-                !messages.contains("FIRST_CONTEXT_PROMPT"),
-                "a later resume must not inherit a sibling's unfinished turn"
+                messages.contains("FIRST_CONTEXT_PROMPT"),
+                "a later resume must inherit the already written user message"
             );
             assert!(
                 !messages.contains("FIRST_CONTEXT_DONE"),

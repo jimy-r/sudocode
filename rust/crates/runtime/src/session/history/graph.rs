@@ -71,6 +71,7 @@ struct Context {
     projection: Projection,
     unsealed: BTreeSet<String>,
     open_tools: BTreeMap<String, String>,
+    inherited_unfinished: bool,
 }
 
 #[derive(Clone)]
@@ -90,6 +91,7 @@ pub struct HistoryGraph {
     contexts: HashMap<String, Context>,
     commits: HashMap<String, CompletedProjection>,
     latest_commit: Option<String>,
+    latest_context: Option<String>,
     seen: HashMap<String, SeenRecord>,
     parents: HashMap<String, Option<String>>,
 }
@@ -182,6 +184,27 @@ fn tool_changes(
     Ok((open, origins))
 }
 
+fn is_recovery_projection(messages: &[ProjectionMessage], source: &[String]) -> io::Result<bool> {
+    let mut retained = source.iter();
+    for entry in messages {
+        if let Some(value) = &entry.message {
+            let message = decode_message(value)?;
+            if !matches!(message.role, MessageRole::Tool | MessageRole::User)
+                || message.blocks.is_empty()
+                || !message
+                    .blocks
+                    .iter()
+                    .all(|block| matches!(block, ContentBlock::ToolResult { is_error: true, .. }))
+            {
+                return Ok(false);
+            }
+        } else if retained.next() != Some(&entry.id) {
+            return Ok(false);
+        }
+    }
+    Ok(retained.next().is_none())
+}
+
 impl HistoryGraph {
     /// The newest completed turn in this reader's folded prefix.
     #[must_use]
@@ -237,32 +260,18 @@ impl HistoryGraph {
         }
         let parent = match &record.event {
             HistoryEvent::Initialize { .. } => None,
-            HistoryEvent::OpenContext { source_commit } => {
-                source_commit.clone().or_else(|| self.latest_commit.clone())
-            }
+            HistoryEvent::OpenContext { source_commit } => source_commit.clone().or_else(|| {
+                self.latest_context
+                    .as_ref()
+                    .and_then(|id| self.revision(id))
+                    .map(str::to_owned)
+            }),
             _ => record.expected_revision.clone(),
         };
         let outcome = match &record.event {
             HistoryEvent::Initialize { session } => self.initialize(record, session)?,
             HistoryEvent::OpenContext { source_commit } => {
-                let source_commit = source_commit.as_ref().or(self.latest_commit.as_ref());
-                if self.contexts.contains_key(record.context_id()) {
-                    rejected("context_already_exists")
-                } else if let Some(projection) = source_commit.and_then(|id| self.commits.get(id)) {
-                    self.contexts.insert(
-                        record.context_id.clone(),
-                        Context {
-                            revision: record.id.clone(),
-                            base_commit: source_commit.expect("found completed source").clone(),
-                            projection: projection.projection.clone(),
-                            unsealed: BTreeSet::new(),
-                            open_tools: BTreeMap::new(),
-                        },
-                    );
-                    RecordOutcome::Applied
-                } else {
-                    rejected("source_turn_not_committed")
-                }
+                self.open_context(record, source_commit.as_deref())?
             }
             _ => self.change(record)?,
         };
@@ -272,6 +281,99 @@ impl HistoryGraph {
         self.seen
             .insert(record.id.clone(), (digest(record)?, outcome.clone()));
         Ok(outcome)
+    }
+
+    fn open_context(
+        &mut self,
+        record: &HistoryRecord,
+        source: Option<&str>,
+    ) -> io::Result<RecordOutcome> {
+        if self.contexts.contains_key(record.context_id()) {
+            return Ok(rejected("context_already_exists"));
+        }
+        let (projection, mutable, base_commit, inherited_unfinished) = if let Some(commit) = source
+        {
+            let Some(source) = self.commits.get(commit) else {
+                return Ok(rejected("source_turn_not_committed"));
+            };
+            (
+                source.projection.clone(),
+                BTreeSet::new(),
+                commit.to_string(),
+                false,
+            )
+        } else {
+            let source = self
+                .latest_context
+                .as_ref()
+                .and_then(|id| self.contexts.get(id))
+                .ok_or_else(|| invalid("resume context missing"))?;
+            (
+                source.projection.clone(),
+                source.unsealed.clone(),
+                source.base_commit.clone(),
+                source.inherited_unfinished || !source.unsealed.is_empty(),
+            )
+        };
+        let session = self.session(&projection)?;
+        let mut chain = Arc::new(MessageChain::default());
+        let mut open = BTreeMap::new();
+        let mut copied_tail = false;
+        let mut nodes = Vec::new();
+        for (index, message) in session.messages.iter().enumerate() {
+            let original = message
+                .history
+                .as_ref()
+                .map(|identity| identity.id.as_str());
+            copied_tail |= original.is_none_or(|id| mutable.contains(id));
+            let id = if copied_tail {
+                let bytes = serde_json::to_vec(&(
+                    "resume-message-v1",
+                    record.context_id(),
+                    index,
+                    original,
+                ))
+                .map_err(io::Error::other)?;
+                format!("resume-{:x}", Sha256::digest(bytes))
+            } else {
+                original
+                    .expect("immutable source message has identity")
+                    .to_string()
+            };
+            let (next_open, origins) = tool_changes(message, &id, &open)?;
+            open = next_open;
+            if copied_tail {
+                if self.messages.contains_key(&id) {
+                    return Ok(rejected("message_identity_conflict"));
+                }
+                nodes.push((
+                    id.clone(),
+                    MessageNode {
+                        message: decode_message(&to_value(message)?)?,
+                        parent: chain.tail.last().cloned(),
+                        tool_origins: origins,
+                    },
+                ));
+            }
+            MessageChain::append(&mut chain, id);
+        }
+        let projection = Projection {
+            chain,
+            metadata: projection.metadata,
+        };
+        self.messages.extend(nodes);
+        self.contexts.insert(
+            record.context_id.clone(),
+            Context {
+                revision: record.id.clone(),
+                base_commit,
+                projection,
+                unsealed: BTreeSet::new(),
+                open_tools: open,
+                inherited_unfinished,
+            },
+        );
+        Ok(RecordOutcome::Applied)
     }
 
     fn initialize(&mut self, record: &HistoryRecord, value: &Value) -> io::Result<RecordOutcome> {
@@ -339,6 +441,7 @@ impl HistoryGraph {
                 projection: projection.clone(),
                 unsealed: BTreeSet::new(),
                 open_tools: BTreeMap::new(),
+                inherited_unfinished: false,
             },
         );
         self.commits.insert(
@@ -349,6 +452,7 @@ impl HistoryGraph {
             },
         );
         self.latest_commit = Some(record.id.clone());
+        self.latest_context = Some(record.context_id.clone());
         Ok(RecordOutcome::Applied)
     }
 
@@ -363,7 +467,9 @@ impl HistoryGraph {
         if record.expected_revision.as_deref() != Some(context.revision.as_str()) {
             return Ok(rejected("context_revision_changed"));
         }
-        let was_completed = context.unsealed.is_empty();
+        let was_completed = context.unsealed.is_empty()
+            && context.open_tools.is_empty()
+            && !context.inherited_unfinished;
         match &record.event {
             HistoryEvent::Message {
                 id,
@@ -467,8 +573,10 @@ impl HistoryGraph {
                 context.projection.metadata = metadata;
             }
             HistoryEvent::Projection { metadata, messages } => {
-                if !context.open_tools.is_empty() {
-                    return Ok(rejected("context_has_unfinished_tools"));
+                if !context.open_tools.is_empty()
+                    && !is_recovery_projection(messages, &context.projection.chain.ids())?
+                {
+                    return Ok(rejected("unfinished_context_requires_preserving_recovery"));
                 }
                 let Some(metadata) = metadata_snapshot(metadata, &context.projection.metadata)?
                 else {
@@ -530,6 +638,7 @@ impl HistoryGraph {
                     self.messages.insert(id, node);
                 }
                 context.projection = Projection { chain, metadata };
+                context.open_tools = open;
             }
             HistoryEvent::CommitTurn { trace_id } => {
                 if trace_id.is_empty() || trace_id.len() > 512 {
@@ -543,6 +652,9 @@ impl HistoryGraph {
         }
         touch(&mut context.projection, record.timestamp_ms);
         context.revision.clone_from(&record.id);
+        if !matches!(record.event, HistoryEvent::Metadata { .. }) {
+            self.latest_context = Some(record.context_id.clone());
+        }
         if matches!(record.event, HistoryEvent::CommitTurn { .. }) {
             self.commits.insert(
                 record.id.clone(),
@@ -554,6 +666,7 @@ impl HistoryGraph {
             self.latest_commit = Some(record.id.clone());
             context.base_commit.clone_from(&record.id);
             context.unsealed.clear();
+            context.inherited_unfinished = false;
         } else if was_completed
             && matches!(
                 record.event,
@@ -703,6 +816,15 @@ impl HistoryGraph {
                 .projection,
         )
         .map(|session| session.with_history_head(Some(commit.into())))
+    }
+
+    /// The continuation most recently advanced by a message, turn or projection.
+    pub fn resume_session(&self) -> io::Result<Session> {
+        self.context_session(
+            self.latest_context
+                .as_deref()
+                .ok_or_else(|| invalid("no resume context"))?,
+        )
     }
 
     pub fn context_session(&self, context: &str) -> io::Result<Session> {

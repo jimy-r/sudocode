@@ -536,11 +536,13 @@ available execution, work and awaiting input.</p>
 Agent indexes can reference the same SID, and several runtimes can append its
 durable history. Messages retain stable identities, parent relationships and
 tool-call associations. Each runtime continues its selected context chain.
-A new runtime resumes from the most recently completed turn; another runtime's
-in-flight turn and tool results remain on that runtime's branch. Opening a
-sibling does not repair or consume its unfinished calls. Compaction changes that context's view
+A new runtime inherits the most recently written continuation, including its
+persisted in-flight messages. Its inherited prefix is frozen. Unfinished tool
+calls receive an interrupted result with an unknown outcome in the new branch;
+the source runtime retains its executing calls and their actual results.
+Compaction changes that context's view
 while preserving the other continuations and their referenced content.
-Completed-turn selection follows committed history order; idle metadata writes
+Continuation selection follows committed history order; idle metadata writes
 preserve that selection. The
 <a href="../../sudo-code-roadmap.html#shared-sid-implementation">implementation and acceptance tasks</a>
 describe the shared runtime layer and host adoption.</p>

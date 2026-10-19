@@ -16,7 +16,7 @@ use runtime::{
     StaticToolExecutor, SystemPrompt, ToolError,
 };
 
-const CASE: &str = "runtime_resume_forks_completed_turn_while_native_tool_runs";
+const CASE: &str = "runtime_resume_inherits_written_prefix_while_native_tool_runs";
 const CHILD: &str = "SCODE_SHARED_RUNTIME_CHILD";
 const RECEIPT: &str = "NEXUS_RUNTIME_HISTORY_RECEIPT";
 const WAIT: Duration = Duration::from_secs(30);
@@ -166,7 +166,7 @@ impl Drop for RunningTurn {
 }
 
 #[test]
-fn runtime_resume_forks_completed_turn_while_native_tool_runs() {
+fn runtime_resume_inherits_written_prefix_while_native_tool_runs() {
     if let Some(root) = std::env::var_os(CHILD) {
         let root = PathBuf::from(root);
         std::fs::write(root.join("tool-pid"), std::process::id().to_string()).unwrap();
@@ -179,7 +179,7 @@ fn runtime_resume_forks_completed_turn_while_native_tool_runs() {
 
 #[test]
 #[ignore = "requires the real pinned Nexus daemon and mTLS credentials"]
-fn live_runtime_resume_preserves_completed_fork_and_native_tool_result() {
+fn live_runtime_resume_inherits_written_prefix_and_keeps_native_tool_result() {
     exercise_runtime_history(true);
 }
 
@@ -274,7 +274,14 @@ fn exercise_runtime_history(nexus: bool) {
     wait_for(&root.join("tool-pid"));
     assert!(!root.join("actual-result").exists());
     let loaded = load(&path, nexus);
-    assert!(!transcript(loaded.messages()).contains("A_LIVE_TOOL_PROMPT"));
+    assert!(transcript(loaded.messages()).contains("A_LIVE_TOOL_PROMPT"));
+    assert!(loaded
+        .messages()
+        .iter()
+        .any(|message| message.blocks.iter().any(|block| matches!(
+            block,
+            runtime::ContentBlock::ToolResult { is_error: true, .. }
+        ))));
     let (mut b, requests) = runtime(
         stale_b,
         vec![answer("B_PRIVATE_ANSWER")],
@@ -283,7 +290,7 @@ fn exercise_runtime_history(nexus: bool) {
     executor
         .block_on(b.run_turn("B_PRIVATE_PROMPT", None, None))
         .unwrap();
-    assert!(!transcript(&requests.lock().unwrap()[0]).contains("A_LIVE_TOOL_PROMPT"));
+    assert!(transcript(&requests.lock().unwrap()[0]).contains("A_LIVE_TOOL_PROMPT"));
     assert!(
         !root.join("actual-result").exists(),
         "B must finish while A is still running"
@@ -316,6 +323,23 @@ fn exercise_runtime_history(nexus: bool) {
         .map(|line| serde_json::from_str(line).unwrap())
         .collect();
     assert!(
+        records.iter().any(|record| {
+            record["event"]["type"] == "projection"
+                && record["event"]["messages"]
+                    .as_array()
+                    .is_some_and(|messages| {
+                        messages.iter().any(|entry| {
+                            entry["message"]["blocks"].as_array().is_some_and(|blocks| {
+                                blocks.iter().any(|block| {
+                                    block["type"] == "tool_result" && block["is_error"] == true
+                                })
+                            })
+                        })
+                    })
+        }),
+        "interrupted recovery must persist its exact result payload"
+    );
+    assert!(
         records
             .iter()
             .filter(|record| record["event"]["type"] == "commit_turn")
@@ -335,7 +359,15 @@ fn exercise_runtime_history(nexus: bool) {
     if nexus {
         let b_commit = records
             .iter()
-            .find(|record| record["event"]["type"] == "projection")
+            .find(|record| {
+                record["event"]["type"] == "projection"
+                    && graph
+                        .completed_session(record["id"].as_str())
+                        .is_ok_and(|view| {
+                            view.messages().len() == 1
+                                && transcript(view.messages()).contains("B_PRIVATE_ANSWER")
+                        })
+            })
             .unwrap()["id"]
             .clone();
         let receipt = serde_json::json!({"path":path, "sid":sid, "b_commit":b_commit,
