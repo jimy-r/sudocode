@@ -431,6 +431,36 @@ impl SessionEngine {
         })
     }
 
+    /// Apply session/load options to this live context without acquiring a
+    /// second writer. Model, permissions, auth and background work stay owned
+    /// by this engine, as they do across its other runtime rebuilds.
+    pub fn reconfigure(
+        &self,
+        mcp_servers: std::collections::BTreeMap<String, runtime::ScopedMcpServerConfig>,
+        prompt_overrides: runtime::SystemPromptOverrides,
+        memory: runtime::memory::MemoryMode,
+    ) -> Result<(), String> {
+        if !self.allows_session_replacement {
+            return Err("hosted sessions are configured through their controller".into());
+        }
+        if self.background_tasks.tool_control().1 {
+            return Err("Return tool control before reloading the session".into());
+        }
+        let mut session = self.lock_session();
+        let previous_servers = std::mem::replace(&mut session.session_mcp_servers, mcp_servers);
+        let previous_prompt = std::mem::replace(&mut session.prompt_overrides, prompt_overrides);
+        let previous_memory = std::mem::replace(&mut session.memory, memory);
+        let snapshot = session.runtime.session().clone();
+        let handle = session.handle.clone();
+        if let Err(error) = self.rebuild_locked(&mut session, snapshot, handle) {
+            session.session_mcp_servers = previous_servers;
+            session.prompt_overrides = previous_prompt;
+            session.memory = previous_memory;
+            return Err(error);
+        }
+        Ok(())
+    }
+
     /// The session's blocking runtime, present for the delegate's whole life
     /// (only `Drop` takes it).
     fn rt(&self) -> &tokio::runtime::Runtime {

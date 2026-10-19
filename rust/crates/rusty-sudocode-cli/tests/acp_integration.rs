@@ -4945,6 +4945,31 @@ async fn acp_session_new_system_prompt_override_and_append_reach_model() {
         "session/load override + append must reach the model; body: {body}"
     );
 
+    // A failed rebuild retains the live writer and its previous prompt options.
+    let config_path = workspace.config_home.join("sudocode.json");
+    let valid_config = fs::read(&config_path).unwrap();
+    let before_failed_reload = server.captured_requests().await.len();
+    fs::write(&config_path, "{invalid reload configuration").unwrap();
+    let (_, failed_reload) = client
+        .send_request(
+            "session/load",
+            json!({
+                "sessionId": plain, "cwd": root.to_string_lossy(), "mcpServers": [],
+                "_meta": {"sudocode": {"systemPrompt": "FAILED_RELOAD_MUST_STAY_PRIVATE"}},
+            }),
+        )
+        .await;
+    fs::write(&config_path, valid_config).unwrap();
+    assert!(failed_reload.get("error").is_some(), "{failed_reload}");
+    assert_eq!(server.captured_requests().await.len(), before_failed_reload);
+    let body = last_model_request_after_prompt(&mut client, &server, &plain, "p4").await;
+    assert!(
+        body.contains(LOAD_OVERRIDE)
+            && body.contains(APPEND)
+            && !body.contains("FAILED_RELOAD_MUST_STAY_PRIVATE"),
+        "failed reload changed the live context: {body}"
+    );
+
     // Validation: empty / non-string values are invalid_params for either key.
     assert_bad_prompt_meta_rejected(&mut client, &root, OVERRIDE).await;
 
@@ -6259,6 +6284,81 @@ fn seed_legacy_completion(workspace: &TestWorkspace, sid: &str, context: &Value)
     journal["context"].clone()
 }
 
+#[tokio::test]
+async fn acp_legacy_completion_upgrade_preserves_context_and_model_history() {
+    let server = MockAnthropicService::spawn().await.unwrap();
+    let workspace = TestWorkspace::new("legacy-completion-upgrade");
+    workspace.create();
+    workspace.write_sudocode_json(&server.base_url());
+    let spawn = || {
+        spawn_stdio_client_with_args_and_env(
+            &workspace,
+            &["--permission-mode", "danger-full-access"],
+            &[("SUDOCODE_EXPERIMENT_SHARED_SESSION_HISTORY", "0")],
+        )
+    };
+    let mut producer = spawn();
+    initialize_task_completions(&mut producer).await;
+    let sid = scenario_session_new(&mut producer, &workspace.root).await;
+    let (_, previous) = producer
+        .send_request(
+            "session/prompt",
+            json!({"sessionId":sid,"_meta":{"traceId":"legacy-prefix"},
+                "prompt":[{"type":"text","text":format!(
+                    "LEGACY_COMPLETION_PREFIX {SCENARIO_PREFIX}streaming_text")}]}),
+        )
+        .await;
+    assert_eq!(previous["result"]["stopReason"], "end_turn", "{previous}");
+    let context = previous["result"]["_meta"]["sudocode"]["contextRef"].clone();
+    producer.shutdown().await;
+    let previous_context = seed_legacy_completion(&workspace, &sid, &context);
+    let binding: Value = serde_json::from_slice(
+        &fs::read(
+            find_session_transcript(&workspace.root, &sid).with_extension("completions.json"),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let before_load = server.captured_requests().await.len();
+    let mut resumed = spawn();
+    initialize_task_completions(&mut resumed).await;
+    let (_, loaded) = resumed
+        .send_request(
+            "session/load",
+            json!({"sessionId":sid,"cwd":workspace.root,"mcpServers":[]}),
+        )
+        .await;
+    assert!(loaded.get("result").is_some(), "{loaded}");
+    let metadata = &loaded["result"]["_meta"]["sudocode"];
+    assert_eq!(metadata["storageRef"], binding["storage_ref"]);
+    assert_eq!(
+        metadata["contextRef"]["revision"],
+        previous_context["revision"]
+    );
+    assert_eq!(
+        metadata["contextRef"]["lastTraceId"],
+        previous_context["lastTraceId"]
+    );
+    assert_eq!(server.captured_requests().await.len(), before_load);
+    let (_, continued) = resumed
+        .send_request(
+            "session/prompt",
+            json!({"sessionId":sid,"_meta":{"traceId":"after-upgrade"},
+                "prompt":[{"type":"text","text":format!("{SCENARIO_PREFIX}streaming_text")}]}),
+        )
+        .await;
+    assert_eq!(continued["result"]["stopReason"], "end_turn", "{continued}");
+    assert!(server
+        .captured_requests()
+        .await
+        .last()
+        .unwrap()
+        .raw_body
+        .contains("LEGACY_COMPLETION_PREFIX"));
+    resumed.shutdown().await;
+    workspace.cleanup();
+}
+
 async fn frozen_completion_sources(workspace: &TestWorkspace, sid: &str, count: usize) -> Value {
     let path = completion_context_path(workspace, sid);
     timeout(Duration::from_secs(15), async {
@@ -6896,7 +6996,7 @@ const timer = setInterval(() => {
         spawn_stdio_client_with_args_and_env(
             &workspace,
             &["--permission-mode", "danger-full-access"],
-            &[],
+            &[("SUDOCODE_EXPERIMENT_SHARED_SESSION_HISTORY", "1")],
         )
     };
     let mut producer = spawn();
@@ -6914,7 +7014,7 @@ const timer = setInterval(() => {
     assert_eq!(previous["result"]["stopReason"], "end_turn", "{previous}");
     let context = previous["result"]["_meta"]["sudocode"]["contextRef"].clone();
     producer.shutdown().await;
-    let previous_context = seed_legacy_completion(&workspace, &sid, &context);
+    let previous_context = context;
     let mut first = spawn();
     initialize_task_completions(&mut first).await;
     let (_, migrated) = first
@@ -7407,7 +7507,7 @@ async fn acp_task_completions_interrupted_shell_and_encoded_budget() {
 }
 
 /// Concurrent ACP contexts append to the same SID while retaining separate
-/// completion ownership. Resuming an interrupted tool preserves uncertainty.
+/// completion ownership. A sibling never repairs another context's live tool.
 #[tokio::test]
 async fn acp_completions_keep_live_contexts_independent_during_replay_and_load() {
     let server = MockAnthropicService::spawn().await.unwrap();
@@ -7418,7 +7518,7 @@ async fn acp_completions_keep_live_contexts_independent_during_replay_and_load()
         spawn_stdio_client_with_args_and_env(
             &workspace,
             &["--permission-mode", "danger-full-access"],
-            &[],
+            &[("SUDOCODE_EXPERIMENT_SHARED_SESSION_HISTORY", "1")],
         )
     };
     let mut owner = spawn();
@@ -7442,14 +7542,21 @@ async fn acp_completions_keep_live_contexts_independent_during_replay_and_load()
     timeout(Duration::from_secs(10), async {
         loop {
             let saved = fs::read_to_string(&transcript).unwrap();
-            if saved.lines().any(|line| {
-                serde_json::from_str::<Value>(line).is_ok_and(|record| {
-                    record["type"] == "assistant_update"
-                        && record["message"]["usage"]["output_tokens"]
-                            .as_u64()
-                            .is_some_and(|tokens| tokens > 0)
+            let graph = runtime::history::HistoryGraph::decode(saved.as_bytes()).unwrap();
+            let record: runtime::history::HistoryRecord =
+                serde_json::from_str(saved.lines().last().unwrap()).unwrap();
+            if graph
+                .context_session(record.context_id())
+                .unwrap()
+                .messages()
+                .iter()
+                .any(|message| {
+                    message
+                        .usage
+                        .as_ref()
+                        .is_some_and(|usage| usage.output_tokens > 0)
                 })
-            }) {
+            {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
@@ -7538,21 +7645,18 @@ async fn acp_completions_keep_live_contexts_independent_during_replay_and_load()
         )
         .await;
     assert_eq!(continued["result"]["stopReason"], "end_turn", "{continued}");
-    let repaired_transcript = fs::read(&transcript).unwrap();
+    let continued_transcript = fs::read(&transcript).unwrap();
     assert!(
-        String::from_utf8_lossy(&repaired_transcript)
+        !String::from_utf8_lossy(&continued_transcript)
             .contains("Side effects may already have occurred"),
-        "the new owner must persist the interrupted tool's uncertain outcome"
+        "a sibling must not repair another runtime's interrupted tool"
     );
+    let requests = server.captured_requests().await;
+    let request = &requests.last().unwrap().raw_body;
     assert!(
-        server
-            .captured_requests()
-            .await
-            .last()
-            .unwrap()
-            .raw_body
-            .contains("Side effects may already have occurred"),
-        "the resumed model must receive the persisted uncertainty about prior effects"
+        !request.contains("Side effects may already have occurred")
+            && !request.contains(&format!("{SCENARIO_PREFIX}ask_user_question_roundtrip")),
+        "the resumed model must exclude the sibling's unfinished turn: {request}"
     );
     competitor.shutdown().await;
     assert_eq!(fs::read(&journal).unwrap(), before_journal);
@@ -7568,8 +7672,8 @@ async fn acp_completions_keep_live_contexts_independent_during_replay_and_load()
     assert!(
         fs::read(&transcript)
             .unwrap()
-            .starts_with(&repaired_transcript),
-        "a further restart must retain the repair and append history"
+            .starts_with(&continued_transcript),
+        "a further restart must retain both contexts and append history"
     );
     competitor.shutdown().await;
 

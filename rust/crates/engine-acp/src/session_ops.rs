@@ -383,6 +383,15 @@ pub(crate) fn open_loaded_session(
     memory: runtime::memory::MemoryMode,
 ) -> Result<(Arc<SessionEngine>, PathBuf), crate::AcpError> {
     let cwd = canonical_session_cwd(&cwd).map_err(crate::AcpError::invalid_params)?;
+    if let Some(engine) = registry.engine(session_id) {
+        if registry.cwd(session_id).as_ref() != Some(&cwd) {
+            return Err(crate::AcpError::invalid_params("session cwd mismatch"));
+        }
+        engine
+            .reconfigure(mcp_servers, prompt_overrides, memory)
+            .map_err(crate::AcpError::internal)?;
+        return Ok((engine, cwd));
+    }
     let (handle, session) = load_session_reference(session_id)
         .map_err(|e| crate::AcpError::internal(format!("failed to load session: {e}")))?;
     registry.attach_completion_writer(&session, &cwd)?;

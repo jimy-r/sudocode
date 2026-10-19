@@ -1757,6 +1757,14 @@ impl Session {
         head: Option<&str>,
     ) -> Result<Self, SessionError> {
         let bytes = fs.read(&path.to_string_lossy())?;
+        if history::is_record_history(&bytes) {
+            let revision = head.ok_or_else(|| {
+                SessionError::Format("shared history context revision missing".into())
+            })?;
+            return history::HistoryGraph::decode(&bytes)?
+                .revision_session(revision)
+                .map_err(SessionError::Io);
+        }
         let contents = crate::session_history::decode(&bytes)?;
         let shared = Self::shared_history_suffix(contents)
             .map_err(SessionError::Format)?
