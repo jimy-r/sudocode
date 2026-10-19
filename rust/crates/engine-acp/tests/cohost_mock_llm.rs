@@ -784,7 +784,13 @@ fn managed_rpc_restores_history_on_a_new_pid_and_keeps_writing_the_same_vfs_sess
         .with_fs_backend(Arc::clone(&fs))
         .save_to_path(&path)
         .unwrap();
-    assert!(managed_call(&kernel, "start_session_v1", request)
-        .unwrap_err()
-        .contains("without identity"));
+    let unbound = runtime::Session::load_from_path_with(&*fs, &path).unwrap();
+    assert!(unbound.identity.is_none());
+    assert_eq!(unbound.session_id, sid);
+    let unbound_bytes = fs.read_to_string(&path).unwrap();
+    let requests_before_rejection = harness.requests_seen();
+    let error = managed_call(&kernel, "start_session_v1", request).unwrap_err();
+    assert!(error.contains("co-host: restore session:"), "{error}");
+    assert_eq!(fs.read_to_string(&path).unwrap(), unbound_bytes);
+    assert_eq!(harness.requests_seen(), requests_before_rejection);
 }
