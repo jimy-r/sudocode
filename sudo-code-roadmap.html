@@ -2406,8 +2406,9 @@ Exercise cancellation, stale candidates, crash and restart.</td></tr>
 context, and a durable repair targets that specific call. Opening another context
 does not establish that a live call in its sibling has ended.</td><td>Resume while
 the sibling tool is still running; A receives its real result once, while B
-continues the completed prefix without synthesizing a failure for A. Recover
-an actually interrupted call without repeating its effects.</td></tr>
+inherits the already written prefix and persists an unknown-outcome interrupted
+result in B's branch. A's live call and actual result retain their original
+identity. A fresh restore reuses the persisted repair without repeating effects.</td></tr>
 <tr><td>Completion delivery</td><td>Separate transcript append from completion
 ownership. The completion protocol binds active traces, context revisions,
 terminal sources, reservations and acknowledgements to the originating context.
