@@ -196,7 +196,9 @@ fn serve(
         json!({"type":"text","text":""})
     };
     let delta = if tool_use {
-        json!({"type":"input_json_delta","partial_json":content["input"].to_string()})
+        // Live providers emit whitespace inside tool arguments. Their durable
+        // object representation must not look like an external history edit.
+        json!({"type":"input_json_delta","partial_json":serde_json::to_string_pretty(&content["input"]).unwrap()})
     } else {
         json!({"type":"text_delta","text":content["text"]})
     };
@@ -392,8 +394,12 @@ fn adaptive_thinking_and_effort_stay_fixed_across_compaction_and_resume() {
             let cli = env.spawn(&[
                 "--resume",
                 path.to_str().unwrap(),
-                "--reasoning-effort",
-                "high",
+                "--effort",
+                if model.contains("4-8") {
+                    "xhigh"
+                } else {
+                    "max"
+                },
                 "--permission-mode",
                 "read-only",
             ]);
@@ -408,7 +414,14 @@ fn adaptive_thinking_and_effort_stay_fixed_across_compaction_and_resume() {
             baseline["thinking"],
             json!({"type":"adaptive","display":"summarized"})
         );
-        assert_eq!(baseline["output_config"]["effort"], "high");
+        assert_eq!(
+            baseline["output_config"]["effort"],
+            if model.contains("4-8") {
+                "xhigh"
+            } else {
+                "max"
+            }
+        );
         assert!(baseline.get("reasoning_effort").is_none());
         turn(&mut cli, "Continue the next step.");
         assert_thinking_replayed(&capture.bodies()[1], 1);
@@ -455,7 +468,7 @@ fn adaptive_hidden_thinking_keeps_signed_history_and_uses_provider_default_effor
             request["thinking"],
             json!({"type":"adaptive","display":"omitted"})
         );
-        assert!(request.get("output_config").is_none());
+        assert_eq!(request["output_config"]["effort"], "medium");
         assert!(request.get("reasoning_effort").is_none());
     }
     assert_thinking_replayed(&requests[1], 1);
@@ -490,7 +503,197 @@ fn opus48_thinking_can_be_disabled_and_reenabled_after_resume() {
             assert!(request.get("thinking").is_none());
         }
         assert_eq!(request["model"], "claude-opus-4-8");
-        assert!(request.get("output_config").is_none());
+        assert_eq!(request["output_config"]["effort"], "high");
+    }
+}
+
+#[test]
+fn effort_changes_preserve_signed_history_and_max_is_session_scoped() {
+    let env = TestEnv::new_mock("effort-cache-prefix");
+    let capture = Capture::new();
+    capture.thinking_blocks.store(true, Ordering::Relaxed);
+    let path = fixture(&env, &capture);
+    let config_path = env.config_home().join("sudocode.json");
+    let mut config: Value = serde_json::from_slice(&std::fs::read(&config_path).unwrap()).unwrap();
+    config["models"]["claude-sonnet"]["providers"]["api-key"]["model"] = json!("claude-opus-4-8");
+    std::fs::write(config_path, config.to_string()).unwrap();
+    let mut cli = spawn(&env, &path);
+    for level in ["xhigh", "max", "low"] {
+        cli.send(&format!("/effort {level}\r")).unwrap();
+        cli.expect(&format!("Effective: {level}")).unwrap();
+        common::expect_input_line_cleared(&cli, WAIT, "effort applied");
+        turn(&mut cli, "Continue with the selected effort.");
+        assert_eq!(
+            capture.bodies().last().unwrap()["output_config"]["effort"],
+            level
+        );
+        let settings: Value = serde_json::from_slice(
+            &std::fs::read(env.config_home().join("settings.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            settings["effortLevel"],
+            if level == "max" { "xhigh" } else { level }
+        );
+    }
+    cli.send("/effort max\r").unwrap();
+    cli.expect("this session only").unwrap();
+    common::expect_input_line_cleared(&cli, WAIT, "session max applied");
+    cli.send("/compact\r").unwrap();
+    cli.expect("Messages removed").unwrap();
+    common::expect_input_line_cleared(&cli, WAIT, "max compaction complete");
+    turn(&mut cli, "Continue after checkpoint.");
+    exit(&mut cli);
+    let before_resume = capture.bodies();
+    assert!(before_resume
+        .iter()
+        .any(|body| body.to_string().contains(COMPACT)));
+    for pair in before_resume[..3].windows(2) {
+        for key in ["model", "system", "tools", "metadata", "thinking"] {
+            assert_eq!(pair[0][key], pair[1][key], "effort rewrote {key}");
+        }
+        history_prefix(&pair[0], &pair[1]);
+    }
+    assert_thinking_replayed(&before_resume[1], 1);
+    let mut cli = spawn(&env, &path);
+    turn(&mut cli, "Continue after restart using persisted effort.");
+    exit(&mut cli);
+    let requests = capture.bodies();
+    assert_eq!(requests.last().unwrap()["output_config"]["effort"], "low");
+    history_prefix(before_resume.last().unwrap(), requests.last().unwrap());
+    assert_thinking_replayed(requests.last().unwrap(), before_resume.len());
+}
+
+#[test]
+fn tool_input_objects_and_legacy_strings_survive_cli_resume_without_number_loss() {
+    for legacy in [false, true] {
+        let env = TestEnv::new_mock("tool-input-history");
+        let capture = Capture::new();
+        let path = fixture(&env, &capture);
+        let input = json!({"fraction":0.375,"exponent":1.25e-7,"large":18446744073709551615u64,"nested":{"label":"缓存 → café 😀","list":[true,null,0.0625]}});
+        let raw_input = input.to_string().replace('😀', r"\ud83d\ude00");
+        let mut session = Session::load_from_path(&path).unwrap();
+        session
+            .push_user_text("Inspect the original sensor sample.")
+            .unwrap();
+        session
+            .push_message(ConversationMessage::assistant(vec![
+                ContentBlock::ToolUse {
+                    id: "history-input".into(),
+                    name: "sensor".into(),
+                    input: raw_input.clone(),
+                    thought_signature: None,
+                },
+            ]))
+            .unwrap();
+        session
+            .push_message(ConversationMessage::tool_result(
+                "history-input",
+                "sensor",
+                "sample=0.375",
+                false,
+            ))
+            .unwrap();
+        session.save_to_path(&path).unwrap();
+        drop(session);
+        if legacy {
+            let raw = std::fs::read_to_string(&path).unwrap();
+            let rewritten: Vec<String> = raw
+                .lines()
+                .map(|line| {
+                    let mut row: Value = serde_json::from_str(line).unwrap();
+                    if let Some(blocks) = row["message"]["blocks"].as_array_mut() {
+                        for block in blocks {
+                            if block["id"] == "history-input" {
+                                block["input"] = json!(raw_input);
+                            }
+                        }
+                    }
+                    row.to_string()
+                })
+                .collect();
+            std::fs::write(&path, rewritten.join("\n") + "\n").unwrap();
+        }
+        let mut cli = spawn(&env, &path);
+        turn(&mut cli, "Continue from the stored sample.");
+        exit(&mut cli);
+        let mut cli = spawn(&env, &path);
+        turn(&mut cli, "Continue after process restart.");
+        exit(&mut cli);
+        let requests = capture.bodies();
+        assert_eq!(requests.len(), 2);
+        history_prefix(&requests[0], &requests[1]);
+        for request in requests {
+            let block = request["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .flat_map(|message| message["content"].as_array().unwrap())
+                .find(|block| block["id"] == "history-input")
+                .unwrap();
+            assert_eq!(block["input"], input);
+        }
+    }
+}
+
+#[test]
+fn model_picker_selects_effort_and_cancel_keeps_the_original_choice() {
+    for mode in ["off", "queue"] {
+        let env = TestEnv::new_mock("model-effort-picker");
+        let capture = Capture::new();
+        capture.thinking_blocks.store(true, Ordering::Relaxed);
+        let path = fixture(&env, &capture);
+        let config_path = env.config_home().join("sudocode.json");
+        let mut config: Value =
+            serde_json::from_slice(&std::fs::read(&config_path).unwrap()).unwrap();
+        for model in ["claude-opus-4-8", "claude-sonnet-4-6"] {
+            let mut entry = config["models"]["claude-sonnet"].clone();
+            entry["alias"] = json!(model);
+            entry["providers"]["api-key"]["model"] = json!(model);
+            config["models"][model] = entry;
+        }
+        std::fs::write(config_path, config.to_string()).unwrap();
+        let mut cli = spawn_with_env(&env, &path, &[("SUDOCODE_INTERRUPT_QUEUE_MODE", mode)]);
+        turn(&mut cli, "Continue before adjusting the model.");
+        let before = capture.bodies()[0].clone();
+        cli.send("/model\r").unwrap();
+        cli.expect("Select model").unwrap();
+        cli.send("claude-opus-4-8\r").unwrap();
+        cli.expect("Select effort").unwrap_or_else(|error| {
+            panic!(
+                "effort picker: {error}\n{}",
+                cli.render(|screen| screen.contents())
+            )
+        });
+        cli.send("\x1b").unwrap();
+        common::expect_input_line_cleared(&cli, WAIT, "effort selection cancelled");
+        turn(&mut cli, "Continue after cancelling the selection.");
+        let cancelled = capture.bodies()[1].clone();
+        fixed_prefix(&before, &cancelled);
+        history_prefix(&before, &cancelled);
+
+        cli.send("/model\r").unwrap();
+        cli.expect("Select model").unwrap();
+        cli.send("claude-opus-4-8\r").unwrap();
+        cli.expect("Select effort").unwrap();
+        cli.send("xhigh\r").unwrap();
+        cli.expect("Effective: xhigh").unwrap();
+        common::expect_input_line_cleared(&cli, WAIT, "model and effort selected");
+        turn(&mut cli, "Continue using the selected model and effort.");
+        let selected = capture.bodies()[2].clone();
+        assert_eq!(selected["model"], "claude-opus-4-8");
+        assert_eq!(selected["output_config"]["effort"], "xhigh");
+        assert_thinking_replayed(&selected, 1);
+        history_prefix(&cancelled, &selected);
+        cli.send("/model claude-sonnet-4-6\r").unwrap();
+        cli.expect("Model updated").unwrap();
+        common::expect_input_line_cleared(&cli, WAIT, "legacy model selected");
+        turn(
+            &mut cli,
+            "Continue with a model that does not support xhigh.",
+        );
+        assert_eq!(capture.bodies()[3]["output_config"]["effort"], "high");
+        exit(&mut cli);
     }
 }
 

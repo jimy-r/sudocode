@@ -78,6 +78,10 @@ impl Drop for Evidence {
                 "attempt":attributes["attempt"], "status":attributes["status"], "retryable":attributes["retryable"]})
         }).collect();
         let report = json!({"requests":shape, "lifecycle":lifecycle, "usage":usage});
+        let mut report = report;
+        report["compaction_events"] = json!(events.iter().filter(|event| event["event"].as_str().is_some_and(|name| name.contains("compact"))).map(|event| {
+            json!({"event":event["event"],"outcome":event["attributes"]["outcome"],"reason":event["attributes"]["reason"],"error":event["attributes"]["error"],"attempt":event["attributes"]["attempt"]})
+        }).collect::<Vec<_>>());
         let _ = std::fs::write(destination, serde_json::to_vec_pretty(&report).unwrap());
     }
 }
@@ -126,6 +130,114 @@ fn without_cache_markers(mut value: Value) -> Value {
         _ => {}
     }
     value
+}
+
+#[test]
+fn effort_live_read_adjust_and_resume_use_persisted_preference() {
+    let env = common::TestEnv::new("effort-live");
+    if env.is_mock() {
+        return;
+    }
+    assert!(!runtime::effort::claude_levels(&common::live_model()).is_empty());
+    std::fs::write(
+        env.config_home().join("settings.json"),
+        r#"{"thinking":false,"effortLevel":"low"}"#,
+    )
+    .unwrap();
+    let file = tempfile::NamedTempFile::new_in(env.workspace_root()).unwrap();
+    let name = file
+        .path()
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .to_string();
+    let nonce = format!("EFFORT-{name}");
+    std::fs::write(file.path(), format!("nonce={nonce}\na=59\nb=83\nc=11\n")).unwrap();
+    let log = env.workspace_root().join("effort-requests.jsonl");
+    let _evidence = Evidence {
+        log: log.clone(),
+        cache: env.config_home().join("cache/prompt-cache"),
+    };
+    let extra_env = [("SCODE_LOG_PATH", log.to_str().unwrap())];
+    let mut cli = env.spawn_with_env(&["--permission-mode", "read-only"], &extra_env);
+    cli.set_default_timeout(WAIT);
+    common::expect_input_line_cleared(&cli, WAIT, "live effort ready");
+    turn(&mut cli, &format!("Read {} with read_file. Return only EFFORT_START:<nonce>:<a+b+c>, replacing placeholders with the file's values.", file.path().display()));
+    let path = transcript(&env.workspace_root().join(".scode")).unwrap();
+    let assert_answer =
+        |marker: &str| {
+            let session = runtime::Session::load_from_path(&path).unwrap();
+            assert!(session.messages.last().unwrap().blocks.iter().any(
+                |b| matches!(b, runtime::ContentBlock::Text { text } if text.trim() == marker)
+            ));
+        };
+    assert_answer(&format!("EFFORT_START:{nonce}:153"));
+    // The resumed model must use remembered tool data; make a re-read fail.
+    std::fs::rename(
+        file.path(),
+        env.workspace_root().join("source-now-unavailable"),
+    )
+    .unwrap();
+    cli.send("/effort max\r").unwrap();
+    cli.expect("this session only").unwrap();
+    common::expect_input_line_cleared(&cli, WAIT, "live max applied");
+    turn(&mut cli, "Using only the earlier result, subtract 17 from its sum. Do not use tools. Return only EFFORT_MAX:<same nonce>:<result>.");
+    assert_answer(&format!("EFFORT_MAX:{nonce}:136"));
+    cli.send("/exit\r").unwrap();
+    assert_eq!(cli.expect_eof().unwrap(), 0);
+    let mut cli = env.spawn_with_env(
+        &[
+            "--resume",
+            path.to_str().unwrap(),
+            "--permission-mode",
+            "read-only",
+        ],
+        &extra_env,
+    );
+    cli.set_default_timeout(WAIT);
+    common::expect_input_line_cleared(&cli, WAIT, "live effort resumed");
+    turn(&mut cli, "Subtract 19 from the EFFORT_MAX result above. Do not use tools. Return only EFFORT_RESUME:<same nonce>:<result>.");
+    assert_answer(&format!("EFFORT_RESUME:{nonce}:117"));
+    cli.send("/exit\r").unwrap();
+    assert_eq!(cli.expect_eof().unwrap(), 0);
+    let bodies = requests(&log);
+    assert_eq!(
+        bodies.len(),
+        4,
+        "one read/tool continuation plus two dependent recall turns"
+    );
+    for (body, effort) in bodies.iter().zip(["low", "low", "max", "low"]) {
+        assert_eq!(body["output_config"]["effort"], effort);
+        for key in ["system", "tools", "metadata", "thinking"] {
+            assert_eq!(body[key], bodies[0][key], "effort changed {key}");
+        }
+    }
+    for pair in bodies.windows(2) {
+        let old = without_cache_markers(pair[0]["messages"].clone());
+        let new = without_cache_markers(pair[1]["messages"].clone());
+        assert!(
+            new.as_array().unwrap().starts_with(old.as_array().unwrap()),
+            "effort rewrote historical messages"
+        );
+    }
+    let raw = std::fs::read_to_string(&path).unwrap();
+    let tool_inputs: Vec<Value> = raw
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .flat_map(|row| {
+            row["message"]["blocks"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default()
+        })
+        .filter(|block| block["type"] == "tool_use")
+        .map(|block| block["input"].clone())
+        .collect();
+    assert!(!tool_inputs.is_empty());
+    assert!(
+        tool_inputs.iter().all(Value::is_object),
+        "real tool inputs must be journaled as JSON objects"
+    );
 }
 
 #[test]
@@ -218,8 +330,13 @@ fn adaptive_live_tool_chain_compaction_and_resume_read_cache() {
     }
     let ordinary = requests(&log);
     assert!(ordinary.len() >= 9, "must exercise the actual tool chain");
-    cli.send("/compact\r").unwrap();
-    cli.expect("Messages removed").unwrap();
+    cli.send("/compact").unwrap();
+    common::expect_input_line(&cli, "/compact", WAIT, "live compact command typed");
+    cli.send("\r").unwrap();
+    cli.expect("Messages removed").unwrap_or_else(|error| {
+        let screen = cli.render(|screen| screen.contents());
+        panic!("live compact: {error}\n{screen}");
+    });
     common::expect_input_line_cleared(&cli, WAIT, "live compaction complete");
     turn(
         &mut cli,

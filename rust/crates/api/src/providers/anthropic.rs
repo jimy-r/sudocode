@@ -1486,14 +1486,6 @@ fn strip_unsupported_beta_body_fields(body: &mut Value, request: &MessageRequest
                     "display": if request.thinking_enabled { "summarized" } else { "omitted" },
                 }),
             );
-            if let Some(effort) = &request.reasoning_effort {
-                let output = object
-                    .entry("output_config")
-                    .or_insert_with(|| serde_json::json!({}));
-                if let Some(output) = output.as_object_mut() {
-                    output.insert("effort".into(), Value::String(effort.clone()));
-                }
-            }
         } else if request.thinking_enabled && request.max_tokens > MIN_THINKING_BUDGET {
             // The budget is a property of the *model*, not of this request's
             // output cap, because the value of the thinking parameter is part
@@ -1532,6 +1524,18 @@ fn strip_unsupported_beta_body_fields(body: &mut Value, request: &MessageRequest
             // Strip thought_signature from tool_use content blocks. The API
             // rejects this field when extended thinking is not enabled.
             strip_thought_signatures(object);
+        }
+        // Effort controls text and tool calls even when thinking is disabled.
+        // Keep it independent of both thinking mode and the output cap.
+        if let Some(effort) =
+            runtime::effort::claude_effort(&request.model, request.reasoning_effort.as_deref())
+        {
+            let output = object
+                .entry("output_config")
+                .or_insert_with(|| serde_json::json!({}));
+            if let Some(output) = output.as_object_mut() {
+                output.insert("effort".into(), Value::String(effort.to_string()));
+            }
         }
     }
 }

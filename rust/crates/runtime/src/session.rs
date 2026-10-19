@@ -686,7 +686,15 @@ impl Session {
             ))
         })?;
         let durable = Self::from_persisted_contents(contents)?;
-        if durable.messages != self.messages {
+        // Tool input objects are stored canonically, while streamed input can
+        // contain different whitespace. Compare the persisted message values;
+        // the byte revision below still guards concurrent durable changes.
+        if !durable
+            .messages
+            .iter()
+            .map(ConversationMessage::to_json)
+            .eq(self.messages.iter().map(ConversationMessage::to_json))
+        {
             return Err(SessionError::SourceChanged);
         }
         Ok((
@@ -1894,7 +1902,15 @@ impl ContentBlock {
                 );
                 object.insert("id".to_string(), JsonValue::String(id.clone()));
                 object.insert("name".to_string(), JsonValue::String(name.clone()));
-                object.insert("input".to_string(), JsonValue::String(input.clone()));
+                // CC journals tool inputs as objects. Continue reading legacy
+                // string records and preserve malformed historical input text.
+                let parsed = JsonValue::parse(input)
+                    .ok()
+                    .filter(|value| matches!(value, JsonValue::Object(_)));
+                object.insert(
+                    "input".to_string(),
+                    parsed.unwrap_or_else(|| JsonValue::String(input.clone())),
+                );
                 if let Some(sig) = thought_signature {
                     object.insert(
                         "thought_signature".to_string(),
@@ -1956,7 +1972,10 @@ impl ContentBlock {
             "tool_use" => Ok(Self::ToolUse {
                 id: required_string(object, "id")?,
                 name: required_string(object, "name")?,
-                input: required_string(object, "input")?,
+                input: match object.get("input") {
+                    Some(JsonValue::Object(input)) => JsonValue::Object(input.clone()).render(),
+                    _ => required_string(object, "input")?,
+                },
                 thought_signature: object
                     .get("thought_signature")
                     .and_then(JsonValue::as_str)

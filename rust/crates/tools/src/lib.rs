@@ -9275,6 +9275,13 @@ fn supported_config_setting(setting: &str) -> Option<ConfigSettingSpec> {
             options: None,
             accepts: None,
         },
+        "effortLevel" => ConfigSettingSpec {
+            scope: ConfigScope::Global,
+            kind: ConfigKind::String,
+            path: &["effortLevel"],
+            options: Some(&["auto", "low", "medium", "high", "xhigh"]),
+            accepts: None,
+        },
         // Options from the parser's own table, not a copy. This list offered
         // four of the seven spellings and the config UI offered a different
         // three, so which names existed depended on where you looked.

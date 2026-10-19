@@ -544,10 +544,11 @@ pub fn build_engine_runtime(
     let mut runtime = build_runtime_for_host(host, session, handle_id, config, session_mcp)?;
     runtime = runtime.with_hook_abort_signal(abort_signal);
     if let Some(rt) = runtime.runtime.as_mut() {
-        rt.api_client_mut().set_reasoning_effort(reasoning_effort);
-        let thinking = ConfigLoader::default_for(&host.config_root)
-            .load()
-            .map_or(true, |cfg| cfg.thinking());
+        let settings = ConfigLoader::default_for(&host.config_root).load()?;
+        rt.api_client_mut().set_reasoning_effort(
+            reasoning_effort.or_else(|| settings.effort_level().map(str::to_string)),
+        );
+        let thinking = settings.thinking();
         rt.api_client_mut().set_thinking_enabled(thinking);
     }
     Ok(runtime)

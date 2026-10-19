@@ -282,6 +282,43 @@ request prefixes. These controlled responses establish client behavior only:
 actual cache-hit acceptance still requires real upstream usage and routing
 evidence. Diagnostic request dumps are private, opt-in evidence.</p>
 
+<h4>Claude effort and journal parity (2026-10-18)</h4>
+
+<p><strong>CCB validation:</strong> read <code>src/utils/effort.ts</code>,
+<code>commands/model/model.tsx</code>, <code>commands/effort/effort.tsx</code>
+and <code>services/compact/compact.ts</code> in the local CCB reconstruction.
+Its older model allowlists are supplemented by real ConPTY captures of the
+installed official CC 2.1.301 and the official effort/thinking documentation.
+The captures verify Opus 4.8 high by default, Opus 5.5 medium by default,
+4.6 xhigh mapping to high, max support, and effort with thinking disabled.
+CC uses the updates display beta; the tested Bedrock route rejects that display,
+so scode retains summarized/omitted rather than advertising full display parity.</p>
+
+<p><strong>Implementation:</strong> one runtime effort policy supplies CLI,
+ACP, settings and both interactive renderer paths. <code>/model</code> stages
+model and effort before applying either; <code>/effort</code> also adjusts the
+current session. Named levels persist except session-only max. Provider
+conversion sends effort independently of thinking mode. Tool inputs journal as
+objects and retain exact fractions, large integers and Unicode across legacy
+history and restart. Durable-history checks compare persisted values while
+retaining the byte-revision guard against concurrent edits. Opus 4.8 defaults
+to a 64K output cap and 5.5 to 128K, bounded by configured model capabilities.</p>
+
+<p><strong>Verification:</strong> <code>pty_cache_prefix</code> covers effort
+changes, cancelled selection, both renderer modes, compaction, restart and
+signed history. Its streamed tool arguments include whitespace observed on
+real providers. A real Sonnet 4.6 ConPTY journey reads a unique file, changes
+effort to max, recalls dependent results, then restarts with the saved low
+preference. Live cache acceptance additionally requires actual upstream usage
+through compaction and resume: the real Opus 4.8 eight-file journey completed
+12 requests, with positive cache reads on all 11 subsequent requests and the
+full expected cached prefix reused where history was unchanged. The Windows
+workspace suite passed 2,233 tests with 36 ignored when run serially; an earlier
+parallel run hit a skills-directory NotFound that passed in isolation.
+These protocol changes do not establish the
+original cause of the historical course output. Strict signature-prefix
+recovery and newer per-message effort remain separate follow-up work.</p>
+
 <h4>PTY test principles</h4>
 
 <ol>
@@ -2126,6 +2163,14 @@ mean inserting another instance's half-finished tool batch into a model request.
 This is source and documentation evidence; a dual-terminal run of installed CC
 remains a separate acceptance check.</p>
 
+<p><b>Default restore boundary · confirmed by the user.</b> A new runtime forks
+from the most recently completed turn. If A is still executing tools when B
+opens the SID, A keeps its in-flight turn and real results on A's branch; B
+continues the completed prefix. Opening B does not establish that A was
+interrupted and must not repair or consume A's unfinished calls. Selection
+follows committed history order. This is Sudo Code's selected restore boundary;
+the CCB evidence above establishes the record/ancestry pattern.</p>
+
 <p>The durable object and authorization contract lives in the
 <a href="docs/design/agent-context-storage-matrix.html#shared-session-context">storage matrix</a>.
 The <a href="https://s.shareone.vip/md/sudo-cloud-plan">cloud architecture</a>
@@ -2171,8 +2216,9 @@ Exercise cancellation, stale candidates, crash and restart.</td></tr>
 <tr><td>Tool recovery</td><td>Interrupted-call repair is a projection of the chosen
 context, and a durable repair targets that specific call. Opening another context
 does not establish that a live call in its sibling has ended.</td><td>Resume while
-the sibling tool is still running; receive its real result once and preserve its
-association. Recover an actually interrupted call without repeating its effects.</td></tr>
+the sibling tool is still running; A receives its real result once, while B
+continues the completed prefix without synthesizing a failure for A. Recover
+an actually interrupted call without repeating its effects.</td></tr>
 <tr><td>Completion delivery</td><td>Separate transcript append from completion
 ownership. The completion protocol binds active traces, context revisions,
 terminal sources, reservations and acknowledgements to the originating context.
