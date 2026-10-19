@@ -2333,9 +2333,20 @@ fn persistence_failure_preserves_original_transcript() {
     workspace.write_mock_config(&provider.url);
     let path = fixture(&workspace);
     let original = std::fs::read(&path).unwrap();
+    let source = Session::load_from_path(&path).unwrap();
     let _restore = RestorePermissions(workspace.root.clone());
     assert_ne!(compact(&workspace, &path, "history preserved"), 0);
-    assert_eq!(std::fs::read(&path).unwrap(), original);
+    // Failure/billing metadata may append to the existing log even when the
+    // directory refuses the archive needed for a context replacement.
+    assert!(std::fs::read(&path).unwrap().starts_with(&original));
+    let restored = Session::load_from_path(&path).unwrap();
+    assert_eq!(restored.messages(), source.messages());
+    assert_eq!(restored.compaction, source.compaction);
+    assert_eq!(
+        restored.last_compaction_report.as_ref().unwrap().outcome,
+        runtime::CompactionOutcome::Failed
+    );
+    assert_eq!(restored.maintenance_usage.len(), 1);
     assert_eq!(
         provider.requests.lock().unwrap().len(),
         1,
