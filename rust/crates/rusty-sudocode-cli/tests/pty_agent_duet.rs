@@ -329,8 +329,25 @@ fn run_duet(transport: &Transport, offline: bool) {
             inbox.read_position(&expected_from).unwrap().unwrap_or(0),
             initial_position
         );
-        let (stored, _) = inbox.poll_conversation(&expected_from, tail, 0).unwrap();
-        assert!(stored.iter().any(|message| message.from == expected_from));
+        // Append acknowledges Raft commit; the receiver's node can still be
+        // applying it. Use the existing delivery budget and blocking tail.
+        let (stored, _) = inbox
+            .poll_conversation(
+                &expected_from,
+                tail,
+                u64::try_from(BUDGET.as_millis()).unwrap(),
+            )
+            .unwrap();
+        assert!(
+            stored.iter().any(|message| message.from == expected_from),
+            "[{}] no durable envelope from {expected_from}: {stored:?}",
+            transport.label()
+        );
+        assert_eq!(
+            inbox.read_position(&expected_from).unwrap().unwrap_or(0),
+            initial_position,
+            "inspecting durable delivery must not acknowledge it for the offline receiver"
+        );
         receiver = Some(start_receiver());
     }
     let mut receiver = receiver.expect("receiver starts after durable delivery");
