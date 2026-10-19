@@ -6974,6 +6974,20 @@ async fn initialize_task_completions(client: &mut AcpTestClient) {
 #[tokio::test]
 async fn acp_shared_sid_scopes_background_results_and_protects_live_contexts() {
     let server = MockAnthropicService::spawn().await.unwrap();
+    // Resolve before isolate_env replaces Unix PATH with /usr/bin:/bin.
+    let node = std::process::Command::new("node")
+        .args(["-p", "process.execPath"])
+        .output()
+        .expect("Node.js is required for the terminal completion fixture");
+    assert!(node.status.success(), "{node:?}");
+    let node = String::from_utf8(node.stdout).expect("Node executable path is UTF-8");
+    let node = node.trim();
+    assert!(Path::new(node).is_absolute(), "{node}");
+    let node = if cfg!(windows) {
+        format!("& '{}'", node.replace('\'', "''"))
+    } else {
+        format!("'{}'", node.replace('\'', "'\"'\"'"))
+    };
     let workspace = TestWorkspace::new("shared-sid-completion-owners");
     workspace.create();
     workspace.write_sudocode_json(&server.base_url());
@@ -7056,7 +7070,7 @@ const timer = setInterval(() => {
         };
         let shell = if cfg!(windows) { "PowerShell" } else { "Bash" };
         let calls = json!([{"id":"call_1","name":shell,"input":{
-            "command":format!("node completion-gate.cjs {label}"),"run_in_background":true
+            "command":format!("{node} completion-gate.cjs {label}"),"run_in_background":true
         }}]);
         let (events, response) = client
             .send_request(
@@ -7068,9 +7082,12 @@ const timer = setInterval(() => {
             )
             .await;
         assert_eq!(response["result"]["stopReason"], "end_turn", "{response}");
-        assert!(events
-            .iter()
-            .all(|event| event["method"] != "_sudocode/task/completed"));
+        assert!(
+            events
+                .iter()
+                .all(|event| event["method"] != "_sudocode/task/completed"),
+            "{label} completed before its release gate: {events:?}"
+        );
         timeout(Duration::from_secs(10), async {
             while !workspace.root.join(format!("{label}.ready")).exists() {
                 tokio::time::sleep(Duration::from_millis(10)).await;
