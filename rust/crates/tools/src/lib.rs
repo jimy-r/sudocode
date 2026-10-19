@@ -2319,7 +2319,6 @@ pub fn collect_agent_list(
     fs: &dyn FsBackend,
 ) -> Result<Vec<AgentListRow>, String> {
     let directory = runtime::mailbox::scoped_directory();
-    let self_name = directory.self_id().to_string();
     // Surface an enumeration failure instead of swallowing it: `list_recipients`
     // returns `Err` precisely so "I could not read a namespace" stays distinct
     // from "no one is there". Across every namespace the session is attached to,
@@ -2336,7 +2335,6 @@ pub fn collect_agent_list(
         .collect();
     Ok(merge_agent_list(
         &peers,
-        &self_name,
         subagents,
         &active_tasks,
         active_only,
@@ -2345,12 +2343,10 @@ pub fn collect_agent_list(
 
 /// Pure core of [`collect_agent_list`], sources injected so it is testable
 /// without a real backend. `peers` are addressable recipients from the
-/// directory (each tagged with the namespaces it was found in); `self_name` is
-/// filtered out (an agent is not its own peer); `subagents` are already-filtered
-/// running snapshots.
+/// directory, which owns namespace identities and excludes self per namespace.
+/// `subagents` are saved snapshots; `active_tasks` supplies runtime evidence.
 pub fn merge_agent_list(
     peers: &[runtime::directory::Recipient],
-    self_name: &str,
     subagents: Vec<AgentSnapshot>,
     active_tasks: &std::collections::BTreeSet<String>,
     active_only: bool,
@@ -2362,8 +2358,8 @@ pub fn merge_agent_list(
     // knowable from the namespace alone (a remote backend does not report it),
     // so `active` is left `None` — the row is addressable, not "running".
     for recipient in peers {
-        if recipient.name == self_name || recipient.name.is_empty() {
-            continue; // an agent is not its own peer
+        if recipient.name.is_empty() {
+            continue;
         }
         for source in &recipient.sources {
             let send_to = format!("{source}:{}", recipient.name);
@@ -10333,10 +10329,6 @@ mod tests {
                 name: "bob".to_string(),
                 sources: vec!["nexus"],
             },
-            Recipient {
-                name: "me".to_string(),
-                sources: vec!["local"],
-            }, // self — filtered out
         ];
 
         // one running sub-agent (own name, distinct from peers)
@@ -10351,11 +10343,10 @@ mod tests {
         }];
 
         let active_tasks = std::collections::BTreeSet::from(["pid-123".to_string()]);
-        let rows = super::merge_agent_list(&peers, "me", subagents, &active_tasks, false);
+        let rows = super::merge_agent_list(&peers, subagents, &active_tasks, false);
         let by: std::collections::BTreeMap<_, _> =
             rows.iter().map(|r| (r.name.as_str(), r)).collect();
 
-        assert!(!by.contains_key("me"), "self is not its own peer");
         // A peer is addressable; liveness is unknown from the namespace → None.
         assert_eq!(by["alice"].active, None, "peer liveness unknown");
         assert_eq!(by["alice"].kind, "peer");
@@ -10377,7 +10368,7 @@ mod tests {
         assert_eq!(by["researcher"].role.as_deref(), Some("Explore"));
 
         // active_only keeps only positively-running rows (not unknown peers).
-        let active = super::merge_agent_list(&peers, "me", Vec::new(), &active_tasks, true);
+        let active = super::merge_agent_list(&peers, Vec::new(), &active_tasks, true);
         assert!(active.iter().all(|r| r.active == Some(true)));
         assert!(
             !active.iter().any(|r| r.name == "alice"),

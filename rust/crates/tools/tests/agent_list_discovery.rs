@@ -159,6 +159,7 @@ fn copied_addresses_preserve_same_name_peers_and_tasks_and_fail_closed() {
     assert_eq!(std::fs::read(&transcript).unwrap(), before);
 
     assert_manifest_errors_preserve_destination(&store, &local_root, &local);
+    assert_self_identity_is_scoped_to_its_namespace(&local_root, &nexus);
 
     let bad_root = root.join("unreadable");
     std::fs::create_dir_all(&bad_root).unwrap();
@@ -183,6 +184,27 @@ fn copied_addresses_preserve_same_name_peers_and_tasks_and_fail_closed() {
     assert_eq!(std::fs::read(&transcript).unwrap(), before);
     std::env::remove_var("SUDOCODE_AGENT_STORE");
     std::fs::remove_dir_all(root).unwrap();
+}
+
+fn assert_self_identity_is_scoped_to_its_namespace(
+    local_root: &std::path::Path,
+    nexus: &Arc<Mailbox>,
+) {
+    let _scope = MailboxScope::enter(Arc::new(Directory::new(vec![
+        Member {
+            label: "local",
+            mailbox: Arc::new(Mailbox::workspace_local(local_root, "alice".into())),
+        },
+        Member {
+            label: "nexus",
+            mailbox: Arc::clone(nexus),
+        },
+    ])));
+    let listing: Value =
+        serde_json::from_str(&tools::execute_tool("agent_list", &json!({})).unwrap()).unwrap();
+    let rows = listing["agents"].as_array().unwrap();
+    assert!(!rows.iter().any(|row| row["send_to"] == "local:alice"));
+    assert!(rows.iter().any(|row| row["send_to"] == "nexus:alice"));
 }
 
 fn assert_discovered_address_routes(row: &Value) {
