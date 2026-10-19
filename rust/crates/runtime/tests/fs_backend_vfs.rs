@@ -375,6 +375,7 @@ fn dt_stream_append_frames_read_back_deframed() {
     );
 
     fs.append(path, b"{\"a\":1}\n").unwrap();
+    fs.append(path, b"").unwrap();
     fs.append(path, b"{\"b\":2}\n").unwrap();
     assert_eq!(
         fs.read(path).unwrap(),

@@ -255,4 +255,8 @@ NEXUS_A2A_TEST_ENDPOINT="$ENDPOINT" NEXUS_A2A_TEST_CERT_DIR="$RESUME_CLIENT_BUND
   NEXUS_A2A_TEST_REPLY_TO="$OPERATOR" NEXUS_A2A_TEST_MODEL="$MODEL" \
   "${CARGO_TEST[@]}" live_cohost_session_resume -- --ignored --nocapture
 
+echo "== 9. filesystem stream reads preserve every committed frame =="
+NEXUS_A2A_TEST_ENDPOINT="$ENDPOINT" NEXUS_A2A_TEST_CERT_DIR="$CLIENT_BUNDLE" \
+  "${CARGO_TEST[@]}" live_filesystem_stream_read_and_append_preserve_all_frames -- --ignored --nocapture
+
 echo "COHOST E2E OK"

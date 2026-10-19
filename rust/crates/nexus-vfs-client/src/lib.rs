@@ -18,6 +18,13 @@ pub struct StreamReadResult {
     pub timed_out: bool,
 }
 
+/// One typed read, including the resolved entry type and stream continuation.
+pub struct VfsReadResult {
+    pub data: Vec<u8>,
+    pub entry_type: i32,
+    pub next_offset: Option<u64>,
+}
+
 /// DT_STREAM entry-type code (mirrors the kernel `entry_type`), passed to
 /// `Setattr` when provisioning a mailbox DT_STREAM.
 const DT_STREAM: i32 = 4;
@@ -52,7 +59,8 @@ enum VfsOp {
     Read {
         path: String,
         auth_token: String,
-        resp: mpsc::SyncSender<io::Result<Vec<u8>>>,
+        offset: u64,
+        resp: mpsc::SyncSender<io::Result<VfsReadResult>>,
     },
     Write {
         path: String,
@@ -272,6 +280,7 @@ impl NexusVfsClient {
                                 VfsOp::Read {
                                     path,
                                     auth_token,
+                                    offset,
                                     resp,
                                 } => {
                                     let r = client
@@ -281,7 +290,7 @@ impl NexusVfsClient {
                                                 auth_token,
                                                 content_id: String::new(),
                                                 timeout_ms: 0,
-                                                offset: 0,
+                                                offset,
                                             },
                                             OP_DEADLINE,
                                         ))
@@ -290,7 +299,11 @@ impl NexusVfsClient {
                                         if r.is_error {
                                             Err(vfs_err(&r.error_payload))
                                         } else {
-                                            Ok(r.content)
+                                            Ok(VfsReadResult {
+                                                data: r.content,
+                                                entry_type: r.entry_type,
+                                                next_offset: r.stream_next_offset,
+                                            })
                                         }
                                     }));
                                 }
@@ -514,11 +527,24 @@ impl NexusVfsClient {
     }
 
     pub fn read(&self, path: &str, auth_token: &str) -> io::Result<Vec<u8>> {
+        self.read_entry(path, 0, auth_token)
+            .map(|result| result.data)
+    }
+
+    /// Read one entry payload at a byte cursor using the existing Read RPC.
+    /// Streams return one deframed payload and its continuation cursor.
+    pub fn read_entry(
+        &self,
+        path: &str,
+        offset: u64,
+        auth_token: &str,
+    ) -> io::Result<VfsReadResult> {
         let (resp_tx, resp_rx) = mpsc::sync_channel(1);
         self.tx
             .send(VfsOp::Read {
                 path: path.to_owned(),
                 auth_token: auth_token.to_owned(),
+                offset,
                 resp: resp_tx,
             })
             .map_err(|_| broken_pipe())?;

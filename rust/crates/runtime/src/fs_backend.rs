@@ -1152,26 +1152,39 @@ impl<K: KernelConvenience + KernelFsAccess> KernelFsBackend<K> {
     /// fetched transparently by the kernel. Non-blocking (`timeout_ms = 0`):
     /// the walk stops at the tail rather than parking for new data.
     fn read_stream_all(&self, path: &str) -> io::Result<Vec<u8>> {
-        let mut out = Vec::new();
-        let mut offset: u64 = 0;
-        loop {
+        read_framed_contents(|offset| {
             let result = self
                 .kernel
                 .sys_read(path, &self.ctx, 0, offset)
                 .map_err(kernel_err)?;
-            match result.data {
-                Some(payload) if !payload.is_empty() => {
-                    out.extend_from_slice(&payload);
-                    match result.stream_next_offset {
-                        Some(next) if next as u64 > offset => offset = next as u64,
-                        // No forward progress (tail reached / unknown) — stop.
-                        _ => break,
-                    }
-                }
-                _ => break,
-            }
+            Ok((
+                result.data.unwrap_or_default(),
+                result.stream_next_offset.map_or(offset, |next| next as u64),
+            ))
+        })
+    }
+}
+
+/// Concatenate frame payloads through the live tail using each transport's
+/// offset read. Empty frames advance; a nonempty frame must advance too.
+fn read_framed_contents(
+    mut read: impl FnMut(u64) -> io::Result<(Vec<u8>, u64)>,
+) -> io::Result<Vec<u8>> {
+    let mut contents = Vec::new();
+    let mut offset = 0;
+    loop {
+        let (payload, next) = read(offset)?;
+        if payload.is_empty() && next == offset {
+            return Ok(contents);
         }
-        Ok(out)
+        if next <= offset {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "stream read did not advance its cursor",
+            ));
+        }
+        contents.extend_from_slice(&payload);
+        offset = next;
     }
 }
 
@@ -1741,7 +1754,24 @@ impl FsBackend for NexusVfsFsBackend {
         })))
     }
     fn read(&self, path: &str) -> io::Result<Vec<u8>> {
-        self.client.read(path, &self.auth_token)
+        let first = self.client.read_entry(path, 0, &self.auth_token)?;
+        if first.entry_type != i32::from(DT_STREAM) {
+            return Ok(first.data);
+        }
+        let mut first = Some(first);
+        read_framed_contents(|offset| {
+            let result = match first.take() {
+                Some(first) => first,
+                None => self.client.read_entry(path, offset, &self.auth_token)?,
+            };
+            if result.entry_type != i32::from(DT_STREAM) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "stream entry type changed during read",
+                ));
+            }
+            Ok((result.data, result.next_offset.unwrap_or(offset)))
+        })
     }
 
     fn write(&self, path: &str, data: &[u8]) -> io::Result<()> {
@@ -1749,15 +1779,8 @@ impl FsBackend for NexusVfsFsBackend {
     }
 
     fn append(&self, path: &str, data: &[u8]) -> io::Result<()> {
-        // Ask the predicate rather than restating it. This branch spelled
-        // spelled the mailbox leaf on its own, so when the mailbox moved
-        // to `…/transcript` it quietly took the read-modify-write path below:
-        // every append re-read the stream through `read` (which yields its FIRST
-        // frame), concatenated the new envelope onto that, and wrote the pair
-        // back as a single frame. Two JSON objects in one frame parse as
-        // neither, so every message after the first became unreadable — sends
-        // reporting success, a receiver seeing nothing, and only a real daemon
-        // able to show it.
+        // Stream identity comes from the server's entry type and uses its
+        // atomic frame append. Ordinary files retain their byte append path.
         if self.is_append_stream(path)? {
             self.client
                 .stream_write(path, data.to_vec(), &self.auth_token)
@@ -1780,7 +1803,11 @@ impl FsBackend for NexusVfsFsBackend {
     }
 
     fn is_append_stream(&self, path: &str) -> io::Result<bool> {
-        Ok(crate::mailbox::is_conversation_transcript_path(path))
+        match self.client.stat(path, &self.auth_token) {
+            Ok(stat) => Ok(stat.entry_type == i32::from(DT_STREAM)),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(error),
+        }
     }
 
     fn delete(&self, path: &str) -> io::Result<()> {

@@ -145,6 +145,55 @@ fn fresh() -> u64 {
 
 #[test]
 #[ignore = "requires a running nexusd-cluster; set NEXUS_A2A_TEST_ENDPOINT"]
+fn live_filesystem_stream_read_and_append_preserve_all_frames() {
+    use runtime::fs_backend::NexusVfsFsBackend;
+    use runtime::FsBackend;
+
+    let endpoint = std::env::var("NEXUS_A2A_TEST_ENDPOINT").unwrap();
+    let auth = std::env::var("NEXUS_API_KEY").unwrap_or_default();
+    let client = dial(&endpoint);
+    let fs = NexusVfsFsBackend::from_arc(Arc::clone(&client), auth);
+    let path = format!("/sessions/vfs-probe-{}/transcript.jsonl", fresh());
+    fs.create_append_log(&path, 0).unwrap();
+    assert!(fs.is_append_stream(&path).unwrap());
+    assert!(!fs.is_append_stream(&format!("{path}.missing")).unwrap());
+    assert!(fs.read(&path).unwrap().is_empty());
+
+    let mut expected = Vec::new();
+    let large_frame = vec![b'x'; 128 * 1024];
+    for payload in [b"first\n".as_slice(), b"", &large_frame, b"last\n"] {
+        fs.append(&path, payload).unwrap();
+        expected.extend_from_slice(payload);
+    }
+    // A write can return before Raft applies it. Wait for the exact complete
+    // content and verify every intermediate read preserves the committed prefix.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let actual = fs.read(&path).unwrap();
+        assert!(expected.starts_with(&actual), "stream content changed");
+        if actual == expected {
+            break;
+        }
+        assert!(Instant::now() < deadline, "stream read lost later frames");
+        thread::sleep(Duration::from_millis(10));
+    }
+
+    let ordinary = format!("/conversations/vfs-probe-{}/transcript", fresh());
+    fs.write(&ordinary, b"ordinary ").unwrap();
+    assert!(!fs.is_append_stream(&ordinary).unwrap());
+    fs.append(&ordinary, b"file").unwrap();
+    assert_eq!(fs.read(&ordinary).unwrap(), b"ordinary file");
+
+    // The server remains authoritative if the entry changes type at this path.
+    fs.delete(&path).unwrap();
+    fs.write(&path, b"replacement").unwrap();
+    assert!(!fs.is_append_stream(&path).unwrap());
+    fs.append(&path, b" bytes").unwrap();
+    assert_eq!(fs.read(&path).unwrap(), b"replacement bytes");
+}
+
+#[test]
+#[ignore = "requires a running nexusd-cluster; set NEXUS_A2A_TEST_ENDPOINT"]
 fn live_inbox_roundtrip() {
     let endpoint =
         std::env::var("NEXUS_A2A_TEST_ENDPOINT").expect("set NEXUS_A2A_TEST_ENDPOINT=host:port");
