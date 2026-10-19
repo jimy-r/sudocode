@@ -9,6 +9,8 @@ mod nexus_transport;
 pub use nexus_transport::ModelAccess;
 mod prompt_cache;
 mod providers;
+mod recorded_response;
+pub use recorded_response::{flush_response_captures, RecordedResponse};
 mod request_scope;
 mod sse;
 mod stream_collect;

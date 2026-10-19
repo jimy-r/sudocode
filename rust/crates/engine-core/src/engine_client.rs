@@ -58,7 +58,29 @@ pub struct EngineApiClient {
     catalog: Option<runtime::model_discovery::ModelCatalog>,
 }
 
+impl Drop for EngineApiClient {
+    fn drop(&mut self) {
+        // Covers every host, including runtimes taken out of BuiltRuntime.
+        if !api::flush_response_captures(&self.session_id, Duration::from_secs(2)) {
+            if let Some(tracer) = self.session_tracer() {
+                tracer.record("response_capture_shutdown_timeout", serde_json::Map::new());
+            }
+        }
+    }
+}
+
 impl EngineApiClient {
+    #[must_use]
+    pub fn with_response_archive(mut self, archive: Arc<dyn telemetry::ResponseArchive>) -> Self {
+        if let Some(tracer) = self.client.session_tracer().cloned() {
+            self.client = self
+                .client
+                .clone()
+                .with_session_tracer(tracer.with_response_archive(archive));
+        }
+        self
+    }
+
     /// Identity every request from this client carries, built in one place so
     /// the main loop and the subagent client cannot disagree about the routing
     /// key — a conversation split across two keys is split across two upstream
