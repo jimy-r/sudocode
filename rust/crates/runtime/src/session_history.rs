@@ -287,6 +287,33 @@ pub(super) struct HistoryReplay {
 }
 
 impl HistoryReplay {
+    fn legacy_append(
+        &self,
+        session_id: &str,
+        line_number: usize,
+        message: ConversationMessage,
+    ) -> Result<ConversationMessage, String> {
+        // An older external writer can append an unversioned message after
+        // migration. Bind it to this physical prefix with a reproducible ID;
+        // repeated payloads and repeated restores must not alias each other.
+        let mut digest = Sha256::new();
+        digest.update(b"sudocode-legacy-tail-v1\0");
+        digest.update(session_id.as_bytes());
+        digest.update((line_number as u64).to_be_bytes());
+        digest.update(message.to_json().render().as_bytes());
+        let id = format!("legacy-tail-{:x}", digest.finalize());
+        let mut messages = self.project(self.head.as_deref())?.messages;
+        messages.push(message);
+        // Reuse the legacy interpreter's tool-origin association. This cold
+        // compatibility path does not run for identified or v3 records.
+        identify_legacy(session_id, &mut messages);
+        let mut message = messages.pop().expect("legacy append was inserted");
+        let identity = Arc::make_mut(message.history.as_mut().expect("legacy identity assigned"));
+        identity.id = id;
+        identity.parent_id.clone_from(&self.head);
+        Ok(message)
+    }
+
     fn insert(
         &mut self,
         message: ConversationMessage,
@@ -562,11 +589,24 @@ fn parse(contents: &str) -> Result<HistoryReplay, crate::SessionError> {
         match object.get("type").and_then(JsonValue::as_str) {
             Some("history_checkpoint") => replay_checkpoint(&mut replay, object, &mut session_id)?,
             Some("message") => {
-                let message = ConversationMessage::from_json(
+                let mut message = ConversationMessage::from_json(
                     object
                         .get("message")
                         .ok_or_else(|| SessionError::Format("message payload missing".into()))?,
                 )?;
+                if message.history.is_none() {
+                    message = replay
+                        .legacy_append(
+                            session_id.as_deref().ok_or_else(|| {
+                                SessionError::Format(
+                                    "legacy append session identity missing".into(),
+                                )
+                            })?,
+                            line_number,
+                            message,
+                        )
+                        .map_err(SessionError::Format)?;
+                }
                 replay
                     .insert(message, object.get("prompt_snapshot").cloned())
                     .map_err(SessionError::Format)?;

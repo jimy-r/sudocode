@@ -788,6 +788,10 @@ fn thinking_repair_preserves_a_concurrent_transcript_append() {
     let session = Session::load_from_path(&path).unwrap();
     assert!(session.messages().iter().flat_map(|message| &message.blocks).any(|block|
         matches!(block,ContentBlock::Thinking {signature:Some(signature),..} if signature == "signed-prefix-0")));
+    assert!(session.messages().iter().flat_map(|message| &message.blocks).any(|block|
+        matches!(block,ContentBlock::Text {text} if text == "EXTERNAL_APPEND_MUST_SURVIVE")));
+    let restored = Session::load_from_path(&path).unwrap();
+    assert_eq!(session.messages(), restored.messages());
     drop(cli);
 }
 

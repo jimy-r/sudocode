@@ -908,7 +908,10 @@ impl Session {
             .ok_or_else(|| SessionError::Format("shared history missing".into()))?;
         crate::session_history::replay(
             shared,
-            crate::session_history::Selection::Head(head.as_deref()),
+            // Legacy writers retain exclusive admission, so maintenance must
+            // also notice an uncoordinated older client's latest append.
+            // Only v3 above has independent committed runtime contexts.
+            crate::session_history::Selection::Latest,
         )
     }
 
