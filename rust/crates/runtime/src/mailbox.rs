@@ -347,15 +347,14 @@ impl Mailbox {
     /// Whether the backend frames appends at `path` itself (a DT_STREAM record
     /// per append) rather than leaving framing to us (a JSONL line per append).
     ///
-    /// Asked per call, deliberately — do NOT cache it on the struct. For
-    /// `KernelFsBackend` this is a real `sys_stat`, so the answer CHANGES the
-    /// moment [`Self::ensure_conversation`] creates the stream: resolved once at
-    /// construction it would be `false` forever, and a provisioned DT_STREAM
-    /// inbox would be written and read as JSONL. The call is cheap — a string
-    /// test for the VFS backend, a constant `false` for the file one.
+    /// Classification comes from the backend's current entry type. Errors
+    /// propagate to the caller. Polling obtains data and its cursor directly
+    /// through `tail_read` within that operation's wait budget.
     #[inline]
-    fn backend_frames(&self, path: &str) -> bool {
-        self.backend.is_append_stream(path).unwrap_or(false)
+    fn backend_frames(&self, path: &str) -> Result<bool, String> {
+        self.backend
+            .is_append_stream(path)
+            .map_err(|error| format!("classify mailbox {path}: {error}"))
     }
 
     /// A nexus A2A mailbox for `agent` over an already-dialled client.
@@ -596,7 +595,7 @@ impl Mailbox {
         // success.
         self.ensure_provisioned(&envelope.to)?;
 
-        if self.backend_frames(&path) {
+        if self.backend_frames(&path)? {
             return self
                 .backend
                 .append(&path, &envelope.to_bytes())
@@ -655,21 +654,16 @@ impl Mailbox {
         block_ms: u64,
     ) -> Result<(Vec<MailboxEnvelope>, u64), String> {
         let path = self.transcript_path(peer);
-        let is_stream = self.backend_frames(&path);
-        let (mut messages, next) = if is_stream {
-            self.poll_stream(&path, cursor, block_ms)
-        } else {
-            self.poll_jsonl(&path, cursor, block_ms)
-        }?;
+        let (mut messages, next) = self.poll_tail(&path, cursor, block_ms)?;
         // Session control has its own generation-aware codec and consumer.
         // All peer consumers skip those frames while advancing past them.
         messages.retain(|message| message.kind != a2a::session::SESSION_KIND);
         Ok((messages, next))
     }
 
-    /// DT_STREAM: one frame per `tail_read`, drain burst non-blocking
-    /// after the first blocking read (same pattern as `nexus_mailbox::poll_new`).
-    fn poll_stream(
+    /// Drain backend-owned chunks without a separate type lookup. A chunk is
+    /// either a complete envelope frame or a batch of JSONL envelope records.
+    fn poll_tail(
         &self,
         path: &str,
         mut cursor: u64,
@@ -687,7 +681,11 @@ impl Mailbox {
             if eof {
                 break;
             }
-            if let Some(env) = MailboxEnvelope::from_bytes(&data) {
+            let envelopes = MailboxEnvelope::from_bytes(&data).map_or_else(
+                || crate::agent_mailbox::parse_envelope_lines(&data),
+                |envelope| vec![envelope],
+            );
+            for env in envelopes {
                 if !env.from.is_empty() && env.from != self.self_id && !env.body.is_empty() {
                     out.push(env);
                 }
@@ -700,45 +698,13 @@ impl Mailbox {
         Ok((out, cursor))
     }
 
-    /// JSONL: `tail_read` returns raw bytes, split by newline.
-    fn poll_jsonl(
-        &self,
-        path: &str,
-        cursor: u64,
-        block_ms: u64,
-    ) -> Result<(Vec<MailboxEnvelope>, u64), String> {
-        let (data, next, _eof) = self
-            .backend
-            .tail_read(path, cursor, block_ms)
-            .map_err(|e| format!("mailbox poll {path}@{cursor}: {e}"))?;
-        if data.is_empty() {
-            return Ok((vec![], next));
-        }
-        let text = String::from_utf8_lossy(&data);
-        let out: Vec<MailboxEnvelope> = text
-            .lines()
-            .filter_map(|line| {
-                let trimmed = line.trim();
-                if trimmed.is_empty() {
-                    return None;
-                }
-                let env = MailboxEnvelope::from_bytes(trimmed.as_bytes())?;
-                if env.from.is_empty() || env.from == self.self_id || env.body.is_empty() {
-                    return None;
-                }
-                Some(env)
-            })
-            .collect();
-        Ok((out, next))
-    }
-
     /// Read the whole conversation with `peer` (batch read). Primarily for the
     /// coordinator's multi-turn loop, which drains between turns.
     pub fn read_conversation(&self, peer: &str) -> Result<Vec<MailboxEnvelope>, String> {
         let path = self.transcript_path(peer);
-        let is_stream = self.backend_frames(&path);
+        let is_stream = self.backend_frames(&path)?;
         if is_stream {
-            let (envs, _cursor) = self.poll_stream(&path, 0, 0)?;
+            let (envs, _cursor) = self.poll_tail(&path, 0, 0)?;
             Ok(envs)
         } else {
             // Through the backend, for the same reason the write is: the
