@@ -566,7 +566,7 @@ fn effort_changes_preserve_signed_history_and_max_is_session_scoped() {
 
 #[test]
 fn tool_input_objects_and_legacy_strings_survive_cli_resume_without_number_loss() {
-    for legacy in [false, true] {
+    for (legacy, changed_input) in [(false, false), (true, false), (false, true)] {
         let env = TestEnv::new_mock("tool-input-history");
         let capture = Capture::new();
         let path = fixture(&env, &capture);
@@ -596,23 +596,60 @@ fn tool_input_objects_and_legacy_strings_survive_cli_resume_without_number_loss(
             .unwrap();
         session.save_to_path(&path).unwrap();
         drop(session);
-        if legacy {
+        if legacy || changed_input {
             let raw = std::fs::read_to_string(&path).unwrap();
-            let rewritten: Vec<String> = raw
+            let mut changed_message = None;
+            let mut rewritten: Vec<String> = raw
                 .lines()
                 .map(|line| {
                     let mut row: Value = serde_json::from_str(line).unwrap();
+                    let mut is_changed = false;
                     if let Some(blocks) = row["message"]["blocks"].as_array_mut() {
                         for block in blocks {
                             if block["id"] == "history-input" {
-                                block["input"] = json!(raw_input);
+                                block["input"] = if changed_input {
+                                    is_changed = true;
+                                    let mut changed = input.clone();
+                                    changed["fraction"] = json!(0.75);
+                                    changed
+                                } else {
+                                    json!(raw_input)
+                                };
                             }
                         }
                     }
-                    row.to_string()
+                    if is_changed {
+                        changed_message = Some(row["message"].clone());
+                        line.to_owned()
+                    } else {
+                        row.to_string()
+                    }
                 })
                 .collect();
+            if changed_input {
+                let mut checkpoint = rewritten
+                    .iter()
+                    .rev()
+                    .find_map(|line| {
+                        let row: Value = serde_json::from_str(line).unwrap();
+                        (row["type"] == "history_checkpoint").then_some(row)
+                    })
+                    .unwrap();
+                checkpoint["parent_id"] = checkpoint["id"].clone();
+                checkpoint["id"] = json!("changed-input-checkpoint");
+                checkpoint["messages"] = json!([changed_message.expect("stored tool message")]);
+                rewritten.push(checkpoint.to_string());
+            }
             std::fs::write(&path, rewritten.join("\n") + "\n").unwrap();
+        }
+        if changed_input {
+            let mut cli = env.spawn(&["--resume", path.to_str().unwrap()]);
+            cli.set_default_timeout(WAIT);
+            cli.expect("checkpoint changes an existing message")
+                .unwrap();
+            cli.expect_eof().unwrap();
+            assert!(capture.bodies().is_empty());
+            continue;
         }
         let mut cli = spawn(&env, &path);
         turn(&mut cli, "Continue from the stored sample.");

@@ -332,7 +332,11 @@ impl HistoryReplay {
                 .as_ref()
                 .ok_or("checkpoint message identity missing")?;
             if let Some(existing) = self.nodes.get(&identity.id) {
-                if !matches!(existing, HistoryNode::Message { message: previous, .. } if previous == &message)
+                // Legacy tool inputs may store either a JSON object or its
+                // encoded string, including different Unicode escapes. The
+                // persisted representation owns their canonical meaning.
+                if !matches!(existing, HistoryNode::Message { message: previous, .. }
+                    if previous == &message || previous.to_json() == message.to_json())
                 {
                     return Err(
                         "checkpoint changes an existing message; append an update instead".into(),

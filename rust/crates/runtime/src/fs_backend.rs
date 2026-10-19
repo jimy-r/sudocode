@@ -1874,6 +1874,13 @@ impl FsBackend for NexusVfsFsBackend {
     }
 
     fn is_append_stream(&self, path: &str) -> io::Result<bool> {
+        // A2A owns its canonical transcript namespace and mandates stream
+        // framing, including before creation. Preserve that shared contract
+        // without a metadata round trip before every bounded mailbox poll.
+        // Other paths, including session WALs, require actual entry metadata.
+        if crate::mailbox::is_conversation_transcript_path(path) {
+            return Ok(true);
+        }
         match self.client.stat(path, &self.auth_token) {
             Ok(stat) => Ok(stat.entry_type == i32::from(DT_STREAM)),
             Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
