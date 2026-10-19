@@ -115,15 +115,15 @@ NEXUS_A2A_TEST_ENDPOINT="$ENDPOINT" NEXUS_A2A_TEST_CERT_DIR="$CLIENT_BUNDLE" \
   "${CARGO_TEST[@]}" live_inbox_roundtrip -- --ignored --nocapture
 
 echo "== [deterministic] independent clients commit complete durable WAL records =="
-RECORD_TEST=(cargo test --manifest-path "$RUST_DIR/Cargo.toml" -q -p runtime --test fs_record_log)
+RECORD_TEST=(cargo_in_workspace test --manifest-path "$RUST_DIR/Cargo.toml" -q -p runtime --test fs_record_log)
 RECORD_RECEIPT="$AUTHON_DATA_DIR/record-log.json"
 NEXUS_A2A_TEST_ENDPOINT="$ENDPOINT" NEXUS_A2A_TEST_CERT_DIR="$CLIENT_BUNDLE" \
   NEXUS_RECORD_LOG_RECEIPT="$(native_path "$RECORD_RECEIPT")" \
   "${RECORD_TEST[@]}" live_record_log_commits_large_frames_from_independent_clients -- --ignored --nocapture
 
 echo "== [deterministic] runtime resume inherits the written prefix while a native tool runs =="
-cargo test --manifest-path "$RUST_DIR/Cargo.toml" -q -p runtime --test shared_runtime_history -- --nocapture
-HISTORY_TEST=(cargo test --manifest-path "$RUST_DIR/Cargo.toml" -q -p runtime --test shared_history_records)
+cargo_in_workspace test --manifest-path "$RUST_DIR/Cargo.toml" -q -p runtime --test shared_runtime_history -- --nocapture
+HISTORY_TEST=(cargo_in_workspace test --manifest-path "$RUST_DIR/Cargo.toml" -q -p runtime --test shared_history_records)
 HISTORY_RECEIPT="$AUTHON_DATA_DIR/shared-history.json"
 NEXUS_A2A_TEST_ENDPOINT="$ENDPOINT" NEXUS_A2A_TEST_CERT_DIR="$CLIENT_BUNDLE" \
   NEXUS_HISTORY_RECEIPT="$(native_path "$HISTORY_RECEIPT")" \
@@ -132,7 +132,7 @@ NEXUS_A2A_TEST_ENDPOINT="$ENDPOINT" NEXUS_A2A_TEST_CERT_DIR="$CLIENT_BUNDLE" \
 RUNTIME_HISTORY_RECEIPT="$AUTHON_DATA_DIR/runtime-history.json"
 NEXUS_A2A_TEST_ENDPOINT="$ENDPOINT" NEXUS_A2A_TEST_CERT_DIR="$CLIENT_BUNDLE" \
   NEXUS_RUNTIME_HISTORY_RECEIPT="$(native_path "$RUNTIME_HISTORY_RECEIPT")" \
-  cargo test --manifest-path "$RUST_DIR/Cargo.toml" -q -p runtime --test shared_runtime_history \
+  cargo_in_workspace test --manifest-path "$RUST_DIR/Cargo.toml" -q -p runtime --test shared_runtime_history \
     live_runtime_resume_inherits_written_prefix_and_keeps_native_tool_result -- --ignored --nocapture
 
 if [ "$(uname -s)" = Linux ]; then
@@ -155,7 +155,7 @@ NEXUS_A2A_TEST_ENDPOINT="$ENDPOINT" NEXUS_A2A_TEST_CERT_DIR="$CLIENT_BUNDLE" \
 
 NEXUS_A2A_TEST_ENDPOINT="$ENDPOINT" NEXUS_A2A_TEST_CERT_DIR="$CLIENT_BUNDLE" \
   NEXUS_RUNTIME_HISTORY_RECEIPT="$(native_path "$RUNTIME_HISTORY_RECEIPT")" \
-  cargo test --manifest-path "$RUST_DIR/Cargo.toml" -q -p runtime --test shared_runtime_history \
+  cargo_in_workspace test --manifest-path "$RUST_DIR/Cargo.toml" -q -p runtime --test shared_runtime_history \
     live_runtime_history_restores_both_branches_after_daemon_restart -- --ignored --nocapture
 
 # /agents and /sessions are mounted from one zone; a router that drops the mount
