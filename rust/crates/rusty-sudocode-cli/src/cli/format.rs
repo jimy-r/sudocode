@@ -71,6 +71,9 @@ pub(crate) fn render_message(
     renderer: &crate::render::TerminalRenderer,
     tool_inputs: &mut ToolInputRegistry,
 ) -> Option<String> {
+    if msg.is_unanswered_turn_boundary() {
+        return None;
+    }
     let mut out = String::new();
 
     match msg.role {
