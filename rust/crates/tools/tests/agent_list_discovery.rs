@@ -139,31 +139,7 @@ fn copied_addresses_preserve_same_name_peers_and_tasks_and_fail_closed() {
         "same-name peers and tasks must remain distinct"
     );
     for row in rows {
-        assert_eq!(row["name"], "alice");
-        assert!(row.get("pid").is_none(), "a task ID is not an OS PID");
-        let address = row["send_to"].as_str().unwrap();
-        if row["kind"] == "peer" {
-            assert!(row.get("active").is_none());
-            tools::execute_tool(
-                "send",
-                &json!({
-                    "to": address, "message": address, "summary": "address roundtrip",
-                }),
-            )
-            .unwrap();
-        } else {
-            assert_eq!(row["kind"], "subagent");
-            assert_eq!(row["task_id"], address);
-            assert_eq!(row["active"], false, "a manifest cannot prove liveness");
-            let error = tools::execute_tool(
-                "send",
-                &json!({
-                    "to": address, "message": "must not deliver", "summary": "stale task",
-                }),
-            )
-            .unwrap_err();
-            assert!(error.contains("no active runtime"), "{error}");
-        }
+        assert_discovered_address_routes(row);
     }
     for (peer, address) in [(&local_peer, "local:alice"), (&nexus_peer, "nexus:alice")] {
         let (messages, _) = peer.poll_conversation("me", 0, 0).unwrap();
@@ -181,6 +157,8 @@ fn copied_addresses_preserve_same_name_peers_and_tasks_and_fail_closed() {
     .unwrap_err();
     assert!(error.contains("not attached"), "{error}");
     assert_eq!(std::fs::read(&transcript).unwrap(), before);
+
+    assert_manifest_errors_preserve_destination(&store, &local_root, &local);
 
     let bad_root = root.join("unreadable");
     std::fs::create_dir_all(&bad_root).unwrap();
@@ -205,6 +183,68 @@ fn copied_addresses_preserve_same_name_peers_and_tasks_and_fail_closed() {
     assert_eq!(std::fs::read(&transcript).unwrap(), before);
     std::env::remove_var("SUDOCODE_AGENT_STORE");
     std::fs::remove_dir_all(root).unwrap();
+}
+
+fn assert_discovered_address_routes(row: &Value) {
+    assert_eq!(row["name"], "alice");
+    assert!(row.get("pid").is_none(), "a task ID is not an OS PID");
+    let address = row["send_to"].as_str().unwrap();
+    if row["kind"] == "peer" {
+        assert!(row.get("active").is_none());
+        tools::execute_tool(
+            "send",
+            &json!({
+                "to": address, "message": address, "summary": "address roundtrip",
+            }),
+        )
+        .unwrap();
+    } else {
+        assert_eq!(row["kind"], "subagent");
+        assert_eq!(row["task_id"], address);
+        assert_eq!(row["active"], false, "a manifest cannot prove liveness");
+        let error = tools::execute_tool(
+            "send",
+            &json!({
+                "to": address, "message": "must not deliver", "summary": "stale task",
+            }),
+        )
+        .unwrap_err();
+        assert!(error.contains("no active runtime"), "{error}");
+    }
+}
+
+fn assert_manifest_errors_preserve_destination(
+    store: &std::path::Path,
+    local_root: &std::path::Path,
+    local: &Mailbox,
+) {
+    std::fs::write(store.join("broken-task.json"), "{incomplete manifest").unwrap();
+    std::fs::create_dir(store.join("unreadable-task.json")).unwrap();
+    for task in ["broken-task", "unreadable-task"] {
+        let transcript = local.transcript_path(task);
+        assert!(!std::path::Path::new(&transcript).exists());
+        let error = tools::execute_tool(
+            "send",
+            &json!({
+                "to": task, "message": "must not deliver", "summary": "invalid task",
+            }),
+        )
+        .expect_err("an unreadable task manifest must not turn a task handle into a peer name");
+        assert!(error.contains("manifest"), "{error}");
+        assert!(!std::path::Path::new(&transcript).exists());
+
+        // An explicit peer namespace selects a different destination even
+        // when a task with the same handle has an unreadable saved manifest.
+        tools::execute_tool(
+            "send",
+            &json!({"to": format!("local:{task}"), "message": task, "summary": "explicit peer"}),
+        )
+        .unwrap();
+        let peer = Mailbox::workspace_local(local_root, task.into());
+        let (messages, _) = peer.poll_conversation("me", 0, 0).unwrap();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].body, task);
+    }
 }
 
 fn seed_same_name_tasks(store: &std::path::Path) {

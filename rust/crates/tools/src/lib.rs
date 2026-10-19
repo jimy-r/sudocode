@@ -213,7 +213,7 @@ pub mod testing {
     /// be sent to (a live pid, or any agent-name), `Err` when it is a
     /// known-terminal pid. Lets a test exercise the D1 rule without a real send.
     pub fn reject_dead_pid_for_test(to: &str) -> Result<(), String> {
-        crate::reject_dead_pid(to)
+        crate::resolve_task_destination(to).map(|_| ())
     }
 
     /// Test seam: does the summary-threshold gate — mirrors the
@@ -437,7 +437,9 @@ impl AgentCompletionRegistry {
 
 /// Fall back to reading the manifest from the agent store on disk.
 fn read_manifest_from_store(agent_id: &str, fs: &dyn FsBackend) -> Result<AgentOutput, String> {
-    let manifest = read_agent_manifest(agent_id, fs)?;
+    let manifest = read_agent_manifest(agent_id, fs)?.ok_or_else(|| {
+        format!("agent {agent_id} not found (no in-process record, no manifest file)")
+    })?;
     if manifest.status == "completed" || manifest.status == "failed" {
         Ok(manifest)
     } else {
@@ -448,15 +450,17 @@ fn read_manifest_from_store(agent_id: &str, fs: &dyn FsBackend) -> Result<AgentO
     }
 }
 
-fn read_agent_manifest(agent_id: &str, fs: &dyn FsBackend) -> Result<AgentOutput, String> {
+fn read_agent_manifest(agent_id: &str, fs: &dyn FsBackend) -> Result<Option<AgentOutput>, String> {
     let store = agent_store_dir(fs)?;
     let manifest_path = store_path(&store, &format!("{agent_id}.json"), fs);
-    let contents = fs
-        .read_to_string(&manifest_path.to_string_lossy())
-        .map_err(|e| {
-            format!("agent {agent_id} not found (no in-process record, no manifest file): {e}")
-        })?;
-    serde_json::from_str(&contents).map_err(|error| error.to_string())
+    let contents = match fs.read_to_string(&manifest_path.to_string_lossy()) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(format!("read agent {agent_id} manifest: {error}")),
+    };
+    serde_json::from_str(&contents)
+        .map(Some)
+        .map_err(|error| format!("invalid agent {agent_id} manifest: {error}"))
 }
 
 fn global_agent_registry() -> &'static AgentCompletionRegistry {
@@ -3080,23 +3084,22 @@ fn generate_request_id(prefix: &str, target: &str) -> String {
 
 /// A known subagent task requires a live entry in this process's registry.
 /// Manifests identify saved tasks; peer names keep durable offline delivery.
-fn reject_dead_pid(to: &str) -> Result<(), String> {
-    // Live? Then it can receive — not dead.
+fn resolve_task_destination(to: &str) -> Result<bool, String> {
     let live = global_agent_abort_signals()
         .lock()
         .map(|m| m.contains_key(to))
-        .unwrap_or(false);
+        .map_err(|_| "subagent runtime registry is unavailable")?;
     if live {
-        return Ok(());
+        return Ok(true);
     }
     let fs = runtime::host_fs_arc();
-    if read_agent_manifest(to, fs.as_ref()).is_ok() {
+    if read_agent_manifest(to, fs.as_ref())?.is_some() {
         return Err(format!(
             "subagent task '{to}' has no active runtime in this process. \
              Use `agent_list` for an addressable peer, or `pid_output` for its saved result."
         ));
     }
-    Ok(())
+    Ok(false)
 }
 
 #[allow(clippy::needless_pass_by_value)]
@@ -3110,10 +3113,11 @@ fn run_send_message(mut input: SendMessageInput) -> Result<String, String> {
                 .to_string(),
         );
     }
-    // Every send path checks task liveness before selecting its mailbox.
-    if input.to != "*" && runtime::directory::Directory::bare_name(&input.to) == input.to {
-        reject_dead_pid(&input.to)?;
-    }
+    // Resolve once: a task exiting after this decision must not change its
+    // destination into the peer namespace during this send.
+    let is_local_task = input.to != "*"
+        && runtime::directory::Directory::bare_name(&input.to) == input.to
+        && resolve_task_destination(&input.to)?;
 
     // Optional task-framing: when the caller supplied context/constraints/
     // acceptance (a task hand-off, not a chat message) and `message` is plain
@@ -3131,20 +3135,15 @@ fn run_send_message(mut input: SendMessageInput) -> Result<String, String> {
         }
     }
 
-    // Resolve the destination once: live in-process pids read workspace-local
+    // Resolve the destination once: live in-process tasks read workspace-local
     // conversations; named peers keep the session's shared mailbox.
-    // A running in-process sub-agent reads the workspace-local mailbox.
+    // A running in-process subagent reads the workspace-local mailbox.
     // The standalone session mailbox lives under the config home so separate
     // scode processes can talk across workspaces; using it for a spawned pid
     // reports a successful send into a conversation the worker never drains.
-    let local_pid = input.to != "*"
-        && global_agent_abort_signals()
-            .lock()
-            .map(|agents| agents.contains_key(&input.to))
-            .unwrap_or(false);
     let directory = runtime::mailbox::scoped_directory();
-    let mailbox = if local_pid {
-        // A running in-process sub-agent reads the workspace-local mailbox, not
+    let mailbox = if is_local_task {
+        // A running in-process subagent reads the workspace-local mailbox, not
         // any addressable namespace — its pid is a process handle, not a peer.
         std::sync::Arc::new(runtime::mailbox::Mailbox::workspace_local(
             &current_workspace_root().map_err(|e| e.to_string())?,
