@@ -7753,7 +7753,7 @@ async fn acp_task_completions_interrupted_shell_and_encoded_budget() {
 }
 
 /// Concurrent ACP contexts append to the same SID while retaining separate
-/// completion ownership. A sibling never repairs another context's live tool.
+/// completion ownership. A continuation repairs only its frozen inherited tail.
 #[tokio::test]
 async fn acp_completions_keep_live_contexts_independent_during_replay_and_load() {
     let server = MockAnthropicService::spawn().await.unwrap();
@@ -7893,16 +7893,16 @@ async fn acp_completions_keep_live_contexts_independent_during_replay_and_load()
     assert_eq!(continued["result"]["stopReason"], "end_turn", "{continued}");
     let continued_transcript = fs::read(&transcript).unwrap();
     assert!(
-        !String::from_utf8_lossy(&continued_transcript)
+        String::from_utf8_lossy(&continued_transcript)
             .contains("Side effects may already have occurred"),
-        "a sibling must not repair another runtime's interrupted tool"
+        "the continuation must retain its inherited tool's unknown outcome"
     );
     let requests = server.captured_requests().await;
     let request = &requests.last().unwrap().raw_body;
     assert!(
-        !request.contains("Side effects may already have occurred")
-            && !request.contains(&format!("{SCENARIO_PREFIX}ask_user_question_roundtrip")),
-        "the resumed model must exclude the sibling's unfinished turn: {request}"
+        request.contains("Side effects may already have occurred")
+            && request.contains(&format!("{SCENARIO_PREFIX}ask_user_question_roundtrip")),
+        "the resumed model must inherit the written turn and its recovery result: {request}"
     );
     competitor.shutdown().await;
     assert_eq!(fs::read(&journal).unwrap(), before_journal);
