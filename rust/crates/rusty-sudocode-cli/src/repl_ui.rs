@@ -35,12 +35,14 @@ use iocraft::prelude::*;
 mod ansi_text;
 mod input_history;
 mod layout;
+mod prompt_text;
 mod queued_message;
 mod tasks;
 use crate::render::output::{split_lines, OutputOp, Utf8Stream};
 use crate::render::styled_text::StyledText;
-use ansi_text::{row_text, AnsiText, PromptTextCache, RichText};
+use ansi_text::{row_text, AnsiText, RichText};
 use layout::{ansi, ansi_with_style, ChromeLayout, InputLayout, Measurements, Slot};
+use prompt_text::PromptTextCache;
 use tasks::{TaskBrowser, TaskFocus};
 
 // ── stderr redirect ───────────────────────────────────────────────────
