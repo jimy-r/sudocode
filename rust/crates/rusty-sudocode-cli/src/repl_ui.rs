@@ -1746,6 +1746,7 @@ fn ReplApp(mut hooks: Hooks) -> impl Into<AnyElement<'static>> {
     let stdout_for_events = stdout.clone();
 
     hooks.use_terminal_events({
+        let input_frame = input_frame.clone();
         move |event| match event {
             TerminalEvent::Key(KeyEvent {
                 code,
@@ -2450,6 +2451,7 @@ fn ReplApp(mut hooks: Hooks) -> impl Into<AnyElement<'static>> {
             .then(|| "Enlarge terminal to review; Esc cancels".to_string())
     });
     let reviewable = input_warning.is_none();
+    input_frame.set_enabled(reviewable);
     if input_reviewable.get() != reviewable {
         input_reviewable.set(reviewable);
     }

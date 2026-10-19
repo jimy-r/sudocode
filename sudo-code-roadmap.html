@@ -2044,7 +2044,13 @@ callbacks. Unix can deliver keyboard bytes before its Resize notification,
 so this barrier alone is insufficient. The terminal also records each input's
 observed dimensions and presented-frame identity; TextInput and the parent's
 confirmation/paste handlers share <code>use_input_frame()</code> admission.
-A later redraw cannot authorize an older observation. Cancellation remains
+A same-size redraw cannot authorize an older observation. Geometry-crossing
+events wait for a newly presented frame and require the same input owner to
+have remained continuously enabled; ordinary visible-to-visible resizing
+must not lose typing/paste/confirmation. Parent controls declare the layout's
+reviewability with <code>set_enabled</code>, while TextInput declares focus.
+Hidden-to-visible and visible-to-hidden input remains rejected. Rapid reflow
+does not wait for an obsolete intermediate size to reappear. Cancellation remains
 available. The layout is still the sole content-visibility authority; the
 terminal owns presentation/geometry, not a second application layout registry.
 This adds one OS size query per key/paste event, without cursor queries or
