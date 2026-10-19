@@ -11589,6 +11589,7 @@ mod tests {
 
     #[test]
     fn core_definitions_includes_all_tools_with_defer_loading() {
+        let _guard = env_guard();
         let registry = GlobalToolRegistry::builtin();
         let core = registry.core_definitions(None, None);
         let all = registry.definitions(None);
@@ -11642,6 +11643,8 @@ mod tests {
 
     #[test]
     fn deferred_tool_listing_returns_non_core_tools() {
+        // Cron visibility shares process-global configuration with the host-gating test.
+        let _guard = env_guard();
         let registry = GlobalToolRegistry::builtin();
         let listing = registry.deferred_tool_listing();
         let names: BTreeSet<_> = listing.iter().map(|(n, _)| n.as_str()).collect();
