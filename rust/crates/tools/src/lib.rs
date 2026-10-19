@@ -437,14 +437,7 @@ impl AgentCompletionRegistry {
 
 /// Fall back to reading the manifest from the agent store on disk.
 fn read_manifest_from_store(agent_id: &str, fs: &dyn FsBackend) -> Result<AgentOutput, String> {
-    let store = agent_store_dir(fs)?;
-    let manifest_path = store_path(&store, &format!("{agent_id}.json"), fs);
-    let contents = fs
-        .read_to_string(&manifest_path.to_string_lossy())
-        .map_err(|e| {
-            format!("agent {agent_id} not found (no in-process record, no manifest file): {e}")
-        })?;
-    let manifest: AgentOutput = serde_json::from_str(&contents).map_err(|e| e.to_string())?;
+    let manifest = read_agent_manifest(agent_id, fs)?;
     if manifest.status == "completed" || manifest.status == "failed" {
         Ok(manifest)
     } else {
@@ -453,6 +446,17 @@ fn read_manifest_from_store(agent_id: &str, fs: &dyn FsBackend) -> Result<AgentO
             manifest.status
         ))
     }
+}
+
+fn read_agent_manifest(agent_id: &str, fs: &dyn FsBackend) -> Result<AgentOutput, String> {
+    let store = agent_store_dir(fs)?;
+    let manifest_path = store_path(&store, &format!("{agent_id}.json"), fs);
+    let contents = fs
+        .read_to_string(&manifest_path.to_string_lossy())
+        .map_err(|e| {
+            format!("agent {agent_id} not found (no in-process record, no manifest file): {e}")
+        })?;
+    serde_json::from_str(&contents).map_err(|error| error.to_string())
 }
 
 fn global_agent_registry() -> &'static AgentCompletionRegistry {
@@ -1513,13 +1517,12 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         ToolSpec {
             name: "agent_list",
             description: concat!(
-                "List every agent you can reach — including ones with no live pid. ",
-                "Each row is an agent NAME (the address) with an `active` flag: ",
-                "active agents have a live pid and receive immediately; inactive ones ",
-                "are still addressable — a message waits in their durable inbox until ",
-                "they next run. Names are the address: to message one, call ",
-                "`send({\"to\": \"<name>\", \"message\": \"...\"})`, copying the name exactly ",
-                "as a row prints it. Read-only discovery; it starts nothing."
+                "List reachable peer Agents and this session's subagent tasks. ",
+                "Copy a row's `send_to` exactly into `send.to`. A peer address selects ",
+                "its namespace and queues messages durably, including while offline. ",
+                "A subagent address selects that task; `task_id` is its task handle. ",
+                "An omitted `active` means runtime liveness is unknown. ",
+                "Read-only discovery; it starts nothing."
             ),
             input_schema: json!({
                 "type": "object",
@@ -2273,15 +2276,13 @@ pub fn list_agent_snapshots_from_store_with(
     Ok(out)
 }
 
-/// One row of `agent_list`: an addressable agent name. `active` is
-/// `Some(true)` only with positive evidence the agent is running now (a live
-/// sub-agent pid); `Some(false)` for a spawned worker that has finished; and
-/// `None` for a peer whose liveness this session cannot answer (a remote
-/// backend does not report "is a poller live"). An addressable row is reachable
-/// regardless — a `send` waits in its durable inbox until it next runs.
+/// One addressable peer or subagent task. Peer messages use durable delivery;
+/// task liveness comes from the current process's runtime registry.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct AgentListRow {
     pub name: String,
+    /// Exact address accepted by `send.to`.
+    pub send_to: String,
     /// `Some(true)`/`Some(false)` when known (a spawned worker); omitted when
     /// liveness is unknowable (a peer discovered through the mailbox namespace).
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -2290,12 +2291,10 @@ pub struct AgentListRow {
     /// scode/agent); `subagent` = a worker this process spawned.
     pub kind: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub pid: Option<String>,
+    pub task_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub role: Option<String>,
-    /// The namespace(s) this agent is addressable in (e.g. `["local"]`,
-    /// `["nexus"]`, or both). A name in more than one is addressed with a
-    /// `label:name` qualifier; a sub-agent row carries none.
+    /// The peer namespace for this address; subagent rows carry none.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub sources: Vec<String>,
 }
@@ -2325,7 +2324,19 @@ pub fn collect_agent_list(
     // The sub-agent store is a local dir; a read failure there is soft — an empty
     // worker list is a reasonable degrade, and the peers above are the tool's point.
     let subagents = list_agent_snapshots_from_store_with(true, fs).unwrap_or_default();
-    Ok(merge_agent_list(&peers, &self_name, subagents, active_only))
+    let active_tasks = global_agent_abort_signals()
+        .lock()
+        .map_err(|_| "subagent runtime registry is unavailable")?
+        .keys()
+        .cloned()
+        .collect();
+    Ok(merge_agent_list(
+        &peers,
+        &self_name,
+        subagents,
+        &active_tasks,
+        active_only,
+    ))
 }
 
 /// Pure core of [`collect_agent_list`], sources injected so it is testable
@@ -2337,10 +2348,11 @@ pub fn merge_agent_list(
     peers: &[runtime::directory::Recipient],
     self_name: &str,
     subagents: Vec<AgentSnapshot>,
+    active_tasks: &std::collections::BTreeSet<String>,
     active_only: bool,
 ) -> Vec<AgentListRow> {
     use std::collections::BTreeMap;
-    let mut rows: BTreeMap<String, AgentListRow> = BTreeMap::new();
+    let mut rows: BTreeMap<(String, String), AgentListRow> = BTreeMap::new();
 
     // Source 1: addressable peers in the mailbox namespace. Liveness is not
     // knowable from the namespace alone (a remote backend does not report it),
@@ -2349,45 +2361,38 @@ pub fn merge_agent_list(
         if recipient.name == self_name || recipient.name.is_empty() {
             continue; // an agent is not its own peer
         }
-        let sources: Vec<String> = recipient.sources.iter().map(|s| (*s).to_string()).collect();
-        rows.entry(recipient.name.clone())
-            .or_insert_with(|| AgentListRow {
-                name: recipient.name.clone(),
-                active: None,
-                kind: "peer".to_string(),
-                pid: None,
-                role: None,
-                sources,
-            });
+        for source in &recipient.sources {
+            let send_to = format!("{source}:{}", recipient.name);
+            rows.entry(("peer".into(), send_to.clone()))
+                .or_insert_with(|| AgentListRow {
+                    name: recipient.name.clone(),
+                    send_to,
+                    active: None,
+                    kind: "peer".to_string(),
+                    task_id: None,
+                    role: None,
+                    sources: vec![(*source).to_string()],
+                });
+        }
     }
 
     // Source 2: sub-agents this process spawned (running/backgrounded).
     for snap in subagents {
-        let status = snap.status.trim().to_ascii_lowercase();
-        let active = status == "running" || status == "backgrounded";
+        let active = active_tasks.contains(&snap.agent_id);
         let role = snap
             .subagent_type
             .clone()
             .or_else(|| (!snap.description.is_empty()).then(|| snap.description.clone()));
-        let entry = rows
-            .entry(snap.name.clone())
+        rows.entry(("subagent".into(), snap.agent_id.clone()))
             .or_insert_with(|| AgentListRow {
                 name: snap.name.clone(),
+                send_to: snap.agent_id.clone(),
                 active: Some(active),
                 kind: "subagent".to_string(),
-                pid: Some(snap.agent_id.clone()),
-                role: role.clone(),
+                task_id: Some(snap.agent_id.clone()),
+                role,
                 sources: Vec::new(),
             });
-        // A pid-bearing (active) worker wins a name collision with a peer row.
-        if active {
-            entry.active = Some(true);
-            entry.pid = Some(snap.agent_id.clone());
-            entry.kind = "subagent".to_string();
-            if entry.role.is_none() {
-                entry.role = role;
-            }
-        }
     }
 
     let mut out: Vec<AgentListRow> = rows.into_values().collect();
@@ -2399,7 +2404,10 @@ pub fn merge_agent_list(
     out.sort_by(|a, b| {
         let ak = a.active == Some(true);
         let bk = b.active == Some(true);
-        bk.cmp(&ak).then_with(|| a.name.cmp(&b.name))
+        bk.cmp(&ak)
+            .then_with(|| a.name.cmp(&b.name))
+            .then_with(|| a.kind.cmp(&b.kind))
+            .then_with(|| a.send_to.cmp(&b.send_to))
     });
     out
 }
@@ -3070,17 +3078,8 @@ fn generate_request_id(prefix: &str, target: &str) -> String {
     format!("{prefix}_{target_slug}_{ts:x}")
 }
 
-/// Refuse a send to a pid that is known-and-dead (design D1: a dead pid errors,
-/// no fallback). "Dead" is narrow on purpose: `to` must be a spawned agent id
-/// this process knows AND that has reached a terminal state — a live pid, or any
-/// agent-name (which is offline-capable, its inbox filled until it next runs),
-/// passes through untouched to the one shared send path.
-///
-/// Liveness is the in-process abort registry; terminal state is the persisted
-/// manifest. `read_manifest_from_store` returns `Ok` ONLY for a terminal
-/// (`completed`/`failed`) manifest, so its `Ok` is exactly "known and dead". A
-/// name with no manifest is not a pid at all — `Err` there means "not dead",
-/// which is why this returns `Ok(())` on that path.
+/// A known subagent task requires a live entry in this process's registry.
+/// Manifests identify saved tasks; peer names keep durable offline delivery.
 fn reject_dead_pid(to: &str) -> Result<(), String> {
     // Live? Then it can receive — not dead.
     let live = global_agent_abort_signals()
@@ -3090,14 +3089,11 @@ fn reject_dead_pid(to: &str) -> Result<(), String> {
     if live {
         return Ok(());
     }
-    // Not live. If it is a KNOWN agent id with a terminal manifest, it is a
-    // dead pid — refuse. Any other case (unknown name, non-terminal) is not a
-    // dead pid and falls through.
     let fs = runtime::host_fs_arc();
-    if read_manifest_from_store(to, fs.as_ref()).is_ok() {
+    if read_agent_manifest(to, fs.as_ref()).is_ok() {
         return Err(format!(
-            "agent '{to}' has exited — its pid is dead, so a message cannot reach it. \
-             Use `agent_list` to find a live agent, or `pid_output` to read what it left."
+            "subagent task '{to}' has no active runtime in this process. \
+             Use `agent_list` for an addressable peer, or `pid_output` for its saved result."
         ));
     }
     Ok(())
@@ -3114,14 +3110,8 @@ fn run_send_message(mut input: SendMessageInput) -> Result<String, String> {
                 .to_string(),
         );
     }
-    // One precondition shared by every send path (plain, broadcast filters it
-    // by construction, structured): refuse a target that is a KNOWN-and-dead
-    // pid, so a message to an exited worker errors instead of provisioning a
-    // phantom inbox nobody reads and reporting success (design D1: a dead pid
-    // has no fallback). A plain agent-name — known or not — is offline-capable
-    // and falls through to the one unchanged send path; only a known-terminal
-    // agent id is refused. Not a second send path: a guard, then the same send.
-    if input.to != "*" {
+    // Every send path checks task liveness before selecting its mailbox.
+    if input.to != "*" && runtime::directory::Directory::bare_name(&input.to) == input.to {
         reject_dead_pid(&input.to)?;
     }
 
@@ -3171,7 +3161,7 @@ fn run_send_message(mut input: SendMessageInput) -> Result<String, String> {
         // one; a name found nowhere falls to the primary, whose durable inbox
         // holds the message until that peer first runs.
         use runtime::directory::Routed;
-        match directory.route(&input.to) {
+        match directory.route(&input.to)? {
             Routed::One(member) => {
                 input.to = runtime::directory::Directory::bare_name(&input.to).to_string();
                 std::sync::Arc::clone(&member.mailbox)
@@ -10361,7 +10351,8 @@ mod tests {
             created_at: "2026-09-23T00:00:00Z".to_string(),
         }];
 
-        let rows = super::merge_agent_list(&peers, "me", subagents, false);
+        let active_tasks = std::collections::BTreeSet::from(["pid-123".to_string()]);
+        let rows = super::merge_agent_list(&peers, "me", subagents, &active_tasks, false);
         let by: std::collections::BTreeMap<_, _> =
             rows.iter().map(|r| (r.name.as_str(), r)).collect();
 
@@ -10375,16 +10366,19 @@ mod tests {
             "peer carries its namespace"
         );
         assert_eq!(by["bob"].sources, vec!["nexus".to_string()]);
-        assert!(by["alice"].pid.is_none());
+        assert!(by["alice"].task_id.is_none());
+        assert_eq!(by["alice"].send_to, "local:alice");
+        assert_eq!(by["bob"].send_to, "nexus:bob");
         assert_eq!(by["bob"].active, None);
         // A running sub-agent is positively active, with its pid + role.
         assert_eq!(by["researcher"].active, Some(true));
         assert_eq!(by["researcher"].kind, "subagent");
-        assert_eq!(by["researcher"].pid.as_deref(), Some("pid-123"));
+        assert_eq!(by["researcher"].task_id.as_deref(), Some("pid-123"));
+        assert_eq!(by["researcher"].send_to, "pid-123");
         assert_eq!(by["researcher"].role.as_deref(), Some("Explore"));
 
         // active_only keeps only positively-running rows (not unknown peers).
-        let active = super::merge_agent_list(&peers, "me", Vec::new(), true);
+        let active = super::merge_agent_list(&peers, "me", Vec::new(), &active_tasks, true);
         assert!(active.iter().all(|r| r.active == Some(true)));
         assert!(
             !active.iter().any(|r| r.name == "alice"),

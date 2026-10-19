@@ -18,6 +18,7 @@ pub const SCENARIO_PREFIX: &str = "PARITY_SCENARIO:";
 /// to name the same agent, and two copies of that name drift into a test that
 /// passes while watching the wrong stream.
 pub const UNIFIED_SEND_RECIPIENT: &str = "team-lead";
+pub const AGENT_DIRECTORY_BODY: &str = "hello from the discovered agent address";
 
 /// The body that scenario sends.
 ///
@@ -257,6 +258,7 @@ enum Scenario {
     RetryThenSucceed,
     DeferredToolRoundtrip,
     UnifiedSendRoundtrip,
+    AgentDirectoryRoundtrip,
     UnifiedSendFromNamedPeer,
     CohostReply,
     CohostReadThenReply,
@@ -395,6 +397,7 @@ impl Scenario {
             "retry_then_succeed" => Some(Self::RetryThenSucceed),
             "deferred_tool_roundtrip" => Some(Self::DeferredToolRoundtrip),
             "unified_send_roundtrip" => Some(Self::UnifiedSendRoundtrip),
+            "agent_directory_roundtrip" => Some(Self::AgentDirectoryRoundtrip),
             "unified_send_from_named_peer" => Some(Self::UnifiedSendFromNamedPeer),
             "cohost_reply" => Some(Self::CohostReply),
             "cohost_read_then_reply" => Some(Self::CohostReadThenReply),
@@ -476,6 +479,7 @@ impl Scenario {
             Self::ToolLoopContextGrowth => "tool_loop_context_growth",
             Self::DeferredToolRoundtrip => "deferred_tool_roundtrip",
             Self::UnifiedSendRoundtrip => "unified_send_roundtrip",
+            Self::AgentDirectoryRoundtrip => "agent_directory_roundtrip",
             Self::UnifiedSendFromNamedPeer => "unified_send_from_named_peer",
             Self::CohostReply => "cohost_reply",
             Self::CohostReadThenReply => "cohost_read_then_reply",
@@ -1592,8 +1596,59 @@ fn plan_fixture_response(request: &MessageRequest, scenario: Scenario) -> Messag
     )
 }
 
+fn agent_directory_response(request: &MessageRequest) -> MessageResponse {
+    let results = tool_results_by_name(request);
+    if let Some((output, is_error)) = results.get("send") {
+        let label = if *is_error { "failed" } else { "complete" };
+        return text_message_response(
+            "msg_directory_final",
+            &format!("Directory send {label}: {output}"),
+        );
+    }
+    if let Some((output, _)) = results.get("agent_list") {
+        let listing = serde_json::from_str::<Value>(output).unwrap_or(Value::Null);
+        let address = listing["agents"].as_array().and_then(|rows| {
+            rows.iter().find_map(|row| {
+                (row["kind"] == "peer" && row["name"] == UNIFIED_SEND_RECIPIENT)
+                    .then(|| row["send_to"].as_str())
+                    .flatten()
+            })
+        });
+        return match address {
+            Some(address) => tool_message_response(
+                "msg_directory_send",
+                "toolu_directory_send",
+                "send",
+                json!({
+                    "to": address, "message": AGENT_DIRECTORY_BODY, "summary": "directory address roundtrip",
+                }),
+            ),
+            None => text_message_response(
+                "msg_directory_missing",
+                "Directory has no copyable peer address",
+            ),
+        };
+    }
+    tool_message_response(
+        "msg_directory_list",
+        "toolu_directory_list",
+        "agent_list",
+        json!({}),
+    )
+}
+
 fn build_stream_body(request: &MessageRequest, scenario: Scenario) -> String {
     match scenario {
+        Scenario::AgentDirectoryRoundtrip => {
+            let response = agent_directory_response(request);
+            match &response.content[0] {
+                OutputContentBlock::ToolUse {
+                    id, name, input, ..
+                } => tool_use_sse(id, name, &[&input.to_string()]),
+                OutputContentBlock::Text { text } => final_text_sse(text),
+                _ => unreachable!("directory fixture emits text or a tool"),
+            }
+        }
         Scenario::PlanExecutionRoundtrip | Scenario::QuestionMarkdownMany => {
             let response = plan_fixture_response(request, scenario);
             match &response.content[0] {
@@ -2814,6 +2869,7 @@ fn build_message_response(request: &MessageRequest, scenario: Scenario) -> Messa
                 json!({}),
             ),
         },
+        Scenario::AgentDirectoryRoundtrip => agent_directory_response(request),
         Scenario::UnifiedSendRoundtrip => match latest_tool_result(request) {
             Some((tool_output, _)) => text_message_response(
                 "msg_unified_send_final",
@@ -3044,6 +3100,7 @@ fn request_id_for(scenario: Scenario) -> &'static str {
         Scenario::ToolLoopContextGrowth => "req_tool_loop_context_growth",
         Scenario::DeferredToolRoundtrip => "req_deferred_tool_roundtrip",
         Scenario::UnifiedSendRoundtrip => "req_unified_send_roundtrip",
+        Scenario::AgentDirectoryRoundtrip => "req_agent_directory_roundtrip",
         Scenario::UnifiedSendFromNamedPeer => "req_unified_send_from_named_peer",
         Scenario::CohostReply => "req_cohost_reply",
         Scenario::CohostReadThenReply => "req_cohost_read_then_reply",
