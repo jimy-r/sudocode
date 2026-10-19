@@ -722,7 +722,8 @@ impl Mailbox {
     ///
     /// # Errors
     ///
-    /// An `Err` when the namespace cannot be enumerated, or when an entry's
+    /// A namespace whose directory has not been created yet has no recipients.
+    /// An `Err` when an existing namespace cannot be enumerated, or when an entry's
     /// presence cannot be determined — never an empty list, and never a silently
     /// shortened one. The difference matters to every caller: a broadcast over "no
     /// recipients" reports success having delivered nothing, and an agent told it
@@ -730,10 +731,11 @@ impl Mailbox {
     /// has to remember to ask first.
     pub fn list_recipients(&self) -> Result<Vec<String>, String> {
         let dir = self.convention.agents_dir();
-        let entries = self
-            .backend
-            .readdir(&dir)
-            .map_err(|e| format!("list recipients at {dir}: {e}"))?;
+        let entries = match self.backend.readdir(&dir) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => return Err(format!("list recipients at {dir}: {error}")),
+        };
         // A recipient is an agent that ANNOUNCED presence, and presence is a
         // `conversations` subdir under `agents_dir/<name>/` (the
         // `ensure_presence` contract). Filter to that shape so infrastructure

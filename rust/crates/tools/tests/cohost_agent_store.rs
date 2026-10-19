@@ -87,4 +87,24 @@ fn a_cohosted_agents_subagent_store_is_written_into_its_own_vfs_subtree() {
         "the store should list the job it just prepared; got {:?}",
         snapshots.iter().map(|s| &s.agent_id).collect::<Vec<_>>()
     );
+
+    let registry = tools::GlobalToolRegistry::builtin().with_fs(Arc::clone(&fs));
+    let send = serde_json::json!({
+        "to": manifest.agent_id,
+        "message": "must not become a peer message",
+        "summary": "saved task",
+    });
+    let error = registry.execute("send", &send).unwrap_err();
+    assert!(error.contains("no active runtime"), "{error}");
+
+    fs.write(&manifest.manifest_file, b"{invalid manifest")
+        .unwrap();
+    let error = registry.execute("send", &send).unwrap_err();
+    assert!(error.contains("invalid agent"), "{error}");
+    assert!(!fs
+        .exists(&format!(
+            "/agents/{AGENT}/conversations/{}",
+            manifest.agent_id
+        ))
+        .unwrap());
 }

@@ -29,6 +29,47 @@ fn temp_root(label: &str) -> std::path::PathBuf {
 }
 
 #[test]
+fn a_fresh_local_namespace_allows_discovery_and_delivery_to_an_attached_peer() {
+    let _guard = ENV_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let root = temp_root("fresh-namespace");
+    let local_root = root.join("local");
+    let nexus_root = root.join("nexus");
+    let store = root.join("agent-store");
+    std::env::set_var("SUDOCODE_AGENT_STORE", &store);
+    let peer = Mailbox::workspace_local(&nexus_root, "alice".into());
+    peer.ensure_presence().unwrap();
+    let _scope = MailboxScope::enter(Arc::new(Directory::new(vec![
+        Member {
+            label: "local",
+            mailbox: Arc::new(Mailbox::workspace_local(&local_root, "me".into())),
+        },
+        Member {
+            label: "nexus",
+            mailbox: Arc::new(Mailbox::workspace_local(&nexus_root, "me".into())),
+        },
+    ])));
+    let listing: Value =
+        serde_json::from_str(&tools::execute_tool("agent_list", &json!({})).unwrap()).unwrap();
+    assert_eq!(listing["agents"][0]["send_to"], "nexus:alice");
+    tools::execute_tool(
+        "send",
+        &json!({"to": "alice", "message": "first message", "summary": "fresh namespace"}),
+    )
+    .unwrap();
+    let (messages, _) = peer.poll_conversation("me", 0, 0).unwrap();
+    assert_eq!(messages.len(), 1);
+    assert_eq!(messages[0].body, "first message");
+    assert!(
+        !local_root.exists(),
+        "delivery must use the attached peer's namespace"
+    );
+    std::env::remove_var("SUDOCODE_AGENT_STORE");
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn agent_list_discovers_a_peer_provisioned_through_the_mailbox() {
     let _guard = ENV_LOCK
         .lock()

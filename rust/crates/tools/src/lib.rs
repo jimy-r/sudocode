@@ -213,7 +213,7 @@ pub mod testing {
     /// be sent to (a live pid, or any agent-name), `Err` when it is a
     /// known-terminal pid. Lets a test exercise the D1 rule without a real send.
     pub fn reject_dead_pid_for_test(to: &str) -> Result<(), String> {
-        crate::resolve_task_destination(to).map(|_| ())
+        crate::resolve_task_destination(to, runtime::host_fs()).map(|_| ())
     }
 
     /// Test seam: does the summary-threshold gate — mirrors the
@@ -1995,13 +1995,8 @@ fn execute_tool_with_enforcer(
         "CronCreate" => from_value::<CronCreateInput>(input).and_then(run_cron_create),
         "CronDelete" => from_value::<CronDeleteInput>(input).and_then(run_cron_delete),
         "CronList" => run_cron_list(input.clone()),
-        // Workspace-mailbox delivery. A host that wired a nexus-A2A sender
-        // intercepts `send` before dispatch reaches here and delivers over the
-        // network instead; this arm is the local destination, not a fallback
-        // for a failed one.
-        "send" => {
-            from_value::<SendMessageInput>(&normalize_send_input(input)).and_then(run_send_message)
-        }
+        "send" => from_value::<SendMessageInput>(&normalize_send_input(input))
+            .and_then(|input| run_send_message(input, fs.as_ref())),
         _ => Err(format!("unsupported tool: {name}")),
     }
 }
@@ -3080,7 +3075,7 @@ fn generate_request_id(prefix: &str, target: &str) -> String {
 
 /// A known subagent task requires a live entry in this process's registry.
 /// Manifests identify saved tasks; peer names keep durable offline delivery.
-fn resolve_task_destination(to: &str) -> Result<bool, String> {
+fn resolve_task_destination(to: &str, fs: &dyn FsBackend) -> Result<bool, String> {
     let live = global_agent_abort_signals()
         .lock()
         .map(|m| m.contains_key(to))
@@ -3088,8 +3083,7 @@ fn resolve_task_destination(to: &str) -> Result<bool, String> {
     if live {
         return Ok(true);
     }
-    let fs = runtime::host_fs_arc();
-    if read_agent_manifest(to, fs.as_ref())?.is_some() {
+    if read_agent_manifest(to, fs)?.is_some() {
         return Err(format!(
             "subagent task '{to}' has no active runtime in this process. \
              Use `agent_list` for an addressable peer, or `pid_output` for its saved result."
@@ -3099,7 +3093,7 @@ fn resolve_task_destination(to: &str) -> Result<bool, String> {
 }
 
 #[allow(clippy::needless_pass_by_value)]
-fn run_send_message(mut input: SendMessageInput) -> Result<String, String> {
+fn run_send_message(mut input: SendMessageInput, fs: &dyn FsBackend) -> Result<String, String> {
     if input.to.trim().is_empty() {
         return Err("to must not be empty".to_string());
     }
@@ -3113,7 +3107,7 @@ fn run_send_message(mut input: SendMessageInput) -> Result<String, String> {
     // destination into the peer namespace during this send.
     let is_local_task = input.to != "*"
         && runtime::directory::Directory::bare_name(&input.to) == input.to
-        && resolve_task_destination(&input.to)?;
+        && resolve_task_destination(&input.to, fs)?;
 
     // Optional task-framing: when the caller supplied context/constraints/
     // acceptance (a task hand-off, not a chat message) and `message` is plain
