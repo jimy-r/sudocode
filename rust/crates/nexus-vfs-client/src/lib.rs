@@ -60,6 +60,7 @@ enum VfsOp {
         path: String,
         auth_token: String,
         offset: u64,
+        timeout_ms: u64,
         resp: mpsc::SyncSender<io::Result<VfsReadResult>>,
     },
     Write {
@@ -281,6 +282,7 @@ impl NexusVfsClient {
                                     path,
                                     auth_token,
                                     offset,
+                                    timeout_ms,
                                     resp,
                                 } => {
                                     let r = client
@@ -289,10 +291,10 @@ impl NexusVfsClient {
                                                 path,
                                                 auth_token,
                                                 content_id: String::new(),
-                                                timeout_ms: 0,
+                                                timeout_ms,
                                                 offset,
                                             },
-                                            OP_DEADLINE,
+                                            tail_deadline(timeout_ms > 0, timeout_ms),
                                         ))
                                         .await;
                                     let _ = resp.send(grpc_result(r, |r| {
@@ -539,16 +541,31 @@ impl NexusVfsClient {
         offset: u64,
         auth_token: &str,
     ) -> io::Result<VfsReadResult> {
+        self.read_entry_wait(path, offset, 0, auth_token)
+    }
+
+    /// Read an entry with a bounded stream wait, retaining its type and cursor.
+    pub fn read_entry_wait(
+        &self,
+        path: &str,
+        offset: u64,
+        timeout_ms: u64,
+        auth_token: &str,
+    ) -> io::Result<VfsReadResult> {
         let (resp_tx, resp_rx) = mpsc::sync_channel(1);
         self.tx
             .send(VfsOp::Read {
                 path: path.to_owned(),
                 auth_token: auth_token.to_owned(),
                 offset,
+                timeout_ms,
                 resp: resp_tx,
             })
             .map_err(|_| broken_pipe())?;
-        await_reply(&resp_rx, OP_DEADLINE + HANDOFF_GRACE)
+        await_reply(
+            &resp_rx,
+            tail_deadline(timeout_ms > 0, timeout_ms) + HANDOFF_GRACE,
+        )
     }
 
     /// Atomically acquire, or renew `lock_id`, through the existing lock RPC.

@@ -302,8 +302,7 @@ pub trait FsBackend: Send + Sync + 'static {
     ///
     /// The default polls file size at 100ms intervals (cross-platform).
     /// `KernelFsBackend` overrides with the kernel's blocking `sys_read`.
-    /// `NexusVfsFsBackend` overrides with `stream_read_at` (gRPC blocking
-    /// tail).
+    /// `NexusVfsFsBackend` uses the typed Read RPC with a bounded stream wait.
     fn tail_read(
         &self,
         path: &str,
@@ -540,12 +539,46 @@ fn read_byte_tail<B: FsBackend + ?Sized>(
     cursor: u64,
     block_ms: u64,
 ) -> io::Result<(Vec<u8>, u64, bool)> {
+    read_tail_with(cursor, block_ms, |_| match backend.read(path) {
+        Ok(bytes) => Ok(TailPayload::Bytes(bytes)),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(TailPayload::Bytes(Vec::new())),
+        Err(error) => Err(error),
+    })
+}
+
+enum TailPayload {
+    Bytes(Vec<u8>),
+    Frame(Vec<u8>, u64),
+}
+
+/// Byte logs poll within one wait budget; framed reads carry their own cursor.
+fn read_tail_with(
+    cursor: u64,
+    block_ms: u64,
+    mut read: impl FnMut(u64) -> io::Result<TailPayload>,
+) -> io::Result<(Vec<u8>, u64, bool)> {
     let deadline = std::time::Instant::now() + std::time::Duration::from_millis(block_ms);
     loop {
-        let bytes = match backend.read(path) {
-            Ok(bytes) => bytes,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => Vec::new(),
-            Err(error) => return Err(error),
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        let wait_ms = if block_ms == 0 {
+            0
+        } else {
+            u64::try_from(remaining.as_millis())
+                .unwrap_or(u64::MAX)
+                .max(1)
+        };
+        let bytes = match read(wait_ms)? {
+            TailPayload::Bytes(bytes) => bytes,
+            TailPayload::Frame(bytes, next) => {
+                if next < cursor || (!bytes.is_empty() && next == cursor) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "stream read did not advance its cursor",
+                    ));
+                }
+                let eof = bytes.is_empty() && next == cursor;
+                return Ok((bytes, next, eof));
+            }
         };
         let next = bytes.len() as u64;
         if next > cursor {
@@ -1361,19 +1394,16 @@ impl<K: KernelConvenience + KernelFsAccess + Send + Sync + 'static> FsBackend
         {
             return read_byte_tail(self, path, cursor, block_ms);
         }
-        let result = self
-            .kernel
-            .sys_read(path, &self.ctx, block_ms, cursor)
-            .map_err(kernel_err)?;
-        match result.data {
-            Some(payload) if !payload.is_empty() => {
-                let next = result
-                    .stream_next_offset
-                    .map_or_else(|| cursor + payload.len() as u64, |offset| offset as u64);
-                Ok((payload, next, false))
-            }
-            _ => Ok((vec![], cursor, true)),
-        }
+        read_tail_with(cursor, block_ms, |wait_ms| {
+            let result = self
+                .kernel
+                .sys_read(path, &self.ctx, wait_ms, cursor)
+                .map_err(kernel_err)?;
+            Ok(TailPayload::Frame(
+                result.data.unwrap_or_default(),
+                result.stream_next_offset.map_or(cursor, |next| next as u64),
+            ))
+        })
     }
 
     fn managed_root(&self, concern: ManagedRoot) -> Option<String> {
@@ -1961,15 +1991,31 @@ impl FsBackend for NexusVfsFsBackend {
         cursor: u64,
         block_ms: u64,
     ) -> io::Result<(Vec<u8>, u64, bool)> {
-        if !self.is_append_stream(path)?
-            && self.client.stat(path, &self.auth_token)?.entry_type
-                == i32::from(kernel::meta_store::DT_REG)
-        {
-            return read_byte_tail(self, path, cursor, block_ms);
-        }
-        self.client
-            .stream_read_at(path, cursor, block_ms > 0, block_ms, &self.auth_token)
-            .map(|result| (result.data, result.next_offset, result.eof))
+        read_tail_with(cursor, block_ms, |wait_ms| {
+            let result = match self
+                .client
+                .read_entry_wait(path, cursor, wait_ms, &self.auth_token)
+            {
+                Ok(result) => result,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    return Ok(TailPayload::Bytes(Vec::new()));
+                }
+                Err(error) => return Err(error),
+            };
+            match result.entry_type {
+                kind if kind == i32::from(DT_STREAM) => Ok(TailPayload::Frame(
+                    result.data,
+                    result.next_offset.unwrap_or(cursor),
+                )),
+                kind if kind == i32::from(kernel::meta_store::DT_REG) => {
+                    Ok(TailPayload::Bytes(result.data))
+                }
+                _ => Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "tail requires a file or stream",
+                )),
+            }
+        })
     }
 }
 

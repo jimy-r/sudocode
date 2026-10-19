@@ -36,6 +36,8 @@
 //! * **Never read a just-sent frame without blocking.** See
 //!   [`DELIVERY_WAIT_MS`].
 
+#[path = "common/paused_transport.rs"]
+mod paused_transport;
 #[path = "common/session_controller.rs"]
 mod session_controller;
 use session_controller::Controller;
@@ -157,7 +159,7 @@ fn live_filesystem_stream_read_and_append_preserve_all_frames() {
     fs.create_append_log(&path, 0).unwrap();
     assert!(fs.is_append_stream(&path).unwrap());
     assert!(!fs.is_append_stream(&format!("{path}.missing")).unwrap());
-    assert!(fs.read(&path).unwrap().is_empty());
+    assert_eq!(fs.read(&path).unwrap(), Vec::<u8>::new());
 
     let mut expected = Vec::new();
     let large_frame = vec![b'x'; 128 * 1024];
@@ -178,11 +180,33 @@ fn live_filesystem_stream_read_and_append_preserve_all_frames() {
         thread::sleep(Duration::from_millis(10));
     }
 
+    let mut cursor = 0;
+    // Empty appends are no-ops in both the memory and WAL stream backends.
+    for expected_frame in [b"first\n".as_slice(), &large_frame, b"last\n"] {
+        let (data, next, eof) = fs.tail_read(&path, cursor, 0).unwrap();
+        assert_eq!(data, expected_frame);
+        assert!(next > cursor, "every committed frame advances its cursor");
+        assert!(!eof);
+        cursor = next;
+    }
+    assert_eq!(
+        fs.tail_read(&path, cursor, 0).unwrap(),
+        (Vec::new(), cursor, true)
+    );
+
     let ordinary = format!("/conversations/vfs-probe-{}/transcript", fresh());
     fs.write(&ordinary, b"ordinary ").unwrap();
     assert!(!fs.is_append_stream(&ordinary).unwrap());
     fs.append(&ordinary, b"file").unwrap();
     assert_eq!(fs.read(&ordinary).unwrap(), b"ordinary file");
+    assert_eq!(
+        fs.tail_read(&ordinary, 9, 0).unwrap(),
+        (b"file".to_vec(), 13, false)
+    );
+    assert_eq!(
+        fs.tail_read(&ordinary, 13, 0).unwrap(),
+        (Vec::new(), 13, true)
+    );
 
     // The server remains authoritative if the entry changes type at this path.
     fs.delete(&path).unwrap();
@@ -190,6 +214,10 @@ fn live_filesystem_stream_read_and_append_preserve_all_frames() {
     assert!(!fs.is_append_stream(&path).unwrap());
     fs.append(&path, b" bytes").unwrap();
     assert_eq!(fs.read(&path).unwrap(), b"replacement bytes");
+    assert_eq!(
+        fs.tail_read(&path, 0, 0).unwrap(),
+        (b"replacement bytes".to_vec(), 17, false)
+    );
 }
 
 #[test]
@@ -1049,6 +1077,66 @@ fn live_a_silent_server_errors_and_then_recovers() {
             ),
         }
         thread::sleep(Duration::from_millis(250));
+    }
+}
+
+/// Keep the real mTLS connection open and stop forwarding bytes on every OS.
+#[test]
+#[ignore = "requires the harness's real mTLS Nexus daemon"]
+fn live_a_silent_transport_errors_and_then_recovers() {
+    let endpoint = std::env::var("NEXUS_A2A_TEST_ENDPOINT").expect("set daemon endpoint");
+    let auth = std::env::var("NEXUS_API_KEY").unwrap_or_default();
+    let transport = paused_transport::PausedTransport::new(&endpoint).unwrap();
+    let client = dial(&transport.endpoint());
+    let direct = dial(&endpoint);
+    let me = "scode-silent-transport-probe";
+    let mailbox = mailbox(&client, me, &auth);
+    mailbox.ensure_conversation(PROBE_PEER).unwrap();
+    let (_, tail) = mailbox.poll_conversation(PROBE_PEER, 0, 0).unwrap();
+
+    transport.set_paused(true);
+    direct
+        .stat(&mailbox.transcript_path(PROBE_PEER), &auth)
+        .expect("daemon remains responsive");
+    let started = Instant::now();
+    let result = mailbox.poll_conversation(PROBE_PEER, tail, 500);
+    let elapsed = started.elapsed();
+    transport.set_paused(false);
+    assert!(result.is_err(), "paused connection returned {result:?}");
+    let error = format!("{result:?}").to_ascii_lowercase();
+    assert!(
+        error.contains("timeout") || error.contains("deadline"),
+        "wrong failure: {result:?}"
+    );
+    assert!(
+        elapsed >= Duration::from_millis(500),
+        "connection closed before its wait expired"
+    );
+    assert!(!format!("{result:?}").contains("vfs worker sent no reply"));
+    assert!(
+        elapsed < Duration::from_secs(7),
+        "request exceeded its deadline: {elapsed:?}"
+    );
+
+    send_to(&direct, PROBE_PEER, me, "transport recovered", &auth).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        match mailbox.poll_conversation(PROBE_PEER, tail, 500) {
+            Ok((messages, next))
+                if messages
+                    .iter()
+                    .any(|message| message.body == "transport recovered") =>
+            {
+                assert!(next > tail);
+                println!("SILENT TRANSPORT OK: timed out after {elapsed:?}, recovered at {next}");
+                break;
+            }
+            result => assert!(
+                Instant::now() < deadline,
+                "connection failed to recover: {result:?}"
+            ),
+        }
+        thread::sleep(Duration::from_millis(100));
     }
 }
 
