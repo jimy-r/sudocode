@@ -14,6 +14,7 @@ use crate::prompt::SessionPromptSnapshot;
 use crate::usage::{parse_usage_cost_currency, TokenUsage};
 
 const SESSION_VERSION: u32 = 1;
+const UNANSWERED_TURN_TEXT: &str = "No response requested.";
 const ROTATE_AFTER_BYTES: u64 = 256 * 1024;
 const MAX_ROTATED_FILES: usize = 3;
 /// Cold-storage retention budget (bytes) for a transcript backed by a native
@@ -860,6 +861,31 @@ impl Session {
         path: impl AsRef<Path>,
         expected_revision: Option<&str>,
     ) -> Result<(), SessionError> {
+        self.save_replacement_to_path_checked(original, path.as_ref(), expected_revision, "compact")
+    }
+
+    /// Preserve rejected signed history before installing a thinking-only repair.
+    pub fn save_thinking_repaired_to_path_checked(
+        &self,
+        original: &Session,
+        path: impl AsRef<Path>,
+        expected_revision: Option<&str>,
+    ) -> Result<(), SessionError> {
+        self.save_replacement_to_path_checked(
+            original,
+            path.as_ref(),
+            expected_revision,
+            "thinking-repair",
+        )
+    }
+
+    fn save_replacement_to_path_checked(
+        &self,
+        original: &Session,
+        path: &Path,
+        expected_revision: Option<&str>,
+        purpose: &str,
+    ) -> Result<(), SessionError> {
         let path = path.as_ref();
         let writer = self.writer_for(path)?;
         let _write = writer
@@ -878,7 +904,7 @@ impl Session {
             return Err(SessionError::SourceChanged);
         }
         let archive = format!(
-            "{}.before-compact-{}",
+            "{}.before-{purpose}-{}",
             path.display(),
             current_time_millis()
         );
@@ -1737,6 +1763,23 @@ impl ConversationMessage {
             model: None,
             duration_ms: None,
         }
+    }
+
+    /// Close an unanswered turn before a new external request, matching CC.
+    #[must_use]
+    pub(crate) fn unanswered_turn_boundary() -> Self {
+        Self::assistant(vec![ContentBlock::Text {
+            text: UNANSWERED_TURN_TEXT.into(),
+        }])
+    }
+
+    /// An internal turn marker belongs in API history, not transcript display.
+    #[must_use]
+    pub fn is_unanswered_turn_boundary(&self) -> bool {
+        self.role == MessageRole::Assistant
+            && self.model.is_none()
+            && self.usage.is_none()
+            && matches!(self.blocks.as_slice(), [ContentBlock::Text { text }] if text == UNANSWERED_TURN_TEXT)
     }
 
     #[must_use]
