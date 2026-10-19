@@ -24,9 +24,29 @@ pub mod testing {
     where
         F: FnMut(String) -> Result<String, String>,
     {
+        let mailbox = runtime::mailbox::Mailbox::workspace_local(workspace_root, agent_id.into());
         crate::run_multi_turn_loop(
-            agent_id,
-            workspace_root,
+            &mailbox,
+            abort_signal,
+            initial_prompt,
+            max_multi_turns,
+            run_turn_fn,
+        )
+    }
+
+    /// Drive the production receive loop over a caller-owned mailbox backend.
+    pub fn run_multi_turn_loop_in_mailbox_for_test<F>(
+        mailbox: &runtime::mailbox::Mailbox,
+        abort_signal: HookAbortSignal,
+        initial_prompt: String,
+        max_multi_turns: usize,
+        run_turn_fn: F,
+    ) -> Result<String, String>
+    where
+        F: FnMut(String) -> Result<String, String>,
+    {
+        crate::run_multi_turn_loop(
+            mailbox,
             abort_signal,
             initial_prompt,
             max_multi_turns,
@@ -1996,7 +2016,7 @@ fn execute_tool_with_enforcer(
         "CronDelete" => from_value::<CronDeleteInput>(input).and_then(run_cron_delete),
         "CronList" => run_cron_list(input.clone()),
         "send" => from_value::<SendMessageInput>(&normalize_send_input(input))
-            .and_then(|input| run_send_message(input, fs.as_ref())),
+            .and_then(|input| run_send_message(input, fs)),
         _ => Err(format!("unsupported tool: {name}")),
     }
 }
@@ -2322,11 +2342,11 @@ pub fn collect_agent_list(
     // The sub-agent store is a local dir; a read failure there is soft — an empty
     // worker list is a reasonable degrade, and the peers above are the tool's point.
     let subagents = list_agent_snapshots_from_store_with(true, fs).unwrap_or_default();
-    let active_tasks = global_agent_abort_signals()
+    let active_tasks = global_agent_runtimes()
         .lock()
         .map_err(|_| "subagent runtime registry is unavailable")?
-        .keys()
-        .cloned()
+        .iter()
+        .filter_map(|(id, runtime)| runtime.mailbox_root.as_ref().map(|_| id.clone()))
         .collect();
     Ok(merge_agent_list(
         &peers,
@@ -3075,13 +3095,18 @@ fn generate_request_id(prefix: &str, target: &str) -> String {
 
 /// A known subagent task requires a live entry in this process's registry.
 /// Manifests identify saved tasks; peer names keep durable offline delivery.
-fn resolve_task_destination(to: &str, fs: &dyn FsBackend) -> Result<bool, String> {
-    let live = global_agent_abort_signals()
-        .lock()
-        .map(|m| m.contains_key(to))
-        .map_err(|_| "subagent runtime registry is unavailable")?;
-    if live {
-        return Ok(true);
+fn resolve_task_destination(to: &str, fs: &dyn FsBackend) -> Result<Option<String>, String> {
+    {
+        let runtimes = global_agent_runtimes()
+            .lock()
+            .map_err(|_| "subagent runtime registry is unavailable")?;
+        if let Some(runtime) = runtimes.get(to) {
+            return runtime
+                .mailbox_root
+                .clone()
+                .map(Some)
+                .ok_or_else(|| format!("subagent task '{to}' has no registered message endpoint"));
+        }
     }
     if read_agent_manifest(to, fs)?.is_some() {
         return Err(format!(
@@ -3089,11 +3114,14 @@ fn resolve_task_destination(to: &str, fs: &dyn FsBackend) -> Result<bool, String
              Use `agent_list` for an addressable peer, or `pid_output` for its saved result."
         ));
     }
-    Ok(false)
+    Ok(None)
 }
 
 #[allow(clippy::needless_pass_by_value)]
-fn run_send_message(mut input: SendMessageInput, fs: &dyn FsBackend) -> Result<String, String> {
+fn run_send_message(
+    mut input: SendMessageInput,
+    fs: &Arc<dyn FsBackend>,
+) -> Result<String, String> {
     if input.to.trim().is_empty() {
         return Err("to must not be empty".to_string());
     }
@@ -3105,9 +3133,12 @@ fn run_send_message(mut input: SendMessageInput, fs: &dyn FsBackend) -> Result<S
     }
     // Resolve once: a task exiting after this decision must not change its
     // destination into the peer namespace during this send.
-    let is_local_task = input.to != "*"
-        && runtime::directory::Directory::bare_name(&input.to) == input.to
-        && resolve_task_destination(&input.to, fs)?;
+    let task_root =
+        if input.to != "*" && runtime::directory::Directory::bare_name(&input.to) == input.to {
+            resolve_task_destination(&input.to, fs.as_ref())?
+        } else {
+            None
+        };
 
     // Optional task-framing: when the caller supplied context/constraints/
     // acceptance (a task hand-off, not a chat message) and `message` is plain
@@ -3132,11 +3163,12 @@ fn run_send_message(mut input: SendMessageInput, fs: &dyn FsBackend) -> Result<S
     // scode processes can talk across workspaces; using it for a spawned pid
     // reports a successful send into a conversation the worker never drains.
     let directory = runtime::mailbox::scoped_directory();
-    let mailbox = if is_local_task {
+    let mailbox = if let Some(root) = task_root {
         // A running in-process subagent reads the workspace-local mailbox, not
-        // any addressable namespace — its pid is a process handle, not a peer.
-        std::sync::Arc::new(runtime::mailbox::Mailbox::workspace_local(
-            &current_workspace_root().map_err(|e| e.to_string())?,
+        // any addressable namespace — its task ID identifies this worker.
+        std::sync::Arc::new(runtime::mailbox::Mailbox::workspace_at(
+            Arc::clone(fs),
+            std::path::Path::new(&root),
             directory.self_id().to_string(),
         ))
     } else if input.to == "*" {
@@ -3377,57 +3409,96 @@ fn run_send_message(mut input: SendMessageInput, fs: &dyn FsBackend) -> Result<S
     }
 }
 
-// ── Agent abort-signal registry ────────────────────────────────────
+// ── Agent runtime registry ────────────────────────────────────
 
-/// Process-wide map from `agent_id` to that subagent's
-/// [`HookAbortSignal`]. Populated by `spawn_agent_job` when a
-/// background subagent starts; consumed by
-/// `SendMessage(shutdown_request)` for live abort delivery
-/// (mirrors CC-fork's `task.abortController.abort()` path in
-/// `SendMessageTool.ts:357`).
-///
-/// Cleared by `run_spawned_agent_job` when the subagent terminates
-/// (success, error, or panic) so a subsequent SendMessage to the same
-/// (recycled) name doesn't attempt to abort a defunct signal.
-fn global_agent_abort_signals() -> &'static Mutex<HashMap<String, HookAbortSignal>> {
-    use std::sync::OnceLock;
-    static REGISTRY: OnceLock<Mutex<HashMap<String, HookAbortSignal>>> = OnceLock::new();
+/// Live in-process task endpoints and cancellation share one registry.
+struct ActiveAgentRuntime {
+    abort: HookAbortSignal,
+    mailbox_root: Option<String>,
+}
+
+fn global_agent_runtimes() -> &'static Mutex<HashMap<String, ActiveAgentRuntime>> {
+    static REGISTRY: std::sync::OnceLock<Mutex<HashMap<String, ActiveAgentRuntime>>> =
+        std::sync::OnceLock::new();
     REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-/// Register a subagent's abort signal so `SendMessage(shutdown_request)`
-/// can look it up by `agent_id` and call `.abort()`. Called by
-/// `spawn_agent_job` before the runtime starts.
+/// Register cancellation without advertising a message endpoint.
 pub fn register_agent_abort_signal(agent_id: &str, signal: HookAbortSignal) {
-    if let Ok(mut guard) = global_agent_abort_signals().lock() {
-        guard.insert(agent_id.to_string(), signal);
+    if let Ok(mut guard) = global_agent_runtimes().lock() {
+        guard.insert(
+            agent_id.into(),
+            ActiveAgentRuntime {
+                abort: signal,
+                mailbox_root: None,
+            },
+        );
     }
 }
 
-/// Remove a subagent from the abort-signal registry — invoked on
-/// subagent completion so a stale entry can't abort a future agent
-/// that gets the same name.
+/// Register the task's workspace in its filesystem's path spelling.
+/// Delivery uses the caller's filesystem and authorization at this root.
+///
+/// # Errors
+/// The root is empty or the runtime registry is unavailable.
+pub fn register_agent_runtime(
+    agent_id: &str,
+    signal: HookAbortSignal,
+    mailbox_root: String,
+) -> Result<(), String> {
+    if mailbox_root.trim().is_empty() {
+        return Err("task mailbox root must not be empty".into());
+    }
+    global_agent_runtimes()
+        .lock()
+        .map_err(|_| "subagent runtime registry is unavailable")?
+        .insert(
+            agent_id.into(),
+            ActiveAgentRuntime {
+                abort: signal,
+                mailbox_root: Some(mailbox_root),
+            },
+        );
+    Ok(())
+}
+
+/// Remove the task's cancellation signal and message endpoint together.
 pub fn unregister_agent_abort_signal(agent_id: &str) {
-    if let Ok(mut guard) = global_agent_abort_signals().lock() {
+    if let Ok(mut guard) = global_agent_runtimes().lock() {
         guard.remove(agent_id);
     }
 }
 
-/// Look up `agent_id` in the abort registry and, if present, call
-/// `abort()` on its signal. Returns `true` when a signal was found and
-/// aborted, `false` when the agent isn't registered (either it
-/// finished already or was never registered).
-///
-/// Matches CC-fork's `findTeammateTaskByAgentId(agentId,
-/// appState.tasks); if (task?.abortController) task.abortController.abort()`.
+/// Cancel a registered task. Returns whether its signal was found.
 pub fn abort_registered_agent(agent_id: &str) -> bool {
-    if let Ok(guard) = global_agent_abort_signals().lock() {
-        if let Some(signal) = guard.get(agent_id) {
-            signal.abort();
+    if let Ok(guard) = global_agent_runtimes().lock() {
+        if let Some(runtime) = guard.get(agent_id) {
+            runtime.abort.abort();
             return true;
         }
     }
     false
+}
+
+struct AgentRuntimeRegistration {
+    agent_id: String,
+}
+
+impl Drop for AgentRuntimeRegistration {
+    fn drop(&mut self) {
+        unregister_agent_abort_signal(&self.agent_id);
+    }
+}
+
+fn register_agent_job(job: &AgentJob) -> Result<AgentRuntimeRegistration, String> {
+    register_agent_runtime(
+        &job.manifest.agent_id,
+        job.abort_signal.clone(),
+        job.fs.working_root().map_err(|error| error.to_string())?,
+    )?;
+    Ok(AgentRuntimeRegistration {
+        agent_id: job.manifest.agent_id.clone(),
+    })
 }
 
 #[allow(clippy::needless_pass_by_value)]
@@ -4660,7 +4731,7 @@ struct AgentJob {
     fs: Arc<dyn FsBackend>,
     /// Signal wired into the subagent's `ConversationRuntime` via
     /// `with_hook_abort_signal`. Registered by name in
-    /// [`global_agent_abort_signals`] so
+    /// [`global_agent_runtimes`] so
     /// `SendMessage(shutdown_request)` can look it up and call
     /// `.abort()` for live delivery — mirrors CC-fork's
     /// `task.abortController.abort()`.
@@ -6038,6 +6109,7 @@ where
 {
     let PreparedAgent { manifest, job } = prepare_agent_job(input, ctx, Arc::clone(fs))?;
     let subagent = job.subagent.clone();
+    let registration = register_agent_job(&job)?;
     let Some(threshold) = auto_background_threshold() else {
         // Auto-bg disabled — original fully-sync path.
         let abort_signal = job.abort_signal.clone();
@@ -6050,11 +6122,9 @@ where
 
     // Auto-bg enabled: run on a worker thread + await up to threshold.
     let agent_id = manifest.agent_id.clone();
-    register_agent_abort_signal(&agent_id, job.abort_signal.clone());
     global_agent_registry().register(&agent_id);
 
     let bg_manifest = manifest.clone();
-    let bg_agent_id = agent_id.clone();
     let workspace = job.workspace.clone();
     let bg_abort_signal = job.abort_signal.clone();
     // The worker's own handle, cloned before `job` moves into the closure. A
@@ -6062,6 +6132,7 @@ where
     // stays honest about who owns the filesystem it writes through.
     let bg_fs = Arc::clone(&job.fs);
     std::thread::spawn(move || {
+        let _registration = registration;
         // Worker threads carry the parent turn's workspace root with them.
         let _workspace = workspace.enter();
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| work_fn(job)));
@@ -6073,7 +6144,6 @@ where
             link.emit_finished(&bg_manifest, bg_abort_signal.is_aborted(), bg_fs.as_ref());
         }
         notify_agent_completion(&bg_manifest, bg_fs.as_ref());
-        unregister_agent_abort_signal(&bg_agent_id);
     });
 
     match global_agent_registry().await_agent(&agent_id, threshold) {
@@ -6123,8 +6193,11 @@ fn spawn_agent_job(job: AgentJob) -> Result<(), String> {
         .map_err(|_| String::from("no tokio runtime available for spawning agent"))?;
     // Register the subagent's abort signal BEFORE the thread starts so a
     // `SendMessage(shutdown_request)` racing the spawn still finds an entry.
-    register_agent_abort_signal(&job.manifest.agent_id, job.abort_signal.clone());
-    handle.spawn_blocking(move || run_spawned_agent_job(job));
+    let registration = register_agent_job(&job)?;
+    handle.spawn_blocking(move || {
+        let _registration = registration;
+        run_spawned_agent_job(job);
+    });
     Ok(())
 }
 
@@ -6132,7 +6205,6 @@ fn spawn_agent_job(job: AgentJob) -> Result<(), String> {
 fn run_spawned_agent_job(job: AgentJob) {
     // Worker threads carry the parent turn's workspace root with them.
     let _workspace = job.workspace.enter();
-    let agent_id = job.manifest.agent_id.clone();
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         run_agent_job_returning_text(&job)
     }))
@@ -6147,13 +6219,6 @@ fn run_spawned_agent_job(job: AgentJob) {
     }
     // Signal the completion registry so TaskOutput(agent_id, block=true) callers unblock.
     notify_agent_completion(&job.manifest, job.fs.as_ref());
-    // Drop the abort-signal registration LAST — a
-    // `SendMessage(shutdown_request)` arriving during teardown against
-    // an already-completed agent is silently a no-op (returns
-    // `live_abort_signaled: false`), which matches CC-fork's
-    // `findTeammateTaskByAgentId → task === undefined → warn-and-skip`
-    // branch in `SendMessageTool.ts:362`.
-    unregister_agent_abort_signal(&agent_id);
 }
 
 /// Re-read the persisted manifest and notify the global completion registry.
@@ -6193,9 +6258,15 @@ fn subagent_max_multi_turns() -> usize {
 }
 
 fn run_agent_job_returning_text(job: &AgentJob) -> Result<String, String> {
+    let mailbox = Arc::new(
+        runtime::mailbox::Mailbox::workspace(Arc::clone(&job.fs), job.manifest.agent_id.clone())
+            .map_err(|error| error.to_string())?,
+    );
+    let _directory = runtime::mailbox::MailboxScope::enter(Arc::new(
+        runtime::directory::Directory::single("local", Arc::clone(&mailbox)),
+    ));
     let mut conv_runtime =
         build_agent_runtime(job)?.with_max_iterations(DEFAULT_AGENT_MAX_ITERATIONS);
-    let workspace_root = current_workspace_root().unwrap_or_default();
     // Accumulate telemetry across every multi-turn iteration so a
     // long coordinator-driven conversation reports one aggregated
     // `<total_tokens>` / `<tool_uses>` count in the task-notification.
@@ -6203,8 +6274,7 @@ fn run_agent_job_returning_text(job: &AgentJob) -> Result<String, String> {
     let mut forwarder = job.subagent.as_ref().map(SubagentLink::observer);
     let mut permission_sink = job.permission_sink.clone();
     let final_text = run_multi_turn_loop(
-        &job.manifest.agent_id,
-        &workspace_root,
+        &mailbox,
         job.abort_signal.clone(),
         job.prompt.clone(),
         subagent_max_multi_turns(),
@@ -6486,8 +6556,7 @@ fn run_agent_summarizer(job: &AgentJob, final_text: &str) -> Result<String, Stri
 /// keeps sending mail forever — mirrors the tool-loop iteration cap
 /// inside a single `run_turn`.
 fn run_multi_turn_loop<F>(
-    agent_id: &str,
-    workspace_root: &std::path::Path,
+    mailbox: &runtime::mailbox::Mailbox,
     abort_signal: HookAbortSignal,
     initial_prompt: String,
     max_multi_turns: usize,
@@ -6496,15 +6565,6 @@ fn run_multi_turn_loop<F>(
 where
     F: FnMut(String) -> Result<String, String>,
 {
-    // Same mailbox the sender writes to: one conversation model, one code
-    // path. The sub-agent's inbound receive used to read a second, flat
-    // `.sudocode-inbox/<id>.jsonl` path via `agent_mailbox::read_all` while
-    // `send` wrote conversation transcripts through `Mailbox` — so a message
-    // to a running sub-agent never arrived. Draining through `Mailbox` here
-    // closes that gap and retires the divergent path. The per-peer reader
-    // register persists the read position, so there is no in-memory cursor to
-    // lose across turns or a restart.
-    let mailbox = runtime::mailbox::Mailbox::workspace_local(workspace_root, agent_id.to_string());
     let mut current_prompt = initial_prompt;
     let mut last_final_text = String::new();
     let mut pending = runtime::mailbox::PendingMessages::default();
@@ -8219,6 +8279,7 @@ struct SubagentToolExecutor {
     /// is a standalone CLI's own disk; a co-hosted parent hands down its kernel,
     /// so a sub-agent's writes pass the same hooks its parent's do.
     fs: Arc<dyn FsBackend>,
+    directory: Arc<runtime::directory::Directory>,
 }
 
 impl SubagentToolExecutor {
@@ -8226,6 +8287,7 @@ impl SubagentToolExecutor {
         Self {
             allowed_tools,
             fs: runtime::host_fs_arc().clone(),
+            directory: runtime::mailbox::scoped_directory(),
             enforcer: None,
             abort_signal: None,
         }
@@ -8280,7 +8342,7 @@ impl ToolExecutor for SubagentToolExecutor {
         let fs = Arc::clone(&self.fs);
         let ctx = ctx.clone();
         let workspace = WorkspaceRootHandoff::capture();
-        let directory = runtime::mailbox::scoped_directory();
+        let directory = Arc::clone(&self.directory);
         // Like the parent executor, keep blocking tools off the async polling
         // thread. Otherwise a batch of sub-agent reads still executes serially
         // and prevents cancellation from being observed during a slow call.

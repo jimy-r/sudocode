@@ -298,8 +298,23 @@ impl Mailbox {
     /// must not each decide for themselves.
     #[must_use]
     pub fn workspace_local(root: &std::path::Path, self_id: String) -> Self {
+        Self::workspace_at(Arc::new(crate::fs_backend::StdFsBackend), root, self_id)
+    }
+
+    /// A mailbox rooted at its backend's own workspace, independently of the shell.
+    ///
+    /// # Errors
+    /// The backend cannot resolve its working root.
+    pub fn workspace(fs: Arc<dyn FsBackend>, self_id: String) -> std::io::Result<Self> {
+        let root = fs.working_root()?;
+        Ok(Self::workspace_at(fs, std::path::Path::new(&root), self_id))
+    }
+
+    /// A mailbox at an explicit root in the supplied backend's namespace.
+    #[must_use]
+    pub fn workspace_at(fs: Arc<dyn FsBackend>, root: &std::path::Path, self_id: String) -> Self {
         Self::new(
-            Arc::new(crate::fs_backend::StdFsBackend),
+            fs,
             self_id,
             InboxConvention::new(
                 strip_windows_verbatim_prefix(&root.to_string_lossy()).into_owned(),
