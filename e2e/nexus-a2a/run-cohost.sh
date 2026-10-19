@@ -267,7 +267,8 @@ echo "== 9. independent concurrent contexts in one durable SID =="
 kill "$AUTHON_DAEMON_PID" 2>/dev/null || true
 wait "$AUTHON_DAEMON_PID" 2>/dev/null || true
 AUTHON_DAEMON_PID=
-authon_boot
+# Enable the experiment only for its stage; earlier recovery stays on defaults.
+SUDOCODE_EXPERIMENT_SHARED_SESSION_HISTORY=1 authon_boot
 authon_wait_log "Zone '$AUTHON_ZONE' registered" 45
 wait_writable
 provision_model

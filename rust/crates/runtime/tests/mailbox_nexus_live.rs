@@ -1793,6 +1793,7 @@ fn live_cohost_session_resume() {
 #[test]
 #[ignore = "requires the shared-history stage of e2e/nexus-a2a/run-cohost.sh"]
 fn live_cohost_shared_sid_concurrent_contexts() {
+    use runtime::history::{HistoryEvent, HistoryGraph, HistoryRecord};
     use serde_json::{json, Value};
     let operator = Arc::new(model_operator());
     let agent = format!("shared-sid-probe-{}", fresh());
@@ -1922,21 +1923,23 @@ fn live_cohost_shared_sid_concurrent_contexts() {
         cursor = frame.next_offset;
     }
     let history = String::from_utf8(durable).unwrap();
+    let graph = HistoryGraph::decode(history.as_bytes()).expect("committed v3 history");
     let mut tool_origins = std::collections::BTreeSet::new();
     for line in history.lines() {
-        let record: Value = serde_json::from_str(line).unwrap();
-        let message = &record["message"];
-        if message["blocks"].as_array().is_some_and(|blocks| {
-            blocks
-                .iter()
-                .any(|block| block["type"] == "tool_result" && block["tool_use_id"] == "call_1")
-        }) {
-            tool_origins.insert(
-                message["history"]["tool_origins"]["call_1"]
-                    .as_str()
-                    .unwrap()
-                    .to_owned(),
-            );
+        let record: HistoryRecord = serde_json::from_str(line).unwrap();
+        if let HistoryEvent::Message { id, message, .. } = record.event {
+            if message["blocks"].as_array().is_some_and(|blocks| {
+                blocks
+                    .iter()
+                    .any(|block| block["type"] == "tool_result" && block["tool_use_id"] == "call_1")
+            }) {
+                tool_origins.insert(
+                    graph
+                        .tool_origin(&id, "call_1")
+                        .expect("recorded tool origin")
+                        .to_owned(),
+                );
+            }
         }
     }
     assert_eq!(
@@ -2031,7 +2034,7 @@ fn live_cohost_shared_sid_concurrent_contexts() {
         operator.read(&linked_file, "").unwrap(),
         b"linked Agent durable effect"
     );
-    let mut identity_checkpoints = 0;
+    let mut complete_history = history.into_bytes();
     loop {
         let frame = operator
             .stream_read_at(&path, cursor, false, 0, "")
@@ -2039,19 +2042,16 @@ fn live_cohost_shared_sid_concurrent_contexts() {
         if frame.data.is_empty() {
             break;
         }
+        assert!(frame.next_offset > cursor);
         cursor = frame.next_offset;
-        for line in String::from_utf8(frame.data).unwrap().lines() {
-            let record: Value = serde_json::from_str(line).unwrap();
-            if record["type"] == "history_checkpoint" {
-                assert_eq!(record["meta"]["identity"]["agent_name"], agent);
-                identity_checkpoints += 1;
-            }
-        }
+        complete_history.extend(frame.data);
     }
-    assert!(
-        identity_checkpoints > 0,
-        "linked context must persist its identity"
-    );
+    let graph = HistoryGraph::decode(&complete_history).expect("linked Agent committed history");
+    let completed = graph.completed_session(None).unwrap();
+    assert_eq!(completed.session_id, sid);
+    assert_eq!(completed.identity.as_ref().unwrap().agent_name, agent);
+    assert!(completed.messages().iter().flat_map(|message| &message.blocks).any(|block|
+        matches!(block, runtime::ContentBlock::Text { text } if text.contains("linked Agent durable effect"))));
     println!(
         "COHOST SHARED SID OK: {sid}, linked Agent={linked_agent}, independent PIDs={},{}",
         first["session_id"], second["session_id"]
