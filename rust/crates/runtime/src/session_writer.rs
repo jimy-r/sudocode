@@ -53,19 +53,39 @@ pub(crate) struct SessionPurgeGuard {
 
 impl SessionWriter {
     pub fn acquire(fs: Arc<dyn FsBackend>, transcript: &Path) -> Result<Arc<Self>, String> {
+        Self::acquire_native(fs, transcript, true)
+    }
+
+    /// A short-lived metadata writer shares the SID commit barrier without
+    /// claiming the legacy runtime's exclusive message-writing admission.
+    pub(crate) fn acquire_maintenance(
+        fs: Arc<dyn FsBackend>,
+        transcript: &Path,
+    ) -> Result<Arc<Self>, String> {
+        Self::acquire_native(fs, transcript, false)
+    }
+
+    fn acquire_native(
+        fs: Arc<dyn FsBackend>,
+        transcript: &Path,
+        exclusive: bool,
+    ) -> Result<Arc<Self>, String> {
         if !fs.fenced_locks() {
             return Err("completion_storage_exclusion_unavailable".into());
         }
         let guard = Self::commit_lock(fs.as_ref(), transcript)?;
-        let legacy_owner = fs
-            .try_lock(
-                &transcript
-                    .with_extension("legacy-writer.lock")
-                    .to_string_lossy(),
-                30_000,
-            )
-            .map_err(|error| error.to_string())?
-            .ok_or("session_writer_busy")?;
+        let legacy_owner = exclusive
+            .then(|| {
+                fs.try_lock(
+                    &transcript
+                        .with_extension("legacy-writer.lock")
+                        .to_string_lossy(),
+                    30_000,
+                )
+                .map_err(|error| error.to_string())?
+                .ok_or_else(|| "session_writer_busy".to_owned())
+            })
+            .transpose()?;
         crate::subagent_completion::prepare_shared_storage(fs.as_ref(), transcript)?;
         let path = transcript.to_string_lossy();
         if fs.exists(&path).map_err(|error| error.to_string())?
@@ -103,7 +123,7 @@ impl SessionWriter {
             writes: Mutex::new(()),
             presence: Some(presence),
             history: Mutex::default(),
-            _legacy_owner: Some(legacy_owner),
+            _legacy_owner: legacy_owner,
         }))
     }
 

@@ -808,6 +808,45 @@ impl Session {
         writer.map_err(SessionError::Format)
     }
 
+    fn maintenance_writer_for(
+        &self,
+        path: &Path,
+    ) -> Result<(Arc<crate::session_writer::SessionWriter>, bool), SessionError> {
+        if let Some(persistence) = &self.persistence {
+            let state = persistence
+                .writer
+                .lock()
+                .map_err(|_| SessionError::Format("session writer poisoned".into()))?;
+            match &*state {
+                SessionWriterState::Closed => {
+                    return Err(SessionError::Format("session_closed".into()));
+                }
+                SessionWriterState::Active(writer) => return Ok((Arc::clone(writer), false)),
+                SessionWriterState::Unopened => {}
+            }
+            let legacy = if self.backend().fenced_locks() {
+                match self.backend().read(&path.to_string_lossy()) {
+                    Ok(bytes) => !bytes.is_empty() && !history::is_record_history(&bytes),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+                    Err(error) => return Err(error.into()),
+                }
+            } else {
+                false
+            };
+            if legacy {
+                // Do not cache this as a runtime writer: a later message append
+                // must still obtain exclusive legacy admission.
+                return crate::session_writer::SessionWriter::acquire_maintenance(
+                    self.fs_handle(),
+                    path,
+                )
+                .map(|writer| (writer, true))
+                .map_err(SessionError::Format);
+            }
+        }
+        self.writer_for(path).map(|writer| (writer, false))
+    }
+
     /// Revision of the current durable transcript through its own backend.
     /// In-memory sessions have no revision. A configured path which is absent
     /// has a distinct sentinel, so external creation also counts as a change.
@@ -1938,7 +1977,7 @@ impl Session {
             .map(ConversationMessage::to_json)
             .collect();
         drop(committed);
-        let mut parent = None;
+        let mut parent = persistence.and_then(|_| self.restored_history_head.clone());
         let mut needs_view = true;
         if let Some(persistence) = persistence {
             if let SessionWriterState::Active(writer) = &*persistence
@@ -2294,9 +2333,9 @@ impl Session {
         newly_known
     }
 
-    /// Persist billing and achievement metadata in a full snapshot. Appending
-    /// a lone `session_meta` would erase history on JSONL replay. A failed write
-    /// keeps all known receipts in memory for the caller to report or retry.
+    /// Persist billing and achievement metadata without claiming another
+    /// runtime's legacy message writer. A failed write keeps all known receipts
+    /// in memory for the caller to report or retry.
     pub fn persist_maintenance_metadata(&self) -> Result<(), SessionError> {
         self.persist_maintenance_metadata_checked(None)
     }
@@ -2309,11 +2348,11 @@ impl Session {
     ) -> Result<(), SessionError> {
         let writer = self
             .persistence_path()
-            .map(|path| self.writer_for(path))
+            .map(|path| self.maintenance_writer_for(path))
             .transpose()?;
         let _write = writer
             .as_ref()
-            .map(|w| w.write())
+            .map(|(writer, _)| writer.write())
             .transpose()
             .map_err(SessionError::Format)?;
         if let Some(expected) = expected_revision {
@@ -2321,7 +2360,13 @@ impl Session {
                 return Err(SessionError::SourceChanged);
             }
         }
-        let (Some(path), Some(writer)) = (self.persistence_path(), writer.as_ref()) else {
+        if let Some((_, true)) = &writer {
+            let (durable, _) = self.durable_history_revision()?;
+            if durable.as_deref() != Some(self.context_digest()?.as_str()) {
+                return Err(SessionError::SourceChanged);
+            }
+        }
+        let (Some(path), Some((writer, _))) = (self.persistence_path(), writer.as_ref()) else {
             return Ok(());
         };
         self.save_snapshot(path, writer)

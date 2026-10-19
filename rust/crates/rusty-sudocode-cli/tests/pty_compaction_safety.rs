@@ -1342,6 +1342,21 @@ fn compaction_preserves_external_billing_for_unchanged_history() {
     let mut external = Session::load_from_path(&path).unwrap();
     external.merge_maintenance_usage(std::slice::from_ref(&receipt));
     external.persist_maintenance_metadata().unwrap();
+    let persisted = std::fs::read(&path).unwrap();
+    assert!(external
+        .push_user_text("METADATA_WRITER_MUST_NOT_APPEND_MESSAGES")
+        .unwrap_err()
+        .to_string()
+        .contains("session_writer_busy"));
+    let changed = external
+        .clone()
+        .with_messages(vec![ConversationMessage::user_text("REPLACED_CONTEXT")]);
+    assert!(changed
+        .persist_maintenance_metadata()
+        .unwrap_err()
+        .to_string()
+        .contains("source changed"));
+    assert_eq!(std::fs::read(&path).unwrap(), persisted);
     drop(external);
     cli.send("/compact\r").unwrap();
     common::expect_screen(
