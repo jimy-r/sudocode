@@ -291,71 +291,74 @@ impl HistoryGraph {
         if self.contexts.contains_key(record.context_id()) {
             return Ok(rejected("context_already_exists"));
         }
-        let (projection, mutable, base_commit, inherited_unfinished) = if let Some(commit) = source
-        {
-            let Some(source) = self.commits.get(commit) else {
-                return Ok(rejected("source_turn_not_committed"));
-            };
-            (
-                source.projection.clone(),
-                BTreeSet::new(),
-                commit.to_string(),
-                false,
-            )
-        } else {
-            let source = self
-                .latest_context
-                .as_ref()
-                .and_then(|id| self.contexts.get(id))
-                .ok_or_else(|| invalid("resume context missing"))?;
-            (
-                source.projection.clone(),
-                source.unsealed.clone(),
-                source.base_commit.clone(),
-                source.inherited_unfinished || !source.unsealed.is_empty(),
-            )
-        };
-        let session = self.session(&projection)?;
-        let mut chain = Arc::new(MessageChain::default());
-        let mut open = BTreeMap::new();
-        let mut copied_tail = false;
-        let mut nodes = Vec::new();
-        for (index, message) in session.messages.iter().enumerate() {
-            let original = message
-                .history
-                .as_ref()
-                .map(|identity| identity.id.as_str());
-            copied_tail |= original.is_none_or(|id| mutable.contains(id));
-            let id = if copied_tail {
-                let bytes = serde_json::to_vec(&(
-                    "resume-message-v1",
-                    record.context_id(),
-                    index,
-                    original,
-                ))
-                .map_err(io::Error::other)?;
-                format!("resume-{:x}", Sha256::digest(bytes))
+        let (projection, mutable, base_commit, inherited_unfinished, mut open) =
+            if let Some(commit) = source {
+                let Some(source) = self.commits.get(commit) else {
+                    return Ok(rejected("source_turn_not_committed"));
+                };
+                (
+                    source.projection.clone(),
+                    BTreeSet::new(),
+                    commit.to_string(),
+                    false,
+                    BTreeMap::new(),
+                )
             } else {
-                original
-                    .expect("immutable source message has identity")
-                    .to_string()
+                let source = self
+                    .latest_context
+                    .as_ref()
+                    .and_then(|id| self.contexts.get(id))
+                    .ok_or_else(|| invalid("resume context missing"))?;
+                (
+                    source.projection.clone(),
+                    source.unsealed.clone(),
+                    source.base_commit.clone(),
+                    source.inherited_unfinished || !source.unsealed.is_empty(),
+                    source.open_tools.clone(),
+                )
             };
-            let (next_open, origins) = tool_changes(message, &id, &open)?;
-            open = next_open;
-            if copied_tail {
-                if self.messages.contains_key(&id) {
-                    return Ok(rejected("message_identity_conflict"));
+        let mut chain = Arc::clone(&projection.chain);
+        let mut nodes = Vec::new();
+        if !mutable.is_empty() {
+            chain = Arc::new(MessageChain::default());
+            open.clear();
+            let mut copied_tail = false;
+            for (index, original) in projection.chain.ids().into_iter().enumerate() {
+                let message = &self
+                    .messages
+                    .get(&original)
+                    .expect("indexed source message")
+                    .message;
+                copied_tail |= mutable.contains(&original);
+                let id = if copied_tail {
+                    let bytes = serde_json::to_vec(&(
+                        "resume-message-v1",
+                        record.context_id(),
+                        index,
+                        Some(original.as_str()),
+                    ))
+                    .map_err(io::Error::other)?;
+                    format!("resume-{:x}", Sha256::digest(bytes))
+                } else {
+                    original
+                };
+                let (next_open, origins) = tool_changes(message, &id, &open)?;
+                open = next_open;
+                if copied_tail {
+                    if self.messages.contains_key(&id) {
+                        return Ok(rejected("message_identity_conflict"));
+                    }
+                    nodes.push((
+                        id.clone(),
+                        MessageNode {
+                            message: message.clone(),
+                            parent: chain.tail.last().cloned(),
+                            tool_origins: origins,
+                        },
+                    ));
                 }
-                nodes.push((
-                    id.clone(),
-                    MessageNode {
-                        message: decode_message(&to_value(message)?)?,
-                        parent: chain.tail.last().cloned(),
-                        tool_origins: origins,
-                    },
-                ));
+                MessageChain::append(&mut chain, id);
             }
-            MessageChain::append(&mut chain, id);
         }
         let projection = Projection {
             chain,

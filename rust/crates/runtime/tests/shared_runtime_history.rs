@@ -20,6 +20,7 @@ const CASE: &str = "runtime_resume_inherits_written_prefix_while_native_tool_run
 const CHILD: &str = "SCODE_SHARED_RUNTIME_CHILD";
 const RECEIPT: &str = "NEXUS_RUNTIME_HISTORY_RECEIPT";
 const WAIT: Duration = Duration::from_secs(30);
+const PREFIX_TURNS: usize = 36;
 type Requests = Arc<Mutex<Vec<Vec<ConversationMessage>>>>;
 
 #[path = "common/live_nexus.rs"]
@@ -197,8 +198,20 @@ fn exercise_runtime_history(nexus: bool) {
     } else {
         root.join("session.jsonl")
     };
-    let session = Session::new()
-        .with_workspace_root(&root)
+    let mut session = Session::new().with_workspace_root(&root);
+    for index in 0..PREFIX_TURNS {
+        session
+            .push_user_text(format!("PREFIX_PROMPT_{index}"))
+            .unwrap();
+        session
+            .push_message(ConversationMessage::assistant(vec![
+                runtime::ContentBlock::Text {
+                    text: format!("PREFIX_ANSWER_{index}"),
+                },
+            ]))
+            .unwrap();
+    }
+    let session = session
         .with_persistence_path(&path)
         .with_fs_backend(backend(nexus));
     let sid = session.session_id.clone();
@@ -313,6 +326,10 @@ fn exercise_runtime_history(nexus: bool) {
     assert_eq!(a.session_id, sid);
     let restored = load(&path, nexus);
     let text = transcript(restored.messages());
+    for index in 0..PREFIX_TURNS {
+        assert!(text.contains(&format!("PREFIX_PROMPT_{index}")));
+        assert!(text.contains(&format!("PREFIX_ANSWER_{index}")));
+    }
     assert!(text.contains("A_ACTUAL_NATIVE_TOOL_RESULT"));
     assert!(!text.contains("B_PRIVATE_ANSWER"));
     let contents = backend(nexus).read(&path.to_string_lossy()).unwrap();

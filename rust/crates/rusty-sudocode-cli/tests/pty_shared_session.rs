@@ -408,7 +408,7 @@ fs.writeFileSync(label + '.ready', 'tool running');
 const timer = setInterval(() => {
   if (!fs.existsSync(label + '.release')) return;
   clearInterval(timer);
-  fs.writeFileSync(label + '.effect', label + ' durable effect');
+  fs.appendFileSync(label + '.effect', label + ' durable effect');
   process.stdout.write((label + '_OUTPUT_').repeat(6000));
 }, 10);
 "#,
@@ -632,7 +632,10 @@ fn assert_gate_outputs(transcript: &std::path::Path, sid: &str, expected_call_id
                 .next()
                 .unwrap();
             let full = fs::read_to_string(output_dir.join(output_id)).unwrap();
-            assert!(full.contains(&format!("{label}_OUTPUT_")));
+            assert!(
+                full.contains(&format!("{label}_OUTPUT_").repeat(6000)),
+                "full tool output must retain every emitted byte"
+            );
             let other = if label == "A" { "B" } else { "A" };
             assert!(
                 !full.contains(&format!("{other}_OUTPUT_")),
