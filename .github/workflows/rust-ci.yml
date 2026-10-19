@@ -210,6 +210,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Reuse unchanged CLI builds and refresh Git metadata
+        env:
+          BUILD_METADATA_EVIDENCE: ${{ runner.temp }}/scode-build-metadata
+        run: python ../e2e/build-metadata/run.py
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: rust -> target
