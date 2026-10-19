@@ -48,6 +48,8 @@ impl PreparedManagedAgent {
     pub fn model(&self) -> &str {
         &self.config.model
     }
+    /// Stop the host when its lifetime or durable-session admission ends.
+    /// Turn cancellation uses the separate signal installed by `open`.
     pub fn abort_signal(&self) -> runtime::HookAbortSignal {
         self.abort.clone()
     }
@@ -71,7 +73,7 @@ impl PreparedManagedAgent {
             self.config,
             mcp_servers,
             prompt_overrides,
-            self.abort,
+            runtime::HookAbortSignal::new(),
         )?;
         Ok(match self.lease {
             Some(lease) => engine.with_lifetime_guard(lease),
