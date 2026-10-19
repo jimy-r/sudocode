@@ -148,6 +148,23 @@ fn write_then_read_round_trips_through_the_vfs() {
 }
 
 #[test]
+fn record_log_requires_wal_and_preserves_regular_files() {
+    use runtime::fs_backend::RecordLogMode;
+
+    let kernel = kernel_with_root_backend();
+    let fs = vfs_backend(&kernel);
+    let path = "/ws/atomic-records";
+    // This real kernel has no Raft coordinator. An explicit WAL request must
+    // fail, with neither a memory stream nor a regular-file fallback.
+    assert!(fs.record_log(path, RecordLogMode::CreateNew).is_err());
+    assert!(kernel.sys_stat(path, "root").is_none());
+    fs.write(path, b"original regular file").unwrap();
+    assert!(fs.record_log(path, RecordLogMode::CreateNew).is_err());
+    assert!(fs.record_log(path, RecordLogMode::Existing).is_err());
+    assert_eq!(fs.read(path).unwrap(), b"original regular file");
+}
+
+#[test]
 fn edit_file_mutates_vfs_content() {
     let kernel = kernel_with_root_backend();
     let fs = vfs_backend(&kernel);
