@@ -1217,7 +1217,7 @@ fn cancelling_a_delayed_checkpoint_preserves_the_resumable_source() {
     cli.set_default_timeout(Duration::from_secs(15));
     let _ = cli.expect_eof().unwrap();
     let restored = Session::load_from_path(&path).unwrap();
-    assert_eq!(restored.messages, original.messages);
+    assert_eq!(restored.messages(), original.messages());
     assert_eq!(restored.compaction, original.compaction);
     assert_eq!(compaction_request_count(&provider), 1);
     let report = restored.last_compaction_report.as_ref().unwrap();
