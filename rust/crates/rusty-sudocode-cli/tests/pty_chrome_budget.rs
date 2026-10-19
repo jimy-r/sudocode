@@ -216,7 +216,19 @@ fn resize_and_confirm_burst_keeps_the_unseen_picker_open() {
 
 #[test]
 fn resize_and_typing_burst_cannot_edit_an_unreviewable_draft() {
-    let env = TestEnv::new("chrome-budget-resize-typing-burst");
+    assert_resize_edit_burst_rejected("MustNotAppear", "chrome-budget-resize-typing-burst");
+}
+
+#[test]
+fn resize_and_paste_burst_cannot_edit_an_unreviewable_draft() {
+    assert_resize_edit_burst_rejected(
+        "\x1b[200~MustNotAppear\x1b[201~",
+        "chrome-budget-resize-paste-burst",
+    );
+}
+
+fn assert_resize_edit_burst_rejected(burst: &str, name: &str) {
+    let env = TestEnv::new(name);
     let mut sess = env.spawn_with_env(&[], &[("SUDOCODE_INTERRUPT_QUEUE_MODE", "queue")]);
     common::expect_screen(&sess, |s| s.contains('❯'), common::DEFAULT_TIMEOUT, "input");
     sess.send("DraftHeadTail").unwrap();
@@ -237,7 +249,7 @@ fn resize_and_typing_burst_cannot_edit_an_unreviewable_draft() {
     );
     sess.resize(8, 12).unwrap();
     // Deliberately do not wait for the warning before this input burst.
-    sess.send("MustNotAppear").unwrap();
+    sess.send(burst).unwrap();
     common::expect_screen_settled(
         &sess,
         |s| s.contains("Enlarge") && s.contains("terminal"),

@@ -1467,6 +1467,7 @@ fn ReplApp(mut hooks: Hooks) -> impl Into<AnyElement<'static>> {
     // use_terminal_size must be called before use_future and use_terminal_events
     // to maintain consistent hook ordering.
     let (term_width, term_height) = hooks.use_terminal_size();
+    let input_frame = hooks.use_input_frame();
 
     let (stdout, _stderr) = hooks.use_output();
     let mut system = hooks.use_context_mut::<SystemContext>();
@@ -1755,7 +1756,7 @@ fn ReplApp(mut hooks: Hooks) -> impl Into<AnyElement<'static>> {
                 let current_slot = input_slot.read().clone();
                 // Never submit or edit contents that cannot be reviewed. The
                 // mounted editor preserves its buffer/cursor while unfocused.
-                if !input_reviewable.get()
+                if (!input_reviewable.get() || !input_frame.is_current())
                     && code != KeyCode::Esc
                     && !(code == KeyCode::Char('c') && modifiers.contains(KeyModifiers::CONTROL))
                 {
@@ -2155,7 +2156,7 @@ fn ReplApp(mut hooks: Hooks) -> impl Into<AnyElement<'static>> {
             // not mounted, so route the paste into the active buffer here using
             // the SAME normalize/placeholder logic (DRY).
             TerminalEvent::Paste(pasted) => {
-                if !input_reviewable.get() {
+                if !input_reviewable.get() || !input_frame.is_current() {
                     return;
                 }
                 let current_slot = input_slot.read().clone();

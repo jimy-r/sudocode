@@ -2039,15 +2039,21 @@ broader UI semantic colors and the streaming-preview position remain
 separate design discussions.</p>
 
 <p><strong>Resize input ownership.</strong> The terminal event pump stops at a
-Resize boundary. Already queued pre-resize input is dispatched with the
-callbacks and focus of the last painted frame, before new geometry replaces
-that frame; subsequent input is admitted only after reflow and presentation.
-The layout remains the single visibility authority: no per-key size query,
-second geometry registry, dropped key batch or cursor-offset correction is
-needed. Real PTY acceptance covers both immediate shrink-then-type/confirm and
-hidden-type/confirm-then-grow, preserving draft bytes and the middle cursor.
-The framework counterpart runs the same two directions on Linux and both
-Windows ConPTY backends; a fixture pass does not replace full CLI acceptance.</p>
+Resize boundary and dispatches the bounded batch with the last painted frame's
+callbacks. Unix can deliver keyboard bytes before its Resize notification,
+so this barrier alone is insufficient. The terminal also records each input's
+observed dimensions and presented-frame identity; TextInput and the parent's
+confirmation/paste handlers share <code>use_input_frame()</code> admission.
+A later redraw cannot authorize an older observation. Cancellation remains
+available. The layout is still the sole content-visibility authority; the
+terminal owns presentation/geometry, not a second application layout registry.
+This adds one OS size query per key/paste event, without cursor queries or
+raw-event reordering; performance must be measured rather than assumed free.
+Real PTY acceptance covers immediate shrink-then-type/paste/confirm and
+hidden-input-then-grow, preserving draft bytes and the middle cursor. Framework
+CI covers Linux/macOS and both Windows ConPTY backends, including Linux-only
+identity-checked pending-readiness probes; a fixture pass does not replace
+the original failing full CLI tests.</p>
 
 <p><strong>Event-time draft navigation.</strong> TextInput owns one working
 value/cursor for a key batch. Logical-line Up/Down jumps, prompt history and
