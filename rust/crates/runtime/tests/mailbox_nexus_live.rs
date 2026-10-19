@@ -1793,7 +1793,7 @@ fn live_cohost_session_resume() {
 #[test]
 #[ignore = "requires the shared-history stage of e2e/nexus-a2a/run-cohost.sh"]
 fn live_cohost_shared_sid_concurrent_contexts() {
-    use runtime::history::{HistoryEvent, HistoryGraph, HistoryRecord};
+    use runtime::history::{HistoryGraph, HistoryRecord};
     use serde_json::{json, Value};
     let operator = Arc::new(model_operator());
     let agent = format!("shared-sid-probe-{}", fresh());
@@ -1809,10 +1809,6 @@ fn live_cohost_shared_sid_concurrent_contexts() {
     let first_controller = Controller::attach(&operator, &first, "");
     let sid = first["durable_session_id"].as_str().unwrap();
     request["resume_session_id"] = json!(sid);
-    let second = rpc("managed_agent.start_session_v1", &request);
-    let second_controller = Controller::attach(&operator, &second, "");
-    assert_eq!(second["durable_session_id"], sid);
-    assert_ne!(first["session_id"], second["session_id"]);
     let root = std::env::temp_dir().join(format!("scode-cohost-shared-{}", fresh()));
     std::fs::create_dir_all(&root).unwrap();
     struct Release(Vec<std::path::PathBuf>);
@@ -1850,13 +1846,18 @@ fn live_cohost_shared_sid_concurrent_contexts() {
             thread::sleep(Duration::from_millis(10));
         }
     };
-    thread::scope(|scope| {
+    let (second, second_controller) = thread::scope(|scope| {
         let _release = Release(vec![root.join("A.release"), root.join("B.release")]);
         let first_prompt = prompt("A");
         let a = scope.spawn(|| first_controller.request("session/prompt", first_prompt));
         wait_ready("A");
+        let second = rpc("managed_agent.start_session_v1", &request);
+        let second_controller = Arc::new(Controller::attach(&operator, &second, ""));
+        assert_eq!(second["durable_session_id"], sid);
+        assert_ne!(first["session_id"], second["session_id"]);
         let second_prompt = prompt("B");
-        let b = scope.spawn(|| second_controller.request("session/prompt", second_prompt));
+        let controller = Arc::clone(&second_controller);
+        let b = scope.spawn(move || controller.request("session/prompt", second_prompt));
         wait_ready("B");
         std::fs::write(root.join("B.release"), "release").unwrap();
         let response = b.join().unwrap();
@@ -1865,8 +1866,9 @@ fn live_cohost_shared_sid_concurrent_contexts() {
         std::fs::write(root.join("A.release"), "release").unwrap();
         let response = a.join().unwrap();
         assert_eq!(response["result"]["stopReason"], "end_turn", "{response}");
+        (second, second_controller)
     });
-    for (controller, label) in [(&first_controller, "A"), (&second_controller, "B")] {
+    for (controller, label) in [(&first_controller, "A"), (second_controller.as_ref(), "B")] {
         // This launch has no repository mount. Use the Agent's durable VFS
         // subtree rather than treating its empty procfs workspace as storage.
         let file = format!("/agents/{agent}/memory/shared-{label}.txt");
@@ -1927,18 +1929,9 @@ fn live_cohost_shared_sid_concurrent_contexts() {
     let mut tool_origins = std::collections::BTreeSet::new();
     for line in history.lines() {
         let record: HistoryRecord = serde_json::from_str(line).unwrap();
-        if let HistoryEvent::Message { id, message, .. } = record.event {
-            if message["blocks"].as_array().is_some_and(|blocks| {
-                blocks
-                    .iter()
-                    .any(|block| block["type"] == "tool_result" && block["tool_use_id"] == "call_1")
-            }) {
-                tool_origins.insert(
-                    graph
-                        .tool_origin(&id, "call_1")
-                        .expect("recorded tool origin")
-                        .to_owned(),
-                );
+        if let Some(id) = record.message_id() {
+            if let Some(origin) = graph.tool_origin(id, "call_1") {
+                tool_origins.insert(origin.to_owned());
             }
         }
     }
