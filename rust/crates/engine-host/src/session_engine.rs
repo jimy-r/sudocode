@@ -168,11 +168,19 @@ pub struct SessionEngine {
     /// model + config; `/auth` pins a concrete mode. Every rebuild reads it.
     auth_mode: std::sync::Mutex<Option<AuthMode>>,
     host_prompt_sections: Vec<String>,
-    // Last to drop: the writer lease outlives the runtime and transcript.
-    _host_resources: Option<std::sync::Mutex<Option<Box<dyn Send + Sync>>>>,
+    /// Whether this runtime can select a different durable transcript.
+    allows_session_replacement: bool,
+    lifetime_guard: std::sync::Mutex<Option<Box<dyn Send>>>,
 }
 
 impl SessionEngine {
+    pub(crate) fn with_lifetime_guard(self, guard: impl Send + 'static) -> Self {
+        *self
+            .lifetime_guard
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Box::new(guard));
+        self
+    }
     pub(crate) fn session_cwd(&self) -> PathBuf {
         self.lock_session().cwd.clone()
     }
@@ -199,7 +207,6 @@ impl SessionEngine {
         mcp_servers: std::collections::BTreeMap<String, runtime::ScopedMcpServerConfig>,
         prompt_overrides: runtime::SystemPromptOverrides,
         abort_signal: runtime::HookAbortSignal,
-        resources: Box<dyn Send + Sync>,
     ) -> Result<Self, String> {
         let handle = SessionHandle {
             id: session.session_id.clone(),
@@ -248,7 +255,8 @@ impl SessionEngine {
             reasoning_effort: std::sync::Mutex::new(None),
             auth_mode: std::sync::Mutex::new(Some(auth_mode)),
             host_prompt_sections,
-            _host_resources: Some(std::sync::Mutex::new(Some(resources))),
+            allows_session_replacement: false,
+            lifetime_guard: std::sync::Mutex::default(),
         })
     }
 
@@ -334,7 +342,8 @@ impl SessionEngine {
             reasoning_effort: std::sync::Mutex::new(reasoning_effort),
             auth_mode: std::sync::Mutex::new(auth_mode),
             host_prompt_sections: Vec::new(),
-            _host_resources: None,
+            allows_session_replacement: true,
+            lifetime_guard: std::sync::Mutex::default(),
         })
     }
 
@@ -417,7 +426,8 @@ impl SessionEngine {
             reasoning_effort: std::sync::Mutex::new(reasoning_effort),
             auth_mode: std::sync::Mutex::new(auth_mode),
             host_prompt_sections: Vec::new(),
-            _host_resources: None,
+            allows_session_replacement: true,
+            lifetime_guard: std::sync::Mutex::default(),
         })
     }
 
@@ -576,7 +586,7 @@ impl SessionEngine {
             let mut session = self.lock_session();
             let _scope = runtime::WorkspaceRootScope::enter(&session.cwd);
             let previous = session.runtime.session().model.clone().unwrap_or_default();
-            let message_count = session.runtime.session().messages.len();
+            let message_count = session.runtime.session().messages().len();
             let turns = session.runtime.usage().turns();
             if resolved == previous {
                 (previous, message_count, turns, false)
@@ -707,7 +717,7 @@ impl SessionEngine {
                 return Err(error);
             }
         }
-        let kept = session.runtime.session().messages.len();
+        let kept = session.runtime.session().messages().len();
         let after_tokens = estimate_session_tokens(session.runtime.session());
         if let Some(tracer) = session.runtime.session_tracer() {
             tracer.record("slash_compact", {
@@ -784,7 +794,7 @@ impl SessionEngine {
             before_tokens,
             after_tokens: before_tokens,
             removed: 0,
-            kept: session.runtime.session().messages.len(),
+            kept: session.runtime.session().messages().len(),
             method: None,
             report: session.runtime.last_compaction_report().cloned(),
         })
@@ -960,6 +970,7 @@ impl SessionEngine {
         let mut session = self.lock_session();
         for block in blocks {
             let msg = runtime::ConversationMessage {
+                history: None,
                 role: runtime::MessageRole::User,
                 blocks: vec![block],
                 usage: None,
@@ -1224,14 +1235,12 @@ impl engine_core::EngineDelegate for SessionEngine {
         if session.runtime.ensure_session_persistence_allowed().is_ok() {
             let _ = session.runtime.session().save_to_path(&path);
         }
-        // Release the writer lease on explicit close, even if a renderer still
-        // retains an Arc to this closed engine for a queued notification.
-        if let Some(resources) = &self._host_resources {
-            resources
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .take();
-        }
+        session.runtime.session().close_persistence();
+        drop(session);
+        self.lifetime_guard
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
     }
 }
 
@@ -1675,7 +1684,7 @@ impl SessionLifecycle for SessionEngine {
     }
 
     fn reset_session(&self) -> Result<SessionHandle, String> {
-        if self._host_resources.is_some() {
+        if !self.allows_session_replacement {
             return Err("managed session identity is fixed; use start_session to create or resume a session".into());
         }
         let mut session = self.lock_session();
@@ -1691,13 +1700,13 @@ impl SessionLifecycle for SessionEngine {
     }
 
     fn resume_session(&self, reference: &str) -> Result<(SessionHandle, usize), String> {
-        if self._host_resources.is_some() {
+        if !self.allows_session_replacement {
             return Err("managed session identity is fixed; use start_session to create or resume a session".into());
         }
         let mut session = self.lock_session();
         let _scope = runtime::WorkspaceRootScope::enter(&session.cwd);
         let (handle, mut loaded) = load_session_reference(reference).map_err(|e| e.to_string())?;
-        let message_count = loaded.messages.len();
+        let message_count = loaded.messages().len();
         // Loading a one-shot transcript into the REPL promotes it to the
         // interactive `latest` lane once the resumed session is persisted.
         loaded.mode = runtime::SessionMode::Interactive;
@@ -1712,8 +1721,8 @@ impl SessionLifecycle for SessionEngine {
         &self,
         branch: Option<String>,
     ) -> Result<(SessionHandle, usize, Option<String>), String> {
-        if self._host_resources.is_some() {
-            return Err("fork requires a separate managed session and writer lease".into());
+        if !self.allows_session_replacement {
+            return Err("fork requires a separate managed session".into());
         }
         let mut session = self.lock_session();
         session
@@ -1729,9 +1738,9 @@ impl SessionLifecycle for SessionEngine {
             .as_ref()
             .and_then(|fork| fork.branch_name.clone());
         let forked = forked.with_persistence_path(handle.path.clone());
-        let message_count = forked.messages.len();
+        let message_count = forked.messages().len();
         forked
-            .save_to_path(&handle.path)
+            .save_fork_to_path(session.runtime.session(), &handle.path)
             .map_err(|e| e.to_string())?;
         self.rebuild_locked(&mut session, forked, handle.clone())?;
         Ok((handle, message_count, branch_name))

@@ -1,10 +1,11 @@
 use std::env;
+use std::path::PathBuf;
 use std::process::Command;
 
-fn main() {
-    // Get git SHA (short hash)
-    let git_sha = Command::new("git")
-        .args(["rev-parse", "--short", "HEAD"])
+fn git(args: &[&str]) -> Option<String> {
+    Command::new("git")
+        .args(args)
+        .current_dir(env::var_os("CARGO_MANIFEST_DIR")?)
         .output()
         .ok()
         .and_then(|output| {
@@ -14,7 +15,26 @@ fn main() {
                 None
             }
         })
-        .map_or_else(|| "unknown".to_string(), |s| s.trim().to_string());
+        .map(|value| value.trim().to_string())
+}
+
+fn watch_git_path(name: &str) {
+    let Some(path) = git(&["rev-parse", "--path-format=absolute", "--git-path", name]) else {
+        return;
+    };
+    let mut path = PathBuf::from(path);
+    // Packed branch refs may have no loose file yet. Watch their existing
+    // parent so the next commit's loose ref creation also invalidates metadata.
+    while !path.exists() {
+        if !path.pop() {
+            return;
+        }
+    }
+    println!("cargo:rerun-if-changed={}", path.display());
+}
+
+fn main() {
+    let git_sha = git(&["rev-parse", "--short", "HEAD"]).unwrap_or_else(|| "unknown".to_string());
 
     println!("cargo:rustc-env=GIT_SHA={git_sha}");
 
@@ -51,25 +71,19 @@ fn main() {
         });
     println!("cargo:rustc-env=BUILD_DATE={build_date}");
 
-    // Resolve the real git directory, handling worktrees where .git is a file
-    // pointing to the main repo (e.g. "gitdir: /repo/.git/worktrees/my-wt").
-    let git_dir = {
-        let dot_git = std::path::Path::new(".git");
-        if dot_git.is_file() {
-            std::fs::read_to_string(dot_git)
-                .ok()
-                .and_then(|content| {
-                    content
-                        .strip_prefix("gitdir: ")
-                        .map(|s| s.trim().to_string())
-                })
-                .unwrap_or_else(|| ".git".to_string())
-        } else {
-            ".git".to_string()
+    watch_git_path("HEAD");
+    if let Some(reference) = git(&["symbolic-ref", "--quiet", "HEAD"]) {
+        watch_git_path(&reference);
+        let packed = git(&[
+            "rev-parse",
+            "--path-format=absolute",
+            "--git-path",
+            "packed-refs",
+        ]);
+        if let Some(path) = packed.filter(|path| PathBuf::from(path).is_file()) {
+            println!("cargo:rerun-if-changed={path}");
         }
-    };
-
-    // Rerun if git state changes (works for both normal repos and worktrees)
-    println!("cargo:rerun-if-changed={git_dir}/HEAD");
-    println!("cargo:rerun-if-changed={git_dir}/refs");
+    }
+    println!("cargo:rerun-if-env-changed=SOURCE_DATE_EPOCH");
+    println!("cargo:rerun-if-env-changed=BUILD_DATE");
 }

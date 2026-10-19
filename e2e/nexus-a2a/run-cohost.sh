@@ -45,7 +45,7 @@ REPLY="${NEXUS_A2A_COHOST_REPLY:-PONG from the co-host}"
 MODEL="${NEXUS_A2A_COHOST_MODEL:-claude-sonnet-4-6}"
 RUST_DIR="${RUST_DIR:-$(cd ../../rust && pwd)}"
 MANIFEST=("--manifest-path" "$RUST_DIR/Cargo.toml")
-CARGO_TEST=(cargo test "${MANIFEST[@]}" -q -p runtime --test mailbox_nexus_live)
+CARGO_TEST=(cargo_in_workspace test "${MANIFEST[@]}" -q -p runtime --test mailbox_nexus_live)
 
 echo "== 0. the co-host daemon binary =="
 BIN="${NEXUSD_COHOST_BIN:-}"
@@ -53,8 +53,8 @@ if [ -z "$BIN" ]; then
   # `--features daemon,driver-ai`: the bin is behind it so the workspace's own test and
   # clippy jobs do not compile a raft + tonic tree on three platforms (and do not
   # need `protoc`, which the macOS runners have not got).
-  cargo build "${MANIFEST[@]}" -q -p nexusd-cohost --features daemon,driver-ai
-  BIN="$(cargo metadata "${MANIFEST[@]}" --format-version 1 --no-deps \
+  cargo_in_workspace build "${MANIFEST[@]}" -q -p nexusd-cohost --features daemon,driver-ai
+  BIN="$(cargo_in_workspace metadata "${MANIFEST[@]}" --format-version 1 --no-deps \
          | sed -n 's/.*"target_directory":"\([^"]*\)".*/\1/p')/debug/nexusd-cohost"
   [ -x "$BIN" ] || BIN="$BIN.exe"
 fi
@@ -102,10 +102,10 @@ else
   echo "== 1. mock model on 127.0.0.1:${MOCK_PORT} =="
   # Built first, then run: `cargo run` would otherwise compile INTO the log this
   # waits on, and a cold build outlasts any sane readiness window.
-  cargo build "${MANIFEST[@]}" -q -p mock-anthropic-service
+  cargo_in_workspace build "${MANIFEST[@]}" -q -p mock-anthropic-service
   # Start the executable itself so cleanup owns the server PID. Killing
   # `cargo run` leaves its child holding the port on Windows.
-  MOCK_BIN="$(cargo metadata "${MANIFEST[@]}" --format-version 1 --no-deps \
+  MOCK_BIN="$(cargo_in_workspace metadata "${MANIFEST[@]}" --format-version 1 --no-deps \
     | sed -n 's/.*"target_directory":"\([^"]*\)".*/\1/p')/debug/mock-anthropic-service"
   [ -x "$MOCK_BIN" ] || MOCK_BIN="$MOCK_BIN.exe"
   "$MOCK_BIN" --bind "127.0.0.1:${MOCK_PORT}" >"$WORK_DIR/mock.log" 2>&1 &
@@ -174,26 +174,34 @@ RESUME_CLIENT_BUNDLE="$(authon_mint "$OPERATOR")"
 authon_boot
 authon_wait_log "Zone '$AUTHON_ZONE' registered" 45
 
-ready=
-for i in $(seq 1 30); do
-  if NEXUS_A2A_TEST_ENDPOINT="$ENDPOINT" NEXUS_A2A_TEST_CERT_DIR="$CLIENT_BUNDLE" \
-       "${CARGO_TEST[@]}" live_inbox_roundtrip -- --ignored 2>/dev/null | grep -q "1 passed"; then
-    echo "   writable after ~$((i * 4))s"
-    ready=1
-    break
-  fi
-  sleep 4
-done
-[ -n "$ready" ] || { echo "!! the co-host daemon never became writable" >&2; \
-  tail -40 "$WORK_DIR/daemon.log" >&2; exit 1; }
+wait_writable() {
+  local i
+  for i in $(seq 1 30); do
+    if NEXUS_A2A_TEST_ENDPOINT="$ENDPOINT" NEXUS_A2A_TEST_CERT_DIR="$CLIENT_BUNDLE" \
+         "${CARGO_TEST[@]}" live_inbox_roundtrip -- --ignored 2>/dev/null | grep -q "1 passed"; then
+      echo "   writable after ~$((i * 4))s"
+      return 0
+    fi
+    sleep 4
+  done
+  echo "!! the co-host daemon never became writable" >&2
+  tail -40 "$WORK_DIR/daemon.log" >&2
+  return 1
+}
+
+provision_model() {
+  NEXUS_A2A_TEST_ENDPOINT="$ENDPOINT" \
+    NEXUS_A2A_MODEL_TLS_DIR="$(native_path "$WORK_DIR/data/tls")" \
+    NEXUS_A2A_MODEL_URL="$NEXUS_A2A_MODEL_URL" \
+    NEXUS_A2A_MODEL_ZONE="model" \
+    NEXUS_A2A_MODEL_STORAGE="$(native_path "$WORK_DIR/model-cache")" \
+    "${CARGO_TEST[@]}" live_mount_cohost_model -- --ignored --nocapture
+}
+
+wait_writable
 
 echo "== 3c. provision the model mount =="
-NEXUS_A2A_TEST_ENDPOINT="$ENDPOINT" \
-  NEXUS_A2A_MODEL_TLS_DIR="$(native_path "$WORK_DIR/data/tls")" \
-  NEXUS_A2A_MODEL_URL="$NEXUS_A2A_MODEL_URL" \
-  NEXUS_A2A_MODEL_ZONE="model" \
-  NEXUS_A2A_MODEL_STORAGE="$(native_path "$WORK_DIR/model-cache")" \
-  "${CARGO_TEST[@]}" live_mount_cohost_model -- --ignored --nocapture
+provision_model
 
 echo "== durable reader receipts through native Raft =="
 NEXUS_A2A_TEST_ENDPOINT="$ENDPOINT" NEXUS_A2A_TEST_CERT_DIR="$CLIENT_BUNDLE" \
@@ -254,5 +262,20 @@ NEXUS_A2A_TEST_ENDPOINT="$ENDPOINT" NEXUS_A2A_TEST_CERT_DIR="$RESUME_CLIENT_BUND
   NEXUS_A2A_MODEL_TLS_DIR="$(native_path "$WORK_DIR/data/tls")" \
   NEXUS_A2A_TEST_REPLY_TO="$OPERATOR" NEXUS_A2A_TEST_MODEL="$MODEL" \
   "${CARGO_TEST[@]}" live_cohost_session_resume -- --ignored --nocapture
+
+echo "== 9. independent concurrent contexts in one durable SID =="
+kill "$AUTHON_DAEMON_PID" 2>/dev/null || true
+wait "$AUTHON_DAEMON_PID" 2>/dev/null || true
+AUTHON_DAEMON_PID=
+authon_boot
+authon_wait_log "Zone '$AUTHON_ZONE' registered" 45
+wait_writable
+provision_model
+NEXUS_A2A_TEST_ENDPOINT="$ENDPOINT" NEXUS_A2A_TEST_CERT_DIR="$RESUME_CLIENT_BUNDLE" \
+  NEXUS_A2A_MODEL_TLS_DIR="$(native_path "$WORK_DIR/data/tls")" \
+  NEXUS_A2A_TEST_MODEL="$MODEL" \
+  "${CARGO_TEST[@]}" live_cohost_shared_sid_concurrent_contexts -- --ignored --exact --nocapture \
+  | tee "$WORK_DIR/shared-sid-test.log"
+grep -F "test result: ok. 1 passed; 0 failed;" "$WORK_DIR/shared-sid-test.log" >/dev/null
 
 echo "COHOST E2E OK"

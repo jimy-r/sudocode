@@ -106,7 +106,7 @@ fn shell_roundtrip(env: &TestEnv, prompt: &str, answer_marker: &str) -> BTreeMap
         .expect("saved transcript");
     let saved = runtime::Session::load_from_path(&path).unwrap();
     let saved_results: BTreeMap<_, _> = saved
-        .messages
+        .messages()
         .iter()
         .flat_map(|m| &m.blocks)
         .filter_map(|b| match b {

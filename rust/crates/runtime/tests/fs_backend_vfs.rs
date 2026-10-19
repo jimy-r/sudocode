@@ -308,6 +308,9 @@ fn oversized_tool_output_offloads_onto_the_vfs() {
     // The VFS root (where sessions/offload live) is chosen here on the
     // sudocode side — nexus only stores what it is told.
     let kernel = kernel_with_root_backend();
+    kernel
+        .create_stream("/ws/sessions/sid-1.jsonl", 64 * 1024)
+        .expect("explicit atomic stream in the non-federated fixture");
     let fs: Arc<dyn FsBackend> = Arc::new(vfs_backend(&kernel));
 
     let session = Session::new()

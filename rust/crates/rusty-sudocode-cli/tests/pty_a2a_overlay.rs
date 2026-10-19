@@ -917,7 +917,7 @@ fn pending_batch_and_two_runtimes_share_one_durable_reader() {
                 .load_session(&summary.id)
                 .unwrap()
                 .session
-                .messages
+                .messages()
                 .iter()
                 .filter(|message| {
                     message.role == runtime::MessageRole::User

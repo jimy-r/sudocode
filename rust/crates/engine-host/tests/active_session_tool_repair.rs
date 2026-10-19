@@ -87,7 +87,7 @@ fn same_process_turn_repairs_orphan_before_model_request() {
     }
     let snapshot = engine.session_snapshot();
     let ids = snapshot
-        .messages
+        .messages()
         .iter()
         .flat_map(|message| &message.blocks)
         .filter_map(|block| match block {
@@ -98,35 +98,28 @@ fn same_process_turn_repairs_orphan_before_model_request() {
         })
         .count();
     assert_eq!(ids, 1, "repeat prompts do not duplicate repairs");
-    let stored = std::fs::read_to_string(path).expect("repaired history persisted");
-    let records: Vec<Value> = stored
-        .lines()
-        .map(|line| serde_json::from_str(line).expect("jsonl record"))
-        .collect();
-    let call_index = records
+    let persisted = runtime::Session::load_from_path(path).expect("repaired history reloads");
+    let call_index = persisted
+        .messages()
         .iter()
-        .position(|record| {
-            record["message"]["blocks"]
-                .as_array()
-                .is_some_and(|blocks| {
-                    blocks.iter().any(|block| {
-                        block["type"] == "tool_use" && block["id"] == "interrupted-call"
-                    })
-                })
+        .position(|message| {
+            message.blocks.iter().any(|block| {
+                matches!(block,
+                    ContentBlock::ToolUse { id, .. } if id == "interrupted-call"
+                )
+            })
         })
         .expect("call persisted");
     assert!(
-        records[call_index + 1]["message"]["blocks"]
-            .as_array()
-            .expect("result blocks")
+        persisted.messages()[call_index + 1]
+            .blocks
             .iter()
-            .any(|block| block["type"] == "tool_result"
-                && block["tool_use_id"] == "interrupted-call"),
+            .any(|block| matches!(block,
+                ContentBlock::ToolResult { tool_use_id, .. } if tool_use_id == "interrupted-call"
+            )),
         "repair persisted before the follow-up user message"
     );
-    let persisted = runtime::Session::load_from_path(engine.session_handle().path)
-        .expect("repaired history reloads");
-    assert_eq!(persisted.messages.len(), snapshot.messages.len());
+    assert_eq!(persisted.messages().len(), snapshot.messages().len());
 
     let requests = rt.block_on(mock.captured_requests());
     let mut checked = 0;

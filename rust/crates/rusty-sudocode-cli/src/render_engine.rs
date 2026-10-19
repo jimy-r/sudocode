@@ -375,6 +375,7 @@ impl EngineEventRenderer {
                 name,
                 output,
                 is_error,
+            ..
             } => {
                 let input = self.tool_inputs.take(&id);
                 self.write_block(&format_tool_result(&name, &input, &output, is_error), OutputBlock::Tool);

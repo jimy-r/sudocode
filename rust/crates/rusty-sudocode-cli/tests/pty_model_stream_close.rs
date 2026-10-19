@@ -501,7 +501,7 @@ fn check_response(kind: ResponseKind) {
             .path;
         let session = runtime::Session::load_from_path(&path).unwrap();
         let usage = session
-            .messages
+            .messages()
             .iter()
             .rev()
             .find(|message| message.role == runtime::MessageRole::Assistant)
@@ -567,7 +567,7 @@ fn check_response(kind: ResponseKind) {
                 |_| {
                     runtime::Session::load_from_path(&path).is_ok_and(|session| {
                         session
-                            .messages
+                            .messages()
                             .iter()
                             .filter(|message| message.role == runtime::MessageRole::Assistant)
                             .count()
@@ -585,7 +585,7 @@ fn check_response(kind: ResponseKind) {
             let restored = runtime::Session::load_from_path(&path).unwrap();
             assert_eq!(
                 restored
-                    .messages
+                    .messages()
                     .iter()
                     .filter(|message| message.role == runtime::MessageRole::Assistant)
                     .count(),

@@ -167,7 +167,7 @@ fn effort_live_read_adjust_and_resume_use_persisted_preference() {
     let assert_answer =
         |marker: &str| {
             let session = runtime::Session::load_from_path(&path).unwrap();
-            assert!(session.messages.last().unwrap().blocks.iter().any(
+            assert!(session.messages().last().unwrap().blocks.iter().any(
                 |b| matches!(b, runtime::ContentBlock::Text { text } if text.trim() == marker)
             ));
         };
@@ -308,14 +308,14 @@ fn adaptive_live_tool_chain_compaction_and_resume_read_cache() {
     let path = transcript(&env.workspace_root().join(".scode")).expect("persisted transcript");
     let session = runtime::Session::load_from_path(&path).unwrap();
     assert!(session
-        .messages
+        .messages()
         .iter()
         .flat_map(|m| &m.blocks)
         .any(|b| matches!(b,
         runtime::ContentBlock::Text { text } if text.contains("ADAPTIVE_CHAIN_OK:324"))));
     assert!(
         session
-            .messages
+            .messages()
             .iter()
             .flat_map(|m| &m.blocks)
             .any(|b| matches!(b,
@@ -324,7 +324,7 @@ fn adaptive_live_tool_chain_compaction_and_resume_read_cache() {
         "live route must preserve signed thinking, including hidden summaries"
     );
     if display == "omitted" {
-        assert!(session.messages.iter().flat_map(|m| &m.blocks).all(|b| {
+        assert!(session.messages().iter().flat_map(|m| &m.blocks).all(|b| {
             !matches!(b, runtime::ContentBlock::Thinking { thinking, .. } if !thinking.is_empty())
         }), "hidden mode must omit readable summaries, not the signed blocks");
     }
@@ -365,7 +365,7 @@ fn adaptive_live_tool_chain_compaction_and_resume_read_cache() {
     assert_eq!(cli.expect_eof().unwrap(), 0);
     let resumed = runtime::Session::load_from_path(&path).unwrap();
     assert!(resumed
-        .messages
+        .messages()
         .last()
         .unwrap()
         .blocks

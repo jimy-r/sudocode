@@ -368,6 +368,11 @@ const TEAMMATE_MODE_OPTIONS: &[&str] = &["tmux", "in-process", "auto"];
 /// there would validate and then fail to load.
 const EXPERIMENTAL_CHILDREN: &[FieldSchema] = &[
     FieldSchema::leaf(
+        "sharedSessionHistory",
+        FieldType::Bool,
+        "Independent runtime continuations from completed session turns",
+    ),
+    FieldSchema::leaf(
         "coordinatorMode",
         FieldType::Bool,
         "Coordinator role prompt + worker-delegation tool allowlist",

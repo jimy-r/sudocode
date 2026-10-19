@@ -539,9 +539,18 @@ tool-call associations. Each runtime continues its selected context chain.
 A new runtime resumes from the most recently completed turn; another runtime's
 in-flight turn and tool results remain on that runtime's branch. Opening a
 sibling does not repair or consume its unfinished calls. Compaction changes that context's view
-while preserving the other continuations and their referenced content. The
+while preserving the other continuations and their referenced content.
+Completed-turn selection follows committed history order; idle metadata writes
+preserve that selection. The
 <a href="../../sudo-code-roadmap.html#shared-sid-implementation">implementation and acceptance tasks</a>
 describe the shared runtime layer and host adoption.</p>
+
+<p id="tool-call-identity"><b>Tool identity and retained output.</b> A tool invocation
+is identified by its originating assistant message ID and the provider's call ID.
+Results, recovery and completion delivery carry that association across providers.
+Full outputs use opaque IDs scoped to the same invocation. A persisted fork
+publishes its transcript after its inherited full outputs are readable through
+the fork's storage backend.</p>
 
 <p><b>Transparent AgentHome.</b> Cohost and standalone expose the same Agent
 identity, logical paths, durable formats, links and attachment recovery semantics.
