@@ -43,6 +43,8 @@ use crate::render::styled_text::StyledText;
 use ansi_text::{row_text, AnsiText, RichText};
 use layout::{ansi, ansi_with_style, ChromeLayout, InputLayout, Measurements, Slot};
 use prompt_text::PromptTextCache;
+pub(crate) mod prose_preview;
+use prose_preview::{PreviewUpdate, ProsePreview};
 use tasks::{TaskBrowser, TaskFocus};
 
 // ── stderr redirect ───────────────────────────────────────────────────
@@ -958,6 +960,11 @@ fn format_question_panel(
 /// (which need a trailing newline) from raw byte chunks (which already
 /// include their own newlines from the markdown renderer).
 enum OutputMsg {
+    /// One event's stable history and replacement live prose, in order.
+    AssistantUpdate {
+        committed: String,
+        preview: PreviewUpdate,
+    },
     /// Complete line — `StdoutHandle::println` will append `\n`.
     Line(String),
     /// Raw chunk — `StdoutHandle::print`, no extra newline.
@@ -1033,6 +1040,12 @@ pub struct OutputSender {
 impl OutputSender {
     pub(crate) fn tool_progress(&self, text: Option<String>) {
         let _ = self.tx.send(OutputMsg::ToolProgress(text));
+    }
+
+    pub(crate) fn assistant_update(&self, committed: String, preview: PreviewUpdate) {
+        let _ = self
+            .tx
+            .send(OutputMsg::AssistantUpdate { committed, preview });
     }
 
     pub fn println(&self, text: &str) {
@@ -1413,6 +1426,7 @@ fn render_todo_panel(todos: &[runtime::Todo], max_display: usize) -> String {
 /// Context passed to `ReplApp` via `ContextProvider`.
 struct ReplContext {
     tasks: Arc<Mutex<TaskBrowser>>,
+    prose_preview: Arc<Mutex<ProsePreview>>,
     output_rx: Arc<Mutex<Receiver<OutputMsg>>>,
     terminal_handoff: Arc<Mutex<Option<TerminalHandoff>>>,
     ui_rx: Arc<Mutex<Receiver<UiCommand>>>,
@@ -1447,6 +1461,8 @@ pub type UpArrowDequeueHook = Arc<dyn Fn() -> Option<String> + Send + Sync>;
 #[component]
 fn ReplApp(mut hooks: Hooks) -> impl Into<AnyElement<'static>> {
     let ctx = hooks.use_context::<ReplContext>();
+    let prose_preview = ctx.prose_preview.clone();
+    let prose_preview_for_future = ctx.prose_preview.clone();
     let output_rx = Arc::clone(&ctx.output_rx);
     let terminal_handoff = Arc::clone(&ctx.terminal_handoff);
     let terminal_handoff_for_future = Arc::clone(&ctx.terminal_handoff);
@@ -1520,6 +1536,7 @@ fn ReplApp(mut hooks: Hooks) -> impl Into<AnyElement<'static>> {
         let mut task_clock_tick = Instant::now();
         loop {
             smol::Timer::after(Duration::from_millis(80)).await;
+            let mut is_preview_changed = false;
 
             // Drain stderr redirect — route captured text through stdout
             // so it appears in the iocraft scrollback instead of corrupting
@@ -1540,6 +1557,16 @@ fn ReplApp(mut hooks: Hooks) -> impl Into<AnyElement<'static>> {
             if let Ok(rx) = output_rx_for_future.lock() {
                 loop {
                     let (text, terminated) = match rx.try_recv() {
+                        Ok(OutputMsg::AssistantUpdate { committed, preview }) => {
+                            prose_preview_for_future
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                .update(preview);
+                            is_preview_changed = true;
+                            // use_output queues history for the same presentation
+                            // as the newly rendered preview, never an empty frame.
+                            (committed, false)
+                        }
                         Ok(OutputMsg::Line(text)) => (text, true),
                         Ok(OutputMsg::Raw(text)) => (text, false),
                         Ok(OutputMsg::ToolProgress(text)) => {
@@ -1601,8 +1628,11 @@ fn ReplApp(mut hooks: Hooks) -> impl Into<AnyElement<'static>> {
                             input_value.set(String::new());
                         }
                         Ok(UiCommand::ClearQuestion) => {
+                            let is_plain_input = matches!(*input_slot.read(), InputSlot::TextInput);
                             input_slot.set(InputSlot::TextInput);
-                            input_value.set(String::new());
+                            if !is_plain_input {
+                                input_value.set(String::new());
+                            }
                         }
                         Ok(UiCommand::SetTurnResult(text)) => {
                             turn_result.set(Some(text));
@@ -1736,6 +1766,11 @@ fn ReplApp(mut hooks: Hooks) -> impl Into<AnyElement<'static>> {
                 if turn_result.read().is_some() {
                     turn_result.set(None);
                 }
+            }
+            if is_preview_changed && text.is_empty() {
+                // A stable Markdown block may pause the spinner. Subsequent
+                // pending prose still needs one coalesced layout on this tick.
+                frame.set(idx.wrapping_add(1));
             }
             if *spinner_text.read() != text {
                 spinner_text.set(text);
@@ -2399,18 +2434,28 @@ fn ReplApp(mut hooks: Hooks) -> impl Into<AnyElement<'static>> {
         heading_rows + body_rows + controls_rows + input_row_count,
         [
             Slot {
+                minimum_full_rows: 0,
                 full: ansi(render_pending_overlay(&pending_items, 10, w)),
                 summary: ansi(pending_summary),
             },
             Slot {
+                // Retain main's stable spinner/result height while the
+                // shared allocator owns all slot and prose row accounting.
+                minimum_full_rows: if status_text.text.is_empty() {
+                    0
+                } else {
+                    128usize.div_ceil(w.max(1))
+                },
                 full: status_text,
                 summary: ansi(status_summary),
             },
             Slot {
+                minimum_full_rows: 0,
                 full: ansi(render_todo_panel(&todos, 10)),
                 summary: ansi(render_todo_panel(&todos, 0)),
             },
             Slot {
+                minimum_full_rows: 0,
                 full: ansi_with_style(footer_text, chrome_muted),
                 summary: ansi_with_style(
                     match &footer_slot {
@@ -2474,9 +2519,32 @@ fn ReplApp(mut hooks: Hooks) -> impl Into<AnyElement<'static>> {
         u32::try_from(rows).expect("allocated chrome rows fit the terminal's u16 geometry")
     };
 
+    let preview_text = (|| {
+        let mut state = prose_preview
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !state.is_active()
+            || !reviewable
+            || task_panel.is_some()
+            || !matches!(&current_input_slot, InputSlot::TextInput)
+        {
+            return None;
+        }
+        state.layout(w, layout.preview_rows)
+    })();
+    let preview_rows = preview_text
+        .as_ref()
+        .map_or(0, |text| text.text.lines().count());
+    let slot_width = Size::Length(u32::from(term_width));
     element! {
         View(width: u32::from(term_width), flex_direction: FlexDirection::Column,
             max_height: u32::from(term_height.saturating_sub(1)), overflow: Overflow::Hidden) {
+            // Keep the preview parent mounted across streaming handoff so it
+            // cannot shift the editor's component identity.
+            View(flex_direction: FlexDirection::Column, width: slot_width,
+                height: Size::Length(row_height(preview_rows))) {
+                #(preview_text.map(|text| element! { RichText(content: text, wrap: TextWrap::NoWrap, width: slot_width) }))
+            }
             #(row_text("pending", layout.pending.content, layout.pending.rows))
             #(row_text("status", layout.status.content, layout.status.rows))
             // TodoSlot owns semantic spans; separator grey is not its
@@ -2484,7 +2552,7 @@ fn ReplApp(mut hooks: Hooks) -> impl Into<AnyElement<'static>> {
             #(row_text("todo", layout.todo.content, layout.todo.rows))
             #((layout.separators > 0).then(|| element! {
                 View(height: row_height(layout.separators), flex_shrink: 0.0) {
-                    Text(content: sep.clone(), color: chrome_border)
+                    Text(content: sep.clone(), color: chrome_border, wrap: TextWrap::NoWrap)
                 }
             }))
             #((!reviewable && layout.input_rows > 0).then(|| element! {
@@ -2604,7 +2672,7 @@ fn ReplApp(mut hooks: Hooks) -> impl Into<AnyElement<'static>> {
             // Separator
             #((layout.separators > 0).then(|| element! {
                 View(height: row_height(layout.separators), flex_shrink: 0.0) {
-                    Text(content: sep, color: chrome_border)
+                    Text(content: sep, color: chrome_border, wrap: TextWrap::NoWrap)
                 }
             }))
             // FooterSlot
@@ -2643,6 +2711,7 @@ pub fn spawn_repl_ui(
 
     let ctx = ReplContext {
         tasks: Arc::new(Mutex::new(TaskBrowser::default())),
+        prose_preview: Arc::new(Mutex::new(ProsePreview::default())),
         output_rx: Arc::new(Mutex::new(output_rx)),
         terminal_handoff: Arc::new(Mutex::new(None)),
         ui_rx: Arc::new(Mutex::new(ui_rx)),
@@ -2695,6 +2764,20 @@ pub fn spawn_repl_ui(
         spinner,
         ui_thread: Some(join_handle),
     }
+}
+
+/// Physical rows of optional chrome, including terminal-width wrapping.
+fn chrome_rows(text: &str, width: usize) -> usize {
+    if text.is_empty() {
+        return 0;
+    }
+    text.split('\n')
+        .map(|line| {
+            crate::render::text_layout::display_width(line)
+                .max(1)
+                .div_ceil(width.max(1))
+        })
+        .sum()
 }
 
 #[cfg(test)]

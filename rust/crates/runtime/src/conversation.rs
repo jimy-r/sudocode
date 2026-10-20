@@ -2944,9 +2944,14 @@ where
                         if quality_responses >= 2 || snapshot.completed_responses >= 2 {
                             return Err(CompactionError::InvalidSummary(message));
                         }
-                        // A second completed response gets a tighter visible
-                        // allowance even when changing provider request shape.
-                        cap = cap * 3 / 4;
+                        // Retrying a truncated checkpoint with fewer output
+                        // tokens only makes the next response more likely to
+                        // truncate. Keep the cap when switching to the
+                        // text-only request shape; tighten only complete but
+                        // invalid checkpoints.
+                        if !message.contains("truncated") {
+                            cap = cap * 3 / 4;
+                        }
                         continue;
                     }
                     return Err(CompactionError::ApiError(message));

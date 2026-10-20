@@ -63,6 +63,7 @@ pub(super) fn ansi_with_style(
 }
 
 pub(super) struct Slot {
+    pub minimum_full_rows: usize,
     pub full: Arc<StyledText>,
     pub summary: Arc<StyledText>,
 }
@@ -85,6 +86,7 @@ pub(super) struct ChromeLayout {
     pub todo: Placement,
     pub footer: Placement,
     pub input_rows: usize,
+    pub preview_rows: usize,
     pub separators: usize,
     pub warning: Option<String>,
 }
@@ -146,18 +148,27 @@ impl ChromeLayout {
     ) -> Self {
         // Leave one row outside the live region; this is not a cursor offset.
         let available = height.saturating_sub(1);
-        let full_rows: usize = slots.iter().map(|s| measurements.rows(&s.full)).sum();
+        let full_rows: usize = slots
+            .iter()
+            .map(|s| measurements.rows(&s.full).max(s.minimum_full_rows))
+            .sum();
         let desired_input = desired_input.max(1);
         let full = width >= 16 && full_rows + desired_input + 2 <= available;
-        let [pending, status, todo, footer] = slots
-            .map(|s| if full { s.full } else { s.summary })
-            .map(|text| Placement::measured(text, measurements));
+        let [pending, status, todo, footer] = slots.map(|slot| {
+            let mut placed =
+                Placement::measured(if full { slot.full } else { slot.summary }, measurements);
+            if full {
+                placed.rows = placed.rows.max(slot.minimum_full_rows);
+            }
+            placed
+        });
         let mut layout = Self {
             pending,
             status,
             todo,
             footer,
             input_rows: desired_input,
+            preview_rows: 0,
             separators: 1,
             warning: None,
         };
@@ -165,6 +176,9 @@ impl ChromeLayout {
             layout.pending.rows + layout.status.rows + layout.todo.rows + layout.footer.rows + 2;
         if overhead < available && width >= 16 {
             layout.input_rows = desired_input.min(available - overhead);
+            // Prose is optional and has the lowest row priority. Keep the
+            // existing extra anchor margin for concurrent status changes.
+            layout.preview_rows = available.saturating_sub(overhead + layout.input_rows + 1);
             return layout;
         }
 
