@@ -105,11 +105,11 @@ pub use bootstrap::{BootstrapPhase, BootstrapPlan};
 pub use branch_lock::{detect_branch_lock_collisions, BranchLockCollision, BranchLockIntent};
 pub use compact::{
     autocompact_buffer_tokens, compact_session, compact_session_sync,
-    compact_session_sync_after_llm_failure, estimate_block_tokens, estimate_session_tokens,
-    format_compact_summary, get_compact_continuation_message, render_todo_continuity_block,
-    should_compact, CompactionConfig, CompactionError, CompactionOutcome, CompactionReport,
-    CompactionResult, CompactionSummarySource, ContextBudget, AUTOCOMPACT_BUFFER_TOKENS,
-    COMPACTION_FAILED, COMPACT_MAX_OUTPUT_TOKENS,
+    compact_session_sync_after_llm_failure, estimate_block_tokens, estimate_image_tokens,
+    estimate_session_tokens, format_compact_summary, get_compact_continuation_message,
+    render_todo_continuity_block, should_compact, CompactionConfig, CompactionError,
+    CompactionOutcome, CompactionReport, CompactionResult, CompactionSummarySource, ContextBudget,
+    AUTOCOMPACT_BUFFER_TOKENS, COMPACTION_FAILED, COMPACT_MAX_OUTPUT_TOKENS,
 };
 pub use config::{
     default_config_home, load_plugin_mcp_servers, ConfigEntry, ConfigError, ConfigLoader,
