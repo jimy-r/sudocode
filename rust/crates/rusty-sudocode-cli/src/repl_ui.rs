@@ -8,17 +8,18 @@
 //! # ChromeSlot pattern
 //!
 //! The REPL chrome uses named slots with explicit content ownership.
-//! `StatusSlot`, `InputSlot`, and `FooterSlot` each select one enum variant;
+//! `StatusSlot` and `InputSlot` select their current view; the footer combines
+//! permission, task summary and one prioritized tip;
 //! `PendingSlot` and `TodoSlot` render their current lists and hide when empty:
 //!
 //! ```text
 //! [PendingSlot]   ← in-flight tools and queued messages
-//! [StatusSlot]    ← spinner | turn_result | tips | empty
+//! [StatusSlot]    ← spinner | turn_result | empty
 //! [TodoSlot]      ← todo summary and items | empty
 //! ──── separator ────
-//! [InputSlot]     ← hint | text_input | question_panel
+//! [InputSlot]     ← text_input | question_panel
 //! ──── separator ────
-//! [FooterSlot]    ← hint (3s) > turn_active > minimal > full
+//! [FooterSlot]    ← permission · tasks · one prioritized tip
 //! ```
 
 use std::fmt::Write as FmtWrite;
@@ -33,12 +34,14 @@ use crossterm::style::Color as TerminalColor;
 use iocraft::prelude::*;
 
 mod ansi_text;
+mod footer;
 mod prompt_text;
 mod queued_message;
 mod tasks;
 use crate::render::output::{split_lines, OutputOp, Utf8Stream};
 use crate::render::styled_text::StyledText;
 use ansi_text::{AnsiText, RichText};
+use footer::FooterTips;
 use prompt_text::PromptTextView;
 pub(crate) mod prose_preview;
 use prose_preview::{PreviewUpdate, ProsePreview};
@@ -326,45 +329,15 @@ fn format_compact_tokens(tokens: u32) -> String {
 
 /// ChromeSlot: status area above the separator. One variant renders at a time.
 ///
-/// Priority: Spinner > TurnResult > Tips > Empty.
+/// Priority: Spinner > TurnResult > Empty.
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum StatusSlot {
     /// Animated progress during a turn.
     Spinner(String),
     /// Turn result (tokens/cost/ctx). Cleared when the next turn starts.
     TurnResult(Arc<StyledText>),
-    /// First-run tips. Dismissed on first submit.
-    Tips,
     /// Nothing — slot not rendered, saves vertical space.
     Empty,
-}
-
-/// ChromeSlot: bottom hint line. Content varies by lifecycle phase.
-///
-/// Priority (highest first): Hint > TurnActive > Minimal > Full.
-#[derive(Clone, Debug, PartialEq, Eq)]
-enum FooterSlot {
-    /// Transient hint — highest priority, auto-dismissed after 3 seconds.
-    Hint(String),
-    /// Before first submit — full hints.
-    Full,
-    /// After first submit — just permission mode + essentials.
-    Minimal,
-    /// During turn — permission mode only.
-    TurnActive,
-}
-
-fn format_footer_text(slot: &FooterSlot, perm: &str) -> String {
-    match slot {
-        FooterSlot::Hint(msg) => format!("  {msg}"),
-        FooterSlot::Full => format!(
-            "  \u{23f5}\u{23f5} {perm} \u{00b7} /help for commands \u{00b7} /exit to quit \u{00b7} Tab for /commands"
-        ),
-        FooterSlot::Minimal => format!(
-            "  \u{23f5}\u{23f5} {perm} \u{00b7} /help \u{00b7} /exit to quit"
-        ),
-        FooterSlot::TurnActive => format!("  \u{23f5}\u{23f5} {perm}"),
-    }
 }
 
 /// Maximum number of options for DialPad mode (digit-key shortcuts 1–9).
@@ -410,8 +383,6 @@ pub struct QuestionPromptView {
 /// Exactly one variant renders at a time.
 #[derive(Clone, Debug)]
 enum InputSlot {
-    /// Transient hint — dismissed on any keypress.
-    Hint(String),
     /// Normal text input with ❯ prompt.
     TextInput,
     /// ≤9 options, digit-key shortcut per item (tool approval, init).
@@ -579,7 +550,9 @@ pub enum UiCommand {
     ShowQuestion(QuestionPromptView),
     ClearQuestion,
     SetTurnResult(Arc<StyledText>),
-    ShowInputHint(String),
+    SetTip(engine_core::Tip),
+    SetCacheTip(Option<engine_core::Tip>),
+    BeginTurn,
     /// Update the `TodoSlot` panel with the current todo list.
     UpdateTodos(Vec<runtime::Todo>),
     /// A tool call started — append a running (yellow) card to the pending
@@ -643,7 +616,22 @@ impl UiCommandSender {
     }
 
     pub fn show_input_hint(&self, text: &str) {
-        let _ = self.tx.send(UiCommand::ShowInputHint(text.to_string()));
+        self.set_tip(engine_core::Tip {
+            priority: engine_core::TipPriority::Normal,
+            message: text.to_string(),
+        });
+    }
+
+    pub(crate) fn set_tip(&self, tip: engine_core::Tip) {
+        let _ = self.tx.send(UiCommand::SetTip(tip));
+    }
+
+    pub(crate) fn begin_turn(&self) {
+        let _ = self.tx.send(UiCommand::BeginTurn);
+    }
+
+    pub(crate) fn set_cache_tip(&self, tip: Option<engine_core::Tip>) {
+        let _ = self.tx.send(UiCommand::SetCacheTip(tip));
     }
 
     pub fn update_todos(&self, todos: Vec<runtime::Todo>) {
@@ -1439,7 +1427,6 @@ struct ReplContext {
     input_tx: SyncSender<InputEvent>,
     spinner: SpinnerState,
     permission_mode: String,
-    tips_line: String,
     stderr_redir: Arc<Mutex<Option<stderr_redirect::StderrRedirect>>>,
     /// Todo items for the `TodoSlot`. Updated by `UiCommand::UpdateTodos`
     /// in the tick loop, read during the render phase. Uses `Arc<Mutex>`
@@ -1476,7 +1463,6 @@ fn ReplApp(mut hooks: Hooks) -> impl Into<AnyElement<'static>> {
     let input_tx = ctx.input_tx.clone();
     let spinner = ctx.spinner.clone();
     let permission_mode = ctx.permission_mode.clone();
-    let tips_text = ctx.tips_line.clone();
     let stderr_redir = Arc::clone(&ctx.stderr_redir);
     let todo_items = Arc::clone(&ctx.todo_items);
     let todo_items_for_future = Arc::clone(&ctx.todo_items);
@@ -1510,6 +1496,7 @@ fn ReplApp(mut hooks: Hooks) -> impl Into<AnyElement<'static>> {
     let mut tab_candidates = hooks.use_state(Vec::<String>::new);
     let mut tab_index = hooks.use_state(|| 0usize);
     let mut footer_hint = hooks.use_state(|| None::<(String, Instant)>);
+    let mut footer_tips = hooks.use_state(FooterTips::default);
     let mut dialpad_cursor = hooks.use_state(|| 0usize);
     // Free-text buffer for a DialPad's built-in custom-input row. Every DialPad
     // has this row (empty until the question opts in via `allow_custom_input`);
@@ -1648,11 +1635,11 @@ fn ReplApp(mut hooks: Hooks) -> impl Into<AnyElement<'static>> {
                                 input_value.set(String::new());
                             }
                         }
+                        Ok(UiCommand::SetTip(tip)) => footer_tips.write().set(tip),
+                        Ok(UiCommand::SetCacheTip(tip)) => footer_tips.write().cache(tip),
+                        Ok(UiCommand::BeginTurn) => footer_tips.write().begin_turn(),
                         Ok(UiCommand::SetTurnResult(text)) => {
                             turn_result.set(Some(text));
-                        }
-                        Ok(UiCommand::ShowInputHint(text)) => {
-                            input_slot.set(InputSlot::Hint(text));
                         }
                         Ok(UiCommand::UpdateTodos(todos)) => {
                             if let Ok(mut items) = todo_items_for_future.lock() {
@@ -1805,11 +1792,6 @@ fn ReplApp(mut hooks: Hooks) -> impl Into<AnyElement<'static>> {
                 ..
             }) if kind != KeyEventKind::Release => {
                 let current_slot = input_slot.read().clone();
-                // Dismiss InputSlot::Hint on any keypress.
-                if matches!(current_slot, InputSlot::Hint(_)) {
-                    input_slot.set(InputSlot::TextInput);
-                    return;
-                }
                 // One keyboard owner. Task browsing never sends a model prompt
                 // or cancels the parent turn, and questions retain priority.
                 if matches!(current_slot, InputSlot::TextInput) {
@@ -1856,9 +1838,6 @@ fn ReplApp(mut hooks: Hooks) -> impl Into<AnyElement<'static>> {
                     // ── Enter ──────────────────────────────────────────
                     KeyCode::Enter if !modifiers.contains(KeyModifiers::SHIFT) => {
                         match &current_slot {
-                            InputSlot::Hint(_) => {
-                                input_slot.set(InputSlot::TextInput);
-                            }
                             InputSlot::DialPad(question) => {
                                 let selected = dialpad_cursor.get();
                                 let on_custom_row =
@@ -2243,10 +2222,10 @@ fn ReplApp(mut hooks: Hooks) -> impl Into<AnyElement<'static>> {
                         }
                     }
                     KeyCode::Esc => {
-                        // In FuzzySelect/DialPad/Hint, ESC cancels. Also drop any
+                        // In FuzzySelect/DialPad, ESC cancels. Also drop any
                         // in-progress DialPad custom-input buffer.
                         dialpad_input.set(String::new());
-                        if !matches!(current_slot, InputSlot::TextInput | InputSlot::Hint(_)) {
+                        if !matches!(current_slot, InputSlot::TextInput) {
                             input_slot.set(InputSlot::TextInput);
                             input_value.set(String::new());
                             let _ = input_tx_for_events.send(InputEvent::Abort);
@@ -2383,8 +2362,9 @@ fn ReplApp(mut hooks: Hooks) -> impl Into<AnyElement<'static>> {
     let val = input_value.read().clone();
     let current_input_slot = input_slot.read().clone();
     let submitted = *has_submitted.read();
+    let turn_active = !st.is_empty();
 
-    // StatusSlot: Spinner > TurnResult > Tips > Empty
+    // StatusSlot: Spinner > TurnResult > Empty
     let status_slot = if !st.is_empty() {
         // Reuse the existing status row and shared column layout. No additional
         // live rows can spill into scrollback as tool output grows.
@@ -2394,21 +2374,8 @@ fn ReplApp(mut hooks: Hooks) -> impl Into<AnyElement<'static>> {
         StatusSlot::Spinner(text)
     } else if let Some(ref tr) = *turn_result.read() {
         StatusSlot::TurnResult(tr.clone())
-    } else if !submitted {
-        StatusSlot::Tips
     } else {
         StatusSlot::Empty
-    };
-
-    // FooterSlot: Hint > TurnActive > Minimal > Full
-    let footer_slot = if let Some((ref msg, _)) = *footer_hint.read() {
-        FooterSlot::Hint(msg.clone())
-    } else if matches!(status_slot, StatusSlot::Spinner(_)) {
-        FooterSlot::TurnActive
-    } else if submitted {
-        FooterSlot::Minimal
-    } else {
-        FooterSlot::Full
     };
 
     // Both choice widgets share the same document presentation. Only the
@@ -2416,11 +2383,11 @@ fn ReplApp(mut hooks: Hooks) -> impl Into<AnyElement<'static>> {
     let question = match &current_input_slot {
         InputSlot::DialPad(question) => Some(question),
         InputSlot::FuzzySelect(state) => Some(&state.question),
-        InputSlot::Hint(_) | InputSlot::TextInput => None,
+        InputSlot::TextInput => None,
     };
     // InputSlot rendering
     let (panel_text, prompt_label) = match &current_input_slot {
-        InputSlot::Hint(_) | InputSlot::TextInput => (None, crate::render::PROMPT_PREFIX),
+        InputSlot::TextInput => (None, crate::render::PROMPT_PREFIX),
         InputSlot::DialPad(q) => (
             Some(format_question_panel(
                 q,
@@ -2438,7 +2405,14 @@ fn ReplApp(mut hooks: Hooks) -> impl Into<AnyElement<'static>> {
     let mut browser = tasks
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let footer_text = browser.footer(&format_footer_text(&footer_slot, &perm), w);
+    let footer_text = Arc::new(footer_tips.read().render(
+        &perm,
+        &browser,
+        submitted,
+        turn_active,
+        footer_hint.read().as_ref().map(|(text, _)| text.as_str()),
+        w,
+    ));
     let task_panel = browser
         .is_panel()
         .then(|| browser.panel(w, term_height as usize));
@@ -2484,7 +2458,6 @@ fn ReplApp(mut hooks: Hooks) -> impl Into<AnyElement<'static>> {
         foreground_color: chrome_has_color.then_some(color),
         ..crossterm::style::ContentStyle::default()
     };
-    let chrome_muted = chrome_style(chrome_theme.muted);
     let chrome_border = chrome_has_color
         .then_some(chrome_theme.border)
         .and_then(ansi_text::ui_color);
@@ -2495,7 +2468,6 @@ fn ReplApp(mut hooks: Hooks) -> impl Into<AnyElement<'static>> {
         let rows = match &status_slot {
             StatusSlot::Spinner(text) => chrome_rows(text, w),
             StatusSlot::TurnResult(text) => chrome_rows(&text.text, w),
-            StatusSlot::Tips => chrome_rows(&tips_text, w),
             StatusSlot::Empty => 0,
         };
         // Keep usual spinner/result transitions at the same height. Reserve
@@ -2518,13 +2490,12 @@ fn ReplApp(mut hooks: Hooks) -> impl Into<AnyElement<'static>> {
         }
         let input_rows = match &current_input_slot {
             InputSlot::TextInput => chrome_rows(&format!("{prompt_label}{val}"), w),
-            InputSlot::Hint(text) => chrome_rows(text, w),
             InputSlot::DialPad(_) => 0,
             InputSlot::FuzzySelect(fs) => chrome_rows(&format!("{prompt_label}{}", fs.filter), w),
         };
         let base_rows = status_rows
             + input_rows
-            + chrome_rows(&footer_text, w)
+            + chrome_rows(&footer_text.text, w)
             + panel_text.as_ref().map_or(0, |text| chrome_rows(text, w))
             + 2; // separators
 
@@ -2553,9 +2524,6 @@ fn ReplApp(mut hooks: Hooks) -> impl Into<AnyElement<'static>> {
         )),
         StatusSlot::TurnResult(s) => Some(AnyElement::from(
             element! { RichText(content: s.clone(), width: slot_width) },
-        )),
-        StatusSlot::Tips => Some(AnyElement::from(
-            element! { AnsiText(content: tips_text.clone(), initial_style: chrome_muted, width: slot_width) },
         )),
         StatusSlot::Empty => None,
     };
@@ -2606,12 +2574,6 @@ fn ReplApp(mut hooks: Hooks) -> impl Into<AnyElement<'static>> {
             })
             #(if task_panel.is_some() {
                 element! { View(flex_direction: FlexDirection::Row) {} }
-            } else if let InputSlot::Hint(ref hint_text) = current_input_slot {
-                element! {
-                    View(flex_direction: FlexDirection::Row) {
-                        AnsiText(content: hint_text.clone(), initial_style: chrome_muted)
-                    }
-                }
             } else if matches!(current_input_slot, InputSlot::DialPad(_)) {
                 // DialPad: no input row — all interaction is via
                 // arrow keys and digit shortcuts shown in the panel.
@@ -2688,7 +2650,7 @@ fn ReplApp(mut hooks: Hooks) -> impl Into<AnyElement<'static>> {
             // Separator
             Text(content: sep, color: chrome_border, wrap: separator_wrap)
             // FooterSlot
-            AnsiText(content: footer_text, initial_style: chrome_muted, width: slot_width)
+            RichText(content: footer_text, width: slot_width, wrap: TextWrap::NoWrap)
         }
     }
 }
@@ -2730,7 +2692,6 @@ pub fn spawn_repl_ui(
         input_tx: input_tx.clone(),
         spinner: spinner.clone(),
         permission_mode: permission_mode.to_string(),
-        tips_line: "Type /help for commands \u{00b7} /status for live context \u{00b7} /resume latest jumps back to the newest session \u{00b7} /diff then /commit to ship \u{00b7} Tab for /command completions".to_string(),
         stderr_redir: Arc::clone(&stderr_redir),
         todo_items: Arc::new(Mutex::new(todo_items)),
         pending: Arc::new(Mutex::new(Vec::new())),
