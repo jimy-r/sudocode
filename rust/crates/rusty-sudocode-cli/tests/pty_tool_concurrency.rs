@@ -19,6 +19,12 @@ fn bash(id: &str, command: &str) -> Value {
     json!({"id": id, "name": "Bash", "input": {"command": command}})
 }
 
+// Releases are newline-framed signals, not global writer-EOF observations.
+// Concurrent PTY forks can temporarily inherit endpoints before pre-exec cleanup.
+fn fifo_read(input: &str) -> String {
+    format!("head -n 1 {input}")
+}
+
 fn fifo(env: &TestEnv, name: &str) {
     mkfifo(
         &env.workspace_root().join(name),
@@ -109,18 +115,24 @@ fn done(sess: &PtySession) {
     );
 }
 
-fn assert_result_order(env: &TestEnv, expected: &[&str]) {
+/// Validate and return the same provider-facing tool result blocks.
+fn assert_result_order(env: &TestEnv, expected: &[&str]) -> Vec<Value> {
     let requests = env.captured_message_bodies();
     let request: Value = serde_json::from_str(requests.last().unwrap()).unwrap();
-    let ids: Vec<_> = request["messages"]
+    let results: Vec<_> = request["messages"]
         .as_array()
         .unwrap()
         .iter()
         .flat_map(|message| message["content"].as_array().into_iter().flatten())
         .filter(|block| block["type"] == "tool_result")
+        .cloned()
+        .collect();
+    let ids: Vec<_> = results
+        .iter()
         .map(|block| block["tool_use_id"].as_str().unwrap())
         .collect();
     assert_eq!(ids, expected, "provider call/result order");
+    results
 }
 
 fn finish(mut sess: PtySession) {
@@ -145,7 +157,7 @@ fn fast_result_and_error_are_visible_before_slow_sibling_finishes() {
     let sess = start(
         &env,
         &[
-            bash("slow", "cat slow.fifo"),
+            bash("slow", &fifo_read("slow.fifo")),
             bash("fast", "cat fast.txt"),
             bash("error", "cat absent-concurrency-fixture.txt"),
         ],
@@ -178,8 +190,8 @@ fn writer_barrier_waits_for_all_reads_and_next_read_sees_write() {
     let sess = start(
         &env,
         &[
-            bash("one", "cat one.fifo"),
-            bash("two", "cat two.fifo"),
+            bash("one", &fifo_read("one.fifo")),
+            bash("two", &fifo_read("two.fifo")),
             bash("write", "printf WRITER_VALUE > result.txt"),
             json!({"id":"read", "name":"Read", "input":{"path":"result.txt"}}),
         ],
@@ -187,6 +199,8 @@ fn writer_barrier_waits_for_all_reads_and_next_read_sees_write() {
     );
     let first = writer(&env, "one.fifo", &sess);
     let second = writer(&env, "two.fifo", &sess);
+    // Another live writer must not delay a newline-framed read completion.
+    let retained_writer = first.try_clone().unwrap();
     assert!(!env.workspace_root().join("result.txt").exists());
     release(first, "FIRST_COMPLETE");
     common::expect_screen(
@@ -205,7 +219,17 @@ fn writer_barrier_waits_for_all_reads_and_next_read_sees_write() {
         std::fs::read_to_string(env.workspace_root().join("result.txt")).unwrap(),
         "WRITER_VALUE"
     );
-    assert!(sess.render(|s| s.raw().contents()).contains("WRITER_VALUE"));
+    let results = assert_result_order(&env, &["one", "two", "write", "read"]);
+    let read = results.last().unwrap();
+    assert_ne!(
+        read["is_error"], true,
+        "the following Read must succeed: {read}"
+    );
+    assert!(
+        read["content"].to_string().contains("WRITER_VALUE"),
+        "the following Read must observe the committed writer output: {read}"
+    );
+    drop(retained_writer);
     finish(sess);
 }
 
@@ -216,7 +240,10 @@ fn concurrency_limit_is_enforced_before_tool_started() {
     fifo(&env, "two.fifo");
     let sess = start(
         &env,
-        &[bash("one", "cat one.fifo"), bash("two", "cat two.fifo")],
+        &[
+            bash("one", &fifo_read("one.fifo")),
+            bash("two", &fifo_read("two.fifo")),
+        ],
         "1",
     );
     let first = writer(&env, "one.fifo", &sess);
@@ -277,9 +304,9 @@ if p.get('command')=='cat rewrite.txt':
     let sess = start(
         &env,
         &[
-            bash("one", "cat one.fifo"),
+            bash("one", &fifo_read("one.fifo")),
             bash("rewrite", "cat rewrite.txt"),
-            bash("three", "cat three.fifo"),
+            bash("three", &fifo_read("three.fifo")),
         ],
         "10",
     );
@@ -427,7 +454,10 @@ fn cancelling_parallel_bash_stops_both_processes_and_preserves_pairs() {
     fifo(&env, "two.fifo");
     let mut sess = start(
         &env,
-        &[bash("one", "cat one.fifo"), bash("two", "cat two.fifo")],
+        &[
+            bash("one", &fifo_read("one.fifo")),
+            bash("two", &fifo_read("two.fifo")),
+        ],
         "10",
     );
     let first = writer(&env, "one.fifo", &sess);
@@ -439,7 +469,7 @@ fn cancelling_parallel_bash_stops_both_processes_and_preserves_pairs() {
         common::DEFAULT_TIMEOUT,
         "parallel cancellation",
     );
-    // Keep the writers open so cat cannot exit via EOF. Disappearing readers
+    // Keep writers open without a signal so readers cannot finish normally. Disappearing readers
     // proves cancellation actually stopped both subprocesses.
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
@@ -477,10 +507,20 @@ fn literal_shell_lists_pipes_and_redirects_allow_real_overlap() {
     let env = TestEnv::new_mock("parallel-shell-syntax");
     fifo(&env, "one.fifo");
     fifo(&env, "two.fifo");
-    let sess = start(&env, &[
-        bash("one", "printf '%s\\n' 'literal ; > harmless $(not-executed)' | cat; cat one.fifo 2>/dev/null"),
-        bash("two", "cd . && cat two.fifo"),
-    ], "10");
+    let sess = start(
+        &env,
+        &[
+            bash(
+                "one",
+                &format!(
+                    "printf '%s\\n' 'literal ; > harmless $(not-executed)' | cat; {} 2>/dev/null",
+                    fifo_read("one.fifo")
+                ),
+            ),
+            bash("two", &format!("cd . && {}", fifo_read("two.fifo"))),
+        ],
+        "10",
+    );
     let first = writer(&env, "one.fifo", &sess);
     let second = writer(&env, "two.fifo", &sess);
     release(first, "LITERAL_ONE");
@@ -546,8 +586,8 @@ fn subagent_blocking_tools_overlap_and_accept_the_same_aliases_as_parent() {
     fifo(&env, "one.fifo");
     fifo(&env, "two.fifo");
     let child_calls = [
-        bash("childone", "cat one.fifo"),
-        bash("childtwo", "cat two.fifo"),
+        bash("childone", &fifo_read("one.fifo")),
+        bash("childtwo", &fifo_read("two.fifo")),
     ];
     let task = format!(
         "PARITY_SCENARIO:tool_concurrency TOOL_BATCH:{}",
@@ -581,7 +621,7 @@ fn prose_preview_preserves_markdown_context_during_tool_completion() {
         let source_path = env.workspace_root().join("stream-text.json");
         std::fs::write(&source_path, json!([source, completion]).to_string()).unwrap();
         let gate = env.workspace_root().join("finish-stream");
-        let mut call = bash("early", "cat early.fifo");
+        let mut call = bash("early", &fifo_read("early.fifo"));
         call["stream_wait_for"] = json!(gate);
         call["stream_text_chunks_path"] = json!(source_path);
         let mut sess = env.spawn_with_env(
@@ -668,7 +708,7 @@ fn prose_preview_preserves_markdown_context_during_tool_completion() {
 fn completed_tool_runs_and_renders_while_provider_stream_is_open() {
     let env = TestEnv::new_mock("parallel-stream-dispatch");
     fifo(&env, "early.fifo");
-    let mut call = bash("early", "cat early.fifo");
+    let mut call = bash("early", &fifo_read("early.fifo"));
     let gate = env.workspace_root().join("finish-stream");
     call["stream_wait_for"] = json!(gate);
     let sess = start(&env, &[call], "10");
@@ -740,7 +780,7 @@ fn question_wait_keeps_sibling_output_visible_and_queues_second_question() {
         &env,
         &[
             question("first", "FIRST_PARALLEL_QUESTION"),
-            bash("read", "cat read.fifo"),
+            bash("read", &fifo_read("read.fifo")),
             question("second", "SECOND_PARALLEL_QUESTION"),
         ],
         "10",
@@ -775,7 +815,7 @@ fn stream_failure_preserves_completed_side_effects_and_closes_pending_ids() {
     let env = TestEnv::new_mock("parallel-stream-failure");
     fifo(&env, "pending.fifo");
     let gate = env.workspace_root().join("break-stream");
-    let mut pending = bash("pending", "cat pending.fifo");
+    let mut pending = bash("pending", &fifo_read("pending.fifo"));
     pending["stream_wait_for"] = json!(gate);
     pending["stream_fail_after"] = json!(true);
     let mut sess = start(
@@ -847,8 +887,8 @@ fn readonly_command_families_globs_and_stdin_redirect_overlap() {
         let sess = start(
             &env,
             &[
-                bash("one", &format!("{prefix}; cat < one.fifo")),
-                bash("two", "cat two.fifo"),
+                bash("one", &format!("{prefix}; {}", fifo_read("< one.fifo"))),
+                bash("two", &fifo_read("two.fifo")),
             ],
             "10",
         );
@@ -1021,7 +1061,7 @@ fn streamed_calls_and_results_survive_resume_before_message_stop() {
     let env = TestEnv::new_mock("parallel-stream-resume");
     fifo(&env, "pending.fifo");
     let gate = env.workspace_root().join("resume-stream");
-    let mut pending = bash("pending", "cat pending.fifo");
+    let mut pending = bash("pending", &fifo_read("pending.fifo"));
     pending["stream_wait_for"] = json!(gate);
     let mut sess = start(
         &env,
@@ -1117,8 +1157,8 @@ fn mutating_or_unknown_command_flags_keep_the_writer_barrier() {
         let sess = start(
             &env,
             &[
-                bash("read", "cat read.fifo"),
-                bash("fenced", &format!("{prefix}; cat after.fifo")),
+                bash("read", &fifo_read("read.fifo")),
+                bash("fenced", &format!("{prefix}; {}", fifo_read("after.fifo"))),
             ],
             "10",
         );
