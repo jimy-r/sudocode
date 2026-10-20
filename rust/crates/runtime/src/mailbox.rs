@@ -298,8 +298,23 @@ impl Mailbox {
     /// must not each decide for themselves.
     #[must_use]
     pub fn workspace_local(root: &std::path::Path, self_id: String) -> Self {
+        Self::workspace_at(Arc::new(crate::fs_backend::StdFsBackend), root, self_id)
+    }
+
+    /// A mailbox rooted at its backend's own workspace, independently of the shell.
+    ///
+    /// # Errors
+    /// The backend cannot resolve its working root.
+    pub fn workspace(fs: Arc<dyn FsBackend>, self_id: String) -> std::io::Result<Self> {
+        let root = fs.working_root()?;
+        Ok(Self::workspace_at(fs, std::path::Path::new(&root), self_id))
+    }
+
+    /// A mailbox at an explicit root in the supplied backend's namespace.
+    #[must_use]
+    pub fn workspace_at(fs: Arc<dyn FsBackend>, root: &std::path::Path, self_id: String) -> Self {
         Self::new(
-            Arc::new(crate::fs_backend::StdFsBackend),
+            fs,
             self_id,
             InboxConvention::new(
                 strip_windows_verbatim_prefix(&root.to_string_lossy()).into_owned(),
@@ -722,7 +737,8 @@ impl Mailbox {
     ///
     /// # Errors
     ///
-    /// An `Err` when the namespace cannot be enumerated, or when an entry's
+    /// A namespace whose directory has not been created yet has no recipients.
+    /// An `Err` when an existing namespace cannot be enumerated, or when an entry's
     /// presence cannot be determined — never an empty list, and never a silently
     /// shortened one. The difference matters to every caller: a broadcast over "no
     /// recipients" reports success having delivered nothing, and an agent told it
@@ -730,10 +746,11 @@ impl Mailbox {
     /// has to remember to ask first.
     pub fn list_recipients(&self) -> Result<Vec<String>, String> {
         let dir = self.convention.agents_dir();
-        let entries = self
-            .backend
-            .readdir(&dir)
-            .map_err(|e| format!("list recipients at {dir}: {e}"))?;
+        let entries = match self.backend.readdir(&dir) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => return Err(format!("list recipients at {dir}: {error}")),
+        };
         // A recipient is an agent that ANNOUNCED presence, and presence is a
         // `conversations` subdir under `agents_dir/<name>/` (the
         // `ensure_presence` contract). Filter to that shape so infrastructure
