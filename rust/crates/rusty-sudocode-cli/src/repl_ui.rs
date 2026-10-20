@@ -1796,8 +1796,13 @@ fn ReplApp(mut hooks: Hooks) -> impl Into<AnyElement<'static>> {
     let input_tx_for_events = input_tx.clone();
     let stdout_for_events = stdout.clone();
 
-    hooks.use_terminal_events({
-        move |event| match event {
+    let text_input_is_live = matches!(*input_slot.read(), InputSlot::TextInput)
+        && !tasks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_panel();
+    let keyboard = {
+        move |event: TerminalEvent| match event {
             TerminalEvent::Key(KeyEvent {
                 code,
                 kind,
@@ -1813,7 +1818,9 @@ fn ReplApp(mut hooks: Hooks) -> impl Into<AnyElement<'static>> {
                 // One keyboard owner. Task browsing never sends a model prompt
                 // or cancels the parent turn, and questions retain priority.
                 if matches!(current_slot, InputSlot::TextInput) {
-                    let mut browser = tasks_for_events.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                    let mut browser = tasks_for_events
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
                     let focus = browser.focus;
                     if focus != TaskFocus::Input {
                         match (focus, code) {
@@ -1823,24 +1830,44 @@ fn ReplApp(mut hooks: Hooks) -> impl Into<AnyElement<'static>> {
                             (TaskFocus::List, KeyCode::Up) => browser.move_selection(false),
                             (TaskFocus::List, KeyCode::Enter) => browser.detail(),
                             (TaskFocus::List, KeyCode::Esc) => browser.close(),
-                            (TaskFocus::Detail, KeyCode::Esc) if modifiers.contains(KeyModifiers::ALT) => browser.close(),
-                            (TaskFocus::Detail, KeyCode::Esc) => browser.open(),
-                            (TaskFocus::Detail, KeyCode::Up | KeyCode::PageUp) => browser.scroll(true, if code == KeyCode::PageUp { 10 } else { 1 }),
-                            (TaskFocus::Detail, KeyCode::Down | KeyCode::PageDown) => browser.scroll(false, if code == KeyCode::PageDown { 10 } else { 1 }),
-                            (TaskFocus::List | TaskFocus::Detail, KeyCode::Char('k')) => {
-                                if let Some(id) = browser.stop_id() { let _ = input_tx_for_events.send(InputEvent::StopBackgroundTask(id)); }
+                            (TaskFocus::Detail, KeyCode::Esc)
+                                if modifiers.contains(KeyModifiers::ALT) =>
+                            {
+                                browser.close()
                             }
-                            (TaskFocus::Footer, KeyCode::Char(_)) if !modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) => {
+                            (TaskFocus::Detail, KeyCode::Esc) => browser.open(),
+                            (TaskFocus::Detail, KeyCode::Up | KeyCode::PageUp) => {
+                                browser.scroll(true, if code == KeyCode::PageUp { 10 } else { 1 })
+                            }
+                            (TaskFocus::Detail, KeyCode::Down | KeyCode::PageDown) => browser
+                                .scroll(false, if code == KeyCode::PageDown { 10 } else { 1 }),
+                            (TaskFocus::List | TaskFocus::Detail, KeyCode::Char('k')) => {
+                                if let Some(id) = browser.stop_id() {
+                                    let _ = input_tx_for_events
+                                        .send(InputEvent::StopBackgroundTask(id));
+                                }
+                            }
+                            (TaskFocus::Footer, KeyCode::Char(_))
+                                if !modifiers
+                                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+                            {
                                 browser.close();
                             }
-                            (_, KeyCode::Char('c')) if modifiers.contains(KeyModifiers::CONTROL) => browser.close(),
+                            (_, KeyCode::Char('c'))
+                                if modifiers.contains(KeyModifiers::CONTROL) =>
+                            {
+                                browser.close()
+                            }
                             _ => {}
                         }
                         frame.set(frame.get().wrapping_add(1));
                         return;
                     }
-                    if code == KeyCode::Down && browser.has_tasks() && history_cursor.get().is_none()
-                        && input_value.read().is_empty() {
+                    if code == KeyCode::Down
+                        && browser.has_tasks()
+                        && history_cursor.get().is_none()
+                        && input_value.read().is_empty()
+                    {
                         browser.focus = TaskFocus::Footer;
                         frame.set(frame.get().wrapping_add(1));
                         return;
@@ -1855,8 +1882,8 @@ fn ReplApp(mut hooks: Hooks) -> impl Into<AnyElement<'static>> {
                             }
                             InputSlot::DialPad(question) => {
                                 let selected = dialpad_cursor.get();
-                                let on_custom_row =
-                                    question.allow_custom_input && selected == question.options.len();
+                                let on_custom_row = question.allow_custom_input
+                                    && selected == question.options.len();
                                 if on_custom_row {
                                     // On the `[+]` row: submit the typed buffer
                                     // as the free-text answer. Empty buffer does
@@ -1866,8 +1893,9 @@ fn ReplApp(mut hooks: Hooks) -> impl Into<AnyElement<'static>> {
                                     // sent in full (same as TextInput submit).
                                     let raw = dialpad_input.read().clone();
                                     let store_snap = paste_store.read().clone();
-                                    let answer =
-                                        expand_paste_placeholders(&raw, &store_snap).trim().to_string();
+                                    let answer = expand_paste_placeholders(&raw, &store_snap)
+                                        .trim()
+                                        .to_string();
                                     if !answer.is_empty() {
                                         if !*has_submitted.read() {
                                             has_submitted.set(true);
@@ -1881,8 +1909,14 @@ fn ReplApp(mut hooks: Hooks) -> impl Into<AnyElement<'static>> {
                                         input_slot.set(InputSlot::TextInput);
                                     }
                                 } else {
-                                    submit_dialpad_selection(question, selected, &input_tx_for_events);
-                                    if !*has_submitted.read() { has_submitted.set(true); }
+                                    submit_dialpad_selection(
+                                        question,
+                                        selected,
+                                        &input_tx_for_events,
+                                    );
+                                    if !*has_submitted.read() {
+                                        has_submitted.set(true);
+                                    }
                                     input_value.set(String::new());
                                     input_slot.set(InputSlot::TextInput);
                                 }
@@ -1898,7 +1932,8 @@ fn ReplApp(mut hooks: Hooks) -> impl Into<AnyElement<'static>> {
                                     if let InputSlot::FuzzySelect(fs) = &*slot {
                                         fs.selected_value().or_else(|| {
                                             let custom = fs.filter.trim();
-                                            if fs.question.allow_custom_input && !custom.is_empty() {
+                                            if fs.question.allow_custom_input && !custom.is_empty()
+                                            {
                                                 Some(custom.to_string())
                                             } else {
                                                 None
@@ -1909,8 +1944,11 @@ fn ReplApp(mut hooks: Hooks) -> impl Into<AnyElement<'static>> {
                                     }
                                 };
                                 if let Some(answer) = answer {
-                                    if !*has_submitted.read() { has_submitted.set(true); }
-                                    let _ = input_tx_for_events.send(InputEvent::QuestionAnswer(answer));
+                                    if !*has_submitted.read() {
+                                        has_submitted.set(true);
+                                    }
+                                    let _ = input_tx_for_events
+                                        .send(InputEvent::QuestionAnswer(answer));
                                     input_value.set(String::new());
                                     input_slot.set(InputSlot::TextInput);
                                 }
@@ -1919,11 +1957,13 @@ fn ReplApp(mut hooks: Hooks) -> impl Into<AnyElement<'static>> {
                         }
                     }
                     // ── Up/Down — DialPad option selection ─────────────
-                    KeyCode::Up if matches!(current_slot, InputSlot::DialPad(ref q) if !q.options.is_empty()) => {
+                    KeyCode::Up if matches!(current_slot, InputSlot::DialPad(ref q) if !q.options.is_empty()) =>
+                    {
                         let cur = dialpad_cursor.get();
                         dialpad_cursor.set(cur.saturating_sub(1));
                     }
-                    KeyCode::Down if matches!(current_slot, InputSlot::DialPad(ref q) if !q.options.is_empty()) => {
+                    KeyCode::Down if matches!(current_slot, InputSlot::DialPad(ref q) if !q.options.is_empty()) =>
+                    {
                         let cur = dialpad_cursor.get();
                         let max = match &current_slot {
                             // With custom input, options.len() is the extra
@@ -1948,9 +1988,15 @@ fn ReplApp(mut hooks: Hooks) -> impl Into<AnyElement<'static>> {
                         }
                     }
                     // ── Left — submit back_value (tree navigation) ────
-                    KeyCode::Left if matches!(current_slot, InputSlot::DialPad(_) | InputSlot::FuzzySelect(_)) => {
+                    KeyCode::Left
+                        if matches!(
+                            current_slot,
+                            InputSlot::DialPad(_) | InputSlot::FuzzySelect(_)
+                        ) =>
+                    {
                         let back = match &current_slot {
-                            InputSlot::DialPad(q) | InputSlot::FuzzySelect(FuzzySelectState { question: q, .. }) => {
+                            InputSlot::DialPad(q)
+                            | InputSlot::FuzzySelect(FuzzySelectState { question: q, .. }) => {
                                 q.back_value.clone()
                             }
                             _ => None,
@@ -2023,9 +2069,8 @@ fn ReplApp(mut hooks: Hooks) -> impl Into<AnyElement<'static>> {
                         } else {
                             let val = input_value.read().clone();
                             let cursor_pos = cursor_at_last_render.get().min(val.len());
-                            let on_first_line = !val.get(..cursor_pos)
-                                .unwrap_or(&val)
-                                .contains('\n');
+                            let on_first_line =
+                                !val.get(..cursor_pos).unwrap_or(&val).contains('\n');
                             if val.is_empty() {
                                 // Empty buffer: `↑` first tries to recall queued
                                 // HUMAN messages. One press pulls back ALL of
@@ -2086,9 +2131,8 @@ fn ReplApp(mut hooks: Hooks) -> impl Into<AnyElement<'static>> {
                         } else {
                             let val = input_value.read().clone();
                             let cursor_pos = cursor_at_last_render.get().min(val.len());
-                            let on_last_line = !val.get(cursor_pos..)
-                                .unwrap_or_default()
-                                .contains('\n');
+                            let on_last_line =
+                                !val.get(cursor_pos..).unwrap_or_default().contains('\n');
                             if on_last_line && cursor_pos < val.len() {
                                 text_input_handle.write().set_cursor_offset(val.len());
                             }
@@ -2120,7 +2164,9 @@ fn ReplApp(mut hooks: Hooks) -> impl Into<AnyElement<'static>> {
                             dialpad_cursor.set(digit - 1);
                             if let InputSlot::DialPad(ref question) = current_slot {
                                 submit_dialpad_selection(question, digit - 1, &input_tx_for_events);
-                                if !*has_submitted.read() { has_submitted.set(true); }
+                                if !*has_submitted.read() {
+                                    has_submitted.set(true);
+                                }
                                 input_value.set(String::new());
                                 input_slot.set(InputSlot::TextInput);
                             }
@@ -2195,7 +2241,11 @@ fn ReplApp(mut hooks: Hooks) -> impl Into<AnyElement<'static>> {
                         } else {
                             last_ctrlc.set(Some(now));
                             let _ = input_tx_for_events.send(InputEvent::Abort);
-                            let hint_msg = format!("{}Press Ctrl-C again to exit{}", crate::render::DIM, crate::render::RESET);
+                            let hint_msg = format!(
+                                "{}Press Ctrl-C again to exit{}",
+                                crate::render::DIM,
+                                crate::render::RESET
+                            );
                             footer_hint.set(Some((hint_msg, Instant::now() + ctrlc_hint_ttl())));
                             input_value.set(String::new());
                         }
@@ -2250,14 +2300,12 @@ fn ReplApp(mut hooks: Hooks) -> impl Into<AnyElement<'static>> {
                 let current_slot = input_slot.read().clone();
                 match &current_slot {
                     InputSlot::DialPad(q)
-                        if q.allow_custom_input
-                            && dialpad_cursor.get() == q.options.len() =>
+                        if q.allow_custom_input && dialpad_cursor.get() == q.options.len() =>
                     {
                         let current = dialpad_input.read().clone();
                         let mut id = next_paste_id.get();
                         let mut store = paste_store.write();
-                        let new_val =
-                            apply_paste_to_buffer(&current, &pasted, &mut id, &mut store);
+                        let new_val = apply_paste_to_buffer(&current, &pasted, &mut id, &mut store);
                         drop(store);
                         next_paste_id.set(id);
                         dialpad_input.set(new_val);
@@ -2277,6 +2325,19 @@ fn ReplApp(mut hooks: Hooks) -> impl Into<AnyElement<'static>> {
             }
             _ => {}
         }
+    };
+    let keyboard = Arc::new(Mutex::new(keyboard));
+    hooks.use_terminal_events({
+        let keyboard = Arc::clone(&keyboard);
+        move |event| {
+            // A mounted editor owns the entire event batch, including panel
+            // navigation triggered by a command submitted within that batch.
+            if !text_input_is_live {
+                keyboard
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)(event);
+            }
+        }
     });
 
     // Snapshot the cursor for the next keypress to decide against. Guarded:
@@ -2293,11 +2354,6 @@ fn ReplApp(mut hooks: Hooks) -> impl Into<AnyElement<'static>> {
     // the value actually changed — an unconditional `State::set` resolves
     // `component.wait()` and can starve `term.wait()`, dropping keystrokes
     // (the failure mode `iocraft_repl_keyboard_input_not_frozen` guards).
-    let text_input_is_live = matches!(*input_slot.read(), InputSlot::TextInput)
-        && !tasks
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .is_panel();
     if text_input_is_live && text_input_was_mounted.get() {
         let live_cursor = text_input_handle.read().cursor_offset();
         if cursor_at_last_render.get() != live_cursor {
@@ -2592,7 +2648,16 @@ fn ReplApp(mut hooks: Hooks) -> impl Into<AnyElement<'static>> {
             } else {
                 let tasks_for_edit = Arc::clone(&tasks);
                 let input_tx_for_edit = input_tx.clone();
+                let keyboard = Arc::clone(&keyboard);
                 let on_edit: TextInputEditHandler = Box::new(move |event, current, cursor| {
+                    keyboard.lock().unwrap_or_else(std::sync::PoisonError::into_inner)(event.clone());
+                    if !matches!(*input_slot.read(), InputSlot::TextInput)
+                        || input_value.read().as_str() != current
+                    {
+                        let value = input_value.read().clone();
+                        let cursor_offset = value.len();
+                        return Some(TextInputEdit { value, cursor_offset });
+                    }
                     // Read focus at event time: several keys can arrive before
                     // the next render. TextInput remains the only draft editor.
                     let mut browser = tasks_for_edit.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -2795,15 +2860,12 @@ fn chrome_rows(text: &str, width: usize) -> usize {
 mod tests {
     use super::*;
 
-    #[test]
-    fn batched_submits_keep_each_input_boundary() {
-        use futures::StreamExt;
-
+    fn mock_context(tasks: Arc<Mutex<TaskBrowser>>) -> (ReplContext, mpsc::Receiver<InputEvent>) {
         let (_output_tx, output_rx) = mpsc::sync_channel(16);
         let (_ui_tx, ui_rx) = mpsc::sync_channel(16);
         let (input_tx, input_rx) = mpsc::sync_channel(16);
         let ctx = ReplContext {
-            tasks: Arc::new(Mutex::new(TaskBrowser::default())),
+            tasks,
             prose_preview: Arc::new(Mutex::new(ProsePreview::default())),
             output_rx: Arc::new(Mutex::new(output_rx)),
             terminal_handoff: Arc::new(Mutex::new(None)),
@@ -2817,6 +2879,67 @@ mod tests {
             pending: Arc::new(Mutex::new(Vec::new())),
             dequeue_hook: None,
         };
+        (ctx, input_rx)
+    }
+
+    #[test]
+    fn tasks_command_does_not_reuse_submit_as_a_detail_key() {
+        use engine_events::{BackgroundTask, BackgroundTaskEvent, BackgroundTaskKind};
+        use futures::StreamExt;
+
+        for (command, expected) in [
+            ("/ps\r", TaskFocus::List),
+            ("/ps\r\r", TaskFocus::Detail),
+            ("/ps\r\r\x1b", TaskFocus::List),
+        ] {
+            let mut browser = TaskBrowser::default();
+            browser.update(BackgroundTaskEvent::Updated(BackgroundTask::new(
+                "fixture".to_string(),
+                BackgroundTaskKind::Terminal,
+                "Background fixture".to_string(),
+            )));
+            let tasks = Arc::new(Mutex::new(browser));
+            let (ctx, _input_rx) = mock_context(Arc::clone(&tasks));
+            let keys = command.chars().map(|character| {
+                TerminalEvent::Key(KeyEvent::new(
+                    KeyEventKind::Press,
+                    match character {
+                        '\r' => KeyCode::Enter,
+                        '\x1b' => KeyCode::Esc,
+                        other => KeyCode::Char(other),
+                    },
+                ))
+            });
+            smol::block_on(smol::future::or(
+                async {
+                    let mut view = element! {
+                        ContextProvider(value: Context::owned(ctx)) { ReplApp }
+                    };
+                    let mut frames = view.mock_terminal_render_loop(
+                        MockTerminalConfig::with_events(futures::stream::iter(keys)),
+                    );
+                    while frames.next().await.is_some() {
+                        let focus = tasks.lock().unwrap().focus;
+                        if focus != TaskFocus::Input {
+                            assert_eq!(focus, expected, "command: {command:?}");
+                            return;
+                        }
+                    }
+                    panic!("task browser never opened");
+                },
+                async {
+                    smol::Timer::after(Duration::from_secs(10)).await;
+                    panic!("task browser never rendered for {command:?}");
+                },
+            ));
+        }
+    }
+
+    #[test]
+    fn batched_submits_keep_each_input_boundary() {
+        use futures::StreamExt;
+
+        let (ctx, input_rx) = mock_context(Arc::new(Mutex::new(TaskBrowser::default())));
         let mut close = KeyEvent::new(KeyEventKind::Press, KeyCode::Char('d'));
         close.modifiers = KeyModifiers::CONTROL;
         let events = "first\rsecond\r".chars().map(|character| {
