@@ -17,7 +17,13 @@ fn strip_ansi(input: &str) -> Cow<'_, str> {
 /// Keep transient status descriptions on one row and discard terminal controls.
 #[inline]
 pub(crate) fn single_line(input: &str) -> Cow<'_, str> {
-    let plain = strip_ansi(input);
+    // Reuse the decoder's fast-path predicate: C0 controls also need removal
+    // when there is no ESC byte. Ordinary progress text stays borrowed.
+    let plain = if StyledText::needs_decoding(input) {
+        Cow::Owned(StyledText::from_ansi(input).text)
+    } else {
+        Cow::Borrowed(input)
+    };
     if plain.contains(['\n', '\r', '\t']) {
         Cow::Owned(plain.replace(['\n', '\r', '\t'], " "))
     } else {
