@@ -183,6 +183,42 @@ fn fast_result_and_error_are_visible_before_slow_sibling_finishes() {
 }
 
 #[test]
+fn short_shells_finish_while_a_parallel_sibling_is_held() {
+    for round in 0..4 {
+        let env = TestEnv::new_mock(&format!("parallel-short-shells-{round}"));
+        fifo(&env, "slow.fifo");
+        let mut calls = vec![bash("slow", &fifo_read("slow.fifo"))];
+        let mut markers = Vec::new();
+        for index in 0..9 {
+            let path = format!("fast-{index}.txt");
+            let marker = format!("SHORT_SHELL_{round}_{index}_DONE");
+            std::fs::write(env.workspace_root().join(&path), format!("{marker}\n")).unwrap();
+            calls.push(bash(&format!("fast-{index}"), &format!("cat {path}")));
+            markers.push(marker);
+        }
+        let sess = start(&env, &calls, "10");
+        let slow = writer(&env, "slow.fifo", &sess);
+        common::expect_screen(
+            &sess,
+            |screen| markers.iter().all(|marker| screen.contains(marker)),
+            Duration::from_secs(15),
+            "all short shells complete before the held sibling is released",
+        );
+        assert!(!sess
+            .render(|screen| screen.contents())
+            .contains("Concurrency batch done."));
+        release(slow, "HELD_SHELL_RELEASED");
+        done(&sess);
+        let ids: Vec<_> = calls
+            .iter()
+            .map(|call| call["id"].as_str().unwrap())
+            .collect();
+        assert_result_order(&env, &ids);
+        finish(sess);
+    }
+}
+
+#[test]
 fn writer_barrier_waits_for_all_reads_and_next_read_sees_write() {
     let env = TestEnv::new_mock("parallel-barrier");
     fifo(&env, "one.fifo");
