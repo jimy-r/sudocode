@@ -80,8 +80,8 @@ impl FooterTips {
         }
         let high = selected.is_some_and(|tip| tip.priority >= TipPriority::Important);
         let sep = " · ";
-        let required = |task: &str| {
-            display_width(&base)
+        let required = |base: &str, task: &str| {
+            display_width(base)
                 + if task.is_empty() {
                     0
                 } else {
@@ -89,17 +89,22 @@ impl FooterTips {
                 }
         };
         if high
-            && required(&task) + display_width(sep) + display_width(&selected.unwrap().message)
+            && required(&base, &task)
+                + display_width(sep)
+                + display_width(&selected.unwrap().message)
                 > width
         {
             task = tasks.footer_label(true);
-            if width.saturating_sub(required(&task) + display_width(sep)) < 16 {
+            if width.saturating_sub(required(&base, &task) + display_width(sep)) < 16 {
                 task.clear();
+            }
+            if width.saturating_sub(required(&base, &task) + display_width(sep)) < 16 {
+                base = truncate_to_width(&base, width.saturating_sub(display_width(sep) + 16));
             }
         }
         let available_task = width.saturating_sub(display_width(&base) + display_width(sep));
         task = truncate_to_width(&task, available_task);
-        let remaining = width.saturating_sub(required(&task) + display_width(sep));
+        let remaining = width.saturating_sub(required(&base, &task) + display_width(sep));
         let tip = selected
             .filter(|_| remaining >= 8)
             .map(|tip| (tip, truncate_to_width(&tip.message, remaining)));
