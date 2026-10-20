@@ -180,6 +180,19 @@ Assistant responses start with a bold text bullet (`•`, U+2022); continuation
 lines use a two-column margin. The marker is a text character rather than an
 emoji-capable record symbol, avoiding emoji font fallback for this prefix.
 
+Unfinished ordinary paragraphs stream above the live status area by default.
+Finalized text
+moves into native scrollback in the same presentation as preview removal,
+and a draft typed during the response stays available. Parallel tool output
+keeps unfinished Markdown formatting intact. The preview keeps
+at most 8 KiB of source and fits around the input; longer paragraphs freeze
+their preview until finalization, which still retains the entire response.
+Code, tables, lists, headings and emoji with ambiguous terminal widths use
+the existing complete-block rendering path. On Windows, this also applies to
+combining sequences whose widths legacy console hosts cannot reliably preserve;
+the original Unicode text is retained without normalization. A clipped paragraph or an
+unusually long result summary can still change its visible position.
+
 The live UI retains the existing formatter colors and supported text styles:
 tool-card borders show status without extra icons: muted while waiting for
 hooks, approval, or an execution slot; amber while running; the code theme's

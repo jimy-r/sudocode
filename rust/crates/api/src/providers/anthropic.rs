@@ -1088,7 +1088,7 @@ pub struct MessageStream {
     gateway_request_id: Option<String>,
     /// Client-generated request ID for tracking.
     client_request_id: Option<String>,
-    response: reqwest::Response,
+    response: crate::RecordedResponse,
     parser: SseParser,
     pending: VecDeque<StreamEvent>,
     done: bool,
