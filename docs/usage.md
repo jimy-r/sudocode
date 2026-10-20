@@ -264,8 +264,9 @@ theme-selected muted foreground without an additional dim attribute; cache
 health indicators keep their semantic colors. Emphasis and color are scoped
 to individual spans so they do not leak into following labels or input.
 
-Tips and footer text use the theme's readable muted foreground without an
-additional dim attribute; separators use its border role. The input draft
+Ordinary footer tips use the theme's readable muted foreground, actionable
+recommendations use its primary accent, and urgent tips use its warning role,
+without an additional dim attribute; separators use the border role. The input draft
 retains the terminal foreground. A slot's initial color is decoded as text
 state, not applied again as a fallback to every span: ANSI foreground/full
 resets restore the terminal default instead of silently inheriting a parent
@@ -373,6 +374,44 @@ persisted before it reaches the provider, so resume sends identical results.
 Large results still use the existing persisted-output marker and
 `read_tool_output` pagination.
 
+## Contextual footer tips
+
+The row below the input combines permission mode, background task counts and
+one contextual tip. General startup guidance also lives here. The highest
+priority applicable tip wins: immediate local interaction feedback, then model
+tips ordered `urgent` > `important` > `normal`, with local cache advice at
+`important` priority. At equal priority an explicit model tip takes precedence
+over cache advice. Routine `/help` guidance fills otherwise unused space.
+While a turn runs, only urgent tips are shown.
+
+The model has an always-loaded, read-only `set_tip` tool:
+
+```json
+{"priority":"important","message":"Check the migration before deploying."}
+```
+
+Both fields are required. Use `urgent` for immediate user action, `important`
+for actionable advice, and `normal` for optional guidance. Each priority has
+one replaceable model tip; an empty message clears that priority. Messages
+must be one plain-text line, at most 160 Unicode characters, without control
+characters. Invalid calls return ordinary tool errors. Tips request neither
+approval nor user answers and do not change configuration. Model tips clear
+when the next turn starts or the context changes. Saved tool traces are not
+replayed as active footer advice.
+
+Tips travel through the existing tool-result stream. The interactive REPL
+shows successful tips in the footer; the saved tool trace, headless output
+and ACP tool results retain their structured data. Question and permission
+instructions stay with their controls. The footer remains one row on resize;
+it compresses background counts or yields their space for important tips,
+and truncates text on Unicode display-column boundaries. Theme colors apply
+to individual spans and no-color terminals retain their default foreground.
+
+With `experimental.cacheTtlAdvisor` enabled, a changed TTL recommendation is
+shown after a committed compact and on resume. It reads the same frozen
+decision as `scode cache stats`, uses no extra model call, and states that
+the recommendation has not been applied. The advisor remains off by default.
+
 ## Background tasks in the REPL
 
 Background Bash/PowerShell terminals and this session's background sub-agents
@@ -381,7 +420,8 @@ and agents automatically moved to the background use the same view. It shows
 running terminal/agent counts and unread completion results. When neither
 exists, the entry is hidden; no additional permanent row is reserved.
 
-With an empty prompt, press **↓**, then **Enter** to open the task list.
+The task summary normally shows just the counts. With an empty prompt, press
+**↓** to focus it; **Enter to view** then appears. Press **Enter** to open the task list.
 **↑/↓** selects a task, **Enter** opens its details, and **k** stops the selected
 running task. In details, **↑/↓** or **PageUp/PageDown** scrolls the output tail;
 **Esc** returns to the list, then **Esc** returns to your preserved prompt.
