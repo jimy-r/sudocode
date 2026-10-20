@@ -1138,6 +1138,9 @@ use cli::doctor::{render_doctor_report, run_doctor};
 /// now"; this answers "what has it been doing", which is the question you have
 /// after changing something that touches the cached prefix.
 fn run_cache_stats(output_format: CliOutputFormat) -> Result<(), Box<dyn std::error::Error>> {
+    let cwd = std::env::current_dir()?;
+    let settings = ConfigLoader::default_for(&cwd).load()?;
+    runtime::experiments::init_config_flags(settings.experiments().clone());
     let root = engine_core::cache_root();
     let mut sessions: Vec<(String, engine_core::PromptCacheStats)> = Vec::new();
     if let Ok(entries) = std::fs::read_dir(&root) {
@@ -1220,13 +1223,17 @@ fn run_cache_stats(output_format: CliOutputFormat) -> Result<(), Box<dyn std::er
                     metrics.read_share_pct = None;
                     metrics.write_share_pct = None;
                 }
-                serde_json::json!({
+                let mut report = serde_json::json!({
                     "session": index + 1,
                     "tracked_requests": stats.tracked_requests,
                     "cache_efficiency": metrics,
                     "completion_intervals": engine_core::cache_report::completion_intervals(
                         &root.join(name).join("requests.jsonl")),
-                })
+                });
+                if runtime::experiments::is_enabled(runtime::experiments::Experiment::CacheTtlAdvisor) {
+                    report["ttl_advisor"] = engine_core::cache_advisor::report(&root.join(name));
+                }
+                report
             }).collect::<Vec<_>>(),
         });
         println!("{}", serde_json::to_string_pretty(&payload)?);
@@ -1248,6 +1255,9 @@ fn run_cache_stats(output_format: CliOutputFormat) -> Result<(), Box<dyn std::er
         None => println!("  prompt read     unknown (legacy input-token coverage)"),
     }
     println!("  interval data   per-session in JSON; response completion, expiry unconfirmed");
+    if runtime::experiments::is_enabled(runtime::experiments::Experiment::CacheTtlAdvisor) {
+        println!("  TTL advice      advisory only; decisions and forward scenarios in JSON; requests unchanged");
+    }
     println!("  breaks          {unexpected} unexpected, {expected} expected");
     if !by_cause.is_empty() {
         // The counts that tell you what to go fix. "Expected" only means the

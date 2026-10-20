@@ -202,6 +202,9 @@ pub type AssistantEventStream =
 /// abort signal for instant cancellation.
 #[async_trait]
 pub trait ApiClient: Send {
+    /// A new/resumed context or a durably committed compaction. Optional local
+    /// instrumentation must not change the request or reset cumulative usage.
+    fn cache_context_boundary(&mut self, _segment: u64) {}
     /// Whether this session forbids model HTTP outside its Nexus mount.
     fn requires_model_mount(&self) -> bool {
         false
@@ -1230,12 +1233,18 @@ where
     #[allow(clippy::needless_pass_by_value)]
     pub fn new_with_features(
         session: Session,
-        api_client: C,
+        mut api_client: C,
         tool_executor: T,
         permission_policy: PermissionPolicy,
         system_prompt: SystemPrompt,
         feature_config: &RuntimeFeatureConfig,
     ) -> Self {
+        api_client.cache_context_boundary(
+            session
+                .compaction
+                .as_ref()
+                .map_or(0, |c| u64::from(c.count)),
+        );
         let usage_tracker = UsageTracker::from_session(&session);
         let workspace_root = session
             .workspace_root()
@@ -2422,6 +2431,12 @@ where
     /// Install only after the owning engine has durably committed the candidate.
     pub fn install_compacted_session(&mut self, session: Session) {
         self.session = session;
+        self.api_client.cache_context_boundary(
+            self.session
+                .compaction
+                .as_ref()
+                .map_or(0, |c| u64::from(c.count)),
+        );
         self.usage_tracker.clear_context_usage();
     }
 

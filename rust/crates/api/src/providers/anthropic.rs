@@ -233,6 +233,23 @@ impl AnthropicClient {
         self.cache_ttl_1h
     }
 
+    #[must_use]
+    pub fn cache_advisor_route_key(&self) -> String {
+        let category = if self.oauth_system_prefix {
+            "subscription"
+        } else {
+            "api_key_or_gateway"
+        };
+        // Credential identity changes invalidate the client-visible route;
+        // only its opaque hash is retained, never the credential itself.
+        let credential = self
+            .auth
+            .api_key()
+            .or_else(|| self.auth.bearer_token())
+            .unwrap_or("");
+        crate::cache_route_key(&format!("{}|{category}|{credential}", self.base_url))
+    }
+
     /// Build from an `AuthSource` and an optional explicit `AuthMode`. When
     /// the mode is `Some(Subscription)` the OAuth system prefix and beta
     /// header are always applied; when `None` the legacy env-sniffer
@@ -436,7 +453,7 @@ impl AnthropicClient {
 
         self.preflight_message_request(&request).await?;
 
-        let result = self.send_request(&request, trace_id).await?;
+        let (result, mut observation) = self.send_request(&request, trace_id).await?;
         let request_id = request_id_from_headers(result.response.headers());
         // A gateway's own correlation id, kept alongside the provider's: it is
         // what a pooling gateway records against the upstream account it chose,
@@ -472,20 +489,26 @@ impl AnthropicClient {
             response.request_id = request_id;
         }
         response.gateway_request_id = gateway_request_id;
+        if let Some(observation) = &mut observation {
+            observation.response_completed_ms = crate::cache_observation::now_ms();
+            observation.message_starts = 1;
+            observation.completed = refusal.is_none() && response.stop_reason.is_some();
+        }
 
         if let Some(prompt_cache) = &self.prompt_cache {
             // Refused responses still incur usage, but cannot enter the completion cache.
             let record = if refusal.is_some() {
-                prompt_cache.record_usage(
+                prompt_cache.record_usage_observed(
                     &request,
                     &response.usage,
                     crate::prompt_cache::ResponseTraceIds {
                         gateway: response.gateway_request_id.clone(),
                         provider: response.request_id.clone(),
                     },
+                    observation,
                 )
             } else {
-                prompt_cache.record_response(&request, &response)
+                prompt_cache.record_response_observed(&request, &response, observation)
             };
             self.store_last_prompt_cache_record(record);
         }
@@ -519,7 +542,7 @@ impl AnthropicClient {
     ) -> Result<MessageStream, ApiError> {
         crate::request_scope::RequestScope::preflight(self.preflight_message_request(request))
             .await?;
-        let result = self
+        let (result, observation) = self
             .send_request(&request.clone().with_streaming(), trace_id)
             .await?;
         let progress = StreamProgress::new(
@@ -555,6 +578,7 @@ impl AnthropicClient {
             session_tracer: self.session_tracer().cloned(),
             cache_diagnostics: cache_diagnostics_enabled().then(|| self.cache_diagnostics.clone()),
             progress,
+            observation,
         })
     }
 
@@ -605,7 +629,13 @@ impl AnthropicClient {
         &self,
         request: &MessageRequest,
         trace_id: Option<&str>,
-    ) -> Result<crate::HttpRequestResult, ApiError> {
+    ) -> Result<
+        (
+            crate::HttpRequestResult,
+            Option<crate::CacheRequestObservation>,
+        ),
+        ApiError,
+    > {
         let url = format!("{}/v1/messages", self.base_url.trim_end_matches('/'));
         let mut body = self.request_profile.render_json_body(request)?;
         strip_unsupported_beta_body_fields(&mut body, request);
@@ -617,6 +647,17 @@ impl AnthropicClient {
             self.cache_diagnostics.apply_request(&mut body);
         }
         dump_request_body("messages", &body);
+        let mut observation =
+            runtime::experiments::is_enabled(runtime::experiments::Experiment::CacheTtlAdvisor)
+                .then(|| {
+                    crate::CacheRequestObservation::from_body(
+                        &body,
+                        self.cache_advisor_route_key(),
+                        self.prompt_cache
+                            .as_ref()
+                            .map_or(0, PromptCache::context_segment),
+                    )
+                });
 
         let mut headers: Vec<(String, String)> =
             vec![("content-type".to_string(), "application/json".to_string())];
@@ -646,7 +687,8 @@ impl AnthropicClient {
             }
         }
 
-        self.http
+        let result = self
+            .http
             .send_json(
                 &url,
                 &headers,
@@ -656,7 +698,13 @@ impl AnthropicClient {
                 trace_id,
             )
             .await
-            .map_err(|e| enrich_bearer_auth_error(e, &self.auth))
+            .map_err(|e| enrich_bearer_auth_error(e, &self.auth))?;
+        if let Some(observation) = &mut observation {
+            observation.request_started_ms = result.request_started_ms;
+            observation.response_started_ms = result.response_started_ms;
+            observation.attempts = result.attempts;
+        }
+        Ok((result, observation))
     }
 
     /// When `oauth_system_prefix` is set, transform the `system` field into
@@ -1112,6 +1160,7 @@ pub struct MessageStream {
     session_tracer: Option<SessionTracer>,
     cache_diagnostics: Option<CacheDiagnostics>,
     progress: StreamProgress,
+    observation: Option<crate::CacheRequestObservation>,
 }
 
 impl MessageStream {
@@ -1254,6 +1303,9 @@ impl MessageStream {
         self.progress.observe_event(event);
         match event {
             StreamEvent::MessageStart(start) => {
+                if let Some(observation) = &mut self.observation {
+                    observation.message_starts += 1;
+                }
                 self.latest_usage
                     .get_or_insert_with(Usage::default)
                     .merge_snapshot(start.message.usage.clone());
@@ -1307,8 +1359,13 @@ impl MessageStream {
             return;
         };
         runtime::compaction_scope::record_usage(usage.token_usage());
+        let mut observation = self.observation.clone();
+        if let Some(observation) = &mut observation {
+            observation.response_completed_ms = crate::cache_observation::now_ms();
+            observation.completed = self.logically_complete;
+        }
         if let Some(prompt_cache) = &self.prompt_cache {
-            let record = prompt_cache.record_usage(
+            let record = prompt_cache.record_usage_observed(
                 &self.request,
                 &usage,
                 crate::prompt_cache::ResponseTraceIds {
@@ -1318,6 +1375,7 @@ impl MessageStream {
                     // from a `MessageResponse` the streaming path never has.
                     provider: self.request_id.clone(),
                 },
+                observation,
             );
             *self
                 .last_prompt_cache_record
@@ -1346,6 +1404,16 @@ impl MessageStream {
             );
         }
         self.usage_recorded = true;
+    }
+}
+
+impl Drop for MessageStream {
+    fn drop(&mut self) {
+        // The opt-in experiment keeps consumed usage from interrupted streams,
+        // explicitly marked incomplete; it never turns them into successes.
+        if self.observation.is_some() && !self.usage_recorded {
+            self.record_usage_once();
+        }
     }
 }
 
