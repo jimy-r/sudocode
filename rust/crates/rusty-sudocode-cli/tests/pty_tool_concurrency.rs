@@ -198,15 +198,13 @@ fn short_shells_finish_while_a_parallel_sibling_is_held() {
         }
         let sess = start(&env, &calls, "10");
         let slow = writer(&env, "slow.fifo", &sess);
-        common::expect_screen(
+        let screen = common::expect_screen(
             &sess,
             |screen| markers.iter().all(|marker| screen.contains(marker)),
             Duration::from_secs(15),
             "all short shells complete before the held sibling is released",
         );
-        assert!(!sess
-            .render(|screen| screen.contents())
-            .contains("Concurrency batch done."));
+        assert!(!screen.contains("Concurrency batch done."));
         release(slow, "HELD_SHELL_RELEASED");
         done(&sess);
         let ids: Vec<_> = calls
