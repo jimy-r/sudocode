@@ -85,6 +85,7 @@ pub mod subagent_events;
 pub mod summary_compression;
 pub mod task_packet;
 mod time;
+pub mod tips;
 pub mod todo_store;
 pub mod tool_concurrency;
 pub mod tool_names;
