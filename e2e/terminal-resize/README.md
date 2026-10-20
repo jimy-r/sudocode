@@ -77,10 +77,10 @@ still require an independent maintainer review. Approval evidence is retained in
 To measure an approved same-repository PR, dispatch `render-performance.yml` from
 its current head branch with `pull_request=<number>` and `profile=core`. This uses
 the PR base's policy and measurement harness, independently builds both releases,
-and publishes the required status only after real A/A and A/B results pass. It
-publishes a fresh Checks API record for the authenticated current approval.
-Actions-owned checks and their historical rejection logs remain unchanged.
-The final publisher rejects a PR that advanced during measurement.
+and publishes the required status only after real A/A and A/B results pass. The native approval
+job and `approval.json` retain the authenticated evidence; the validator only
+reads GitHub data. Historical Actions checks and measurement results remain
+unchanged. The final publisher rejects a PR that advanced during measurement.
 The workflow also tests stale PR-event and dispatch inputs against the live GitHub
 API in a separate job with a read-only token.
 
