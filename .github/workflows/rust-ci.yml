@@ -92,6 +92,8 @@ jobs:
       contents: read
       pull-requests: read
       statuses: write
+      checks: write
+      actions: read
     uses: ./.github/workflows/render-performance.yml
     with:
       profile: core
