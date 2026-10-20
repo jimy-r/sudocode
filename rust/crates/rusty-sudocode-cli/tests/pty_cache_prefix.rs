@@ -1571,12 +1571,33 @@ fn ttl_advisor_is_opt_in_and_marks_retried_or_restarted_streams() {
         let mut cli = spawn_with_env(
             &env,
             &path,
-            &[(
-                "SUDOCODE_EXPERIMENT_CACHE_TTL_ADVISOR",
-                if mode == "off" { "0" } else { "1" },
-            )],
+            &[
+                (
+                    "SUDOCODE_EXPERIMENT_CACHE_TTL_ADVISOR",
+                    if mode == "off" { "0" } else { "1" },
+                ),
+                (
+                    "SUDOCODE_CACHE_DIAGNOSTICS",
+                    if mode == "restarted" { "1" } else { "0" },
+                ),
+            ],
         );
-        turn(&mut cli, "Observe a normal reply.");
+        if mode == "restarted" {
+            cli.send("Observe an invalid upstream restart.\r").unwrap();
+            common::expect_screen(
+                &cli,
+                |screen| common::screen_contains(screen, "multiple message_start"),
+                WAIT,
+                "a restarted message is a protocol failure",
+            );
+            common::expect_input_line_cleared(
+                &cli,
+                WAIT,
+                "protocol failure returned to the prompt",
+            );
+        } else {
+            turn(&mut cli, "Observe a normal reply.");
+        }
         exit(&mut cli);
         let rows = cache_rows(&directory);
         let o = &rows.last().unwrap()["observation"];
@@ -1609,7 +1630,29 @@ fn ttl_advisor_is_opt_in_and_marks_retried_or_restarted_streams() {
                     "an incomplete response must not advance the successful prefix state"
                 );
             }
-            _ => assert_eq!(o["message_starts"], 2),
+            "restarted" => {
+                assert_eq!(
+                    o["message_starts"], 1,
+                    "reject the second start before it changes usage"
+                );
+                assert_eq!(o["completed"], false);
+                assert_eq!(rows.last().unwrap()["cache_creation_input_tokens"], 5235);
+                assert_eq!(rows.last().unwrap()["cache_read_input_tokens"], 124730);
+                let diagnostics: Value = serde_json::from_str(
+                    &std::fs::read_to_string(directory.join("cache-diagnostics.json")).unwrap(),
+                )
+                .unwrap();
+                assert_eq!(
+                    diagnostics["message_id"], "abandoned-attempt",
+                    "the rejected start must not replace the accepted diagnostic identity"
+                );
+                assert_eq!(
+                    capture.bodies().len(),
+                    1,
+                    "never replay an invalid upstream restart"
+                );
+            }
+            _ => unreachable!(),
         }
     }
 }
