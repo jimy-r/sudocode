@@ -43,9 +43,9 @@ mod tasks;
 use crate::render::output::{split_lines, OutputOp, Utf8Stream};
 use crate::render::styled_text::StyledText;
 use ansi_text::{row_text, AnsiText, RichText};
+use footer::FooterTips;
 use layout::{ansi, ansi_with_style, ChromeLayout, InputLayout, Measurements, Slot};
 use prompt_text::PromptTextCache;
-use footer::FooterTips;
 pub(crate) mod prose_preview;
 use prose_preview::{PreviewUpdate, ProsePreview};
 use tasks::{TaskBrowser, TaskFocus};
@@ -2293,8 +2293,12 @@ fn ReplApp(mut hooks: Hooks) -> impl Into<AnyElement<'static>> {
         w,
     ));
     let footer_summary = Arc::new(footer_tips.read().render(
-        "compact · enlarge to expand", &browser, submitted, turn_active,
-        footer_hint.read().as_ref().map(|(text, _)| text.as_str()), w,
+        "compact · enlarge to expand",
+        &browser,
+        submitted,
+        turn_active,
+        footer_hint.read().as_ref().map(|(text, _)| text.as_str()),
+        w,
     ));
     let task_panel = browser.is_panel().then(|| browser.panel(w, usize::MAX));
     let task_focus = browser.focus;

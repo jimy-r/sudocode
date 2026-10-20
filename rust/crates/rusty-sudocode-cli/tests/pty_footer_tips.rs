@@ -186,8 +186,8 @@ fn footer_tips_preserve_theme_and_unicode_and_draft_across_resize() {
         });
         session.send("KEEP_DRAFT").unwrap();
         common::expect_input_line(&session, "KEEP_DRAFT", common::DEFAULT_TIMEOUT, "draft");
-        for width in [80, 40, 120] {
-            session.resize(30, width).unwrap();
+        for (height, width) in [(30, 80), (30, 40), (30, 120), (8, 40), (8, 120), (30, 120)] {
+            session.resize(height, width).unwrap();
             common::expect_input_line(
                 &session,
                 "KEEP_DRAFT",
