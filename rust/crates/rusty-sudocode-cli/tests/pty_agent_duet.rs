@@ -1,63 +1,17 @@
-//! Two `scode` processes converse, over every transport a message can take.
+//! Two real `scode` processes exchange durable A2A messages over Nexus.
 //!
-//! ## One workflow, two nexus transports
+//! The fixture uses one daemon, or two Raft-connected daemons when a peer
+//! endpoint is supplied. Both processes authenticate with minted credentials.
+//! Conversation layout and indexing follow the shared Mailbox contract.
 //!
-//! | transport | path an envelope takes | reach |
-//! |---|---|---|
-//! | nexus, one node | `/agents/<to>/chat-with-me` on that node | one machine |
-//! | nexus, two nodes | the same stream, replicated by raft | the cross-machine case |
+//! The sender calls `send`; the receiver surfaces its exact message in the
+//! REPL and commits its own reader position. The offline journey starts the
+//! receiver after the message is stored and verifies that inspecting delivery
+//! leaves its unread position intact.
 //!
-//! The standalone same-machine (no-daemon) pair is covered deterministically by
-//! `runtime/tests/same_machine_pair.rs`; this test is the nexus, real-binary
-//! duet.
-//!
-//! The steps and the dependencies between them do not change with the
-//! transport, so this is one test rather than near-copies that would
-//! drift. What changes is which mailbox the assertions read and, for the local
-//! case, how the sender gets a name — see [`Transport`].
-//!
-//! ## What it covers that nothing else does
-//!
-//! `send_message_routing.rs` proves which destination a recipient's name
-//! resolves to, against a recording backend, and covers the tool's spellings.
-//! `mailbox_nexus_live` proves a real `nexusd-cluster` moves an envelope and
-//! wakes a parked tail, by driving `Mailbox` directly. Neither runs what a user
-//! runs: two real binaries, one calling the `send` tool and one whose REPL
-//! receiver is parked waiting.
-//!
-//! That seam is where the failure this path exists because of lived — a `send`
-//! that answered "Message sent to <peer>'s inbox" while writing a local file —
-//! so a test that drives the transport but not the tool, or the tool but not
-//! the receiver, is blind to half of it.
-//!
-//! ## The workflow
-//!
-//! 1. provision the receiver's inbox — over nexus a send to an unprovisioned
-//!    stream fails, so this is a prerequisite rather than setup
-//! 2. start the RECEIVER: a real `scode` REPL, and wait until it has recorded
-//!    where it starts reading. A first-ever receiver seeks to the tail rather
-//!    than replaying a backlog, so a message sent before that seek lands behind
-//!    the cursor and is never delivered — establishing "listening" is part of
-//!    the workflow
-//! 3. run the SENDER: another real `scode`, whose model calls `send`
-//! 4. the receiver's screen shows it, which is the whole chain: the tool
-//!    resolved the peer's path, the transport carried it, the parked receiver
-//!    woke, and the REPL surfaced it
-//! 5. read the envelope back and check what crossed — `from`, the summary, and
-//!    that the cursor advanced past a consumed message
-//!
-//! Step 4 is the one no client-side read can stand in for: a delivered message
-//! nobody surfaces looks like success from the sender's side.
-//!
-//! ## Dual mode
-//!
-//! Mock by default (CI-safe, no key), live under `SCODE_TEST_BACKEND=live` with
-//! a real model choosing to call the tool. The nexus transports need a daemon:
-//! `e2e/nexus-a2a/run.sh` sets `NEXUS_A2A_TEST_ENDPOINT`, and
-//! `e2e/nexus-a2a/run-cross-node.sh` adds `NEXUS_A2A_TEST_PEER_ENDPOINT` for the
-//! two-node case. Absent a daemon those cases return early rather than
-//! pretending to have checked; the workspace-file case needs nothing and always
-//! runs.
+//! Mock models run by default. `SCODE_TEST_BACKEND=live` lets a funded model
+//! choose the tool call. `e2e/nexus-a2a/run.sh` supplies the daemon and credentials;
+//! absent an endpoint, these tests report that transport acceptance was skipped.
 
 mod common;
 
@@ -329,8 +283,26 @@ fn run_duet(transport: &Transport, offline: bool) {
             inbox.read_position(&expected_from).unwrap().unwrap_or(0),
             initial_position
         );
-        let (stored, _) = inbox.poll_conversation(&expected_from, tail, 0).unwrap();
-        assert!(stored.iter().any(|message| message.from == expected_from));
+        // Append acknowledges Raft commit; the receiver's node can still be
+        // applying it. Use the existing delivery budget and blocking tail.
+        let (stored, _) = inbox
+            .poll_conversation(
+                &expected_from,
+                tail,
+                u64::try_from(BUDGET.as_millis()).unwrap(),
+            )
+            .unwrap();
+        assert!(
+            stored.iter().any(|message| message.from == expected_from),
+            "[{}] no durable envelope from {expected_from}: {stored:?}\nsender:\n{}",
+            transport.label(),
+            common::screen_tail(&sending, 6000)
+        );
+        assert_eq!(
+            inbox.read_position(&expected_from).unwrap().unwrap_or(0),
+            initial_position,
+            "inspecting durable delivery must not acknowledge it for the offline receiver"
+        );
         receiver = Some(start_receiver());
     }
     let mut receiver = receiver.expect("receiver starts after durable delivery");
