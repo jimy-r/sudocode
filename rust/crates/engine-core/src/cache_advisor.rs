@@ -308,10 +308,17 @@ pub fn context_boundary(directory: &Path, segment: u64, model: &str, route: &str
     // Never train on a later response or a still-running request.
     let rows: Vec<_> = rows
         .into_iter()
-        .filter(|r| {
-            r.observation
+        .map(|r| {
+            if r.observation
                 .as_ref()
                 .is_some_and(|o| o.response_completed_ms < now)
+            {
+                r
+            } else {
+                // Unknown or future rows break adjacency; dropping them would
+                // invent reuse intervals across missing observations.
+                Row::default()
+            }
         })
         .collect();
     let table = prices();

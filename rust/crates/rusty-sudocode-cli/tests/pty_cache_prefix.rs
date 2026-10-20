@@ -24,6 +24,7 @@ const WAIT: Duration = Duration::from_secs(30);
 const DIAGNOSTIC_SSE: usize = 1;
 const DIAGNOSTIC_JSON: usize = 2;
 const RESTARTED_MESSAGE: usize = 3;
+const INTERRUPTED_MESSAGE: usize = 4;
 const DIAGNOSTIC_BETA: &str = "cache-diagnosis-2026-04-07";
 
 #[inline]
@@ -290,6 +291,10 @@ fn serve(
                 }}),
             ),
         );
+    }
+    if shape == INTERRUPTED_MESSAGE {
+        events.truncate(1);
+        diagnostic_shape.store(0, Ordering::Relaxed);
     }
     if binding {
         events[0].1["message"]["input_transformations"] = json!([]);
@@ -1475,11 +1480,11 @@ fn ttl_advisor_records_wire_timing_and_decides_once_after_compact() {
     // Synthetic history, not a measurement of the fake server's cache. It is
     // written before the boundary, so the next decision cannot see the future.
     let mut history = String::new();
-    for index in 0..9u64 {
+    for index in 0..10u64 {
         let mut row = template.clone();
         row["gateway_request_id"] = json!(format!("fixture-{index}"));
         row["provider_request_id"] = Value::Null;
-        let at = start - (10 - index) * 600_000;
+        let at = start - (11 - index) * 600_000;
         row["observation"]["request_started_ms"] = json!(at);
         row["observation"]["response_started_ms"] = json!(at + 1);
         row["observation"]["response_completed_ms"] = json!(at + 2);
@@ -1487,6 +1492,9 @@ fn ttl_advisor_records_wire_timing_and_decides_once_after_compact() {
         row["cache_creation_input_tokens"] = json!(100_000);
         row["cache_read_input_tokens"] = json!(0);
         writeln!(history, "{row}").unwrap();
+        if index == 4 {
+            writeln!(history, "{{\"model\":\"claude-opus-5-5\"}}").unwrap();
+        }
     }
     for row in rows {
         writeln!(history, "{row}").unwrap();
@@ -1513,6 +1521,7 @@ fn ttl_advisor_records_wire_timing_and_decides_once_after_compact() {
     assert_eq!(after["decisions"][1]["suggested_ttl_seconds"], 3600);
     assert_eq!(after["decisions"][1]["configured_ttl_seconds"], 300);
     assert_eq!(after["decisions"][1]["reason"], "hypothetical_1h_saving");
+    assert_eq!(after["decisions"][1]["training"]["eligible_intervals"], 8);
     let rows = cache_rows(&directory);
     assert!(rows
         .iter()
@@ -1540,7 +1549,7 @@ fn ttl_advisor_records_wire_timing_and_decides_once_after_compact() {
 
 #[test]
 fn ttl_advisor_is_opt_in_and_marks_retried_or_restarted_streams() {
-    for mode in ["off", "retry", "restarted"] {
+    for mode in ["off", "retry", "restarted", "interrupted"] {
         let env = TestEnv::new_mock("ttl-advisor-coverage");
         let capture = Capture::new();
         let path = fixture(&env, &capture);
@@ -1553,6 +1562,11 @@ fn ttl_advisor_is_opt_in_and_marks_retried_or_restarted_streams() {
             capture
                 .diagnostic_shape
                 .store(RESTARTED_MESSAGE, Ordering::Relaxed);
+        }
+        if mode == "interrupted" {
+            capture
+                .diagnostic_shape
+                .store(INTERRUPTED_MESSAGE, Ordering::Relaxed);
         }
         let mut cli = spawn_with_env(
             &env,
@@ -1572,6 +1586,29 @@ fn ttl_advisor_is_opt_in_and_marks_retried_or_restarted_streams() {
                 assert!(!directory.join("ttl-advice.json").exists());
             }
             "retry" => assert!(o["attempts"].as_u64().unwrap() >= 2),
+            "interrupted" => {
+                assert!(
+                    rows.iter().any(|r| r["observation"]["completed"] == false
+                        && r["input_tokens"].as_u64().unwrap_or(0) > 0),
+                    "interrupted observed usage must survive separately from the retry"
+                );
+                assert_eq!(o["completed"], true);
+                assert_eq!(
+                    o["attempts"], 1,
+                    "empty-response fallback opens a distinct HTTP request scope"
+                );
+                assert_eq!(capture.bodies().len(), 2);
+                let partial = &rows.first().unwrap()["observation"];
+                assert!(
+                    partial["response_completed_ms"].as_u64().unwrap()
+                        <= o["request_started_ms"].as_u64().unwrap(),
+                    "consumed partial usage must be recorded before the fallback"
+                );
+                assert!(
+                    o["client_prefix_compatible"].is_null(),
+                    "an incomplete response must not advance the successful prefix state"
+                );
+            }
             _ => assert_eq!(o["message_starts"], 2),
         }
     }

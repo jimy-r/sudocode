@@ -525,12 +525,15 @@ session. The text report points to this view without adding terminal warnings.
 
 The existing request ledger gains request-start, response-start and logical
 completion times, final client cache-marker TTLs (including the default 5m),
-context segment, opaque route/settings keys, attempt count and completion
+context segment, opaque route/settings keys, HTTP attempt count and completion
 coverage. Compaction requests are distinguished. Upstream TTL remains unknown:
 client markers do not prove a gateway's effective policy. Interrupted streams
 retain consumed usage with `completed=false`; retried, restarted, mixed-TTL and
 legacy samples are excluded from the advisor, rather than counted as clean
 successes. Prefix compatibility reuses the existing local fingerprints.
+An empty-response fallback opens a separate request scope. Its consumed partial
+usage is recorded before the replacement, and incomplete responses never advance
+the successful prefix state. Missing or legacy rows break reuse adjacency.
 
 One recommendation is frozen at session creation/resume and each committed
 compaction. Resume of the same model/route/configuration and segment reuses the

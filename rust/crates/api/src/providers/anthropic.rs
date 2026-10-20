@@ -1170,6 +1170,16 @@ impl MessageStream {
     }
 
     pub async fn next_event(&mut self) -> Result<Option<StreamEvent>, ApiError> {
+        let result = self.next_event_inner().await;
+        if (result.is_err() || matches!(&result, Ok(None))) && self.observation.is_some() {
+            // Persist consumed usage before a caller starts its retry. Waiting
+            // for Drop can put this old attempt after the successful response.
+            self.record_usage_once();
+        }
+        result
+    }
+
+    async fn next_event_inner(&mut self) -> Result<Option<StreamEvent>, ApiError> {
         loop {
             if let Some(event) = self.pending.pop_front() {
                 self.observe_event(&event);

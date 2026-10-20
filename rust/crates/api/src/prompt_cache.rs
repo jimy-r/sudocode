@@ -400,7 +400,10 @@ impl PromptCache {
         let mut inner = self.lock();
         let previous = inner.previous.clone();
         let current = TrackedPromptState::from_usage(request, usage);
-        let cache_break = detect_cache_break(&inner.config, previous.as_ref(), &current);
+        let complete = observation.as_ref().is_none_or(|o| o.completed);
+        let cache_break = complete
+            .then(|| detect_cache_break(&inner.config, previous.as_ref(), &current))
+            .flatten();
         if let Some(observation) = &mut observation {
             observation.client_prefix_compatible = previous.as_ref().map(|before| {
                 before.fingerprint_version == current.fingerprint_version
@@ -430,7 +433,9 @@ impl PromptCache {
             }
         }
 
-        inner.previous = Some(current);
+        if complete {
+            inner.previous = Some(current);
+        }
         append_request_row(
             &inner.paths,
             &PromptCacheRequestRow {
