@@ -254,6 +254,11 @@ append log that still contains these records requires a version that supports
 streamed tool execution; this includes native append streams retaining earlier
 snapshots. Ordinary rewritten transcript snapshots remain compatible.
 
+A second `message_start` in the same upstream response is a protocol error.
+Sudo Code preserves received partial progress and stops without replaying the
+request or combining usage from the two responses. HTTP failures before a
+response starts remain eligible for the normal transport retry policy.
+
 Incoming peer messages appear in a separate `Message from <peer>` frame with
 muted content and a blue peer name. This presentation does not alter the
 message envelope or content supplied to the model.
