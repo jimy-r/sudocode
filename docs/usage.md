@@ -162,11 +162,12 @@ scode
 The REPL accepts prose and slash commands. Tab completion expands slash
 command names, model aliases, permission modes, and recent session IDs.
 
-The live status follows the foreground engine lifecycle. A single amber
-character animation approximates the Sudoprivacy logo in one row. Model work
+The live status follows the foreground engine lifecycle. A four-cell amber
+animation approximates the Sudoprivacy logo in one row. Model work
 shows `Thinking...` or `Reasoning...`, with model, elapsed time and tokens.
 Foreground tools use the same row and show available progress first. Quiet
-tools show `Running Bash…` or `Running 2 tools…`. Long descriptions truncate before the time/token details.
+tools show `Running Bash…` or `Running 2 tools…`. Long descriptions truncate
+before the time/token details.
 Questions and approvals stop the animation and use the existing input panel;
 there is no additional waiting row. After the turn ends, the normal result and
 footer return. Background work keeps its separate task summary in the footer.

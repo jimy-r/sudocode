@@ -19,7 +19,12 @@ fn live_status(screen: &str) -> &str {
             return "";
         }
     }
-    lines.next().unwrap_or_default().trim_start()
+    // StatusSlot reserves space for the post-turn result. That padding is
+    // intentional, so inspect the content row above it after a resize.
+    lines
+        .find(|line| !line.trim().is_empty())
+        .unwrap_or_default()
+        .trim_start()
 }
 
 fn running_status(screen: &str) -> bool {
