@@ -729,7 +729,7 @@ pub(crate) fn build_runtime_with_plugin_state(
         workspace_root,
         agent_name,
     });
-    let client = match EngineApiClient::new(
+    let mut client = match EngineApiClient::new(
         session_id,
         &config.sudocode_config,
         &config.model,
@@ -748,6 +748,24 @@ pub(crate) fn build_runtime_with_plugin_state(
             return Err(error);
         }
     };
+    match runtime::response_archive::SessionResponseArchive::for_session(
+        &session,
+        feature_config.response_recording(),
+    ) {
+        Ok(Some(archive)) => client = client.with_response_archive(archive),
+        Ok(None) => {}
+        Err(error) => {
+            if let Some(tracer) = client.session_tracer() {
+                tracer.record(
+                    "response_capture_unavailable",
+                    serde_json::Map::from_iter([(
+                        "reason".into(),
+                        serde_json::Value::String(error.to_string()),
+                    )]),
+                );
+            }
+        }
+    }
     let mut tool_executor = CliToolExecutor::new(
         config.allowed_tools,
         tool_registry.clone(),

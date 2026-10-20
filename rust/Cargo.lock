@@ -189,6 +189,7 @@ name = "api"
 version = "0.2.34"
 dependencies = [
  "base64 0.22.1",
+ "bytes",
  "criterion",
  "futures-util",
  "http",
@@ -2475,7 +2476,7 @@ dependencies = [
 [[package]]
 name = "iocraft"
 version = "0.8.4"
-source = "git+https://github.com/sudoprivacy/iocraft.git?rev=b200b76ffcf707751f80b18cd786ffda313e5f59#b200b76ffcf707751f80b18cd786ffda313e5f59"
+source = "git+https://github.com/sudoprivacy/iocraft.git?rev=a43bc2a9dfc30e636bdadc9582da9e39f91f5018#a43bc2a9dfc30e636bdadc9582da9e39f91f5018"
 dependencies = [
  "async-io",
  "bitflags 2.13.1",
@@ -2491,7 +2492,7 @@ dependencies = [
 [[package]]
 name = "iocraft-macros"
 version = "0.2.4"
-source = "git+https://github.com/sudoprivacy/iocraft.git?rev=b200b76ffcf707751f80b18cd786ffda313e5f59#b200b76ffcf707751f80b18cd786ffda313e5f59"
+source = "git+https://github.com/sudoprivacy/iocraft.git?rev=a43bc2a9dfc30e636bdadc9582da9e39f91f5018#a43bc2a9dfc30e636bdadc9582da9e39f91f5018"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -4421,6 +4422,7 @@ dependencies = [
  "contracts",
  "criterion",
  "cron",
+ "flate2",
  "futures",
  "getrandom 0.2.17",
  "glob",

@@ -33,7 +33,7 @@ const CLIENT_REQUEST_ID_HEADER: &str = "x-client-request-id";
 /// Result of a successful HTTP request with tracking information.
 pub struct HttpRequestResult {
     /// The HTTP response.
-    pub response: reqwest::Response,
+    pub response: crate::RecordedResponse,
     /// Client-generated unique request ID for tracking.
     pub request_id: String,
 }
@@ -334,8 +334,57 @@ impl HttpTransport {
                                     Map::new(),
                                 );
                             }
+                            let capture = self.session_tracer.as_ref().and_then(|tracer| {
+                                if !tracer.has_response_archive()
+                                    || (!is_streaming
+                                        && body.get("stream").and_then(Value::as_bool)
+                                            != Some(true)
+                                        && !url.contains(":streamGenerateContent"))
+                                {
+                                    return None;
+                                }
+                                let endpoint = reqwest::Url::parse(url).ok().map_or_else(
+                                    || "unknown".to_string(),
+                                    |url| {
+                                        format!("{}{}", url.host_str().unwrap_or(""), url.path())
+                                            .chars()
+                                            .take(512)
+                                            .collect()
+                                    },
+                                );
+                                Some((
+                                    tracer.clone(),
+                                    telemetry::ResponseCaptureMetadata {
+                                        request_id: request_id.clone(),
+                                        model: body
+                                            .get("model")
+                                            .and_then(Value::as_str)
+                                            .map(|v| v.chars().take(256).collect()),
+                                        endpoint,
+                                        status,
+                                        content_type: response
+                                            .headers()
+                                            .get("content-type")
+                                            .and_then(|v| v.to_str().ok())
+                                            .unwrap_or("")
+                                            .chars()
+                                            .take(128)
+                                            .collect(),
+                                        provider_request_id: request_id_from_headers(
+                                            response.headers(),
+                                        )
+                                        .map(|v| v.chars().take(128).collect()),
+                                        gateway_request_id: response
+                                            .headers()
+                                            .get(ONEAPI_REQUEST_ID_HEADER)
+                                            .and_then(|v| v.to_str().ok())
+                                            .map(|v| v.chars().take(128).collect()),
+                                        started_at_ms: start_timestamp_ms,
+                                    },
+                                ))
+                            });
                             return Ok(HttpRequestResult {
-                                response,
+                                response: crate::RecordedResponse::new(response, capture),
                                 request_id,
                             });
                         }

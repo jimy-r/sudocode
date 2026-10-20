@@ -395,12 +395,26 @@ fn dt_stream_append_frames_read_back_deframed() {
     );
 
     fs.append(path, b"{\"a\":1}\n").unwrap();
+    let before_empty = fs.stat(path).unwrap().len;
+    fs.append(path, b"").unwrap();
+    assert_eq!(
+        fs.stat(path).unwrap().len,
+        before_empty,
+        "empty writes are no-ops"
+    );
     fs.append(path, b"{\"b\":2}\n").unwrap();
     assert_eq!(
         fs.read(path).unwrap(),
         b"{\"a\":1}\n{\"b\":2}\n",
         "reading a DT_STREAM reproduces the appended records in order"
     );
+    let (first, cursor, eof) = fs.tail_read(path, 0, 0).unwrap();
+    assert_eq!(first, b"{\"a\":1}\n");
+    assert!(!eof);
+    let (second, after_second, eof) = fs.tail_read(path, cursor, 0).unwrap();
+    assert_eq!(second, b"{\"b\":2}\n");
+    assert!(after_second > cursor);
+    assert!(!eof);
 }
 
 #[test]

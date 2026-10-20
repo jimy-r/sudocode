@@ -120,6 +120,7 @@ pub(super) fn purge(
     if current["deleted"] == true {
         return Ok(());
     }
+    let _responses = crate::response_archive::ResponseArchiveWriter::acquire(fs, transcript)?;
     let directory = context_dir(transcript);
     let mut owners = Vec::new();
     if fs
@@ -156,6 +157,33 @@ pub(super) fn purge(
         &serde_json::to_vec(&binding).map_err(|error| error.to_string())?,
     )
     .map_err(|error| error.to_string())
+}
+
+/// Response evidence supports both released completion bindings without
+/// converting or replacing the transcript's journal.
+pub(crate) fn check_response_storage(fs: &dyn FsBackend, transcript: &Path) -> Result<(), String> {
+    let path = binding_path(transcript);
+    if !fs
+        .exists(&path.to_string_lossy())
+        .map_err(|error| error.to_string())?
+    {
+        return Ok(());
+    }
+    let bytes = fs
+        .read(&path.to_string_lossy())
+        .map_err(|error| error.to_string())?;
+    let binding: Binding = serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
+    if !matches!(binding.version, 2 | SHARED_VERSION) {
+        return Err("legacy_writer_unconfirmed".into());
+    }
+    if binding.deleted.is_some() {
+        return Err("session_deleted".into());
+    }
+    if binding.version == 2 {
+        serde_json::from_slice::<Journal>(&bytes)
+            .map_err(|error| format!("completion_journal_unsupported: {error}"))?;
+    }
+    Ok(())
 }
 
 pub(crate) fn check_shared_storage(fs: &dyn FsBackend, transcript: &Path) -> Result<(), String> {

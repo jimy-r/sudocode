@@ -19,10 +19,20 @@ use serde_json::{json, Value};
 use std::fmt::Write as _;
 
 const COMPACT: &str = "Create a concise checkpoint";
+const RESPONSE_LOG_ONLY: &str = "RESPONSE_LOG_ONLY_MUST_STAY_OUT_OF_CONTEXT";
 const WAIT: Duration = Duration::from_secs(30);
 const DIAGNOSTIC_SSE: usize = 1;
 const DIAGNOSTIC_JSON: usize = 2;
 const DIAGNOSTIC_BETA: &str = "cache-diagnosis-2026-04-07";
+
+#[inline]
+fn response_body_paths(directory: &std::path::Path) -> Vec<std::path::PathBuf> {
+    std::fs::read_dir(directory)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| path.extension().is_some_and(|extension| extension == "gz"))
+        .collect()
+}
 
 #[derive(Clone)]
 struct CapturedRequest {
@@ -303,7 +313,7 @@ fn serve(
         }
         events.splice(1..1, prefix);
     }
-    let mut body = String::new();
+    let mut body = format!(": {RESPONSE_LOG_ONLY}\n\n");
     for (event, data) in events {
         if shape == DIAGNOSTIC_SSE {
             // Legal multi-line SSE data, JSON whitespace and CRLF framing.
@@ -874,18 +884,81 @@ fn adaptive_thinking_and_effort_stay_fixed_across_compaction_and_resume() {
         assert!(baseline.get("reasoning_effort").is_none());
         turn(&mut cli, "Continue the next step.");
         assert_thinking_replayed(&capture.bodies()[1], 1);
+        let response_dir = Session::response_captures_dir_for(
+            &path,
+            &Session::load_from_path(&path).unwrap().session_id,
+        )
+        .unwrap();
+        common::expect_screen(
+            &cli,
+            |_| {
+                let bodies = response_body_paths(&response_dir);
+                bodies.len() == 2
+                    && bodies.iter().all(|path| {
+                        std::fs::read(path.with_extension("").with_extension("json"))
+                            .ok()
+                            .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+                            .is_some_and(|metadata| metadata["gzip_complete"] == true)
+                    })
+            },
+            WAIT,
+            "two background response logs finalized",
+        );
+        let before_compact: Vec<_> = response_body_paths(&response_dir)
+            .into_iter()
+            .map(|path| {
+                let bytes = std::fs::read(&path).unwrap();
+                let mut body = String::new();
+                flate2::read::GzDecoder::new(bytes.as_slice())
+                    .read_to_string(&mut body)
+                    .unwrap();
+                assert!(body.contains(RESPONSE_LOG_ONLY));
+                (path, bytes)
+            })
+            .collect();
+        assert_eq!(before_compact.len(), 2);
+        assert!(!common::screen_tail(&cli, 12000).contains(RESPONSE_LOG_ONLY));
         cli.send("/compact\r").unwrap();
-        cli.expect("Messages removed").unwrap();
+        cli.expect("Messages removed").unwrap_or_else(|error| {
+            panic!(
+                "compaction did not complete: {error}; {}",
+                common::screen_tail(&cli, 12000)
+            )
+        });
         common::expect_input_line_cleared(&cli, WAIT, "adaptive compaction finished");
         turn(&mut cli, "Continue after compaction.");
         exit(&mut cli);
+        let bodies_before_restart = response_body_paths(&response_dir).len();
+        let settings_path = env.config_home().join("settings.json");
+        std::fs::write(&settings_path, r#"{"responseRecording":{"enabled":false}}"#).unwrap();
         let mut cli = start();
         turn(&mut cli, "Continue after restart.");
         exit(&mut cli);
+        assert_eq!(
+            response_body_paths(&response_dir).len(),
+            bodies_before_restart
+        );
+        std::fs::write(&settings_path, r#"{"responseRecording":{"enabled":true}}"#).unwrap();
+        let mut cli = start();
+        turn(&mut cli, "Continue after enabling response logs again.");
+        exit(&mut cli);
+        assert_eq!(
+            response_body_paths(&response_dir).len(),
+            bodies_before_restart + 1
+        );
         let requests = capture.bodies();
         assert!(requests.iter().any(|r| r.to_string().contains(COMPACT)));
         for request in &requests[1..] {
             fixed_prefix(&baseline, request);
+        }
+        for request in &requests {
+            assert!(!request.to_string().contains(RESPONSE_LOG_ONLY));
+        }
+        assert!(!std::fs::read_to_string(&path)
+            .unwrap()
+            .contains(RESPONSE_LOG_ONLY));
+        for (path, bytes) in before_compact {
+            assert_eq!(std::fs::read(path).unwrap(), bytes);
         }
         assert_thinking_replayed(requests.last().unwrap(), requests.len() - 1);
     }

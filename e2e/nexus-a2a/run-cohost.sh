@@ -74,7 +74,7 @@ MOCK_PID=
 AUTHON_DAEMON_PID=
 WORK_DIR=
 cleanup() {
-  [ -n "$AUTHON_DAEMON_PID" ] && kill "$AUTHON_DAEMON_PID" 2>/dev/null || true
+  authon_stop
   [ -n "$MOCK_PID" ] && kill "$MOCK_PID" 2>/dev/null || true
   # `NEXUS_A2A_KEEP_WORK=1` leaves the data dir, both logs and the generated
   # config behind. The failure dumps below are a tail; a real diagnosis usually
@@ -162,9 +162,7 @@ authon_wait_log "Static topology applied" 45
 
 # The mint opens the same data dir the daemon locks, so it must be down for it.
 echo "== 3b. stop, mint the client bundle, restart =="
-kill "$AUTHON_DAEMON_PID" 2>/dev/null || true
-wait "$AUTHON_DAEMON_PID" 2>/dev/null || true
-AUTHON_DAEMON_PID=
+authon_stop
 CLIENT_ID="live-probe"
 [ "${NEXUS_A2A_MODEL_LIVE:-0}" != 1 ] || CLIENT_ID="$OPERATOR"
 CLIENT_BUNDLE="$(authon_mint "$CLIENT_ID")" || { tail -40 "$WORK_DIR/daemon.log" >&2; exit 1; }
@@ -263,7 +261,15 @@ NEXUS_A2A_TEST_ENDPOINT="$ENDPOINT" NEXUS_A2A_TEST_CERT_DIR="$RESUME_CLIENT_BUND
   NEXUS_A2A_TEST_REPLY_TO="$OPERATOR" NEXUS_A2A_TEST_MODEL="$MODEL" \
   "${CARGO_TEST[@]}" live_cohost_session_resume -- --ignored --nocapture
 
-echo "== 9. independent concurrent contexts in one durable SID =="
+echo "== 9. filesystem stream reads preserve every committed frame =="
+NEXUS_A2A_TEST_ENDPOINT="$ENDPOINT" NEXUS_A2A_TEST_CERT_DIR="$CLIENT_BUNDLE" \
+  "${CARGO_TEST[@]}" live_filesystem_stream_read_and_append_preserve_all_frames -- --ignored --nocapture
+
+echo "== 10. a silent client connection times out and recovers =="
+NEXUS_A2A_TEST_ENDPOINT="$ENDPOINT" NEXUS_A2A_TEST_CERT_DIR="$CLIENT_BUNDLE" \
+  "${CARGO_TEST[@]}" live_a_silent_transport_errors_and_then_recovers -- --ignored --nocapture
+
+echo "== 11. independent concurrent contexts in one durable SID =="
 kill "$AUTHON_DAEMON_PID" 2>/dev/null || true
 wait "$AUTHON_DAEMON_PID" 2>/dev/null || true
 AUTHON_DAEMON_PID=
