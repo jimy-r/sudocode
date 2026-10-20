@@ -112,7 +112,7 @@ async function review(host, config) {
 let text='';process.stdin.setEncoding('utf8');process.stdin.on('data',chunk=>text+=chunk);
 process.stdin.on('end',()=>{fs.writeFileSync(path.join(__dirname,'pager-source.txt'),text);
 console.log('Full frozen review inspected.');});`);
-  config.env.PAGER = `node ${pager}`;
+  config.env.PAGER = `node '${pager.replace(/'/g, "'\\''")}'`;
   const host = createHost(config);
   try {
     await review(host, config);
