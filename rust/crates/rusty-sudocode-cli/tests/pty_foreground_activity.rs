@@ -12,10 +12,7 @@ use serde_json::json;
 fn live_status(screen: &str) -> &str {
     let mut lines = screen.lines().rev();
     for _ in 0..2 {
-        if lines
-            .find(|line| !line.is_empty() && line.chars().all(|ch| ch == '─'))
-            .is_none()
-        {
+        if lines.find(|line| line.starts_with("──")).is_none() {
             return "";
         }
     }
@@ -204,9 +201,11 @@ fn question_owns_the_status_until_answered_then_running_resumes() {
     common::expect_screen(
         &session,
         |view| {
-            view.lines()
-                .any(|line| line.starts_with("1/1") && line.contains("Choose the second answer"))
-                && view.contains("[2] Second")
+            common::input_and_footer_of(view).is_some_and(|input| {
+                input.lines().any(|line| {
+                    line.starts_with("1/1") && line.contains("Choose the second answer")
+                }) && input.contains("[2] Second")
+            })
         },
         common::LIVE_TURN_BUDGET,
         "actual question options",
