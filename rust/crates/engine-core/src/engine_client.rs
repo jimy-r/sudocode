@@ -580,6 +580,21 @@ impl ApiClient for EngineApiClient {
         Some(self.session_id.as_str())
     }
 
+    fn cache_context_boundary(&mut self, segment: u64) {
+        if runtime::experiments::is_enabled(runtime::experiments::Experiment::CacheTtlAdvisor) {
+            if let Some((cache, route, ttl)) = self.client.cache_advisor_context() {
+                cache.set_context_segment(segment);
+                crate::cache_advisor::context_boundary(
+                    &cache.paths().session_dir,
+                    segment,
+                    &self.model,
+                    &route,
+                    ttl,
+                );
+            }
+        }
+    }
+
     async fn stream_final_answer(
         &mut self,
         request: ApiRequest,

@@ -43,6 +43,8 @@ pub enum Experiment {
     McpConfigServers,
     /// Independent runtime continuations over a durable session record log.
     SharedSessionHistory,
+    /// Local TTL recommendations; never changes a request's cache policy.
+    CacheTtlAdvisor,
 }
 
 impl Experiment {
@@ -50,6 +52,7 @@ impl Experiment {
         Experiment::CoordinatorMode,
         Experiment::McpConfigServers,
         Experiment::SharedSessionHistory,
+        Experiment::CacheTtlAdvisor,
     ];
 
     /// Key under `"experimental"` in `settings.json` (camelCase, like
@@ -60,6 +63,7 @@ impl Experiment {
             Experiment::CoordinatorMode => "coordinatorMode",
             Experiment::McpConfigServers => "mcpConfigServers",
             Experiment::SharedSessionHistory => "sharedSessionHistory",
+            Experiment::CacheTtlAdvisor => "cacheTtlAdvisor",
         }
     }
 
@@ -70,6 +74,7 @@ impl Experiment {
             Experiment::CoordinatorMode => "COORDINATOR_MODE",
             Experiment::McpConfigServers => "MCP_CONFIG_SERVERS",
             Experiment::SharedSessionHistory => "SHARED_SESSION_HISTORY",
+            Experiment::CacheTtlAdvisor => "CACHE_TTL_ADVISOR",
         }
     }
 
@@ -82,6 +87,7 @@ impl Experiment {
             Experiment::CoordinatorMode => Some("SUDOCODE_COORDINATOR_MODE"),
             Experiment::McpConfigServers => Some("SUDOCODE_ENABLE_MCP"),
             Experiment::SharedSessionHistory => None,
+            Experiment::CacheTtlAdvisor => None,
         }
     }
 }

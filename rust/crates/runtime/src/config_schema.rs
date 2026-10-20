@@ -394,6 +394,11 @@ const EXPERIMENTAL_CHILDREN: &[FieldSchema] = &[
         "Independent runtime continuations from completed session turns",
     ),
     FieldSchema::leaf(
+        "cacheTtlAdvisor",
+        FieldType::Bool,
+        "Record request timing and recommend TTL at context boundaries without changing requests",
+    ),
+    FieldSchema::leaf(
         "coordinatorMode",
         FieldType::Bool,
         "Coordinator role prompt + worker-delegation tool allowlist",

@@ -255,6 +255,20 @@ impl ProviderClient {
         format!("{:?}|{base_url}", self.provider_kind())
     }
 
+    /// Local-only advisor context; the provider remains the policy owner.
+    #[must_use]
+    pub fn cache_advisor_context(&self) -> Option<(PromptCache, String, u32)> {
+        let Self::Anthropic(client) = self else {
+            return None;
+        };
+        let cache = client.prompt_cache()?.clone();
+        Some((
+            cache,
+            client.cache_advisor_route_key(),
+            if client.cache_ttl_1h() { 3600 } else { 300 },
+        ))
+    }
+
     #[must_use]
     pub fn with_session_tracer(self, session_tracer: SessionTracer) -> Self {
         match self {
