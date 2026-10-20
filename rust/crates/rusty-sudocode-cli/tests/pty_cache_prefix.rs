@@ -1449,7 +1449,7 @@ fn ttl_advisor_records_wire_timing_and_decides_once_after_compact() {
     let env = TestEnv::new_mock("ttl-advisor-boundary");
     let capture = Capture::new();
     let path = fixture(&env, &capture);
-    let id = Session::load_from_path(&path).unwrap().metadata.session_id;
+    let id = Session::load_from_path(&path).unwrap().session_id;
     let directory = env.config_home().join("cache/prompt-cache").join(id);
     let enabled = [("SUDOCODE_EXPERIMENT_CACHE_TTL_ADVISOR", "1")];
     let mut cli = spawn_with_env(&env, &path, &enabled);
@@ -1544,7 +1544,7 @@ fn ttl_advisor_is_opt_in_and_marks_retried_or_restarted_streams() {
         let env = TestEnv::new_mock("ttl-advisor-coverage");
         let capture = Capture::new();
         let path = fixture(&env, &capture);
-        let id = Session::load_from_path(&path).unwrap().metadata.session_id;
+        let id = Session::load_from_path(&path).unwrap().session_id;
         let directory = env.config_home().join("cache/prompt-cache").join(id);
         if mode == "retry" {
             capture.retry_next.store(true, Ordering::Relaxed);
