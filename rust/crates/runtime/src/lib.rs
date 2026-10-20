@@ -65,6 +65,7 @@ mod policy_engine;
 mod prompt;
 pub mod recovery_recipes;
 mod remote;
+pub mod response_archive;
 pub mod sandbox;
 mod session;
 pub mod session_control;
