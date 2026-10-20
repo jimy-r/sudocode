@@ -1845,12 +1845,6 @@ fn ReplApp(mut hooks: Hooks) -> impl Into<AnyElement<'static>> {
                         frame.set(frame.get().wrapping_add(1));
                         return;
                     }
-                    if code == KeyCode::Enter && matches!(commands::validate_slash_command_input(input_value.read().trim()), Ok(Some(commands::SlashCommand::Tasks { args: None }))) {
-                        browser.open();
-                        input_value.set(String::new());
-                        frame.set(frame.get().wrapping_add(1));
-                        return;
-                    }
                 }
                 match code {
                     // ── Enter ──────────────────────────────────────────
@@ -1921,43 +1915,7 @@ fn ReplApp(mut hooks: Hooks) -> impl Into<AnyElement<'static>> {
                                     input_slot.set(InputSlot::TextInput);
                                 }
                             }
-                            InputSlot::TextInput => {
-                                let val = input_value.read().clone();
-                                if let Some(event) = enter_key_event_for_value(None, 0, &val) {
-                                    if !*has_submitted.read() { has_submitted.set(true); }
-                                    match event {
-                                        InputEvent::Exit => {
-                                            should_exit.set(true);
-                                            let _ = input_tx_for_events.send(InputEvent::Exit);
-                                        }
-                                        InputEvent::Submit { text, .. } => {
-                                            let store_snap = paste_store.read().clone();
-                                            let expanded = expand_paste_placeholders(&text, &store_snap);
-                                            let display = expand_paste_for_display(&text, &store_snap);
-                                            paste_store.write().clear();
-                                            next_paste_id.set(1);
-                                            let trimmed = expanded.trim();
-                                            if !trimmed.is_empty() {
-                                                let mut h = history.write();
-                                                if h.last().map_or(true, |last| last != trimmed) {
-                                                    h.push(trimmed.to_string());
-                                                }
-                                            }
-                                            // The coordinator owns the `❯` echo to scrollback: it
-                                            // alone knows whether this runs now (idle) or waits in
-                                            // the queue overlay behind a running turn. Echoing here
-                                            // would make a queued input look sent.
-                                            let _ = input_tx_for_events.send(InputEvent::Submit { text: expanded, display });
-                                        }
-                                        InputEvent::QuestionAnswer(_) | InputEvent::Abort | InputEvent::StopBackgroundTask(_) => {}
-                                    }
-                                    input_value.set(String::new());
-                                    if history_cursor.get().is_some() {
-                                        history_cursor.set(None);
-                                        saved_input.set(String::new());
-                                    }
-                                }
-                            }
+                            InputSlot::TextInput => {}
                         }
                     }
                     // ── Up/Down — DialPad option selection ─────────────
@@ -2633,6 +2591,7 @@ fn ReplApp(mut hooks: Hooks) -> impl Into<AnyElement<'static>> {
                 }
             } else {
                 let tasks_for_edit = Arc::clone(&tasks);
+                let input_tx_for_edit = input_tx.clone();
                 let on_edit: TextInputEditHandler = Box::new(move |event, current, cursor| {
                     // Read focus at event time: several keys can arrive before
                     // the next render. TextInput remains the only draft editor.
@@ -2651,6 +2610,46 @@ fn ReplApp(mut hooks: Hooks) -> impl Into<AnyElement<'static>> {
                     }
                     drop(browser);
                     match event {
+                        TerminalEvent::Key(KeyEvent { code: KeyCode::Enter, modifiers, .. })
+                            if !modifiers.contains(KeyModifiers::SHIFT) => {
+                            // Submission reads the same working buffer as editing. A
+                            // parent callback sees the end of an entire event batch,
+                            // after later characters and Enter keys have already landed.
+                            if matches!(commands::validate_slash_command_input(current.trim()), Ok(Some(commands::SlashCommand::Tasks { args: None }))) {
+                                tasks_for_edit.lock().unwrap_or_else(std::sync::PoisonError::into_inner).open();
+                                frame.set(frame.get().wrapping_add(1));
+                            } else if let Some(event) = enter_key_event_for_value(None, 0, current) {
+                                has_submitted.set(true);
+                                match event {
+                                    InputEvent::Exit => {
+                                        should_exit.set(true);
+                                        let _ = input_tx_for_edit.send(InputEvent::Exit);
+                                    }
+                                    InputEvent::Submit { text, .. } => {
+                                        let store = paste_store.read();
+                                        let expanded = expand_paste_placeholders(&text, &store);
+                                        let display = expand_paste_for_display(&text, &store);
+                                        drop(store);
+                                        paste_store.write().clear();
+                                        next_paste_id.set(1);
+                                        let trimmed = expanded.trim();
+                                        if !trimmed.is_empty() {
+                                            let mut h = history.write();
+                                            if h.last().is_none_or(|last| last != trimmed) {
+                                                h.push(trimmed.to_string());
+                                            }
+                                        }
+                                        let _ = input_tx_for_edit.send(InputEvent::Submit { text: expanded, display });
+                                    }
+                                    InputEvent::QuestionAnswer(_) | InputEvent::Abort | InputEvent::StopBackgroundTask(_) => {}
+                                }
+                            }
+                            if history_cursor.get().is_some() {
+                                history_cursor.set(None);
+                                saved_input.set(String::new());
+                            }
+                            Some(TextInputEdit { value: String::new(), cursor_offset: 0 })
+                        }
                         TerminalEvent::Key(KeyEvent { code: KeyCode::Char('u'), modifiers, .. })
                             if modifiers.contains(KeyModifiers::CONTROL) => Some(TextInputEdit {
                                 value: String::new(), cursor_offset: 0,
@@ -2795,6 +2794,68 @@ fn chrome_rows(text: &str, width: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn batched_submits_keep_each_input_boundary() {
+        use futures::StreamExt;
+
+        let (_output_tx, output_rx) = mpsc::sync_channel(16);
+        let (_ui_tx, ui_rx) = mpsc::sync_channel(16);
+        let (input_tx, input_rx) = mpsc::sync_channel(16);
+        let ctx = ReplContext {
+            tasks: Arc::new(Mutex::new(TaskBrowser::default())),
+            prose_preview: Arc::new(Mutex::new(ProsePreview::default())),
+            output_rx: Arc::new(Mutex::new(output_rx)),
+            terminal_handoff: Arc::new(Mutex::new(None)),
+            ui_rx: Arc::new(Mutex::new(ui_rx)),
+            input_tx,
+            spinner: SpinnerState::new_inactive(),
+            permission_mode: "read-only".to_string(),
+            tips_line: String::new(),
+            stderr_redir: Arc::new(Mutex::new(None)),
+            todo_items: Arc::new(Mutex::new(Vec::new())),
+            pending: Arc::new(Mutex::new(Vec::new())),
+            dequeue_hook: None,
+        };
+        let mut close = KeyEvent::new(KeyEventKind::Press, KeyCode::Char('d'));
+        close.modifiers = KeyModifiers::CONTROL;
+        let events = "first\rsecond\r".chars().map(|character| {
+            TerminalEvent::Key(KeyEvent::new(
+                KeyEventKind::Press,
+                if character == '\r' {
+                    KeyCode::Enter
+                } else {
+                    KeyCode::Char(character)
+                },
+            ))
+        });
+        smol::block_on(
+            element! {
+                ContextProvider(value: Context::owned(ctx)) {
+                    ReplApp
+                }
+            }
+            .mock_terminal_render_loop(MockTerminalConfig::with_events(futures::stream::iter(
+                events.chain(std::iter::once(TerminalEvent::Key(close))),
+            )))
+            .collect::<Vec<_>>(),
+        );
+        let submitted: Vec<_> = input_rx.try_iter().collect();
+        assert_eq!(
+            submitted,
+            vec![
+                InputEvent::Submit {
+                    text: "first".to_string(),
+                    display: "first".to_string(),
+                },
+                InputEvent::Submit {
+                    text: "second".to_string(),
+                    display: "second".to_string(),
+                },
+                InputEvent::Exit,
+            ]
+        );
+    }
 
     fn tool_card(id: &str, name: &str) -> ToolCard {
         ToolCard::new(id.to_string(), name, "{}")

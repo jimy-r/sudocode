@@ -1424,7 +1424,10 @@ fn turn(cli: &mut PtySession, text: &str) {
 
 fn exit(cli: &mut PtySession) {
     cli.send("/exit\r").unwrap();
-    assert_eq!(cli.expect_eof().unwrap(), 0);
+    let status = cli.expect_eof().unwrap_or_else(|error| {
+        panic!("{error}\nexit screen:\n{}", common::screen_tail(cli, 6000))
+    });
+    assert_eq!(status, 0);
 }
 
 fn fixed_prefix(before: &Value, after: &Value) {
