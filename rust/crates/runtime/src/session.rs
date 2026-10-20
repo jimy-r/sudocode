@@ -786,7 +786,7 @@ impl Session {
         let record_history =
             existing && history::is_record_history(&self.backend().read(&path_str)?);
         if record_history
-            || (!existing
+            || ((!existing || self.backend().fenced_locks())
                 && crate::experiments::is_enabled(
                     crate::experiments::Experiment::SharedSessionHistory,
                 ))
@@ -1293,7 +1293,7 @@ impl Session {
     }
 
     /// Replay either persisted format with the repairs used by every load.
-    fn from_persisted_contents(contents: &str) -> Result<Self, SessionError> {
+    pub(crate) fn from_persisted_contents(contents: &str) -> Result<Self, SessionError> {
         let is_record_history = history::is_record_history(contents.as_bytes());
         let mut session = if is_record_history {
             history::HistoryGraph::decode(contents.as_bytes())?.resume_session()?

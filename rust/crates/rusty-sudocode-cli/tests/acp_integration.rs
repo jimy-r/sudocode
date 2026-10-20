@@ -6322,6 +6322,15 @@ fn seed_legacy_completion(workspace: &TestWorkspace, sid: &str, context: &Value)
 
 #[tokio::test]
 async fn acp_legacy_completion_upgrade_preserves_context_and_model_history() {
+    exercise_legacy_completion_upgrade(false).await;
+}
+
+#[tokio::test]
+async fn acp_legacy_completion_upgrade_into_record_history_preserves_context_and_model_history() {
+    exercise_legacy_completion_upgrade(true).await;
+}
+
+async fn exercise_legacy_completion_upgrade(is_record_history: bool) {
     let server = MockAnthropicService::spawn().await.unwrap();
     let workspace = TestWorkspace::new("legacy-completion-upgrade");
     workspace.create();
@@ -6330,7 +6339,10 @@ async fn acp_legacy_completion_upgrade_preserves_context_and_model_history() {
         spawn_stdio_client_with_args_and_env(
             &workspace,
             &["--permission-mode", "danger-full-access"],
-            &[("SUDOCODE_EXPERIMENT_SHARED_SESSION_HISTORY", "0")],
+            &[(
+                "SUDOCODE_EXPERIMENT_SHARED_SESSION_HISTORY",
+                if is_record_history { "1" } else { "0" },
+            )],
         )
     };
     let mut producer = spawn();
