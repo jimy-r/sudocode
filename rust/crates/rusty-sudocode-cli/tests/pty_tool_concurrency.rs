@@ -115,18 +115,24 @@ fn done(sess: &PtySession) {
     );
 }
 
-fn assert_result_order(env: &TestEnv, expected: &[&str]) {
+/// Validate and return the same provider-facing tool result blocks.
+fn assert_result_order(env: &TestEnv, expected: &[&str]) -> Vec<Value> {
     let requests = env.captured_message_bodies();
     let request: Value = serde_json::from_str(requests.last().unwrap()).unwrap();
-    let ids: Vec<_> = request["messages"]
+    let results: Vec<_> = request["messages"]
         .as_array()
         .unwrap()
         .iter()
         .flat_map(|message| message["content"].as_array().into_iter().flatten())
         .filter(|block| block["type"] == "tool_result")
+        .cloned()
+        .collect();
+    let ids: Vec<_> = results
+        .iter()
         .map(|block| block["tool_use_id"].as_str().unwrap())
         .collect();
     assert_eq!(ids, expected, "provider call/result order");
+    results
 }
 
 fn finish(mut sess: PtySession) {
@@ -213,7 +219,16 @@ fn writer_barrier_waits_for_all_reads_and_next_read_sees_write() {
         std::fs::read_to_string(env.workspace_root().join("result.txt")).unwrap(),
         "WRITER_VALUE"
     );
-    assert!(sess.render(|s| s.raw().contents()).contains("WRITER_VALUE"));
+    let results = assert_result_order(&env, &["one", "two", "write", "read"]);
+    let read = results.last().unwrap();
+    assert_ne!(
+        read["is_error"], true,
+        "the following Read must succeed: {read}"
+    );
+    assert!(
+        read["content"].to_string().contains("WRITER_VALUE"),
+        "the following Read must observe the committed writer output: {read}"
+    );
     drop(retained_writer);
     finish(sess);
 }
