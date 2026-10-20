@@ -1001,9 +1001,32 @@ impl FsBackend for StdFsBackend {
     }
 
     fn write_atomic(&self, path: &str, data: &[u8]) -> io::Result<()> {
-        let temp = format!("{path}.tmp.{}", std::process::id());
-        std::fs::write(&temp, data)?;
-        std::fs::rename(&temp, path)
+        use std::io::Write;
+
+        let temp = format!("{path}.tmp.{}", uuid::Uuid::new_v4());
+        let result = (|| {
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&temp)?;
+            file.write_all(data)?;
+            file.sync_all()?;
+            drop(file);
+            std::fs::rename(&temp, path)?;
+            #[cfg(unix)]
+            {
+                let parent = std::path::Path::new(path)
+                    .parent()
+                    .filter(|parent| !parent.as_os_str().is_empty())
+                    .unwrap_or_else(|| std::path::Path::new("."));
+                std::fs::File::open(parent)?.sync_all()?;
+            }
+            Ok(())
+        })();
+        if result.is_err() {
+            let _ = std::fs::remove_file(&temp);
+        }
+        result
     }
 
     /// The turn's workspace root (see [`crate::workspace_root`]), which is
