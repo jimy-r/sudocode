@@ -17,7 +17,8 @@ const hash = bytes => createHash('sha256').update(bytes).digest('hex');
 // PNG readback ends near a compositor frame boundary. Sweep input dispatch
 // across frame phases instead of phase-locking every key to the previous PNG.
 // Both releases receive this same deterministic schedule outside timed regions.
-const inputDelaysMs = [0, 7, 19, 31, 3, 13, 23, 5, 17, 29, 11, 2, 37, 9, 21, 4, 15, 27, 1, 33];
+const sampling = require('./gui-policy.json').sampling;
+const inputDelaysMs = sampling.input_delays_ms;
 
 async function run(config) {
   fs.mkdirSync(config.logRoot, { recursive: true });
@@ -61,7 +62,7 @@ async function run(config) {
     browser = await chromium.launch({ headless: process.env.SCODE_GUI_HEADED !== '1' });
     cdp = await browser.newBrowserCDPSession();
     page = await browser.newPage({ viewport: { width: 1400, height: 1000 }, deviceScaleFactor: 1 });
-    report.environment = { platform: process.platform, arch: process.arch, node: process.versions.node, cols: config.cols, rows: config.rows, deviceScaleFactor: 1, inputDelaysMs };
+    report.environment = { platform: process.platform, arch: process.arch, node: process.versions.node, cols: config.cols, rows: config.rows, deviceScaleFactor: 1, inputDelaysMs, sampling };
     report.browser = await browser.version();
     report.xterm = require('@xterm/xterm/package.json').version;
     await page.goto(`http://127.0.0.1:${server.address().port}/?options=${encodeURIComponent(JSON.stringify({ cols: config.cols, rows: config.rows }))}`);
@@ -183,7 +184,7 @@ async function run(config) {
       assert.equal(await page.evaluate(() => fixture.activated.length), beforeDrag, 'drag activated a link');
       return { selected, samples: dragSamples };
     }
-    const selection = await drag(12);
+    const selection = await drag(sampling.drag_steps);
     report.samples.drag_frame_ms = selection.samples;
     await page.evaluate(() => { fixture.terminal.clearSelection(); fixture.terminal.scrollToBottom(); fixture.terminal.focus(); });
     async function keys(phase) {
@@ -196,28 +197,35 @@ async function run(config) {
       // its own burst, then repeat the same keys with pixel evidence.
       for (const capture of [false, true]) {
         const timing = report.input_timing[`${phase}_${capture ? 'painted' : 'parsed'}`] = [];
-        await page.evaluate(() => fixture.frame());
-        let draft = '', previous = capture ? await painted() : null;
-        for (const delay of inputDelaysMs) {
-          draft += 'x';
-          await page.evaluate(draft => fixture.armInput(draft), draft);
-          if (delay) await sleep(delay);
-          const began = performance.now();
-          await page.keyboard.type('x');
-          const events = await page.evaluate(() => fixture.waitForInput());
-          assert(events.sent >= events.keydown && events.parsed >= events.sent, 'input event ordering');
-          timing.push({ ...events, observed_ms: performance.now() - began });
-          if (capture) {
-            const next = await painted();
-            samples.push(performance.now() - began);
-            assert.notEqual(hash(previous), hash(next), 'input changed cells but no pixels');
-            previous = next;
-          } else {
-            parseSamples.push(events.parsed - events.keydown);
+        // Twenty observations leave P95 dependent on only two slow keys.
+        // Repeat short drafts to sample the scheduler tail without wrapping
+        // the input. Rotate the fixed delay sweep across successive bursts.
+        const bursts = capture ? sampling.painted_bursts : sampling.parsed_bursts;
+        for (let burst = 0; burst < bursts; burst++) {
+          await page.evaluate(() => fixture.frame());
+          let draft = '', previous = capture ? await painted() : null;
+          for (let key = 0; key < inputDelaysMs.length; key++) {
+            const delay = inputDelaysMs[(key + burst) % inputDelaysMs.length];
+            draft += 'x';
+            await page.evaluate(draft => fixture.armInput(draft), draft);
+            if (delay) await sleep(delay);
+            const began = performance.now();
+            await page.keyboard.type('x');
+            const events = await page.evaluate(() => fixture.waitForInput());
+            assert(events.sent >= events.keydown && events.parsed >= events.sent, 'input event ordering');
+            timing.push({ ...events, burst, observed_ms: performance.now() - began });
+            if (capture) {
+              const next = await painted();
+              samples.push(performance.now() - began);
+              assert.notEqual(hash(previous), hash(next), 'input changed cells but no pixels');
+              previous = next;
+            } else {
+              parseSamples.push(events.parsed - events.keydown);
+            }
           }
+          await page.keyboard.press('Control+u');
+          await wait(() => fixture.viewport().split('\n').some(row => row.trimEnd() === '❯'));
         }
-        await page.keyboard.press('Control+u');
-        await wait(() => fixture.viewport().split('\n').some(row => row.trimEnd() === '❯'));
       }
       report.samples[`input_${phase}_frame_ms`] = samples;
       report.samples[`input_${phase}_parsed_ms`] = parseSamples;

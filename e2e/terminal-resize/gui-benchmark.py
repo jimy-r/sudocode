@@ -20,6 +20,13 @@ def main():
         parser.error("choose an empty output directory to preserve previous evidence")
     args.output.mkdir(parents=True, exist_ok=True)
     policy = json.loads(Path(__file__).with_name("gui-policy.json").read_text())
+    sampling = policy["sampling"]
+    keys = len(sampling["input_delays_ms"])
+    sample_counts = {"drag_frame_ms": sampling["drag_steps"]}
+    for phase in ["history", "wait", "stream"]:
+        sample_counts[f"input_{phase}_parsed_ms"] = keys * sampling["parsed_bursts"]
+        sample_counts[f"input_{phase}_frame_ms"] = keys * sampling["painted_bursts"]
+    assert keys >= 20 and sample_counts["input_wait_parsed_ms"] >= 100
     report = {"version": 1, "status": "running", "policy": policy, "samples": [],
               "base_sha256": digest(args.base), "candidate_sha256": digest(args.candidate),
               "driver_sha256": digest(args.driver)}
@@ -55,9 +62,10 @@ def main():
         assert all(isinstance(value, (int, float)) and math.isfinite(value) and value >= 0
                    for value in data["metrics"].values()), "invalid metric"
         assert set(data["metrics"]) == set(policy["metrics"]), "missing/unbudgeted browser metrics"
+        assert set(data["samples"]) == set(sample_counts), "missing interaction workload"
         for name, values in data["samples"].items():
             assert all(math.isfinite(value) and value >= 0 for value in values)
-            assert len(values) == (12 if name == "drag_frame_ms" else 20), "missing interaction samples"
+            assert len(values) == sample_counts[name], "missing interaction samples"
         report["samples"].append({"label": label, "path": str(output.relative_to(args.output)), "data": data})
         save()
         return data

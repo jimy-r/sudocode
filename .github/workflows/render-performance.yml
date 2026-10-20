@@ -61,7 +61,6 @@ jobs:
       pull-requests: read
       statuses: write
       checks: write
-      actions: read
     outputs:
       baseline: ${{ steps.policy.outputs.baseline }}
       head: ${{ steps.policy.outputs.head }}
@@ -202,7 +201,6 @@ jobs:
       pull-requests: read
       contents: read
       checks: write
-      actions: read
     steps:
       - uses: actions/checkout@v4
         with:

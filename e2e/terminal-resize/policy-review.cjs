@@ -104,51 +104,24 @@ module.exports = async function review({ github, context, core, root, output }) 
   fs.mkdirSync(output, { recursive: true });
   fs.writeFileSync(path.join(output, 'performance-policy.json'), JSON.stringify(policy, null, 2));
   if (provenance.approved_by.length) {
-    // Reassess only approval failures now satisfied by an authenticated review.
-    // Test results and their original workflow logs are never rewritten here.
+    // Actions-owned checks are immutable. Publish a fresh approval record;
+    // never rewrite historical rejection logs or any measurement result.
     const current = await github.rest.pulls.get({ owner, repo, pull_number: pr.number });
     if (current.data.head.sha !== head) throw new Error('PR advanced before recording approval');
-    const checks = await github.paginate(github.rest.checks.listForRef, {
-      owner, repo, ref: head, check_name: 'Rendering benchmark policy', filter: 'all', per_page: 100,
-    });
     const runUrl = `${context.serverUrl}/${owner}/${repo}/actions/runs/${context.runId}`;
-    provenance.superseded_approval_checks = [];
-    for (const check of checks) {
-      if (check.app?.slug !== 'github-actions' || check.conclusion !== 'failure') continue;
-      const prefix = `${context.serverUrl}/${owner}/${repo}/actions/runs/`;
-      if (!check.details_url?.startsWith(prefix)) continue;
-      const source = /^([0-9]+)\/job\/([0-9]+)$/.exec(check.details_url.slice(prefix.length));
-      if (!source) continue;
-      const original = (await github.rest.actions.getWorkflowRun({
-        owner, repo, run_id: Number(source[1]),
-      })).data;
-      if (original.path !== '.github/workflows/render-performance.yml'
-        || original.event !== 'pull_request_target' || original.head_sha !== head
-        || !original.pull_requests.some(item => item.number === pr.number)) continue;
-      const originalJob = (await github.rest.actions.getJobForWorkflowRun({
-        owner, repo, job_id: Number(source[2]),
-      })).data;
-      if (originalJob.run_id !== original.id
-        || !originalJob.check_run_url?.endsWith(`/check-runs/${check.id}`)) continue;
-      const annotations = await github.paginate(github.rest.checks.listAnnotations, {
-        owner, repo, check_run_id: check.id, per_page: 100,
-      });
-      const failures = annotations.filter(item => item.annotation_level === 'failure');
-      if (!failures.length || !failures.every(item => item.message === missingApproval
-        || item.message === `Unhandled error: Error: ${missingApproval}`)) continue;
-      await github.rest.checks.update({
-        owner, repo, check_run_id: check.id, status: 'completed', conclusion: 'success',
-        details_url: runUrl,
-        output: {
-          title: `Harness approved by ${provenance.approved_by.join(', ')}`,
-          summary: `The harness changes at ${head} have ${provenance.approval_method} approval. `
-            + `Reviews: ${provenance.review_ids.map(id => `${pr.html_url}#pullrequestreview-${id}`).join(', ')}. `
-            + `Approval validation: ${runUrl}. Original approval rejection and logs: ${check.details_url}. `
-            + 'The required render performance status is published separately after real A/A and A/B measurements.',
-        },
-      });
-      provenance.superseded_approval_checks.push(check.id);
-    }
+    const approval = await github.rest.checks.create({
+      owner, repo, name: 'Rendering benchmark policy', head_sha: head,
+      status: 'completed', conclusion: 'success', details_url: runUrl,
+      external_id: `rendering-approval-${head}`,
+      output: {
+        title: `Harness approved by ${provenance.approved_by.join(', ')}`,
+        summary: `The harness changes at ${head} have ${provenance.approval_method} approval. `
+          + `Reviews: ${provenance.review_ids.map(id => `${pr.html_url}#pullrequestreview-${id}`).join(', ')}. `
+          + `Live approval validation: ${runUrl}. Original Actions results remain unchanged. `
+          + 'The required render performance status is published separately after real A/A and A/B measurements.',
+      },
+    });
+    provenance.approval_check_id = approval.data.id;
     core.info(`${provenance.approval_method} by ${provenance.approved_by.join(', ')} at ${head}`);
   }
   fs.writeFileSync(path.join(output, 'approval.json'), JSON.stringify(provenance, null, 2));

@@ -78,9 +78,9 @@ To measure an approved same-repository PR, dispatch `render-performance.yml` fro
 its current head branch with `pull_request=<number>` and `profile=core`. This uses
 the PR base's policy and measurement harness, independently builds both releases,
 and publishes the required status only after real A/A and A/B results pass. It
-reassesses only earlier checks whose sole failure was missing harness approval,
-linking their original logs to the authenticated review. Test failures remain test
-failures. The final publisher rejects a PR that advanced during measurement.
+publishes a fresh Checks API record for the authenticated current approval.
+Actions-owned checks and their historical rejection logs remain unchanged.
+The final publisher rejects a PR that advanced during measurement.
 The workflow also tests stale PR-event and dispatch inputs against the live GitHub
 API in a separate job with a read-only token.
 
@@ -121,8 +121,11 @@ This is a conservative rendering/readback measurement, including automation and
 capture overhead; it does not measure physical keyboard/display scanout latency.
 Parsed-cell latency uses browser `keydown` and xterm `onWriteParsed` timestamps
 on the same clock, accepting only the event containing the expected input text.
-Each phase first samples 20 keys without screenshots, then repeats 20 keys with
-pixel evidence. PNG readback can delay the next WebSocket dispatch, so parsed
+Each phase first samples 100 keys in five short drafts without screenshots,
+then samples 20 keys with pixel evidence. This keeps P95 from depending on only
+two scheduler-tail observations. Sampling counts and the delay schedule are
+owned by `gui-policy.json` and shared by the observer and completeness checks.
+PNG readback can delay the next WebSocket dispatch, so parsed
 latency must come from the independent burst. Both releases receive the same
 deterministic inter-key delays outside timed regions, retained in the report.
 Event completion uses a promise instead of frame polling. Raw key, PTY output,
