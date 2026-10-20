@@ -67,6 +67,23 @@ the evaluator still comes from the base. Baselines never update automatically.
 Candidate compilation has read permissions and no persisted checkout token;
 the separate status publisher executes trusted code only.
 
+A repository administrator who authored a PR may explicitly approve **harness-only**
+changes in a GitHub `COMMENTED` review bound to the current commit. Its first line
+must be `<!-- scode-render-harness-admin-approval -->`. CI verifies the review's
+author, commit and current administrator permission. Budget and baseline changes
+still require an independent maintainer review. Approval evidence is retained in
+`approval.json`; ordinary comments and approvals of older commits do not qualify.
+
+To measure an approved same-repository PR, dispatch `render-performance.yml` from
+its current head branch with `pull_request=<number>` and `profile=core`. This uses
+the PR base's policy and measurement harness, independently builds both releases,
+and publishes the required status only after real A/A and A/B results pass. It
+reassesses only earlier checks whose sole failure was missing harness approval,
+linking their original logs to the authenticated review. Test failures remain test
+failures. The final publisher rejects a PR that advanced during measurement.
+The workflow also tests stale PR-event and dispatch inputs against the live GitHub
+API in a separate job with a read-only token.
+
 Initial rollout: run Rust CI's optional `render_performance` dispatch on the
 candidate branch to validate hosted A/A calibration, merge the harness, then require
 the published `render performance` status in main's branch protection. The

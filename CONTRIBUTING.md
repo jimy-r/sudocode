@@ -634,16 +634,14 @@ typos) unless the PR description opts out. Larger changes go through
 review comments.
 
 Once approved, a maintainer merges with **`--merge`** (not squash)
-to preserve the feature-branch commit history. The "Block Merge
-Commits in PR" CI check requires your branch to include the latest
-`main` and have a linear PR history. Update with `git fetch origin`,
-`git rebase origin/main`, resolve any conflicts, and
-`git push --force-with-lease` for an already-pushed branch. Preserve the
-feature commits and their authors while rebasing. The check examines the
-actual PR head and rejects every merge commit introduced by the PR,
-including merges of `main`. Existing merge commits already in `main`
-remain valid. It also rejects new conflict markers and runs for every PR
-regardless of changed paths.
+to preserve the feature-branch commit history. The "Verify PR history"
+CI check requires your branch to include the latest `main`. Update with
+`git fetch origin`, `git merge origin/main`, resolve any conflicts, and
+`git push`. Preserve the existing commits and their authors; do not rebase
+or squash already-published history. The check examines the actual PR head,
+accepts merge commits, rejects new conflict markers, and runs for every PR
+regardless of changed paths. Its implementation is
+[`check_pr_history.py`](.github/scripts/check_pr_history.py).
 Strict branch protection also requires the PR to remain up to date
 and pass the required CI checks before merging, including for admins.
 
