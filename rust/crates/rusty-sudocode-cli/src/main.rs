@@ -3672,6 +3672,22 @@ fn run_repl_iocraft_dispatch(
                         action: engine_events::BackgroundTaskAction::Stop { id },
                     });
                 }
+                repl_ui::InputEvent::InspectDocument(document) => {
+                    // The turn owns LiveCli while awaiting its answer. Pager
+                    // inspection needs only terminal ownership, never that lock
+                    // or an engine command. Resume the same question and draft.
+                    match repl_output.suspend() {
+                        Ok(mut suspension) => {
+                            print_with_pager(&document);
+                            if let Err(error) = suspension.finish() {
+                                repl_output.println(&format!("Could not restore review: {error}"));
+                            }
+                        }
+                        Err(error) => {
+                            repl_output.println(&format!("Could not open review: {error}"));
+                        }
+                    }
+                }
                 repl_ui::InputEvent::Submit { text, display } => {
                     // `!<cmd>` bash mode: run it here, no model turn. The
                     // runner thread holds the `LiveCli` mutex for the whole
