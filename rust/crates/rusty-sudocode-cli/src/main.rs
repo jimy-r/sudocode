@@ -3431,6 +3431,7 @@ fn run_repl_iocraft_dispatch(
     let engine_events = std::mem::replace(&mut cli.engine_handle.events, turn_rx);
     let completion_tx = coord_tx.clone();
     let task_ui = repl_ui_cmd.clone();
+    let activity = repl_spinner.clone();
     thread::Builder::new()
         .name("repl-engine-events".into())
         .spawn(move || {
@@ -3438,6 +3439,7 @@ fn run_repl_iocraft_dispatch(
                 // Background work keeps publishing while the parent is idle.
                 // Its UI uses the same seam as every other engine consumer.
                 match &event {
+                    EngineEvent::State(state) => activity.observe_engine_state(*state),
                     EngineEvent::BackgroundTask(event) => {
                         task_ui.background_task(event.clone());
                         continue;
@@ -3473,6 +3475,7 @@ fn run_repl_iocraft_dispatch(
                     return;
                 }
             }
+            activity.observe_engine_state(engine_events::EngineState::Idle);
         })
         .expect("spawn REPL engine event bridge");
     let cli_shared = Arc::new(Mutex::new(cli));
@@ -4018,7 +4021,7 @@ fn spawn_iocraft_turn(
     next: input_queue::NextTurn<mpsc::Sender<()>>,
     output: repl_ui::OutputSender,
     ui: repl_ui::UiCommandSender,
-    spinner: repl_ui::SpinnerState,
+    spinner: render::activity::ActivityState,
     pending_question_answer: PendingQuestionAnswer,
     done_tx: mpsc::Sender<CoordinatorEvent>,
 ) -> thread::JoinHandle<()> {
@@ -4881,7 +4884,7 @@ impl LiveCli {
         let token_budget = crate::render::parse_token_budget(input);
         let model = self.lifecycle.current_model();
         let mut spinner = SpinnerHandle::new(
-            "🦀 Thinking...",
+            render::activity::THINKING_LABEL,
             Some(model.as_str()),
             TerminalRenderer::new().color_theme(),
             token_budget,
@@ -5011,24 +5014,24 @@ impl LiveCli {
     }
 
     /// Run a turn using the iocraft REPL path. Output is routed through
-    /// `OutputSender` and the spinner is managed via the shared
-    /// `SpinnerState` atomics instead of indicatif.
+    /// `OutputSender`; the foreground activity projection owns the status
+    /// instead of indicatif.
     fn run_turn_iocraft(
         &mut self,
         input: &str,
         output: &repl_ui::OutputSender,
         ui: &repl_ui::UiCommandSender,
-        spinner_state: &repl_ui::SpinnerState,
+        spinner_state: &render::activity::ActivityState,
         pending_question_answer: PendingQuestionAnswer,
     ) -> Result<bool, Box<dyn std::error::Error>> {
         let turn_start = Instant::now();
         let token_budget = crate::render::parse_token_budget(input);
         let model = self.lifecycle.current_model();
 
-        // Activate the shared spinner state for the iocraft render loop, then
-        // bridge it into the SpinnerRef the renderer drives (bytes + thinking).
-        spinner_state.start_turn("\u{1f980} Thinking...", Some(model.as_str()), token_budget);
-        let spinner_ref = render::SpinnerRef::from_spinner_state(spinner_state);
+        // Prepare display metadata before submission. Engine events own the
+        // lifecycle; SpinnerRef updates only response progress and phase.
+        spinner_state.prepare_turn(model.as_str(), token_budget);
+        let spinner_ref = render::SpinnerRef::from_activity_state(spinner_state);
 
         let mut question_prompter =
             IocraftQuestionPrompter::new(ui.clone(), pending_question_answer);
@@ -5045,7 +5048,6 @@ impl LiveCli {
             &mut question_prompter,
             None,
         )?;
-        spinner_state.stop_turn();
 
         // Explicit cancellation finishes this input. The mailbox sink decides
         // whether the receiver is still running and can acknowledge delivery.

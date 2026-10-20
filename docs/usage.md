@@ -169,6 +169,16 @@ scode
 The REPL accepts prose and slash commands. Tab completion expands slash
 command names, model aliases, permission modes, and recent session IDs.
 
+The live status follows the foreground engine lifecycle. A four-cell amber
+animation approximates the Sudoprivacy logo in one row. Model work
+shows `Thinking...` or `Reasoning...`, with model, elapsed time and tokens.
+Foreground tools use the same row and show available progress first. Quiet
+tools show `Running Bash…` or `Running 2 tools…`. Long descriptions truncate
+before the time/token details.
+Questions and approvals stop the animation and use the existing input panel;
+there is no additional waiting row. After the turn ends, the normal result and
+footer return. Background work keeps its separate task summary in the footer.
+
 `/memory` opens the discovered instruction file in `$VISUAL`, then `$EDITOR`,
 or `vi` when neither is set. With several instruction files, type to filter
 the file picker, press Enter to edit, or Esc to cancel. With none, it creates
@@ -216,9 +226,10 @@ Bash commands that cannot fit the title are preserved in the card body. Long
 list items keep their continuation lines aligned with the item text, including
 in session replay. Replayed message blocks have one blank separator.
 
-In the live REPL UI, Bash and MCP progress replaces the existing live
-status row; it does not append partial output or spinner summaries to terminal
-history. The completed tool card retains its normal output preview. Progress
+In the live REPL UI, Bash and MCP progress takes priority in the existing
+status row; input requests take priority over activity. It does not append partial
+output or spinner summaries to terminal history. The completed tool card
+retains its normal output preview. Progress
 is laid out with the same column and grapheme rules as other terminal text;
 external cursor/screen commands cannot take ownership of the live region.
 Paths without a live UI retain bounded progress log lines. Buffered answer and

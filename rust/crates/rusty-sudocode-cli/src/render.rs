@@ -8,6 +8,7 @@ use crossterm::style::{Color, ContentStyle, Stylize};
 use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
 use pulldown_cmark::{CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
 
+pub(crate) mod activity;
 mod code_theme;
 mod color_math;
 mod color_theme;
@@ -184,24 +185,20 @@ pub struct SpinnerRef {
     is_thinking: Arc<AtomicBool>,
     is_paused: Arc<AtomicBool>,
     draw_lock: Arc<Mutex<()>>,
-    phase: Option<Arc<Mutex<crate::repl_ui::TurnPhase>>>,
-    /// When true, a TurnRenderer manages the spinner display — pause/resume
-    /// only set the atomic flag without writing to stdout.
-    managed: bool,
+    activity: Option<activity::ActivityState>,
 }
 
 impl SpinnerRef {
-    /// Create a `SpinnerRef` from a `SpinnerState`. Convenience wrapper
+    /// Create a `SpinnerRef` from the foreground activity projection. Convenience wrapper
     /// for the iocraft REPL path, sharing the same activity clock.
-    pub fn from_spinner_state(state: &crate::repl_ui::SpinnerState) -> Self {
+    pub fn from_activity_state(state: &activity::ActivityState) -> Self {
         Self {
             pb: ProgressBar::hidden(),
             progress: Arc::clone(&state.progress),
             is_thinking: Arc::new(AtomicBool::new(false)),
             is_paused: Arc::new(AtomicBool::new(false)),
             draw_lock: Arc::new(Mutex::new(())),
-            phase: Some(state.phase_arc()),
-            managed: true,
+            activity: Some(state.clone()),
         }
     }
 
@@ -213,17 +210,11 @@ impl SpinnerRef {
         result
     }
 
-    /// Pause the spinner and clear its line. The updater thread stops
-    /// ticking while paused. When managed by a TurnRenderer, only the
-    /// atomic flag is set — the render thread handles clearing.
+    /// Suspend only the legacy spinner while writing to its terminal row.
+    /// Inline output has its own region; foreground activity remains visible.
     pub fn pause(&self) {
-        if let Some(ref phase) = self.phase {
-            *phase.lock().unwrap() = crate::repl_ui::TurnPhase::Paused;
-        }
         self.is_paused.store(true, Ordering::SeqCst);
-        if self.managed {
-            // TurnRenderer sees is_paused and clears the spinner line
-            // on its next tick (≤80ms). No direct stdout write needed.
+        if self.activity.is_some() {
             return;
         }
         // A frame may already be drawing when the flag changes. Wait for
@@ -237,31 +228,20 @@ impl SpinnerRef {
     /// Resume the spinner after a pause.
     pub fn resume(&self) {
         self.progress.record_activity();
-        if let Some(ref phase) = self.phase {
-            *phase.lock().unwrap() = crate::repl_ui::TurnPhase::Thinking;
-        }
         self.is_paused.store(false, Ordering::SeqCst);
     }
 
     pub fn set_thinking(&self, on: bool) {
         self.progress.record_activity();
-        if let Some(ref phase) = self.phase {
-            *phase.lock().unwrap() = if on {
-                crate::repl_ui::TurnPhase::Reasoning
-            } else {
-                crate::repl_ui::TurnPhase::Thinking
-            };
+        if let Some(activity) = &self.activity {
+            activity.set_reasoning(on);
         }
         self.is_thinking.store(on, Ordering::SeqCst);
     }
 
-    pub fn set_retry(&self, attempt: u32, max_retries: u32, reason: String) {
-        if let Some(ref phase) = self.phase {
-            *phase.lock().unwrap() = crate::repl_ui::TurnPhase::Retry {
-                attempt,
-                max_retries,
-                reason,
-            };
+    pub fn set_retry(&self, attempt: u32, max_retries: u32, reason: &str) {
+        if let Some(activity) = &self.activity {
+            activity.set_retry(attempt, max_retries, reason);
         }
     }
 
@@ -288,11 +268,6 @@ pub struct SpinnerHandle {
 }
 
 impl SpinnerHandle {
-    const FRAMES_DEFAULT: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
-    const FRAMES_THINKING: &[&str] = &["◐", "◓", "◑", "◒"];
-    const LABEL_THINKING: &str = "🧠 Reasoning...";
-    const SHOW_TOKENS_AFTER_SECS: f64 = 1.0;
-
     #[must_use]
     pub fn new(
         label: &str,
@@ -336,8 +311,7 @@ impl SpinnerHandle {
             is_thinking: Arc::clone(&self.is_thinking),
             is_paused: Arc::clone(&self.is_paused),
             draw_lock: Arc::clone(&self.draw_lock),
-            phase: None,
-            managed: false,
+            activity: None,
         }
     }
 
@@ -360,58 +334,26 @@ impl SpinnerHandle {
                 let paused = is_paused.load(Ordering::SeqCst);
                 if !paused {
                     let thinking = is_thinking.load(Ordering::SeqCst);
-                    let frames: &[&str] = if thinking {
-                        SpinnerHandle::FRAMES_THINKING
-                    } else {
-                        SpinnerHandle::FRAMES_DEFAULT
-                    };
                     let current_label = if thinking {
-                        SpinnerHandle::LABEL_THINKING
+                        activity::REASONING_LABEL
                     } else {
                         &label
                     };
-
-                    let frame = frames[frame_index % frames.len()];
+                    let line = activity::progress_line(
+                        frame_index,
+                        current_label,
+                        activity::ProgressValues {
+                            model: model.as_deref(),
+                            elapsed: start_time.elapsed().as_secs_f64(),
+                            bytes: progress.response_bytes(),
+                            token_budget,
+                        },
+                        query_terminal_width(),
+                        text_layout::ColumnMetric::Terminal,
+                        progress.is_stalled(thinking),
+                    );
                     frame_index += 1;
-                    let elapsed = start_time.elapsed().as_secs_f64();
-
-                    let mut line = format!("{frame} {current_label}");
-                    if let Some(ref m) = model {
-                        let _ = write!(line, " [{m}]");
-                    }
-                    let _ = write!(line, " ({elapsed:.1}s)");
-
-                    let bytes = progress.response_bytes();
-                    if bytes > 0 && elapsed >= SpinnerHandle::SHOW_TOKENS_AFTER_SECS {
-                        let approx_tokens = bytes / 4;
-                        if let Some(budget) = token_budget {
-                            let pct =
-                                (f64::from(approx_tokens) / f64::from(budget) * 100.0).min(100.0);
-                            let fmt_t = format_compact_tokens(approx_tokens);
-                            let fmt_b = format_compact_tokens(budget);
-                            let _ = write!(line, " ↓ {fmt_t} / {fmt_b} ({pct:.0}%)");
-                            if approx_tokens >= 2000 && elapsed > 5.0 {
-                                let rate = f64::from(approx_tokens) / elapsed;
-                                let remaining = f64::from(budget.saturating_sub(approx_tokens));
-                                let eta_secs = remaining / rate;
-                                let _ = if eta_secs >= 60.0 {
-                                    write!(line, " ~{:.0}m", eta_secs / 60.0)
-                                } else {
-                                    write!(line, " ~{eta_secs:.0}s")
-                                };
-                            }
-                        } else {
-                            let _ = if approx_tokens >= 1000 {
-                                write!(line, " ↓ {:.1}k tokens", f64::from(approx_tokens) / 1000.0)
-                            } else {
-                                write!(line, " ↓ {approx_tokens} tokens")
-                            };
-                        }
-                    }
-
-                    let color = theme().spinner_fg(progress.is_stalled(thinking));
-                    let colored = format!("{color}{line}{RESET}");
-                    pb.set_message(colored);
+                    pb.set_message(line);
                     pb.tick();
                 }
                 drop(draw);
@@ -471,17 +413,6 @@ mod spinner_tests {
     fn case_insensitive() {
         assert_eq!(parse_token_budget("+500K"), Some(500_000));
         assert_eq!(parse_token_budget("+2M"), Some(2_000_000));
-    }
-}
-
-/// Format a token count compactly: `500`, `1.2k`, `500k`, `1.0M`.
-fn format_compact_tokens(tokens: u32) -> String {
-    if tokens >= 1_000_000 {
-        format!("{:.1}M", f64::from(tokens) / 1_000_000.0)
-    } else if tokens >= 1_000 {
-        format!("{:.1}k", f64::from(tokens) / 1_000.0)
-    } else {
-        tokens.to_string()
     }
 }
 
