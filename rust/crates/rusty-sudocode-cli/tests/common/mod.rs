@@ -404,11 +404,22 @@ pub fn turn_status_line(screen: &str) -> String {
         .to_string()
 }
 
-/// Snapshot the status line BEFORE submitting, for
+/// Stable completed-turn identity, independent of line wrapping and details.
+#[must_use]
+pub fn turn_status_identity(screen: &str) -> String {
+    let line = turn_status_line(screen);
+    line.split_once("· turn ")
+        .and_then(|(_, rest)| rest.split_whitespace().next())
+        .filter(|number| number.bytes().all(|byte| byte.is_ascii_digit()))
+        .unwrap_or_default()
+        .to_owned()
+}
+
+/// Snapshot the completed-turn identity BEFORE submitting, for
 /// [`expect_turn_complete_after`].
 #[must_use]
 pub fn turn_status_marker(sess: &PtySession) -> String {
-    turn_status_line(&sess.render(screen_contents))
+    turn_status_identity(&sess.render(screen_contents))
 }
 
 /// Block until the turn submitted after `marker` was taken has finished AND the
@@ -423,10 +434,11 @@ pub fn turn_status_marker(sess: &PtySession) -> String {
 ///   it read the filesystem before the model had written anything — the
 ///   regression recorded in #689 after #685 removed the status-line waits from
 ///   `pty_memory`.
-/// * **It differs from `marker`.** The result line stays on screen until the
+/// * **Its turn counter differs from `marker`.** The result line stays on screen until the
 ///   next turn starts, so a presence check alone is satisfied by the PREVIOUS
-///   turn's line and returns before this turn has run. Comparing against the
-///   pre-submit snapshot is what separates the two. Snapshotting rather than
+///   turn's line and returns before this turn has run. Compare the counter,
+///   since repainting or wrapping that same line can change its text without
+///   another turn completing. Snapshotting rather than
 ///   waiting for the old line to vanish also keeps a turn that finishes before
 ///   the first poll from deadlocking the gate.
 /// * **The input line is empty.** The status line can be printed before the
@@ -451,7 +463,8 @@ pub fn expect_turn_complete_after(
     loop {
         let screen = sess.render(screen_contents);
         let status = turn_status_line(&screen);
-        let fresh = !status.is_empty() && status != marker;
+        let identity = turn_status_identity(&screen);
+        let fresh = !identity.is_empty() && identity != marker;
         if fresh && screen.contains(PROMPT_MARKER) && input_line_of(&screen).is_empty() {
             return;
         }
@@ -461,7 +474,7 @@ pub fn expect_turn_complete_after(
             } else if status.is_empty() {
                 "no per-turn status line ever appeared, so no turn ran"
             } else {
-                "the status line still reads exactly as it did before the \
+                "the completed turn counter still reads exactly as it did before the \
                  submit, so no NEW turn completed"
             };
             panic!(

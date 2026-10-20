@@ -178,3 +178,48 @@ fn middle_paste_then_typing_preserves_submitted_content() {
         "saved assistant result"
     );
 }
+
+#[test]
+fn completed_turn_identity_survives_wrapping_and_advances_after_the_next_turn() {
+    let env = TestEnv::new_mock("input-turn-identity");
+    let mut session = start(&env);
+    session.resize(24, 80).unwrap();
+    let marker = common::turn_status_marker(&session);
+    session
+        .send(&format!(
+            "{}\r",
+            env.prompt("Calculate 2 + 2.", "single_turn_text")
+        ))
+        .unwrap();
+    common::expect_turn_complete_after(&session, &marker, env.timeout(), "first turn");
+    common::expect_input_line_cleared(&session, env.timeout(), "first turn ready");
+    let first = common::turn_status_marker(&session);
+    assert!(!first.is_empty());
+    let before = session.render(|screen| common::turn_status_line(&screen.contents()));
+
+    session.resize(24, 120).unwrap();
+    let screen = common::expect_screen_settled(
+        &session,
+        |screen| screen.contains(&"─".repeat(120)) && screen.contains("· turn 1"),
+        env.timeout(),
+        "completed status repainted at the new width",
+    );
+    assert_ne!(common::turn_status_line(&screen), before);
+    assert_eq!(
+        common::turn_status_marker(&session),
+        first,
+        "wrapping the same completed status must not acknowledge another turn"
+    );
+
+    session
+        .send(&format!(
+            "{}\r",
+            env.prompt("Calculate 2 + 2 again.", "single_turn_text")
+        ))
+        .unwrap();
+    common::expect_turn_complete_after(&session, &first, env.timeout(), "second turn");
+    common::expect_input_line_cleared(&session, env.timeout(), "second turn ready");
+    assert_ne!(common::turn_status_marker(&session), first);
+    exit(&mut session, &env);
+    assert_eq!(env.captured_message_count(), 2);
+}
