@@ -46,6 +46,9 @@ pub struct HttpRequestResult {
     pub response: crate::RecordedResponse,
     /// Client-generated unique request ID for tracking.
     pub request_id: String,
+    pub request_started_ms: u64,
+    pub response_started_ms: u64,
+    pub attempts: u32,
 }
 
 /// Returns the current timestamp in milliseconds since Unix epoch.
@@ -303,6 +306,7 @@ impl HttpTransport {
 
             match send_result {
                 Ok(response) => {
+                    let response_started_ms = current_timestamp_ms();
                     let status = response.status().as_u16();
                     let response_headers = mask_response_headers(response.headers());
 
@@ -396,6 +400,9 @@ impl HttpTransport {
                             return Ok(HttpRequestResult {
                                 response: crate::RecordedResponse::new(response, capture),
                                 request_id,
+                                request_started_ms: start_timestamp_ms,
+                                response_started_ms,
+                                attempts: observed_attempt,
                             });
                         }
                         Err(error)

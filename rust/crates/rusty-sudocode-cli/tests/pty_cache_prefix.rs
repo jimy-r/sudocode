@@ -23,6 +23,8 @@ const RESPONSE_LOG_ONLY: &str = "RESPONSE_LOG_ONLY_MUST_STAY_OUT_OF_CONTEXT";
 const WAIT: Duration = Duration::from_secs(30);
 const DIAGNOSTIC_SSE: usize = 1;
 const DIAGNOSTIC_JSON: usize = 2;
+const RESTARTED_MESSAGE: usize = 3;
+const INTERRUPTED_MESSAGE: usize = 4;
 const DIAGNOSTIC_BETA: &str = "cache-diagnosis-2026-04-07";
 
 #[inline]
@@ -277,6 +279,23 @@ fn serve(
         ),
         ("message_stop", json!({"type":"message_stop"})),
     ];
+    if shape == RESTARTED_MESSAGE {
+        events.insert(
+            0,
+            (
+                "message_start",
+                json!({"type":"message_start","message":{
+                    "id":"abandoned-attempt", "type":"message", "role":"assistant", "content":[],
+                    "model":request["model"], "usage":{"input_tokens":2,
+                    "cache_creation_input_tokens":5235,"cache_read_input_tokens":124730}
+                }}),
+            ),
+        );
+    }
+    if shape == INTERRUPTED_MESSAGE {
+        events.truncate(1);
+        diagnostic_shape.store(0, Ordering::Relaxed);
+    }
     if binding {
         events[0].1["message"]["input_transformations"] = json!([]);
         if number == 4 {
@@ -1420,6 +1439,179 @@ fn turn(cli: &mut PtySession, text: &str) {
     cli.send(&format!("{text}\r")).unwrap();
     common::expect_turn_complete_after(cli, &marker, WAIT, text);
     common::expect_input_line_cleared(cli, WAIT, "turn completed");
+}
+
+fn cache_rows(directory: &std::path::Path) -> Vec<Value> {
+    std::fs::read_to_string(directory.join("requests.jsonl"))
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect()
+}
+
+#[test]
+fn ttl_advisor_records_wire_timing_and_decides_once_after_compact() {
+    let env = TestEnv::new_mock("ttl-advisor-boundary");
+    let capture = Capture::new();
+    let path = fixture(&env, &capture);
+    let id = Session::load_from_path(&path).unwrap().session_id;
+    let directory = env.config_home().join("cache/prompt-cache").join(id);
+    let enabled = [("SUDOCODE_EXPERIMENT_CACHE_TTL_ADVISOR", "1")];
+    let mut cli = spawn_with_env(&env, &path, &enabled);
+    turn(&mut cli, "First observed request.");
+    let rows = cache_rows(&directory);
+    let template = rows.last().unwrap();
+    let observation = &template["observation"];
+    let start = observation["request_started_ms"].as_u64().unwrap();
+    assert!(start <= observation["response_started_ms"].as_u64().unwrap());
+    assert!(
+        observation["response_started_ms"].as_u64().unwrap()
+            <= observation["response_completed_ms"].as_u64().unwrap()
+    );
+    let ttls = observation["requested_ttls_seconds"].as_array().unwrap();
+    assert!(!ttls.is_empty() && ttls.iter().all(|ttl| *ttl == 300));
+    assert!(observation["upstream_ttl_seconds"].is_null());
+    let original: Value =
+        serde_json::from_str(&std::fs::read_to_string(directory.join("ttl-advice.json")).unwrap())
+            .unwrap();
+    assert_eq!(original["decisions"].as_array().unwrap().len(), 1);
+    assert_eq!(original["decisions"][0]["reason"], "insufficient_evidence");
+
+    // Synthetic history, not a measurement of the fake server's cache. It is
+    // written before the boundary, so the next decision cannot see the future.
+    let mut history = String::new();
+    for index in 0..10u64 {
+        let mut row = template.clone();
+        row["gateway_request_id"] = json!(format!("fixture-{index}"));
+        row["provider_request_id"] = Value::Null;
+        let at = start - (11 - index) * 600_000;
+        row["observation"]["request_started_ms"] = json!(at);
+        row["observation"]["response_started_ms"] = json!(at + 1);
+        row["observation"]["response_completed_ms"] = json!(at + 2);
+        row["observation"]["client_prefix_compatible"] = json!(true);
+        row["cache_creation_input_tokens"] = json!(100_000);
+        row["cache_read_input_tokens"] = json!(0);
+        writeln!(history, "{row}").unwrap();
+        if index == 4 {
+            writeln!(history, "{{\"model\":\"claude-opus-5-5\"}}").unwrap();
+        }
+    }
+    for row in rows {
+        writeln!(history, "{row}").unwrap();
+    }
+    std::fs::write(directory.join("requests.jsonl"), history).unwrap();
+    turn(
+        &mut cli,
+        "History alone must not re-decide inside this context.",
+    );
+    let unchanged: Value =
+        serde_json::from_str(&std::fs::read_to_string(directory.join("ttl-advice.json")).unwrap())
+            .unwrap();
+    assert_eq!(unchanged, original);
+    cli.send("/compact\r").unwrap();
+    cli.expect("Messages removed").unwrap();
+    common::expect_input_line_cleared(&cli, WAIT, "advisor compaction committed");
+    turn(&mut cli, "Continue with the configured policy.");
+    exit(&mut cli);
+    let state_path = directory.join("ttl-advice.json");
+    let after: Value =
+        serde_json::from_str(&std::fs::read_to_string(&state_path).unwrap()).unwrap();
+    assert_eq!(after["decisions"].as_array().unwrap().len(), 2);
+    assert_eq!(after["decisions"][1]["context_segment"], 1);
+    assert_eq!(after["decisions"][1]["suggested_ttl_seconds"], 3600);
+    assert_eq!(after["decisions"][1]["configured_ttl_seconds"], 300);
+    assert_eq!(after["decisions"][1]["reason"], "hypothetical_1h_saving");
+    assert_eq!(after["decisions"][1]["training"]["eligible_intervals"], 8);
+    let rows = cache_rows(&directory);
+    assert!(rows
+        .iter()
+        .any(|r| r["observation"]["request_kind"] == "compaction"));
+    assert_eq!(rows.last().unwrap()["observation"]["context_segment"], 1);
+    for body in capture.bodies() {
+        assert!(
+            !body.to_string().contains("\"ttl\":\"1h\""),
+            "advice must never change the wire policy"
+        );
+    }
+    let metadata = rows.last().unwrap()["observation"].to_string();
+    for secret in ["test-pty-key", "PREFIX_ORIGINAL", capture.url.as_str()] {
+        assert!(!metadata.contains(secret));
+    }
+    let mut cli = spawn_with_env(&env, &path, &enabled);
+    exit(&mut cli);
+    let resumed: Value =
+        serde_json::from_str(&std::fs::read_to_string(state_path).unwrap()).unwrap();
+    assert_eq!(
+        resumed, after,
+        "resume must preserve the decision and its training cutoff"
+    );
+}
+
+#[test]
+fn ttl_advisor_is_opt_in_and_marks_retried_or_restarted_streams() {
+    for mode in ["off", "retry", "restarted", "interrupted"] {
+        let env = TestEnv::new_mock("ttl-advisor-coverage");
+        let capture = Capture::new();
+        let path = fixture(&env, &capture);
+        let id = Session::load_from_path(&path).unwrap().session_id;
+        let directory = env.config_home().join("cache/prompt-cache").join(id);
+        if mode == "retry" {
+            capture.retry_next.store(true, Ordering::Relaxed);
+        }
+        if mode == "restarted" {
+            capture
+                .diagnostic_shape
+                .store(RESTARTED_MESSAGE, Ordering::Relaxed);
+        }
+        if mode == "interrupted" {
+            capture
+                .diagnostic_shape
+                .store(INTERRUPTED_MESSAGE, Ordering::Relaxed);
+        }
+        let mut cli = spawn_with_env(
+            &env,
+            &path,
+            &[(
+                "SUDOCODE_EXPERIMENT_CACHE_TTL_ADVISOR",
+                if mode == "off" { "0" } else { "1" },
+            )],
+        );
+        turn(&mut cli, "Observe a normal reply.");
+        exit(&mut cli);
+        let rows = cache_rows(&directory);
+        let o = &rows.last().unwrap()["observation"];
+        match mode {
+            "off" => {
+                assert!(o.is_null());
+                assert!(!directory.join("ttl-advice.json").exists());
+            }
+            "retry" => assert!(o["attempts"].as_u64().unwrap() >= 2),
+            "interrupted" => {
+                assert!(
+                    rows.iter().any(|r| r["observation"]["completed"] == false
+                        && r["input_tokens"].as_u64().unwrap_or(0) > 0),
+                    "interrupted observed usage must survive separately from the retry"
+                );
+                assert_eq!(o["completed"], true);
+                assert_eq!(
+                    o["attempts"], 1,
+                    "empty-response fallback opens a distinct HTTP request scope"
+                );
+                assert_eq!(capture.bodies().len(), 2);
+                let partial = &rows.first().unwrap()["observation"];
+                assert!(
+                    partial["response_completed_ms"].as_u64().unwrap()
+                        <= o["request_started_ms"].as_u64().unwrap(),
+                    "consumed partial usage must be recorded before the fallback"
+                );
+                assert!(
+                    o["client_prefix_compatible"].is_null(),
+                    "an incomplete response must not advance the successful prefix state"
+                );
+            }
+            _ => assert_eq!(o["message_starts"], 2),
+        }
+    }
 }
 
 fn exit(cli: &mut PtySession) {
