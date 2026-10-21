@@ -1,4 +1,5 @@
 //! Task browser with bounded, lazily decoded output and event-driven repaint.
+use super::choice_text::ChoiceText;
 use crate::render::{
     ansi_fg,
     styled_text::StyledText,
@@ -262,11 +263,11 @@ impl TaskBrowser {
             for id in self.rows.iter().skip(start).take(rows) {
                 let entry = &self.entries[id];
                 let task = &entry.task;
-                let marker = if self.selected.as_ref() == Some(id) {
-                    "❯"
-                } else {
-                    " "
-                };
+                let focused = self.selected.as_ref() == Some(id);
+                let marker = if focused { "❯" } else { " " };
+                let marker =
+                    ChoiceText::new(theme(), crate::render::ColorSupport::detect(), focused)
+                        .prefix(marker);
                 let kind = match task.kind {
                     BackgroundTaskKind::Terminal => "terminal",
                     BackgroundTaskKind::Agent => "agent",

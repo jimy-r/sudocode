@@ -5,7 +5,7 @@ use crate::render::{
     text_layout::{display_width, truncate_to_width},
     theme, ColorSupport,
 };
-use crossterm::style::{Attribute, ContentStyle};
+use crossterm::style::ContentStyle;
 use engine_core::{Tip, TipPriority};
 use std::collections::BTreeMap;
 
@@ -108,7 +108,8 @@ impl FooterTips {
         let tip = selected
             .filter(|_| remaining >= 8)
             .map(|tip| (tip, truncate_to_width(&tip.message, remaining)));
-        let colors = ColorSupport::detect() != ColorSupport::NoColor;
+        let support = ColorSupport::detect();
+        let colors = support != ColorSupport::NoColor;
         let palette = theme();
         let style = |color| ContentStyle {
             foreground_color: colors.then_some(color),
@@ -119,10 +120,11 @@ impl FooterTips {
         result.push(muted, &base);
         if !task.is_empty() {
             result.push(muted, sep);
-            let mut task_style = muted;
-            if tasks.focus == TaskFocus::Footer {
-                task_style.attributes.set(Attribute::Reverse);
-            }
+            let task_style = if tasks.focus == TaskFocus::Footer {
+                palette.selection_style(support)
+            } else {
+                muted
+            };
             result.push(task_style, &task);
         }
         if let Some((tip, text)) = tip {
