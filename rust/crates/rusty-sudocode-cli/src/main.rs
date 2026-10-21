@@ -3370,8 +3370,8 @@ fn run_repl_iocraft_dispatch(
     };
     let permission_label = cli.lifecycle.current_permission_mode().as_str().to_string();
     // On resume, seed the status line with the session's running totals so the
-    // ChromeSlot shows the same B2 line you saw before exit — not the first-run
-    // Tips. `None` for a fresh session (no turns yet) leaves Tips in place.
+    // ChromeSlot shows the previous result. Fresh-session guidance belongs
+    // to the shared footer, leaving the upper status area empty until needed.
     let resume_status = cli.resume_status_line();
 
     // iocraft owns stdin (raw mode) and delivers Ctrl-C / ESC as key events;
@@ -3409,6 +3409,7 @@ fn run_repl_iocraft_dispatch(
     if let Some(status) = resume_status {
         repl_ui_cmd.set_turn_result(&status);
     }
+    repl_ui_cmd.set_cache_tip(cli.cache_ttl_tip());
     let pending_question_answer: PendingQuestionAnswer = Arc::new(Mutex::new(None));
 
     // Route LiveCli output through iocraft's OutputSender so it goes
@@ -3833,6 +3834,10 @@ fn run_repl_iocraft_dispatch(
                         Ok(Some(command)) => {
                             let mut cli_lock = cli_shared.lock().expect("LiveCli mutex poisoned");
                             let refresh_context = matches!(command, SlashCommand::Compact);
+                            let prior_context = (
+                                cli_lock.lifecycle.session_handle().id,
+                                cli_lock.lifecycle.current_model(),
+                            );
                             match cli_lock.handle_repl_command(command) {
                                 Ok(true) => {
                                     if let Err(e) = cli_lock.persist_session() {
@@ -3855,6 +3860,16 @@ fn run_repl_iocraft_dispatch(
                                     repl_ui_cmd.set_turn_result(&status);
                                 }
                             }
+                            if refresh_context
+                                || prior_context
+                                    != (
+                                        cli_lock.lifecycle.session_handle().id,
+                                        cli_lock.lifecycle.current_model(),
+                                    )
+                            {
+                                repl_ui_cmd.begin_turn();
+                            }
+                            repl_ui_cmd.set_cache_tip(cli_lock.cache_ttl_tip());
                             true
                         }
                         Ok(None) => false,
@@ -3912,7 +3927,24 @@ fn run_repl_iocraft_dispatch(
                 }
                 repl_ui::InputEvent::QuestionAnswer(text) => {
                     if let Some(handler) = pending_slash_selection.take() {
+                        let prior = {
+                            let cli = cli_shared.lock().expect("LiveCli mutex poisoned");
+                            (
+                                cli.lifecycle.session_handle().id,
+                                cli.lifecycle.current_model(),
+                            )
+                        };
                         pending_slash_selection = (handler.0)(&text, &cli_shared, &repl_output);
+                        let cli = cli_shared.lock().expect("LiveCli mutex poisoned");
+                        if prior
+                            != (
+                                cli.lifecycle.session_handle().id,
+                                cli.lifecycle.current_model(),
+                            )
+                        {
+                            repl_ui_cmd.begin_turn();
+                        }
+                        repl_ui_cmd.set_cache_tip(cli.cache_ttl_tip());
                     } else if !consume_pending_question_answer(&pending_question_answer, text) {
                         repl_output.println(&format!(
                             "{DIM}(no question is waiting for an answer){RESET}"
@@ -4556,7 +4588,7 @@ impl LiveCli {
     /// live REPL shows after a turn, but rebuilt from the persisted session so
     /// the running totals (cost, tokens, wall time) continue seamlessly. Returns
     /// `None` for a session with no recorded turns (nothing to summarize —
-    /// StatusSlot falls back to Tips, as for a brand-new session).
+    /// StatusSlot stays empty, as for a brand-new session).
     fn resume_status_line(&self) -> Option<render::StyledLine> {
         let catalog = self.lifecycle.model_catalog();
         let _scope = catalog
@@ -4672,7 +4704,9 @@ impl LiveCli {
                     // queued until ToolStarted acquires a slot. The
                     // finished card is committed to scrollback by the renderer
                     // on the ordered output channel, not from here.
-                    if let Some(ui) = ui {
+                    if let Some(ui) =
+                        ui.filter(|_| tools::canonicalize_tool_name(name) != "set_tip")
+                    {
                         ui.tool_queued(id, name, input);
                     }
                     // Parity: `--output-format json` emits the tool input as the
@@ -4687,7 +4721,9 @@ impl LiveCli {
                     }));
                 }
                 EngineEvent::ToolStarted { id, name, input } => {
-                    if let Some(ui) = ui {
+                    if let Some(ui) =
+                        ui.filter(|_| tools::canonicalize_tool_name(name) != "set_tip")
+                    {
                         ui.tool_started(id, name, input);
                     }
                 }
@@ -4706,6 +4742,11 @@ impl LiveCli {
                     // Canonicalize first: this name is whatever the model
                     // spelled, so matching it raw would leave the panel stale.
                     if let Some(ui) = ui {
+                        if !*is_error && tools::canonicalize_tool_name(name) == "set_tip" {
+                            if let Some(tip) = tools::tip_from_tool_result(output) {
+                                ui.set_tip(tip);
+                            }
+                        }
                         if !*is_error && tools::canonicalize_tool_name(name).as_str() == "TodoWrite"
                         {
                             // From the result itself — the list is in the
@@ -4925,10 +4966,15 @@ impl LiveCli {
         Ok(())
     }
 
-    /// Print the end-of-turn status line. Usage/turns come from a lifecycle
-    /// snapshot (the engine's live `UsageTracker`), context-window from the
-    /// response model (falling back to the active model). Routes to the iocraft
-    /// `OutputSender` when present, else the plain `out_println`.
+    /// Read the engine's frozen recommendation without copying pricing logic.
+    fn cache_ttl_tip(&self) -> Option<engine_core::Tip> {
+        engine_core::cache_advisor::session_tip(
+            &self.lifecycle.session_handle().id,
+            &self.lifecycle.current_model(),
+        )
+    }
+
+    /// Show lifecycle usage in the dynamic status slot, or plain output.
     fn print_turn_status_line(
         &self,
         model: &str,
@@ -4974,6 +5020,9 @@ impl LiveCli {
         } else {
             turn_status_line(&status)
         };
+        if let Some(ui) = ui {
+            ui.set_cache_tip(self.cache_ttl_tip());
+        }
         match (ui, output) {
             // Show in the ChromeSlot only (visible until the next turn). The
             // status line is deliberately NOT echoed to scrollback: the
@@ -4999,6 +5048,7 @@ impl LiveCli {
         spinner_state: &render::activity::ActivityState,
         pending_question_answer: PendingQuestionAnswer,
     ) -> Result<bool, Box<dyn std::error::Error>> {
+        ui.begin_turn();
         let turn_start = Instant::now();
         let token_budget = crate::render::parse_token_budget(input);
         let model = self.lifecycle.current_model();
