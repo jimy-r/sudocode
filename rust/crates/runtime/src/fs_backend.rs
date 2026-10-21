@@ -1979,34 +1979,97 @@ impl NexusVfsFsBackend {
     }
 
     fn authorize_target(&self, path: &str, access_kind: ResourceAccessKind) -> io::Result<()> {
+        // A descriptor/env delegation reference is not a credential the VFS
+        // server can verify: refuse before ANY RPC leaves the process,
+        // surfacing the scope verdict's own reason when it has one.
+        if !matches!(self.zone_context.source(), ContextSource::TrustedLocal) {
+            let normalized = lexical_join("/", path)?.replace('\\', "/");
+            let capability = match access_kind {
+                ResourceAccessKind::Read => "zone.data.read",
+                ResourceAccessKind::Write => "zone.data.write",
+            };
+            self.zone_context
+                .authorize_path_for(access_kind, capability, &normalized)
+                .map(|_| ())
+                .map_err(|error| io::Error::new(io::ErrorKind::PermissionDenied, error))?;
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                ZoneAuthError::DelegationInvalid,
+            ));
+        }
+        // A transport the server itself authenticated (mTLS SAN identity)
+        // carries its own authorization. The scope verdict here is the
+        // early-deny layer — READS continue to [`Self::admit_entry`], which
+        // admits link entries from the operation's own answer (zero extra
+        // RPC); only WRITES pay for the follow-walk below, because a write
+        // through an in-scope alias would land before any result could be
+        // checked.
+        let capability = match access_kind {
+            ResourceAccessKind::Read => "zone.data.read",
+            ResourceAccessKind::Write => "zone.data.write",
+        };
         let normalized = lexical_join("/", path)?.replace('\\', "/");
-        let verdict = self
-            .zone_context
-            .authorize_path_for(
-                access_kind,
-                match access_kind {
-                    ResourceAccessKind::Read => "zone.data.read",
-                    ResourceAccessKind::Write => "zone.data.write",
-                },
-                &normalized,
-            )
-            .map(|_| ())
-            .map_err(|error| io::Error::new(io::ErrorKind::PermissionDenied, error));
-        match self.zone_context.source() {
-            // A transport the server itself authenticated (mTLS SAN identity)
-            // carries its own authorization; the scope check above is the
-            // early-deny layer and its verdict stands.
-            ContextSource::TrustedLocal => verdict,
-            // A descriptor/env delegation reference is not a credential the VFS
-            // server can verify. Scope matching is only an early-deny layer.
-            ContextSource::Absent | ContextSource::UnverifiedDelegationRef => {
-                verdict?; // surface the early-deny reason when it has one
-                Err(io::Error::new(
-                    io::ErrorKind::PermissionDenied,
-                    ZoneAuthError::DelegationInvalid,
-                ))
+        if access_kind == ResourceAccessKind::Read || !self.zone_context.has_resource_restriction()
+        {
+            return self
+                .zone_context
+                .authorize_path_for(access_kind, capability, &normalized)
+                .map(|_| ())
+                .map_err(|error| io::Error::new(io::ErrorKind::PermissionDenied, error));
+        }
+        // The write-side link-follow guard: the server resolves a DT_LINK
+        // when it executes a write, so admission resolves it first. Each hop
+        // re-admits against the scope (depth-capped); a stat that cannot
+        // answer leaves the verdict to the operation itself rather than
+        // widening it here.
+        let mut normalized = normalized;
+        for _ in 0..8 {
+            self.zone_context
+                .authorize_path_for(access_kind, capability, &normalized)
+                .map(|_| ())
+                .map_err(|error| io::Error::new(io::ErrorKind::PermissionDenied, error))?;
+            let Some(link_target) = self
+                .client
+                .stat(&normalized, &self.auth_token)
+                .ok()
+                .and_then(|stat| stat.link_target)
+            else {
+                return Ok(());
+            };
+            normalized = lexical_join("/", &link_target)?.replace('\\', "/");
+        }
+        Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("{path}: too many link hops to admit"),
+        ))
+    }
+
+    /// The read-side link-follow guard, from the operation's own answer: the
+    /// transport reports the entry type it read and, for a `DT_LINK`, the
+    /// target it resolved. A scoped runtime refuses a link whose target falls
+    /// outside its scope — a legitimately planted link (link() authorizes
+    /// alias AND target) never points out, so only an out-of-scope layout
+    /// can, and it is not this runtime's to follow.
+    fn admit_entry(
+        &self,
+        path: &str,
+        entry_type: i32,
+        link_target: Option<&str>,
+    ) -> io::Result<()> {
+        if !self.zone_context.has_resource_restriction() {
+            return Ok(());
+        }
+        if let Some(target) = link_target {
+            if entry_type == 6 {
+                let normalized = lexical_join("/", target)?.replace('\\', "/");
+                return self
+                    .zone_context
+                    .authorize_path_for(ResourceAccessKind::Read, "zone.data.read", &normalized)
+                    .map(|_| ())
+                    .map_err(|error| io::Error::new(io::ErrorKind::PermissionDenied, error));
             }
         }
+        Ok(())
     }
 
     fn remote_stat(&self, path: &str) -> io::Result<nexus_vfs_client::VfsStat> {
@@ -2040,6 +2103,17 @@ impl FsBackend for NexusVfsFsBackend {
     }
     fn read(&self, path: &str) -> io::Result<Vec<u8>> {
         self.authorize_target(path, ResourceAccessKind::Read)?;
+        // The pre-flight link guard (scoped reads only). The server resolves
+        // a DT_LINK as it executes the read and answers in the TARGET's
+        // shape, so nothing in the result identifies the bytes as link
+        // content — admission has to resolve the link first. One stat on the
+        // cold read path; the receiver's `tail_read` keeps its wait budget.
+        if self.zone_context.has_resource_restriction() {
+            let stat = self.remote_stat(path)?;
+            if let Some(target) = stat.link_target {
+                self.admit_entry(path, 6, Some(&target))?;
+            }
+        }
         let first = self.client.read_entry(path, 0, &self.auth_token)?;
         if first.entry_type != i32::from(DT_STREAM) {
             return Ok(first.data);
@@ -2108,6 +2182,9 @@ impl FsBackend for NexusVfsFsBackend {
     fn stat(&self, path: &str) -> io::Result<FsMetadata> {
         self.authorize_target(path, ResourceAccessKind::Read)?;
         let stat = self.remote_stat(path)?;
+        if let Some(target) = stat.link_target.as_deref() {
+            self.admit_entry(path, 6, Some(target))?;
+        }
         Ok(FsMetadata {
             len: stat.size,
             is_dir: stat.is_directory,
@@ -2145,8 +2222,12 @@ impl FsBackend for NexusVfsFsBackend {
     }
 
     fn exists(&self, path: &str) -> io::Result<bool> {
+        // Admission refusals (scope verdict, unverified source) are errors.
+        // Beyond that, existence must not leak: the server normalizes an
+        // authentication refusal to absence and the client reads any stat
+        // failure the same way, so an unauthenticated prober learns nothing.
         self.authorize_target(path, ResourceAccessKind::Read)?;
-        Ok(self.client.stat(path, &self.auth_token).is_ok())
+        Ok(self.remote_stat(path).is_ok())
     }
 
     /// A DT_LINK, with the destination in the entry's metadata.
@@ -2193,12 +2274,17 @@ impl FsBackend for NexusVfsFsBackend {
     /// shape federation uses.
     fn read_link(&self, alias: &str) -> io::Result<String> {
         self.authorize_target(alias, ResourceAccessKind::Read)?;
-        self.remote_stat(alias)?.link_target.ok_or_else(|| {
+        let stat = self.remote_stat(alias)?;
+        let target = stat.link_target.ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::NotFound,
                 format!("{alias}: not a link or no target"),
             )
-        })
+        })?;
+        // The follow guard, from the stat the operation already made: the
+        // alias being in scope is not enough — where it points must be too.
+        self.admit_entry(alias, 6, Some(&target))?;
+        Ok(target)
     }
 
     /// Provision each component as a DT_DIR, idempotently.

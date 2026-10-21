@@ -225,6 +225,12 @@ impl HostZoneContext {
         &self.source
     }
 
+    /// True when a host-injected resource scope narrows this context. A
+    /// backend consults this before paying for scope-shaped admission.
+    pub(crate) fn has_resource_restriction(&self) -> bool {
+        self.resource_scope_present
+    }
+
     #[must_use]
     pub fn nexus_v2_base_url(&self) -> Option<&str> {
         self.nexus_v2_base_url.as_deref()
