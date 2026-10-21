@@ -1090,6 +1090,33 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
             required_permission: PermissionMode::DangerFullAccess,
         },
         ToolSpec {
+            name: "Monitor",
+            description: concat!(
+                "Watch, monitor, or keep an eye on a process, log, or command. ",
+                "The call returns immediately with a task id and the watch keeps ",
+                "running across turns.\n\n",
+                "End your turn after starting one: you will be notified when it ",
+                "finishes or fires. Keep working — do not poll, sleep, or re-read ",
+                "its output while you wait. An event may arrive while you are ",
+                "waiting for the user; it is not their reply.\n\n",
+                "To wait until a condition is met, give it a loop that exits when ",
+                "the condition holds (e.g. `until grep -q \"Ready\" dev.log; do ",
+                "sleep 2; done`) — you are notified when the loop exits. For a ",
+                "one-shot \"wait until this command is done\", use bash with ",
+                "`run_in_background` instead."
+            ),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "command": { "type": "string", "description": "Shell command to watch. The watch ends when it exits." },
+                    "description": { "type": "string", "description": "Short label for this watch, shown in notifications and the task panel." }
+                },
+                "required": ["command", "description"],
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::DangerFullAccess,
+        },
+        ToolSpec {
             name: "read_file",
             description: "Read a text file or a PNG/JPEG/GIF/WebP image from the workspace. Images are attached for visual inspection; a vision-capable model is required. After a screenshot command, call Read on its saved image path. Text reads up to 2000 lines by default; a page that would exceed the size cap is shrunk automatically and ends with a [Truncated: PARTIAL view …] banner telling you the offset/limit for the next page. When you already know which part of the file you need, only read that part.",
             input_schema: json!({
@@ -1857,6 +1884,16 @@ fn execute_tool_with_enforcer(
                         .map(|tasks| tasks.for_tool(ctx.tool_use_id.as_deref()))
                 })
                 .as_ref(),
+            )
+        }
+        "Monitor" => {
+            let monitor_input: MonitorInput = from_value(input)?;
+            // A watch runs arbitrary shell, so it is gated exactly like bash.
+            let classified_mode = classify_bash_permission(&monitor_input.command);
+            maybe_enforce_permission_check_with_mode(enforcer, name, input, classified_mode)?;
+            run_monitor(
+                monitor_input,
+                ctx.and_then(|ctx| ctx.background_tasks.as_ref()),
             )
         }
         "read_file" => {
@@ -3478,6 +3515,40 @@ fn from_value<T: for<'de> Deserialize<'de>>(input: &Value) -> Result<T, String> 
 /// Classify bash command permission based on command type and path.
 /// ROADMAP #50: Read-only commands targeting CWD paths get `WorkspaceWrite`,
 /// all others remain `DangerFullAccess`.
+/// Input for the `Monitor` tool.
+#[derive(Debug, Deserialize)]
+struct MonitorInput {
+    command: String,
+    description: String,
+}
+
+/// Start a watch and return immediately.
+///
+/// Reuses the same launcher the `bash` tool's `run_in_background` path uses, so
+/// a watch and a background command share one registry, one output owner, one
+/// cancellation contract and one process group. The only thing `Monitor` adds
+/// is the intent: the model is told to end its turn and wait to be notified.
+fn run_monitor(
+    input: MonitorInput,
+    tasks: Option<&runtime::background_tasks::BackgroundTasks>,
+) -> Result<String, String> {
+    let cwd = runtime::current_workspace_root_or_default();
+    let command = runtime::shell_command_in(&cwd, &input.command);
+    let (id, output_path) = runtime::launch_background_command(
+        command,
+        runtime::subagent_completion::ShellKind::Bash,
+        &input.command,
+        &input.description,
+        tasks,
+    )
+    .map_err(|error| format!("failed to start monitor: {error}"))?;
+    Ok(format!(
+        "Monitor started (task {id}, output {output_path}). You will be notified \
+         when it finishes or fires. Keep working — do not poll or sleep. An event \
+         may arrive while you are waiting for the user; it is not their reply."
+    ))
+}
+
 fn classify_bash_permission(command: &str) -> PermissionMode {
     // Read-only commands that are safe when targeting workspace paths
     const READ_ONLY_COMMANDS: &[&str] = &[
