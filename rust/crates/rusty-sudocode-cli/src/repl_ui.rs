@@ -46,7 +46,6 @@ use ansi_text::{row_text, AnsiText, RichText};
 use choice_text::ChoiceText;
 use footer::FooterTips;
 use layout::{ansi, ansi_with_style, ChromeLayout, InputLayout, Measurements, Slot};
-use prompt_text::PromptTextCache;
 pub(crate) mod prose_preview;
 use prose_preview::{PreviewUpdate, ProsePreview};
 use tasks::{TaskBrowser, TaskFocus};
@@ -938,6 +937,8 @@ pub enum InputEvent {
         display: String,
     },
     QuestionAnswer(String),
+    /// Inspect the frozen review without answering it.
+    InspectDocument(String),
     StopBackgroundTask(String),
     /// ESC pressed — cancel the running turn.
     Abort,
@@ -1347,10 +1348,6 @@ fn ReplApp(mut hooks: Hooks) -> impl Into<AnyElement<'static>> {
     let mut next_paste_id = hooks.use_state(|| 1u32);
     let mut input_reviewable = hooks.use_state(|| true);
     let mut measurements = hooks.use_ref_default::<Measurements>();
-    let prompt_renderer = hooks.use_ref(crate::render::TerminalRenderer::new);
-    let mut prompt_text = hooks.use_ref_default::<PromptTextCache>();
-    // Stay mounted at zero height so the handle never references torn-down state.
-    let mut review_handle = hooks.use_ref_default::<ScrollViewHandle>();
 
     // Clone handles for the future (StdoutHandle is Clone).
     let stdout_for_future = stdout.clone();
@@ -1435,7 +1432,18 @@ fn ReplApp(mut hooks: Hooks) -> impl Into<AnyElement<'static>> {
                                 .set(Some((message, Instant::now() + Duration::from_secs(3))));
                         }
                         Ok(UiCommand::ShowQuestion(question)) => {
-                            review_handle.write().scroll_to_top();
+                            // A request's immutable description belongs to
+                            // history. Only its first field presents it; the
+                            // live slot owns the current field's controls.
+                            if question.index == 0 {
+                                if let Some(description) = &question.description {
+                                    let document = prompt_text::render_document(
+                                        description,
+                                        crate::render::query_terminal_width(),
+                                    );
+                                    write_iocraft_output(&stdout_for_future, &document, true);
+                                }
+                            }
                             tasks_for_future
                                 .lock()
                                 .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -1610,6 +1618,21 @@ fn ReplApp(mut hooks: Hooks) -> impl Into<AnyElement<'static>> {
                 ..
             }) if kind != KeyEventKind::Release => {
                 let current_slot = input_slot.read().clone();
+                if code == KeyCode::Char('o') && modifiers.contains(KeyModifiers::CONTROL) {
+                    let question = match &current_slot {
+                        InputSlot::DialPad(question) => Some(question),
+                        InputSlot::FuzzySelect(state) => Some(&state.question),
+                        _ => None,
+                    };
+                    if let Some(description) = question.and_then(|q| q.description.as_ref()) {
+                        let document = prompt_text::render_document(
+                            description,
+                            crate::render::query_terminal_width(),
+                        );
+                        let _ = input_tx_for_events.send(InputEvent::InspectDocument(document));
+                        return;
+                    }
+                }
                 // Never submit or edit contents that cannot be reviewed. The
                 // mounted editor preserves its buffer/cursor while unfocused.
                 if (!input_reviewable.get() || !input_frame.is_current())
@@ -1617,21 +1640,6 @@ fn ReplApp(mut hooks: Hooks) -> impl Into<AnyElement<'static>> {
                     && !(code == KeyCode::Char('c') && modifiers.contains(KeyModifiers::CONTROL))
                 {
                     return;
-                }
-                if matches!(current_slot, InputSlot::DialPad(_) | InputSlot::FuzzySelect(_)) {
-                    let mut review = review_handle.write();
-                    let page = i32::from(review.viewport_height()).saturating_sub(1).max(1);
-                    match code {
-                        KeyCode::PageUp => { review.scroll_by(-page); return; }
-                        KeyCode::PageDown => { review.scroll_by(page); return; }
-                        KeyCode::Home if modifiers.contains(KeyModifiers::CONTROL) => {
-                            review.scroll_to_top(); return;
-                        }
-                        KeyCode::End if modifiers.contains(KeyModifiers::CONTROL) => {
-                            review.scroll_to_bottom(); return;
-                        }
-                        _ => {}
-                    }
                 }
                 // One keyboard owner. Task browsing never sends a model prompt
                 // or cancels the parent turn, and questions retain priority.
@@ -1769,7 +1777,7 @@ fn ReplApp(mut hooks: Hooks) -> impl Into<AnyElement<'static>> {
                                             // would make a queued input look sent.
                                             let _ = input_tx_for_events.send(InputEvent::Submit { text: expanded, display });
                                         }
-                                        InputEvent::QuestionAnswer(_) | InputEvent::Abort | InputEvent::StopBackgroundTask(_) => {}
+                                        InputEvent::QuestionAnswer(_) | InputEvent::InspectDocument(_) | InputEvent::Abort | InputEvent::StopBackgroundTask(_) => {}
                                     }
                                     input_value.set(String::new());
                                     if history_cursor.get().is_some() {
@@ -2106,8 +2114,7 @@ fn ReplApp(mut hooks: Hooks) -> impl Into<AnyElement<'static>> {
         StatusSlot::Empty
     };
 
-    // Both choice widgets share the same document presentation. Only the
-    // controls below it differ; neither picker interprets Markdown itself.
+    // The frozen document belongs to history; both pickers retain only controls.
     let question = match &current_input_slot {
         InputSlot::DialPad(question) => Some(question),
         InputSlot::FuzzySelect(state) => Some(&state.question),
@@ -2207,15 +2214,19 @@ fn ReplApp(mut hooks: Hooks) -> impl Into<AnyElement<'static>> {
     };
     let heading = ansi_with_style(
         question
-            .and_then(|q| q.title.as_ref())
-            .map(|title| format!("[{title}]"))
+            .map(|q| {
+                let title = q.title.as_ref().map(|title| format!("[{title}]"));
+                if q.description.is_some() {
+                    format!(
+                        "{} · Ctrl+O view full text",
+                        title.as_deref().unwrap_or("Review document")
+                    )
+                } else {
+                    title.unwrap_or_default()
+                }
+            })
             .unwrap_or_default(),
         question_style,
-    );
-    let body = prompt_text.write().render(
-        &prompt_renderer.read(),
-        question.and_then(|q| q.description.as_ref()),
-        w,
     );
     let mut controls = if let Some(panel) = task_panel.clone() {
         ansi(panel)
@@ -2240,7 +2251,6 @@ fn ReplApp(mut hooks: Hooks) -> impl Into<AnyElement<'static>> {
     let mut measured = measurements.write();
     measured.begin(w);
     let heading_rows = measured.rows(&heading);
-    let body_rows = measured.rows(&body);
     let mut controls_rows = measured.rows(&controls);
     let input_row_count = if task_panel.is_some() {
         0
@@ -2256,7 +2266,7 @@ fn ReplApp(mut hooks: Hooks) -> impl Into<AnyElement<'static>> {
     let layout = ChromeLayout::allocate(
         w,
         term_height as usize,
-        heading_rows + body_rows + controls_rows + input_row_count,
+        heading_rows + controls_rows + input_row_count,
         [
             Slot {
                 minimum_full_rows: 0,
@@ -2306,8 +2316,7 @@ fn ReplApp(mut hooks: Hooks) -> impl Into<AnyElement<'static>> {
     }
     let input_layout = InputLayout::allocate(
         layout.input_rows,
-        [heading_rows, body_rows, controls_rows, input_row_count],
-        &mut measured,
+        [heading_rows, controls_rows, input_row_count],
     );
     measured.end();
     drop(measured);
@@ -2325,14 +2334,6 @@ fn ReplApp(mut hooks: Hooks) -> impl Into<AnyElement<'static>> {
         input_layout
     } else {
         InputLayout::default()
-    };
-    let review_hint = if visible.hint > 0 {
-        let offset = usize::try_from(review_handle.read().scroll_offset())
-            .unwrap_or(0)
-            .min(body_rows.saturating_sub(visible.body));
-        layout::review_hint(offset, visible.body, body_rows)
-    } else {
-        String::new()
     };
     let row_height = |rows: usize| {
         u32::try_from(rows).expect("allocated chrome rows fit the terminal's u16 geometry")
@@ -2380,15 +2381,6 @@ fn ReplApp(mut hooks: Hooks) -> impl Into<AnyElement<'static>> {
                 }
             }))
             #(row_text("heading", heading, visible.heading))
-            // Stateful owners stay mounted for their handle's entire lifetime,
-            // including between questions. Only their stateless text can be
-            // omitted; a handle outliving its ScrollView references dead State.
-            View(height: row_height(visible.body), flex_shrink: 0.0, overflow: Overflow::Hidden) {
-                ScrollView(handle: Some(review_handle), auto_scroll: false, scrollbar: Some(false), keyboard_scroll: Some(false)) {
-                    #((body_rows > 0).then(|| element! { RichText(content: body) }))
-                }
-            }
-            #(row_text("review-hint", ansi_with_style(review_hint, chrome_muted), visible.hint))
             #(row_text("controls", controls, visible.controls))
             // The editor stays mounted even with zero allocated rows so a
             // shrink/grow cannot discard its cursor, draft or edit ownership.
