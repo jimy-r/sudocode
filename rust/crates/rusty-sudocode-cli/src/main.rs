@@ -2710,6 +2710,18 @@ enum CoordinatorEvent {
         prompt: String,
         display: String,
     },
+    /// A background shell or monitor the model started has ended.
+    ///
+    /// Separate from [`Self::SubagentCompleted`] because the two want opposite
+    /// idle behaviour: a sub-agent result wakes a turn (the model delegated the
+    /// work and is waiting for it), while a background task must NOT seize an
+    /// idle prompt — the human may be mid-thought or exiting. It is queued and
+    /// delivered with the next turn, which still keeps the tool description's
+    /// promise that the model hears about it without polling.
+    BackgroundTaskCompleted {
+        prompt: String,
+        display: String,
+    },
     TurnComplete,
 }
 
@@ -3512,7 +3524,7 @@ fn run_repl_iocraft_dispatch(
                         // you will be notified" is a promise nothing keeps.
                         if let Some(finished) = background.observe(event) {
                             if completion_tx
-                                .send(CoordinatorEvent::SubagentCompleted {
+                                .send(CoordinatorEvent::BackgroundTaskCompleted {
                                     prompt: finished.prompt,
                                     display: finished.display,
                                 })
@@ -3666,10 +3678,15 @@ fn run_repl_iocraft_dispatch(
                 continue;
             }
             event @ (CoordinatorEvent::PeerMessage(..)
-            | CoordinatorEvent::SubagentCompleted { .. }) => {
+            | CoordinatorEvent::SubagentCompleted { .. }
+            | CoordinatorEvent::BackgroundTaskCompleted { .. }) => {
                 // Peer messages and sub-agent results share human input's
                 // scheduling: run while idle, otherwise queue until the turn
                 // boundary. Keep their origin distinct in the UI and history.
+                // A background task's news must never seize an idle prompt:
+                // the human may be typing or exiting, and a turn started under
+                // their `/exit` leaves the session unable to shut down.
+                let mut wake_on_idle = true;
                 let (prompt, display, kind, ack) = match event {
                     CoordinatorEvent::PeerMessage(msg, ack) => {
                         let prompt = tools::compose_next_turn_from_envelopes(&[msg]);
@@ -3683,9 +3700,13 @@ fn run_repl_iocraft_dispatch(
                     CoordinatorEvent::SubagentCompleted { prompt, display } => {
                         (prompt, display, input_queue::QueuedKind::Subagent, None)
                     }
+                    CoordinatorEvent::BackgroundTaskCompleted { prompt, display } => {
+                        wake_on_idle = false;
+                        (prompt, display, input_queue::QueuedKind::Subagent, None)
+                    }
                     _ => unreachable!(),
                 };
-                if !turn_active {
+                if !turn_active && wake_on_idle {
                     match kind {
                         input_queue::QueuedKind::Subagent => repl_output.println(&display),
                         _ => echo_peer_to_scrollback(&repl_output, &display),
