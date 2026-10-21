@@ -1070,14 +1070,35 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
     let mut specs = vec![
         ToolSpec {
             name: "bash",
-            description: "Execute a shell command in the current workspace.",
+            description: concat!(
+                "Executes a bash command and returns its output.\n\n",
+                "- `timeout` is in milliseconds (default 120000 for a foreground command).\n",
+                "- `run_in_background` runs the command detached: it keeps running across ",
+                "turns and notifies you when it exits. No `&` needed. Use it when you do not ",
+                "need the result immediately — you will be told when it completes, and you ",
+                "can read its output file at any time.\n",
+                "- Avoid unnecessary `sleep` commands:\n",
+                "  - Do not sleep between commands that can run immediately — just run them.\n",
+                "  - If your command is long running and you would like to be notified when ",
+                "it finishes, use `run_in_background`. No sleep needed.\n",
+                "  - If waiting on a background task or monitor you started, end your turn: ",
+                "you will be notified when it finishes or fires — do not poll.\n",
+                "  - Do not retry failing commands in a sleep loop — diagnose the root cause.\n",
+                "  - Long leading `sleep` commands block the turn and everything queued ",
+                "behind it. To wait until a condition is met, use Monitor with a loop that ",
+                "exits when it holds (e.g. `until <check>; do sleep 2; done`) — you are ",
+                "notified when the loop exits. Do not chain shorter sleeps to work around ",
+                "this.\n",
+                "- Use the Monitor tool to watch a process or log; for a one-shot ",
+                "\"wait until done\", use `run_in_background` instead."
+            ),
             input_schema: json!({
                 "type": "object",
                 "properties": {
                     "command": { "type": "string" },
                     "timeout": { "type": "integer", "minimum": 1, "description": "Maximum milliseconds to wait before interrupting the command (default 120000)." },
                     "description": { "type": "string" },
-                    "run_in_background": { "type": "boolean" },
+                    "run_in_background": { "type": "boolean", "description": "Run the command detached: it keeps running across turns and notifies you when it exits. No `&` needed. Prefer this over sleeping or polling for long-running work." },
                     "dangerouslyDisableSandbox": { "type": "boolean" },
                     "namespaceRestrictions": { "type": "boolean" },
                     "isolateNetwork": { "type": "boolean" },
