@@ -64,6 +64,10 @@ const DT_DIR_SETATTR: i32 = DT_DIR.cast_signed();
 const DT_LINK_SETATTR: i32 = 6;
 
 enum VfsOp {
+    Scoped {
+        request: Box<proto::ScopedFsRequest>,
+        resp: mpsc::SyncSender<io::Result<proto::ScopedFsResponse>>,
+    },
     Lock {
         request: LockRequest,
         resp: mpsc::SyncSender<io::Result<Option<String>>>,
@@ -284,6 +288,12 @@ impl NexusVfsClient {
                         // that as `Disconnected` -> `BrokenPipe`.
                         tokio::spawn(async move {
                             match op {
+                                VfsOp::Scoped { request, resp } => {
+                                    let deadline = scoped_deadline(request.operation.as_ref());
+                                    let result =
+                                        client.scoped_fs(deadlined(*request, deadline)).await;
+                                    let _ = resp.send(grpc_result(result, Ok));
+                                }
                                 VfsOp::Lock { request, resp } => {
                                     let result =
                                         client.lock(deadlined(request, LOCK_DEADLINE)).await;
@@ -626,6 +636,32 @@ impl NexusVfsClient {
         )
     }
 
+    /// Execute a restricted operation without ever falling back to an old RPC.
+    pub fn scoped(
+        &self,
+        operation: proto::scoped_fs_request::Operation,
+        scope: &[u8],
+        auth_token: &str,
+    ) -> io::Result<proto::scoped_fs_response::Result> {
+        let (resp_tx, resp_rx) = mpsc::sync_channel(1);
+        let deadline = scoped_deadline(Some(&operation));
+        self.tx
+            .send(VfsOp::Scoped {
+                request: Box::new(proto::ScopedFsRequest {
+                    version: 1,
+                    auth_token: auth_token.to_owned(),
+                    resource_scope_json: scope.to_vec(),
+                    operation: Some(operation),
+                }),
+                resp: resp_tx,
+            })
+            .map_err(|_| broken_pipe())?;
+        let response = await_reply(&resp_rx, deadline + HANDOFF_GRACE)?;
+        response
+            .result
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing scoped result"))
+    }
+
     /// Atomically acquire, or renew `lock_id`, through the existing lock RPC.
     pub fn lock(
         &self,
@@ -938,7 +974,7 @@ where
 }
 
 /// Preserve missing-entry and admission errors from the VFS response envelope.
-fn vfs_err(payload: &[u8]) -> io::Error {
+pub fn vfs_err(payload: &[u8]) -> io::Error {
     /// `FileNotFound` on the node's error enum (`transport/src/grpc.rs`).
     const FILE_NOT_FOUND: i64 = -32007;
     const PERMISSION_ERROR: i64 = -32003;
@@ -1013,6 +1049,15 @@ const HANDOFF_GRACE: Duration = Duration::from_secs(2);
 /// Derived in ONE place because two callers need the same answer: the public
 /// method (to size its backstop) and the worker arm (to stamp the request). They
 /// computed it separately before, which is the same value with two definitions.
+fn scoped_deadline(op: Option<&proto::scoped_fs_request::Operation>) -> Duration {
+    match op {
+        Some(proto::scoped_fs_request::Operation::StreamReadAt(r)) => {
+            tail_deadline(r.blocking, r.timeout_ms)
+        }
+        _ => OP_DEADLINE,
+    }
+}
+
 fn tail_deadline(blocking: bool, timeout_ms: u64) -> Duration {
     if blocking {
         Duration::from_millis(timeout_ms) + TAIL_GRACE
@@ -1086,6 +1131,36 @@ fn await_reply<T>(resp_rx: &mpsc::Receiver<io::Result<T>>, budget: Duration) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scoped_unsupported_never_falls_back_to_legacy_rpc() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let worker = std::thread::spawn(move || {
+            match rx.blocking_recv().unwrap() {
+                VfsOp::Scoped { resp, .. } => resp
+                    .send(Err(io::Error::new(
+                        io::ErrorKind::Unsupported,
+                        "old server",
+                    )))
+                    .unwrap(),
+                _ => panic!("restricted request used legacy RPC"),
+            }
+            assert!(matches!(
+                rx.try_recv(),
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+            ));
+        });
+        let client = NexusVfsClient { tx };
+        let error = client
+            .scoped(
+                proto::scoped_fs_request::Operation::Write(WriteRequest::default()),
+                b"{}",
+                "token",
+            )
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Unsupported);
+        worker.join().unwrap();
+    }
 
     #[test]
     fn times_out_rather_than_parking_forever() {

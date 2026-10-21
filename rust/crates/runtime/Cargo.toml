@@ -71,6 +71,9 @@ walkdir = "2"
 [target.'cfg(unix)'.dependencies]
 nix = { version = "0.29", features = ["poll", "process", "signal"] }
 
+[dev-dependencies]
+backends = { workspace = true }
+
 [target.'cfg(target_os = "linux")'.dev-dependencies]
 # Exercise the shipped VFS host and its error envelopes over real mTLS gRPC.
 transport = { workspace = true }

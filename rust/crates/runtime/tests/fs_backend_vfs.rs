@@ -1874,3 +1874,590 @@ fn remote_stat_preserves_modification_time() {
     let (remote, _host, _client) = remote_backend(&kernel);
     assert_eq!(remote.stat("/ws/ready.txt").unwrap().modified, expected);
 }
+
+fn scoped_descriptor(prefix: &str, read: bool) -> AgentDescriptor {
+    let mut descriptor = desc_for("scoped-agent", "root");
+    let mut rules =
+        vec![serde_json::json!({"capability":"zone.data.write","resource_prefixes":[prefix]})];
+    if read {
+        rules.push(serde_json::json!({"capability":"zone.data.read","resource_prefixes":[prefix]}));
+    }
+    descriptor.labels.insert(
+        ENV_NEXUS_RESOURCE_SCOPE.into(),
+        serde_json::json!({"schema_version":1,"zone_id":"root","rules":rules}).to_string(),
+    );
+    descriptor
+}
+
+#[track_caller]
+fn permission_denied<T>(result: io::Result<T>) {
+    match result {
+        Err(error) => assert_eq!(error.kind(), io::ErrorKind::PermissionDenied, "{error}"),
+        Ok(_) => panic!("expected permission denial"),
+    }
+}
+
+#[test]
+fn metadata_and_lock_share_scope_with_positive_lifecycle_controls() {
+    let kernel = kernel_with_root_backend();
+    let unrestricted = vfs_backend(&kernel);
+    unrestricted.create_dir_all("/private").unwrap();
+    unrestricted.create_dir_all("/ws").unwrap();
+    unrestricted.write("/private/target", b"private").unwrap();
+    unrestricted
+        .link("/private/alias", "/private/target")
+        .unwrap();
+    unrestricted.write("/ws/target", b"allowed").unwrap();
+    unrestricted.link("/ws/alias", "/ws/target").unwrap();
+    let restricted = KernelFsBackend::for_agent_descriptor(
+        kernel.clone(),
+        &scoped_descriptor("/ws", true),
+        "/ws",
+    );
+    permission_denied(restricted.stat("/private/alias"));
+    permission_denied(restricted.read_link("/private/alias"));
+    permission_denied(restricted.try_lock("/private/lease", 1000));
+    assert_eq!(restricted.read_link("/ws/alias").unwrap(), "/ws/target");
+    assert!(restricted.stat("/ws/alias").unwrap().is_symlink);
+    let lease = restricted.try_lock("/ws/lease", 1000).unwrap().unwrap();
+    assert!(restricted.try_lock("/ws/lease", 1000).unwrap().is_none());
+    assert!(lease.renew().unwrap());
+    drop(lease);
+    assert!(restricted.try_lock("/ws/lease", 1000).unwrap().is_some());
+    // The refused scope never acquired the private lock.
+    assert!(unrestricted
+        .try_lock("/private/lease", 1000)
+        .unwrap()
+        .is_some());
+}
+
+#[test]
+fn links_cannot_redirect_scoped_io_or_rename_to_private_content() {
+    let kernel = kernel_with_root_backend();
+    let unrestricted = vfs_backend(&kernel);
+    unrestricted.create_dir_all("/ws").unwrap();
+    unrestricted.create_dir_all("/private").unwrap();
+    unrestricted.write("/private/target", b"private").unwrap();
+    unrestricted.link("/ws/escape", "/private/target").unwrap();
+    let restricted = KernelFsBackend::for_agent_descriptor(
+        kernel.clone(),
+        &scoped_descriptor("/ws", true),
+        "/ws",
+    );
+    permission_denied(restricted.read("/ws/escape"));
+    permission_denied(restricted.write("/ws/escape", b"changed"));
+    permission_denied(restricted.append("/ws/escape", b"changed"));
+    permission_denied(restricted.tail_read("/ws/escape", 0, 0));
+    permission_denied(restricted.rename("/ws/escape", "/ws/copy"));
+    permission_denied(restricted.rename("/ws/file", "/private/copy"));
+    assert_eq!(unrestricted.read("/private/target").unwrap(), b"private");
+    assert!(!unrestricted.exists("/ws/copy").unwrap());
+    assert_eq!(
+        restricted.read_link("/ws/escape").unwrap(),
+        "/private/target"
+    );
+    restricted.write("/ws/file", b"allowed").unwrap();
+    restricted.append("/ws/file", b" append").unwrap();
+    restricted.rename("/ws/file", "/ws/moved").unwrap();
+    assert_eq!(restricted.read("/ws/moved").unwrap(), b"allowed append");
+}
+
+#[test]
+fn scoped_directories_do_not_create_unauthorized_ancestors() {
+    let kernel = kernel_with_root_backend();
+    let restricted = KernelFsBackend::for_agent_descriptor(
+        kernel.clone(),
+        &scoped_descriptor("/fresh/sub", true),
+        "/fresh/sub",
+    );
+    assert!(restricted.create_dir_all("/fresh/sub/leaf").is_err());
+    assert!(kernel.sys_stat("/fresh", "root").is_none());
+    let unrestricted = vfs_backend(&kernel);
+    unrestricted.create_dir_all("/fresh/sub").unwrap();
+    restricted.create_dir_all("/fresh/sub/leaf/deeper").unwrap();
+    assert!(restricted.stat("/fresh/sub/leaf/deeper").unwrap().is_dir);
+}
+
+#[test]
+fn exact_file_scope_and_native_spelling_retain_valid_writes() {
+    let kernel = kernel_with_root_backend();
+    let unrestricted = vfs_backend(&kernel);
+    unrestricted.create_dir_all("/ws").unwrap();
+    let descriptor = scoped_descriptor("/ws/new.txt", true);
+    let mount = std::env::temp_dir().join("pr871-native-spelling");
+    let restricted = KernelFsBackend::for_agent_descriptor(kernel, &descriptor, "/ws")
+        .with_local_workspace(&mount)
+        .unwrap();
+    restricted
+        .write(&mount.join("new.txt").to_string_lossy(), b"new")
+        .unwrap();
+    assert_eq!(restricted.read("/ws/new.txt").unwrap(), b"new");
+    permission_denied(restricted.write("/ws/other.txt", b"other"));
+}
+
+#[test]
+fn write_only_kernel_scope_preserves_internal_read_and_rename() {
+    let kernel = kernel_with_root_backend();
+    let unrestricted = vfs_backend(&kernel);
+    unrestricted.create_dir_all("/ws").unwrap();
+    let restricted =
+        KernelFsBackend::for_agent_descriptor(kernel, &scoped_descriptor("/ws", false), "/ws");
+    restricted.write("/ws/file", b"a").unwrap();
+    restricted.append("/ws/file", b"b").unwrap();
+    restricted.rename("/ws/file", "/ws/moved").unwrap();
+    permission_denied(restricted.read("/ws/moved"));
+    permission_denied(restricted.read_link("/ws/alias"));
+    assert_eq!(unrestricted.read("/ws/moved").unwrap(), b"ab");
+}
+
+#[test]
+fn revoked_lease_does_not_renew_or_release_without_permission() {
+    let kernel = kernel_with_root_backend();
+    let restricted = KernelFsBackend::for_agent_descriptor(
+        kernel.clone(),
+        &scoped_descriptor("/ws", true),
+        "/ws",
+    );
+    let held = restricted.try_lock("/ws/held", 10000).unwrap().unwrap();
+    let lease = restricted.try_lock("/ws/lease", 1).unwrap().unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(650));
+    kernel.set_permission_provider(Arc::new(Box::new(DenyAllMetadata)));
+    permission_denied(lease.renew());
+    drop(lease);
+    drop(held);
+    kernel.set_permission_provider(Arc::new(Box::new(CountingAllow(Arc::new(
+        AtomicUsize::new(0),
+    )))));
+    assert!(restricted.try_lock("/ws/held", 10000).unwrap().is_none());
+    // The lock backend records expiry in integer seconds; wait beyond the original TTL.
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    kernel.set_permission_provider(Arc::new(Box::new(CountingAllow(Arc::new(
+        AtomicUsize::new(0),
+    )))));
+    assert!(restricted.try_lock("/ws/lease", 1).unwrap().is_some());
+}
+
+#[test]
+fn scoped_native_write_does_not_create_ancestors_and_existing_parent_allows_exact_file() {
+    let root = std::env::temp_dir().join(format!("pr871-local-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir(&root).unwrap();
+    let kernel = Arc::new(Kernel::new());
+    kernel.vfs_router_arc().add_mount(
+        "/",
+        "root",
+        Some(Arc::new(
+            backends::storage::local_connector::LocalConnectorBackend::new(&root, true, false)
+                .unwrap(),
+        )),
+        false,
+    );
+    let restricted = KernelFsBackend::for_agent_descriptor(
+        kernel.clone(),
+        &scoped_descriptor("/fresh/sub", true),
+        "/fresh/sub",
+    );
+    assert!(restricted.write("/fresh/sub/file", b"denied").is_err());
+    assert!(restricted.create_dir_all("/fresh/sub/dir").is_err());
+    assert!(!root.join("fresh").exists());
+    std::fs::create_dir_all(root.join("fresh/sub")).unwrap();
+    let exact = KernelFsBackend::for_agent_descriptor(
+        kernel,
+        &scoped_descriptor("/fresh/sub/file", true),
+        "/",
+    );
+    exact.write("/fresh/sub/file", b"allowed").unwrap();
+    assert_eq!(
+        std::fs::read(root.join("fresh/sub/file")).unwrap(),
+        b"allowed"
+    );
+    restricted.create_dir_all("/fresh/sub/dir/deep").unwrap();
+    assert!(root.join("fresh/sub/dir/deep").is_dir());
+    assert!(matches!(
+        restricted.workspace_directory("/private"),
+        Err(KernelError::PermissionDenied(_))
+    ));
+    assert!(!root.join("private").exists());
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+#[cfg(unix)]
+fn stable_native_symlink_targets_are_scoped_and_delete_removes_only_alias() {
+    let root = std::env::temp_dir().join(format!("pr871-links-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(root.join("ws")).unwrap();
+    std::fs::create_dir(root.join("private")).unwrap();
+    std::fs::write(root.join("private/target"), b"private").unwrap();
+    std::os::unix::fs::symlink("../private/target", root.join("ws/escape")).unwrap();
+    std::os::unix::fs::symlink("../private", root.join("ws/dir-escape")).unwrap();
+    let kernel = Arc::new(Kernel::new());
+    kernel.vfs_router_arc().add_mount(
+        "/",
+        "root",
+        Some(Arc::new(
+            backends::storage::local_connector::LocalConnectorBackend::new(&root, true, false)
+                .unwrap(),
+        )),
+        false,
+    );
+    kernel
+        .sys_setattr(
+            "/ws/indirect",
+            &OperationContext::new("test-owner", "root", false, Some("agent-x"), false),
+            0,
+            "",
+            None,
+            None,
+            None,
+            "",
+            "root",
+            false,
+            0,
+            None,
+            None,
+            None,
+            None,
+            Some("private/target"),
+            Some(7),
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+    let restricted = KernelFsBackend::for_agent_descriptor(
+        kernel.clone(),
+        &scoped_descriptor("/ws", true),
+        "/ws",
+    );
+    permission_denied(restricted.read("/ws/indirect"));
+    permission_denied(restricted.read("/ws/escape"));
+    permission_denied(restricted.write("/ws/escape", b"changed"));
+    permission_denied(restricted.stat("/ws/escape"));
+    permission_denied(restricted.readdir("/ws/dir-escape"));
+    let mut descriptor = scoped_descriptor("/", false);
+    descriptor.labels.insert(
+        ENV_NEXUS_RESOURCE_SCOPE.into(),
+        serde_json::json!({"schema_version":1,"zone_id":"root","rules":[
+            {"capability":"zone.data.read","resource_prefixes":["/ws"]},
+            {"capability":"zone.data.write","resource_prefixes":["/"]}
+        ]})
+        .to_string(),
+    );
+    let workspace = KernelFsBackend::for_agent_descriptor(kernel, &descriptor, "/ws");
+    assert!(matches!(
+        workspace.workspace_directory("/ws/dir-escape"),
+        Err(KernelError::PermissionDenied(_))
+    ));
+    restricted.delete("/ws/escape").unwrap();
+    assert!(!root.join("ws/escape").exists());
+    assert_eq!(
+        std::fs::read(root.join("private/target")).unwrap(),
+        b"private"
+    );
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn scoped_mtls_workflow_rejects_actual_targets_and_preserves_lock_and_metadata_controls() {
+    let kernel = kernel_with_root_backend();
+    let local = vfs_backend(&kernel);
+    local.create_dir_all("/ws").unwrap();
+    local.create_dir_all("/private").unwrap();
+    local.write("/ws/ready.txt", b"ready").unwrap();
+    local.write("/private/target", b"private").unwrap();
+    local.link("/private/alias", "/private/target").unwrap();
+    local.link("/ws/escape", "/private/target").unwrap();
+    let (_, _host, client) = remote_backend(&kernel);
+    let scope = scoped_descriptor("/ws", true)
+        .labels
+        .remove(ENV_NEXUS_RESOURCE_SCOPE)
+        .unwrap();
+    let remote = NexusVfsFsBackend::from_arc_mtls_with_scope(
+        client.clone(),
+        "agent-key".into(),
+        "root",
+        &scope,
+    );
+    permission_denied(remote.read_link("/private/alias"));
+    permission_denied(remote.try_lock("/private/lease", 1000));
+    permission_denied(remote.read("/ws/escape"));
+    permission_denied(remote.write("/ws/escape", b"changed"));
+    permission_denied(remote.append("/ws/escape", b"changed"));
+    permission_denied(remote.tail_read("/ws/escape", 0, 0));
+    remote.write("/ws/file", b"a").unwrap();
+    remote.append("/ws/file", b"b").unwrap();
+    remote.rename("/ws/file", "/ws/moved").unwrap();
+    assert_eq!(remote.read("/ws/moved").unwrap(), b"ab");
+    remote.link("/ws/alias", "/ws/moved").unwrap();
+    assert_eq!(remote.read_link("/ws/alias").unwrap(), "/ws/moved");
+    remote.create_dir_all("/ws/nested/deep").unwrap();
+    assert!(remote.stat("/ws/nested/deep").unwrap().is_dir);
+    let lease = remote.try_lock("/ws/lease", 1000).unwrap().unwrap();
+    assert!(remote.try_lock("/ws/lease", 1000).unwrap().is_none());
+    assert!(lease.renew().unwrap());
+    drop(lease);
+    assert!(remote.try_lock("/ws/lease", 1000).unwrap().is_some());
+    assert_eq!(local.read("/private/target").unwrap(), b"private");
+    // The server validates scope even when a caller bypasses client admission.
+    let op = nexus_vfs_client::proto::scoped_fs_request::Operation::Write(
+        nexus_vfs_client::proto::WriteRequest {
+            path: "/private/new".into(),
+            content: b"denied".to_vec(),
+            ..Default::default()
+        },
+    );
+    let invalid = client.scoped(op, b"{}", "agent-key");
+    permission_denied(invalid);
+    assert!(!local.exists("/private/new").unwrap());
+    permission_denied(
+        client
+            .scoped(
+                nexus_vfs_client::proto::scoped_fs_request::Operation::Write(
+                    nexus_vfs_client::proto::WriteRequest {
+                        path: "/private/new".into(),
+                        content: b"denied".to_vec(),
+                        ..Default::default()
+                    },
+                ),
+                scope.as_bytes(),
+                "agent-key",
+            )
+            .and_then(|reply| match reply {
+                nexus_vfs_client::proto::scoped_fs_response::Result::Write(r) if r.is_error => {
+                    Err(nexus_vfs_client::vfs_err(&r.error_payload))
+                }
+                _ => Ok(()),
+            }),
+    );
+    let wrong_zone = scope.replace("root", "different-zone");
+    permission_denied(client.scoped(
+        nexus_vfs_client::proto::scoped_fs_request::Operation::Write(
+            nexus_vfs_client::proto::WriteRequest {
+                path: "/ws/wrong-zone".into(),
+                content: b"denied".to_vec(),
+                ..Default::default()
+            },
+        ),
+        wrong_zone.as_bytes(),
+        "agent-key",
+    ));
+    assert!(!local.exists("/ws/wrong-zone").unwrap());
+    let exact = scoped_descriptor("/ws/atomic", true)
+        .labels
+        .remove(ENV_NEXUS_RESOURCE_SCOPE)
+        .unwrap();
+    let atomic = NexusVfsFsBackend::from_arc_mtls_with_scope(
+        client.clone(),
+        "agent-key".into(),
+        "root",
+        &exact,
+    );
+    permission_denied(atomic.write_atomic("/ws/atomic", b"denied"));
+    assert!(!local.exists("/ws/atomic").unwrap());
+    assert!(!local
+        .readdir("/ws")
+        .unwrap()
+        .iter()
+        .any(|entry| entry.name.contains("atomic")));
+    let write_only = scoped_descriptor("/ws", false)
+        .labels
+        .remove(ENV_NEXUS_RESOURCE_SCOPE)
+        .unwrap();
+    let remote = NexusVfsFsBackend::from_arc_mtls_with_scope(
+        client.clone(),
+        "agent-key".into(),
+        "root",
+        &write_only,
+    );
+    permission_denied(
+        client
+            .scoped(
+                nexus_vfs_client::proto::scoped_fs_request::Operation::Read(
+                    nexus_vfs_client::proto::ReadRequest {
+                        path: "/ws/moved".into(),
+                        ..Default::default()
+                    },
+                ),
+                write_only.as_bytes(),
+                "agent-key",
+            )
+            .and_then(|reply| match reply {
+                nexus_vfs_client::proto::scoped_fs_response::Result::Read(r) if r.is_error => {
+                    Err(nexus_vfs_client::vfs_err(&r.error_payload))
+                }
+                _ => Ok(()),
+            }),
+    );
+    remote.rename("/ws/moved", "/ws/renamed").unwrap();
+    permission_denied(remote.read("/ws/renamed"));
+    permission_denied(remote.append("/ws/renamed", b"denied"));
+    permission_denied(remote.create_dir_all("/ws/write-only"));
+    assert_eq!(local.read("/ws/renamed").unwrap(), b"ab");
+}
+
+#[test]
+fn scoped_stream_append_and_existing_log_keep_write_only_principal_behavior() {
+    let kernel = kernel_with_root_backend();
+    kernel.create_stream("/ws/stream", 65536).unwrap();
+    let restricted = KernelFsBackend::for_agent_descriptor(
+        kernel.clone(),
+        &scoped_descriptor("/ws", false),
+        "/ws",
+    );
+    let policy = install_file_policy(&kernel);
+    policy
+        .read_denied
+        .lock()
+        .unwrap()
+        .insert("/ws/stream".into());
+    restricted.create_append_log("/ws/stream", 0).unwrap();
+    restricted.append("/ws/stream", b"frame").unwrap();
+    assert_eq!(
+        kernel.sys_stat("/ws/stream", "root").unwrap().entry_type,
+        kernel::meta_store::DT_STREAM
+    );
+    permission_denied(restricted.read("/ws/stream"));
+    policy.read_denied.lock().unwrap().clear();
+    assert_eq!(vfs_backend(&kernel).read("/ws/stream").unwrap(), b"frame");
+}
+
+#[test]
+fn scoped_local_read_retains_not_found_and_backend_io_errors() {
+    struct FaultStore(MemStore);
+    impl ObjectStore for FaultStore {
+        fn name(&self) -> &str {
+            "fault-store"
+        }
+        fn read_content(&self, id: &str, ctx: &OperationContext) -> Result<Vec<u8>, StorageError> {
+            if id.ends_with("missing") {
+                return Err(StorageError::NotFound(id.into()));
+            }
+            if id.ends_with("broken") {
+                return Err(StorageError::IOError(io::Error::other(
+                    "actual backend fault",
+                )));
+            }
+            self.0.read_content(id, ctx)
+        }
+        fn write_content(
+            &self,
+            bytes: &[u8],
+            id: &str,
+            ctx: &OperationContext,
+            offset: u64,
+        ) -> Result<WriteResult, StorageError> {
+            self.0.write_content(bytes, id, ctx, offset)
+        }
+        fn get_content_size(&self, id: &str) -> Result<u64, StorageError> {
+            self.0.get_content_size(id)
+        }
+    }
+    let kernel = Arc::new(Kernel::new());
+    kernel.vfs_router_arc().add_mount(
+        "/",
+        "root",
+        Some(Arc::new(FaultStore(MemStore::default()))),
+        false,
+    );
+    let local = vfs_backend(&kernel);
+    local.write("/ws/missing", b"tracked").unwrap();
+    local.write("/ws/broken", b"tracked").unwrap();
+    let restricted =
+        KernelFsBackend::for_agent_descriptor(kernel, &scoped_descriptor("/ws", true), "/ws");
+    assert_eq!(
+        restricted.read("/ws/missing").unwrap_err().kind(),
+        io::ErrorKind::NotFound
+    );
+    let error = restricted.read("/ws/broken").unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::Other);
+    assert!(error.to_string().contains("actual backend fault"));
+}
+
+#[test]
+fn scoped_enumeration_does_not_seed_unadmitted_child_metadata() {
+    use kernel::abc::object_store::BackendStat;
+    struct ListingStore {
+        children: Mutex<Vec<String>>,
+        stats: AtomicUsize,
+    }
+    impl ObjectStore for ListingStore {
+        fn name(&self) -> &str {
+            "listing"
+        }
+        fn list_dir(&self, _: &str) -> Result<Vec<String>, StorageError> {
+            Ok(self.children.lock().unwrap().clone())
+        }
+        fn stat(&self, _: &str) -> Result<BackendStat, StorageError> {
+            self.stats.fetch_add(1, Ordering::SeqCst);
+            Ok(BackendStat {
+                size: 7,
+                is_dir: false,
+            })
+        }
+        fn read_content(&self, _: &str, _: &OperationContext) -> Result<Vec<u8>, StorageError> {
+            unreachable!()
+        }
+        fn write_content(
+            &self,
+            _: &[u8],
+            _: &str,
+            _: &OperationContext,
+            _: u64,
+        ) -> Result<WriteResult, StorageError> {
+            unreachable!()
+        }
+        fn get_content_size(&self, _: &str) -> Result<u64, StorageError> {
+            unreachable!()
+        }
+    }
+    let backend = Arc::new(ListingStore {
+        children: Mutex::new(Vec::new()),
+        stats: AtomicUsize::new(0),
+    });
+    let kernel = Arc::new(Kernel::new());
+    kernel
+        .vfs_router_arc()
+        .add_mount("/ws", "root", Some(backend.clone()), false);
+    kernel.arm_metadata_sync("/ws", "root");
+    backend.children.lock().unwrap().push("escape".into());
+    backend.stats.store(0, Ordering::SeqCst);
+    let restricted =
+        KernelFsBackend::for_agent_descriptor(kernel, &scoped_descriptor("/ws", true), "/ws");
+    assert_eq!(restricted.readdir("/ws").unwrap()[0].name, "escape");
+    assert_eq!(
+        backend.stats.load(Ordering::SeqCst),
+        0,
+        "scoped discovery must not stat or seed newly discovered child targets"
+    );
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn scoped_remote_revocation_preserves_lease_until_expiry() {
+    let kernel = kernel_with_root_backend();
+    let local = vfs_backend(&kernel);
+    local.create_dir_all("/ws").unwrap();
+    local.write("/ws/ready.txt", b"ready").unwrap();
+    let (_, _host, client) = remote_backend(&kernel);
+    let policy = install_file_policy(&kernel);
+    let scope = scoped_descriptor("/ws", true)
+        .labels
+        .remove(ENV_NEXUS_RESOURCE_SCOPE)
+        .unwrap();
+    let remote =
+        NexusVfsFsBackend::from_arc_mtls_with_scope(client, "agent-key".into(), "root", &scope);
+    let held = remote.try_lock("/ws/held", 10000).unwrap().unwrap();
+    let lease = remote.try_lock("/ws/lease", 1).unwrap().unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(650));
+    policy.deny("/ws/lease");
+    policy.deny("/ws/held");
+    permission_denied(lease.renew());
+    drop(lease);
+    drop(held);
+    policy.denied.lock().unwrap().clear();
+    assert!(remote.try_lock("/ws/held", 10000).unwrap().is_none());
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    assert!(remote.try_lock("/ws/lease", 1).unwrap().is_some());
+}

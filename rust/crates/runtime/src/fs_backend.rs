@@ -11,6 +11,7 @@
 use std::io;
 use std::sync::Arc;
 
+use crate::scoped_vfs::{call as scoped_call, wrong_reply};
 use crate::workspace_root::current_workspace_root;
 use crate::zone_context::{ContextSource, HostZoneContext, ResourceAccessKind, ZoneAuthError};
 use kernel::core::agents::registry::AgentDescriptor;
@@ -19,6 +20,10 @@ use kernel::kernel::syscall::ReaddirOpts;
 use kernel::kernel::{Kernel, KernelError, OperationContext};
 use kernel::meta_store::{DT_LINK, DT_STREAM};
 use kernel::Permission;
+use nexus_vfs_client::proto::{
+    self as vfs_proto, scoped_fs_request::Operation as ScopedOp,
+    scoped_fs_response::Result as ScopedReply,
+};
 
 /// An exclusive backend lock. Dropping the handle releases ownership.
 /// Renewal returning false means ownership was lost and writes must stop.
@@ -934,11 +939,61 @@ pub struct KernelFsBackend<K: KernelConvenience> {
     path_view: KernelPathView,
 }
 
+#[derive(Debug)]
+struct FsResourceGuard {
+    zone: HostZoneContext,
+    kind: ResourceAccessKind,
+}
+
+impl contracts::resource_guard::ResourceGuard for FsResourceGuard {
+    fn check(&self, path: &str) -> Result<(), String> {
+        self.zone
+            .authorize_path_for(
+                self.kind,
+                match self.kind {
+                    ResourceAccessKind::Read => "zone.data.read",
+                    ResourceAccessKind::Write => "zone.data.write",
+                },
+                path,
+            )
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    }
+}
+
+#[derive(Debug)]
+struct WorkspaceResourceGuard {
+    read: FsResourceGuard,
+    write: FsResourceGuard,
+}
+impl contracts::resource_guard::ResourceGuard for WorkspaceResourceGuard {
+    fn check(&self, path: &str) -> Result<(), String> {
+        self.read.check(path)?;
+        self.write.check(path)
+    }
+}
+
 /// Permission capability needed by the in-process filesystem adapter.
 /// Metadata syscalls carry only a routing zone, so the adapter must admit them
 /// through the kernel's installed policy using the caller's full identity.
 /// Implementations delegate to that policy rather than maintaining another one.
 pub trait KernelFsAccess {
+    fn admitted_stat(
+        &self,
+        path: &str,
+        ctx: &OperationContext,
+    ) -> Result<Option<kernel::kernel::StatResult>, KernelError>;
+    fn admitted_write_stat(
+        &self,
+        path: &str,
+        ctx: &OperationContext,
+    ) -> Result<Option<kernel::kernel::StatResult>, KernelError>;
+    fn admitted_readdir(
+        &self,
+        path: &str,
+        ctx: &OperationContext,
+    ) -> Result<Vec<(String, u8)>, KernelError>;
+    fn admitted_mkdir_all(&self, path: &str, ctx: &OperationContext) -> Result<(), KernelError>;
     fn check_fs_permission(
         &self,
         path: &str,
@@ -956,6 +1011,30 @@ pub trait KernelFsAccess {
 }
 
 impl KernelFsAccess for Kernel {
+    fn admitted_stat(
+        &self,
+        path: &str,
+        ctx: &OperationContext,
+    ) -> Result<Option<kernel::kernel::StatResult>, KernelError> {
+        self.scoped_stat(path, ctx)
+    }
+    fn admitted_write_stat(
+        &self,
+        path: &str,
+        ctx: &OperationContext,
+    ) -> Result<Option<kernel::kernel::StatResult>, KernelError> {
+        self.scoped_stat_for(path, ctx, Permission::Write)
+    }
+    fn admitted_readdir(
+        &self,
+        path: &str,
+        ctx: &OperationContext,
+    ) -> Result<Vec<(String, u8)>, KernelError> {
+        self.scoped_readdir(path, ctx, ReaddirOpts::default())
+    }
+    fn admitted_mkdir_all(&self, path: &str, ctx: &OperationContext) -> Result<(), KernelError> {
+        self.scoped_mkdir_all(path, ctx)
+    }
     fn check_fs_permission(
         &self,
         path: &str,
@@ -996,7 +1075,7 @@ impl KernelFsAccess for Kernel {
                 "workspace directory escapes its backend root".into(),
             ));
         }
-        self.mkdir(path, ctx, true, true)?;
+        self.scoped_mkdir_all(path, ctx)?;
         let physical = physical
             .canonicalize()
             .map_err(|error| KernelError::IOError(format!("workspace directory: {error}")))?;
@@ -1010,6 +1089,49 @@ impl KernelFsAccess for Kernel {
 }
 
 impl<K: KernelConvenience + KernelFsAccess> KernelFsBackend<K> {
+    fn operation_context(&self, kind: ResourceAccessKind) -> OperationContext {
+        let mut ctx = self.ctx.clone();
+        if let Some(zone) = &self.zone_context {
+            if zone.has_resource_restriction() {
+                ctx.resource_guard = Some(Arc::new(FsResourceGuard {
+                    zone: zone.clone(),
+                    kind,
+                }));
+            }
+        }
+        ctx
+    }
+
+    pub fn workspace_directory(
+        &self,
+        path: &str,
+    ) -> Result<Option<std::path::PathBuf>, KernelError> {
+        self.authorize_target(path, ResourceAccessKind::Read)
+            .map_err(|error| KernelError::PermissionDenied(error.to_string()))?;
+        self.authorize_target(path, ResourceAccessKind::Write)
+            .map_err(|error| KernelError::PermissionDenied(error.to_string()))?;
+        let path = self
+            .to_kernel(path)
+            .map_err(|error| KernelError::PermissionDenied(error.to_string()))?;
+        let mut ctx = self.operation_context(ResourceAccessKind::Write);
+        if let Some(zone) = self
+            .zone_context
+            .as_ref()
+            .filter(|zone| zone.has_resource_restriction())
+        {
+            ctx.resource_guard = Some(Arc::new(WorkspaceResourceGuard {
+                read: FsResourceGuard {
+                    zone: zone.clone(),
+                    kind: ResourceAccessKind::Read,
+                },
+                write: FsResourceGuard {
+                    zone: zone.clone(),
+                    kind: ResourceAccessKind::Write,
+                },
+            }));
+        }
+        self.kernel.local_workspace_directory(&path, &ctx)
+    }
     /// Build a backend whose zone authority is unverified by construction.
     ///
     /// `new` is the raw seam: whatever the caller claims in `ctx`, nothing
@@ -1105,7 +1227,7 @@ impl<K: KernelConvenience + KernelFsAccess> KernelFsBackend<K> {
         let Some(zone_context) = &self.zone_context else {
             return Ok(());
         };
-        let normalized = lexical_join(&self.workspace_root, path)?.replace('\\', "/");
+        let normalized = self.to_kernel(path)?.replace('\\', "/");
         zone_context
             .authorize_path_for(
                 access_kind,
@@ -1254,10 +1376,14 @@ impl<K: KernelConvenience + KernelFsAccess> KernelFsBackend<K> {
     }
 
     /// True when the entry at `path` is a DT_STREAM (native append-log).
-    fn is_stream_entry(&self, path: &str) -> bool {
-        self.kernel
-            .sys_stat(path, &self.ctx.zone_id)
-            .is_some_and(|s| s.entry_type == DT_STREAM)
+    fn is_stream_entry(&self, path: &str, ctx: &OperationContext, write: bool) -> io::Result<bool> {
+        let stat = if write {
+            self.kernel.admitted_write_stat(path, ctx)
+        } else {
+            self.kernel.admitted_stat(path, ctx)
+        };
+        stat.map_err(kernel_err)
+            .map(|stat| stat.is_some_and(|s| s.entry_type == DT_STREAM))
     }
 
     /// Read an entire DT_STREAM as the concatenation of its record payloads.
@@ -1268,17 +1394,31 @@ impl<K: KernelConvenience + KernelFsAccess> KernelFsBackend<K> {
     /// stream byte-for-byte. Cold segments spilled out of the hot tier are
     /// fetched transparently by the kernel. Non-blocking (`timeout_ms = 0`):
     /// the walk stops at the tail rather than parking for new data.
-    fn read_stream_all(&self, path: &str) -> io::Result<Vec<u8>> {
+    fn read_stream_all(&self, path: &str, ctx: &OperationContext) -> io::Result<Vec<u8>> {
         read_framed_contents(|offset| {
             let result = self
                 .kernel
-                .sys_read(path, &self.ctx, 0, offset)
+                .sys_read(path, ctx, 0, offset)
                 .map_err(kernel_err)?;
             Ok((
                 result.data.unwrap_or_default(),
                 result.stream_next_offset.map_or(offset, |next| next as u64),
             ))
         })
+    }
+
+    fn read_unchecked(&self, path: &str, ctx: &OperationContext) -> io::Result<Vec<u8>> {
+        if self.is_stream_entry(path, ctx, true)? {
+            return self.read_stream_all(path, ctx);
+        }
+        self.kernel
+            .sys_read(path, ctx, 0, 0)
+            .map_err(kernel_err)
+            .and_then(|result| {
+                result.data.ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::NotFound, format!("{path}: no data"))
+                })
+            })
     }
 }
 
@@ -1303,20 +1443,6 @@ fn read_framed_contents(
         contents.extend_from_slice(&payload);
         offset = next;
     }
-
-    fn read_unchecked(&self, path: &str) -> io::Result<Vec<u8>> {
-        if self.is_stream_entry(path) {
-            return self.read_stream_all(path);
-        }
-        self.kernel
-            .sys_read(path, &self.ctx, 0, 0)
-            .map_err(kernel_err)
-            .and_then(|result| {
-                result.data.ok_or_else(|| {
-                    io::Error::new(io::ErrorKind::NotFound, format!("{path}: no data"))
-                })
-            })
-    }
 }
 
 /// Preserve the error kinds filesystem callers use for admission and creation.
@@ -1333,14 +1459,16 @@ impl<K: KernelConvenience + KernelFsAccess + Send + Sync + 'static> FsBackend
     for KernelFsBackend<K>
 {
     fn try_lock(&self, path: &str, ttl_ms: u64) -> io::Result<Option<Arc<dyn FsLock>>> {
+        let ctx = self.operation_context(ResourceAccessKind::Write);
+        self.authorize_target(path, ResourceAccessKind::Write)?;
         let path = self.to_kernel(path)?;
         self.kernel
-            .check_fs_permission(&path, Permission::Write, &self.ctx)
+            .check_fs_permission(&path, Permission::Write, &ctx)
             .map_err(kernel_err)?;
         let ttl_secs = ttl_ms / 1000 + 1;
         let Some(id) = self
             .kernel
-            .sys_lock(&path, "", 1, ttl_secs, &self.ctx.user_id)
+            .sys_lock(&path, "", 1, ttl_secs, &ctx.user_id)
             .map_err(kernel_err)?
         else {
             return Ok(None);
@@ -1349,30 +1477,40 @@ impl<K: KernelConvenience + KernelFsAccess + Send + Sync + 'static> FsBackend
         let renew_kernel = Arc::clone(&kernel);
         let renew_path = path.clone();
         let renew_id = id.clone();
+        let renew_ctx = ctx.clone();
         Ok(Some(Arc::new(BackendLock {
             renew: Box::new(move || {
                 renew_kernel
-                    .sys_lock(&renew_path, &renew_id, 1, ttl_secs, "")
+                    .check_fs_permission(&renew_path, Permission::Write, &renew_ctx)
+                    .map_err(kernel_err)?;
+                renew_kernel
+                    .sys_lock(&renew_path, &renew_id, 1, ttl_secs, &renew_ctx.user_id)
                     .map(|id| id.is_some())
                     .map_err(kernel_err)
             }),
             release: Box::new(move || {
-                let _ = kernel.sys_unlock(&path, &id, false);
+                if kernel
+                    .check_fs_permission(&path, Permission::Write, &ctx)
+                    .is_ok()
+                {
+                    let _ = kernel.sys_unlock(&path, &id, false);
+                }
             }),
         })))
     }
     fn read(&self, path: &str) -> io::Result<Vec<u8>> {
+        let ctx = self.operation_context(ResourceAccessKind::Read);
         self.authorize_target(path, ResourceAccessKind::Read)?;
         // The message this builds names the path as the CALLER spelled it: an
         // error a user reads should name the file the way they named it.
         let vfs = &self.to_kernel(path)?;
         // A DT_STREAM is read by walking its framed records to the tail; a
         // single `sys_read` would return only the first record's payload.
-        if self.is_stream_entry(vfs) {
-            return self.read_stream_all(vfs);
+        if self.is_stream_entry(vfs, &ctx, false)? {
+            return self.read_stream_all(vfs, &ctx);
         }
         self.kernel
-            .sys_read(vfs, &self.ctx, 0, 0)
+            .sys_read(vfs, &ctx, 0, 0)
             .map_err(kernel_err)
             .and_then(|r| {
                 r.data.ok_or_else(|| {
@@ -1383,10 +1521,11 @@ impl<K: KernelConvenience + KernelFsAccess + Send + Sync + 'static> FsBackend
     }
 
     fn write(&self, path: &str, data: &[u8]) -> io::Result<()> {
+        let ctx = self.operation_context(ResourceAccessKind::Write);
         self.authorize_target(path, ResourceAccessKind::Write)?;
         let path = &self.to_kernel(path)?;
         self.kernel
-            .sys_write(path, &self.ctx, data, 0)
+            .sys_write(path, &ctx, data, 0)
             .map_err(kernel_err)
             .and_then(|result| {
                 if result.hit {
@@ -1400,16 +1539,17 @@ impl<K: KernelConvenience + KernelFsAccess + Send + Sync + 'static> FsBackend
     }
 
     fn append(&self, path: &str, data: &[u8]) -> io::Result<()> {
+        let ctx = self.operation_context(ResourceAccessKind::Write);
         self.authorize_target(path, ResourceAccessKind::Write)?;
         let path = &self.to_kernel(path)?;
         // A DT_STREAM appends `data` as one framed record in O(1): `sys_write`
         // pushes to the log tail (the offset arg is ignored for streams).
         // Regular files have no O(1) append, so fall back to read-concat-write
         // (kernel `sys_write` is a whole-object replace, not an OS append).
-        if self.is_stream_entry(path) {
+        if self.is_stream_entry(path, &ctx, true)? {
             return self.write(path, data);
         }
-        let existing = match self.read_unchecked(path) {
+        let existing = match self.read_unchecked(path, &ctx) {
             Ok(bytes) => bytes,
             Err(error) if error.kind() == io::ErrorKind::NotFound => Vec::new(),
             Err(error) => return Err(error),
@@ -1420,12 +1560,18 @@ impl<K: KernelConvenience + KernelFsAccess + Send + Sync + 'static> FsBackend
     }
 
     fn create_append_log(&self, path: &str, retention: u64) -> io::Result<()> {
+        let ctx = self.operation_context(ResourceAccessKind::Write);
         self.authorize_target(path, ResourceAccessKind::Write)?;
         let path = &self.to_kernel(path)?;
         self.authorize(path, Permission::Write)?;
         // Idempotent: an existing entry (DT_STREAM to append to, or a DT_REG
         // from a prior degraded run) is left as-is.
-        if self.kernel.sys_stat(path, &self.ctx.zone_id).is_some() {
+        if self
+            .kernel
+            .admitted_write_stat(path, &ctx)
+            .map_err(kernel_err)?
+            .is_some()
+        {
             return Ok(());
         }
         if let Some(parent) = std::path::Path::new(path).parent() {
@@ -1442,14 +1588,14 @@ impl<K: KernelConvenience + KernelFsAccess + Send + Sync + 'static> FsBackend
             .kernel
             .sys_setattr(
                 path,
-                &self.ctx,
+                &ctx,
                 DT_STREAM as i32,
                 "",    // backend_name
                 None,  // backend
                 None,  // metastore
                 None,  // raft_backend
                 "wal", // io_profile — durable raft-replicated stream
-                &self.ctx.zone_id,
+                &ctx.zone_id,
                 false,              // is_external
                 retention as usize, // capacity == cold-storage retention budget
                 None,               // read_fd
@@ -1474,13 +1620,13 @@ impl<K: KernelConvenience + KernelFsAccess + Send + Sync + 'static> FsBackend
     }
 
     fn is_append_stream(&self, path: &str) -> io::Result<bool> {
+        let ctx = self.operation_context(ResourceAccessKind::Read);
         self.authorize_target(path, ResourceAccessKind::Read)?;
         let vfs = &self.to_kernel(path)?;
         // `sys_stat` carries only a routing zone — no principal — so the
         // metadata probe must pass the kernel's policy here, with the
         // caller's full identity, exactly like `stat`.
-        self.authorize(vfs, Permission::Read)?;
-        Ok(self.is_stream_entry(vfs))
+        self.is_stream_entry(vfs, &ctx, false)
     }
 
     fn tail_read(
@@ -1489,6 +1635,7 @@ impl<K: KernelConvenience + KernelFsAccess + Send + Sync + 'static> FsBackend
         cursor: u64,
         block_ms: u64,
     ) -> io::Result<(Vec<u8>, u64, bool)> {
+        let ctx = self.operation_context(ResourceAccessKind::Read);
         self.authorize_target(path, ResourceAccessKind::Read)?;
         let path = &self.to_kernel(path)?;
         // Missing paths can become asynchronous model reply streams. Only a
@@ -1496,7 +1643,8 @@ impl<K: KernelConvenience + KernelFsAccess + Send + Sync + 'static> FsBackend
         // kernel's stream cursor and let a missing-path read be retried.
         if self
             .kernel
-            .sys_stat(path, &self.ctx.zone_id)
+            .admitted_stat(path, &ctx)
+            .map_err(kernel_err)?
             .is_some_and(|entry| entry.entry_type == kernel::meta_store::DT_REG)
         {
             return read_byte_tail(self, path, cursor, block_ms);
@@ -1504,7 +1652,7 @@ impl<K: KernelConvenience + KernelFsAccess + Send + Sync + 'static> FsBackend
         read_tail_with(cursor, block_ms, |wait_ms| {
             let result = self
                 .kernel
-                .sys_read(path, &self.ctx, wait_ms, cursor)
+                .sys_read(path, &ctx, wait_ms, cursor)
                 .map_err(kernel_err)?;
             Ok(TailPayload::Frame(
                 result.data.unwrap_or_default(),
@@ -1540,6 +1688,7 @@ impl<K: KernelConvenience + KernelFsAccess + Send + Sync + 'static> FsBackend
     }
 
     fn link(&self, alias: &str, target: &str) -> io::Result<()> {
+        let ctx = self.operation_context(ResourceAccessKind::Write);
         self.authorize_target(alias, ResourceAccessKind::Write)?;
         self.authorize_target(target, ResourceAccessKind::Write)?;
         let alias = &self.to_kernel(alias)?;
@@ -1553,14 +1702,14 @@ impl<K: KernelConvenience + KernelFsAccess + Send + Sync + 'static> FsBackend
         self.kernel
             .sys_setattr(
                 alias,
-                &self.ctx,
+                &ctx,
                 DT_LINK as i32,
                 "",   // backend_name
                 None, // backend
                 None, // metastore
                 None, // raft_backend
                 "",   // io_profile
-                &self.ctx.zone_id,
+                &ctx.zone_id,
                 false,        // is_external
                 0,            // capacity
                 None,         // read_fd
@@ -1580,13 +1729,15 @@ impl<K: KernelConvenience + KernelFsAccess + Send + Sync + 'static> FsBackend
     }
 
     fn read_link(&self, alias: &str) -> io::Result<String> {
+        let ctx = self.operation_context(ResourceAccessKind::Read);
+        self.authorize_target(alias, ResourceAccessKind::Read)?;
         let alias = &self.to_kernel(alias)?;
-        self.authorize(alias, Permission::Read)?;
         // `sys_stat` is lstat — for a `DT_LINK` it fills `link_target` with the
         // path this alias points at. The host-FS `read_link` returns the same
         // target string, so a caller resolving a link is backend-agnostic.
         self.kernel
-            .sys_stat(alias, &self.ctx.zone_id)
+            .admitted_stat(alias, &ctx)
+            .map_err(kernel_err)?
             .and_then(|s| s.link_target)
             // The target was converted on the way in, so it comes back in VFS
             // spelling; a caller gets paths in the one spelling this backend
@@ -1601,20 +1752,22 @@ impl<K: KernelConvenience + KernelFsAccess + Send + Sync + 'static> FsBackend
     }
 
     fn delete(&self, path: &str) -> io::Result<()> {
+        let ctx = self.operation_context(ResourceAccessKind::Write);
         self.authorize_target(path, ResourceAccessKind::Write)?;
         let path = &self.to_kernel(path)?;
         self.kernel
-            .sys_unlink(path, &self.ctx, false)
+            .sys_unlink(path, &ctx, false)
             .map_err(kernel_err)
             .map(|_| ())
     }
 
     fn stat(&self, path: &str) -> io::Result<FsMetadata> {
+        let ctx = self.operation_context(ResourceAccessKind::Read);
         self.authorize_target(path, ResourceAccessKind::Read)?;
         let vfs = &self.to_kernel(path)?;
-        self.authorize(vfs, Permission::Read)?;
         self.kernel
-            .sys_stat(vfs, &self.ctx.zone_id)
+            .admitted_stat(vfs, &ctx)
+            .map_err(kernel_err)?
             .ok_or_else(|| {
                 self.explain_not_found(
                     path,
@@ -1639,10 +1792,9 @@ impl<K: KernelConvenience + KernelFsAccess + Send + Sync + 'static> FsBackend
     }
 
     fn readdir(&self, path: &str) -> io::Result<Vec<FsDirEntry>> {
+        let ctx = self.operation_context(ResourceAccessKind::Read);
         self.authorize_target(path, ResourceAccessKind::Read)?;
         let path = &self.to_kernel(path)?;
-        self.authorize(path, Permission::Read)?;
-        let zone = &self.ctx.zone_id;
         // `sys_readdir` returns `Vec<(child_GLOBAL_path, entry_type)>` —
         // full paths like `/ws/a.rs`, not basenames. The `FsBackend`
         // contract (matching `StdFsBackend` / `NexusVfsFsBackend`) is the
@@ -1651,14 +1803,10 @@ impl<K: KernelConvenience + KernelFsAccess + Send + Sync + 'static> FsBackend
         // basename listing of direct children, so no recursive descent here.
         let entries = self
             .kernel
-            .sys_readdir(path, zone, false, ReaddirOpts::default());
+            .admitted_readdir(path, &ctx)
+            .map_err(kernel_err)?;
         let mut visible = Vec::with_capacity(entries.len());
         for (child, entry_type) in entries {
-            match self.authorize(&child, Permission::Read) {
-                Ok(()) => {}
-                Err(error) if error.kind() == io::ErrorKind::PermissionDenied => continue,
-                Err(error) => return Err(error),
-            }
             visible.push(FsDirEntry {
                 name: child
                     .rsplit(['/', '\\'])
@@ -1672,64 +1820,38 @@ impl<K: KernelConvenience + KernelFsAccess + Send + Sync + 'static> FsBackend
     }
 
     fn create_dir_all(&self, path: &str) -> io::Result<()> {
+        let ctx = self.operation_context(ResourceAccessKind::Write);
         self.authorize_target(path, ResourceAccessKind::Write)?;
         let path = &self.to_kernel(path)?;
         self.authorize(path, Permission::Write)?;
-        // Writing `/ws/sub/c.rs` creates only the leaf's metastore entry —
-        // the intermediate `/ws/sub` dirent is NOT auto-planted, so a later
-        // `readdir("/ws")` would not see `sub` and a recursive walk could
-        // not descend. Plant an explicit DT_DIR for every intermediate
-        // component (idempotent: re-setattr on an existing dir is a no-op).
-        let mut prefix = String::new();
-        for comp in path.split(['/', '\\']).filter(|c| !c.is_empty()) {
-            prefix.push('/');
-            prefix.push_str(comp);
-            // Skip if it already exists as a directory.
-            if self
-                .kernel
-                .sys_stat(&prefix, &self.ctx.zone_id)
-                .is_some_and(|s| s.is_directory)
-            {
-                continue;
-            }
-            self.authorize(&prefix, Permission::Write)?;
-            self.kernel
-                .sys_setattr(
-                    &prefix,
-                    &self.ctx,
-                    1, // DT_DIR
-                    "",
-                    None,
-                    None,
-                    None,
-                    "balanced",
-                    &self.ctx.zone_id,
-                    false,
-                    0,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                )
-                .map_err(kernel_err)?;
-        }
-        Ok(())
+        self.kernel
+            .admitted_mkdir_all(path, &ctx)
+            .map_err(kernel_err)
     }
 
     fn rename(&self, from: &str, to: &str) -> io::Result<()> {
+        let ctx = self.operation_context(ResourceAccessKind::Write);
         self.authorize_target(from, ResourceAccessKind::Write)?;
         self.authorize_target(to, ResourceAccessKind::Write)?;
+        if self
+            .zone_context
+            .as_ref()
+            .is_some_and(|zone| zone.has_resource_restriction())
+        {
+            // A scoped rename must compose from read + write + delete so every
+            // step re-admits through the guard; the kernel refuses a guarded
+            // native rename by design. `read_unchecked` takes the VFS form
+            // (already authorized here), so convert first: over a host-rooted
+            // backend `from` arrives in host spelling.
+            let data = self.read_unchecked(&self.to_kernel(from)?, &ctx)?;
+            self.write(to, &data)?;
+            self.delete(from)?;
+            return Ok(());
+        }
         let from = &self.to_kernel(from)?;
         let to = &self.to_kernel(to)?;
         self.kernel
-            .sys_rename(from, to, &self.ctx)
+            .sys_rename(from, to, &ctx)
             .map_err(kernel_err)
             .and_then(|result| {
                 if result.hit {
@@ -1918,6 +2040,26 @@ impl NexusVfsFsBackend {
         }
     }
 
+    /// Bind an explicit narrowing scope to an already authenticated transport.
+    pub fn from_arc_mtls_with_scope(
+        client: Arc<nexus_vfs_client::NexusVfsClient>,
+        auth_token: String,
+        zone_id: &str,
+        scope_json: &str,
+    ) -> Self {
+        Self {
+            client,
+            auth_token,
+            zone_context: HostZoneContext::from_parts_with_scope(
+                zone_id,
+                None,
+                None,
+                Some(scope_json),
+                ContextSource::TrustedLocal,
+            ),
+        }
+    }
+
     fn authorize_target(&self, path: &str, access_kind: ResourceAccessKind) -> io::Result<()> {
         let normalized = lexical_join("/", path)?.replace('\\', "/");
         let verdict = self
@@ -1948,11 +2090,78 @@ impl NexusVfsFsBackend {
             }
         }
     }
+
+    fn scoped(&self, op: ScopedOp) -> io::Result<ScopedReply> {
+        let scope = self.zone_context.resource_scope_bytes().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::PermissionDenied, "missing resource scope")
+        })?;
+        scoped_call(&self.client, &scope, &self.auth_token, op)
+    }
+    fn restricted(&self) -> bool {
+        self.zone_context.has_resource_restriction()
+    }
+    fn remote_stat(&self, path: &str) -> io::Result<nexus_vfs_client::VfsStat> {
+        if !self.restricted() {
+            return self.client.stat(path, &self.auth_token);
+        }
+        match self.scoped(ScopedOp::Stat(vfs_proto::StatRequest {
+            path: path.into(),
+            ..Default::default()
+        }))? {
+            ScopedReply::Stat(r) if r.found => Ok(nexus_vfs_client::VfsStat {
+                size: r.size as u64,
+                is_directory: r.is_directory,
+                entry_type: r.entry_type,
+                zone_id: r.zone_id,
+                modified_at_ms: r.modified_at_ms,
+                link_target: (!r.link_target.is_empty()).then_some(r.link_target),
+            }),
+            ScopedReply::Stat(_) => Err(io::Error::new(io::ErrorKind::NotFound, path.to_owned())),
+            _ => Err(wrong_reply()),
+        }
+    }
+}
+
+fn remote_lock(
+    client: &nexus_vfs_client::NexusVfsClient,
+    scope: Option<&[u8]>,
+    path: &str,
+    id: &str,
+    ttl_ms: u64,
+    token: &str,
+) -> io::Result<Option<String>> {
+    let Some(scope) = scope else {
+        return client.lock(path, id, ttl_ms, token);
+    };
+    match scoped_call(
+        client,
+        scope,
+        token,
+        ScopedOp::Lock(vfs_proto::LockRequest {
+            path: path.into(),
+            lock_id: id.into(),
+            timeout_ms: ttl_ms,
+            ..Default::default()
+        }),
+    )? {
+        ScopedReply::Lock(r) => Ok(r.acquired.then_some(r.lock_id)),
+        _ => Err(wrong_reply()),
+    }
 }
 
 impl FsBackend for NexusVfsFsBackend {
     fn try_lock(&self, path: &str, ttl_ms: u64) -> io::Result<Option<Arc<dyn FsLock>>> {
-        let Some(id) = self.client.lock(path, "", ttl_ms, &self.auth_token)? else {
+        self.authorize_target(path, ResourceAccessKind::Write)?;
+        let scope = self.zone_context.resource_scope_bytes();
+        let acquired = remote_lock(
+            &self.client,
+            scope.as_deref(),
+            path,
+            "",
+            ttl_ms,
+            &self.auth_token,
+        )?;
+        let Some(id) = acquired else {
             return Ok(None);
         };
         let client = Arc::clone(&self.client);
@@ -1962,19 +2171,48 @@ impl FsBackend for NexusVfsFsBackend {
         let renew_token = token.clone();
         let renew_path = path.clone();
         let renew_id = id.clone();
+        let renew_scope = scope.clone();
         Ok(Some(Arc::new(BackendLock {
             renew: Box::new(move || {
-                renew_client
-                    .lock(&renew_path, &renew_id, ttl_ms, &renew_token)
-                    .map(|id| id.is_some())
+                remote_lock(
+                    &renew_client,
+                    renew_scope.as_deref(),
+                    &renew_path,
+                    &renew_id,
+                    ttl_ms,
+                    &renew_token,
+                )
+                .map(|id| id.is_some())
             }),
             release: Box::new(move || {
-                let _ = client.unlock(&path, &id, &token);
+                if let Some(scope) = &scope {
+                    let _ = scoped_call(
+                        &client,
+                        scope,
+                        &token,
+                        ScopedOp::Unlock(vfs_proto::UnlockRequest {
+                            path: path.clone(),
+                            lock_id: id.clone(),
+                            ..Default::default()
+                        }),
+                    );
+                } else {
+                    let _ = client.unlock(&path, &id, &token);
+                }
             }),
         })))
     }
     fn read(&self, path: &str) -> io::Result<Vec<u8>> {
         self.authorize_target(path, ResourceAccessKind::Read)?;
+        if self.restricted() {
+            return match self.scoped(ScopedOp::Read(vfs_proto::ReadRequest {
+                path: path.into(),
+                ..Default::default()
+            }))? {
+                ScopedReply::Read(r) => Ok(r.content),
+                _ => Err(wrong_reply()),
+            };
+        }
         let first = self.client.read_entry(path, 0, &self.auth_token)?;
         if first.entry_type != i32::from(DT_STREAM) {
             return Ok(first.data);
@@ -1997,11 +2235,32 @@ impl FsBackend for NexusVfsFsBackend {
 
     fn write(&self, path: &str, data: &[u8]) -> io::Result<()> {
         self.authorize_target(path, ResourceAccessKind::Write)?;
+        if self.restricted() {
+            return match self.scoped(ScopedOp::Write(vfs_proto::WriteRequest {
+                path: path.into(),
+                content: data.to_vec(),
+                ..Default::default()
+            }))? {
+                ScopedReply::Write(_) => Ok(()),
+                _ => Err(wrong_reply()),
+            };
+        }
         self.client.write(path, data.to_vec(), &self.auth_token)
     }
 
     fn append(&self, path: &str, data: &[u8]) -> io::Result<()> {
         self.authorize_target(path, ResourceAccessKind::Write)?;
+        if self.restricted() {
+            let stream = self.is_append_stream(path)?;
+            return match self.scoped(ScopedOp::Append(vfs_proto::ScopedAppendRequest {
+                path: path.into(),
+                content: data.to_vec(),
+                stream,
+            }))? {
+                ScopedReply::Append(_) => Ok(()),
+                _ => Err(wrong_reply()),
+            };
+        }
         // Stream identity comes from the server's entry type and uses its
         // atomic frame append. Ordinary files retain their byte append path.
         if self.is_append_stream(path)? {
@@ -2021,6 +2280,18 @@ impl FsBackend for NexusVfsFsBackend {
 
     fn create_append_log(&self, path: &str, retention: u64) -> io::Result<()> {
         self.authorize_target(path, ResourceAccessKind::Write)?;
+        if self.restricted() {
+            return match self.scoped(ScopedOp::Setattr(vfs_proto::SetattrRequest {
+                path: path.into(),
+                entry_type: 4,
+                io_profile: "wal,memory".into(),
+                capacity: retention,
+                ..Default::default()
+            }))? {
+                ScopedReply::Setattr(_) => Ok(()),
+                _ => Err(wrong_reply()),
+            };
+        }
         self.client
             .ensure_stream(path, "wal,memory", retention, &self.auth_token)
             .map(|_| ())
@@ -2037,12 +2308,21 @@ impl FsBackend for NexusVfsFsBackend {
 
     fn delete(&self, path: &str) -> io::Result<()> {
         self.authorize_target(path, ResourceAccessKind::Write)?;
+        if self.restricted() {
+            return match self.scoped(ScopedOp::Delete(vfs_proto::DeleteRequest {
+                path: path.into(),
+                ..Default::default()
+            }))? {
+                ScopedReply::Delete(_) => Ok(()),
+                _ => Err(wrong_reply()),
+            };
+        }
         self.client.delete(path, &self.auth_token)
     }
 
     fn stat(&self, path: &str) -> io::Result<FsMetadata> {
         self.authorize_target(path, ResourceAccessKind::Read)?;
-        let stat = self.client.stat(path, &self.auth_token)?;
+        let stat = self.remote_stat(path)?;
         Ok(FsMetadata {
             len: stat.size,
             is_dir: stat.is_directory,
@@ -2056,6 +2336,22 @@ impl FsBackend for NexusVfsFsBackend {
 
     fn readdir(&self, path: &str) -> io::Result<Vec<FsDirEntry>> {
         self.authorize_target(path, ResourceAccessKind::Read)?;
+        if self.restricted() {
+            return match self.scoped(ScopedOp::Readdir(vfs_proto::ReaddirRequest {
+                path: path.into(),
+                ..Default::default()
+            }))? {
+                ScopedReply::Readdir(r) => Ok(r
+                    .entries
+                    .into_iter()
+                    .map(|e| FsDirEntry {
+                        name: e.name.rsplit('/').next().unwrap_or(&e.name).to_owned(),
+                        is_dir: e.entry_type == 1,
+                    })
+                    .collect()),
+                _ => Err(wrong_reply()),
+            };
+        }
         let entries = self.client.readdir(path, &self.auth_token)?;
         Ok(entries
             .into_iter()
@@ -2081,7 +2377,14 @@ impl FsBackend for NexusVfsFsBackend {
 
     fn exists(&self, path: &str) -> io::Result<bool> {
         self.authorize_target(path, ResourceAccessKind::Read)?;
-        Ok(self.client.stat(path, &self.auth_token).is_ok())
+        if !self.restricted() {
+            return Ok(self.client.stat(path, &self.auth_token).is_ok());
+        }
+        match self.remote_stat(path) {
+            Ok(_) => Ok(true),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(error),
+        }
     }
 
     /// A DT_LINK, with the destination in the entry's metadata.
@@ -2098,10 +2401,25 @@ impl FsBackend for NexusVfsFsBackend {
     fn link(&self, alias: &str, target: &str) -> io::Result<()> {
         self.authorize_target(alias, ResourceAccessKind::Write)?;
         self.authorize_target(target, ResourceAccessKind::Write)?;
+        if self.restricted() {
+            self.authorize_target(alias, ResourceAccessKind::Read)?;
+        }
         if let Some(parent) = std::path::Path::new(alias).parent() {
             let _ = self.create_dir_all(&parent.to_string_lossy());
         }
-        self.client.ensure_link(alias, target, &self.auth_token)?;
+        if self.restricted() {
+            match self.scoped(ScopedOp::Setattr(vfs_proto::SetattrRequest {
+                path: alias.into(),
+                entry_type: 6,
+                link_target: Some(target.into()),
+                ..Default::default()
+            }))? {
+                ScopedReply::Setattr(_) => {}
+                _ => return Err(wrong_reply()),
+            }
+        } else {
+            self.client.ensure_link(alias, target, &self.auth_token)?;
+        }
         // Read the target back, because a daemon that predates the wire field ignores
         // it: `Setattr` would succeed, the entry would exist as a link to NOWHERE, and
         // the chat-list index would list a peer whose conversation cannot be found.
@@ -2128,15 +2446,12 @@ impl FsBackend for NexusVfsFsBackend {
     /// shape federation uses.
     fn read_link(&self, alias: &str) -> io::Result<String> {
         self.authorize_target(alias, ResourceAccessKind::Read)?;
-        self.client
-            .stat(alias, &self.auth_token)?
-            .link_target
-            .ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::NotFound,
-                    format!("{alias}: not a link or no target"),
-                )
-            })
+        self.remote_stat(alias)?.link_target.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("{alias}: not a link or no target"),
+            )
+        })
     }
 
     /// Provision each component as a DT_DIR, idempotently.
@@ -2160,6 +2475,18 @@ impl FsBackend for NexusVfsFsBackend {
     /// plant its own rows, so the cost this adds to a write is that one `stat`.
     fn create_dir_all(&self, path: &str) -> io::Result<()> {
         self.authorize_target(path, ResourceAccessKind::Write)?;
+        if self.restricted() {
+            self.authorize_target(path, ResourceAccessKind::Read)?;
+            return match self.scoped(ScopedOp::Mkdir(vfs_proto::MkdirRequest {
+                path: path.into(),
+                parents: true,
+                exist_ok: true,
+                ..Default::default()
+            }))? {
+                ScopedReply::Mkdir(_) => Ok(()),
+                _ => Err(wrong_reply()),
+            };
+        }
         if self.exists(path)? {
             return Ok(());
         }
@@ -2175,6 +2502,15 @@ impl FsBackend for NexusVfsFsBackend {
     fn rename(&self, from: &str, to: &str) -> io::Result<()> {
         self.authorize_target(from, ResourceAccessKind::Write)?;
         self.authorize_target(to, ResourceAccessKind::Write)?;
+        if self.restricted() {
+            return match self.scoped(ScopedOp::Rename(vfs_proto::ScopedRenameRequest {
+                from: from.into(),
+                to: to.into(),
+            }))? {
+                ScopedReply::Rename(_) => Ok(()),
+                _ => Err(wrong_reply()),
+            };
+        }
         self.client.rename(from, to, &self.auth_token)
     }
 
@@ -2204,6 +2540,18 @@ impl FsBackend for NexusVfsFsBackend {
         block_ms: u64,
     ) -> io::Result<(Vec<u8>, u64, bool)> {
         self.authorize_target(path, ResourceAccessKind::Read)?;
+        if self.restricted() {
+            return match self.scoped(ScopedOp::StreamReadAt(vfs_proto::StreamReadAtRequest {
+                path: path.into(),
+                offset: cursor,
+                blocking: block_ms > 0,
+                timeout_ms: block_ms,
+                ..Default::default()
+            }))? {
+                ScopedReply::StreamReadAt(r) => Ok((r.data, r.next_offset, r.eof)),
+                _ => Err(wrong_reply()),
+            };
+        }
         read_tail_with(cursor, block_ms, |wait_ms| {
             let result = match self
                 .client
