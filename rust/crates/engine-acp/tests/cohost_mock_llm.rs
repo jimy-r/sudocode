@@ -629,11 +629,15 @@ fn a_cohost_subagent_consumes_a_followup_during_its_first_model_response() {
                     }
                     std::thread::sleep(Duration::from_millis(10));
                 }
-                let fs: Arc<dyn FsBackend> = Arc::new(KernelFsBackend::for_agent(
+                let fs: Arc<dyn FsBackend> = Arc::new(KernelFsBackend::for_agent_descriptor(
                     Arc::clone(kernel),
-                    "test-owner",
-                    "root",
-                    agent,
+                    &kernel::core::agents::registry::AgentDescriptor {
+                        pid: format!("pid-{agent}"),
+                        name: agent.to_string(),
+                        owner_id: "test-owner".to_string(),
+                        zone_id: "root".to_string(),
+                        ..kernel::core::agents::registry::AgentDescriptor::default()
+                    },
                     format!("{workspace}/another-runtime"),
                 ));
                 let tasks = tools::list_agent_snapshots_from_store_with(false, fs.as_ref())?;

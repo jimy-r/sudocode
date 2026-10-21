@@ -158,7 +158,8 @@ fn live_filesystem_stream_read_and_append_preserve_all_frames() {
     let endpoint = std::env::var("NEXUS_A2A_TEST_ENDPOINT").unwrap();
     let auth = std::env::var("NEXUS_API_KEY").unwrap_or_default();
     let client = dial(&endpoint);
-    let fs = NexusVfsFsBackend::from_arc(Arc::clone(&client), auth);
+    // Cert-only dial — the mTLS transport is the authorization (see `dial`).
+    let fs = NexusVfsFsBackend::from_arc_mtls(Arc::clone(&client), auth, "root");
     let path = format!("/sessions/vfs-probe-{}/transcript.jsonl", fresh());
     fs.create_append_log(&path, 0).unwrap();
     assert!(fs.is_append_stream(&path).unwrap());
@@ -232,7 +233,10 @@ fn live_rename_replaces_files_and_refuses_streams() {
 
     let endpoint = std::env::var("NEXUS_A2A_TEST_ENDPOINT").unwrap();
     let auth = std::env::var("NEXUS_API_KEY").unwrap_or_default();
-    let fs = NexusVfsFsBackend::from_arc(dial(&endpoint), auth);
+    // Cert-only dial: the transport itself is the server-verified
+    // authorization, so the backend is the mTLS (trusted-local) shape — the
+    // fail-closed `from_arc` would refuse every operation by design.
+    let fs = NexusVfsFsBackend::from_arc_mtls(dial(&endpoint), auth, "root");
     let dir = format!("/sessions/rename-probe-{}", fresh());
 
     // Temp-then-rename over an existing file: one Rename on the node.

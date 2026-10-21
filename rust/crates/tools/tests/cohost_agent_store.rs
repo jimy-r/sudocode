@@ -166,11 +166,15 @@ fn a_live_cohost_task_receives_followups_only_through_its_session_filesystem() {
     let task = format!("cohost-followup-{}", std::process::id());
     let abort = HookAbortSignal::new();
     tools::register_agent_runtime(&task, abort.clone(), fs.working_root().unwrap()).unwrap();
-    let blocked_fs: Arc<dyn FsBackend> = Arc::new(KernelFsBackend::for_agent(
+    let blocked_fs: Arc<dyn FsBackend> = Arc::new(KernelFsBackend::for_agent_descriptor(
         Arc::clone(&kernel),
-        "test-owner",
-        "root",
-        "blocked-sender",
+        &kernel::core::agents::registry::AgentDescriptor {
+            pid: "pid-blocked".to_string(),
+            name: "blocked-sender".to_string(),
+            owner_id: "test-owner".to_string(),
+            zone_id: "root".to_string(),
+            ..kernel::core::agents::registry::AgentDescriptor::default()
+        },
         "/another-runtime",
     ));
     let denied = tools::GlobalToolRegistry::builtin()
