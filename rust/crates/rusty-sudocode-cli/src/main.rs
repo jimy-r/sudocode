@@ -2328,11 +2328,10 @@ fn run_repl_loop(mut cli: LiveCli) -> Result<(), Box<dyn std::error::Error>> {
     println!("{}", cli.startup_banner());
 
     // The A2A receiver lives on the coordinator loop, and that loop exists only
-    // in the async REPL. Reaching the SYNC one with an endpoint configured
-    // means the session dialled the broker and provisioned its inbox, and then
-    // nothing ever polls it — peer messages cannot arrive. An inbox nobody
-    // reads looks exactly like an inbox nobody has written to, so this says
-    // which one it is.
+    // in the async REPL. Reaching the SYNC one attached to a node means the
+    // session dialled it and provisioned its inbox, and then nothing ever polls
+    // it — peer messages cannot arrive. An inbox nobody reads looks exactly like
+    // an inbox nobody has written to, so this says which one it is.
     //
     // `SUDOCODE_INTERRUPT_QUEUE_MODE` is about input queueing and has no
     // business deciding whether A2A works. Until the sync REPL can carry a
@@ -2342,14 +2341,12 @@ fn run_repl_loop(mut cli: LiveCli) -> Result<(), Box<dyn std::error::Error>> {
     // harness matches on.
     //
     // Both `off` and the EMPTY string land here — see `QueueMode::from_str`.
-    let a2a_configured = std::env::var("NEXUS_A2A_ENDPOINT")
-        .map(|v| !v.trim().is_empty())
-        .unwrap_or(false);
-    if a2a_configured {
+    if engine_host::peer::attach(&cli.lifecycle.agent_name()).is_ok_and(|peer| peer.is_node()) {
         eprintln!(
-            "warning: NEXUS_A2A_ENDPOINT is set, but this REPL mode cannot RECEIVE A2A \
-             messages (sending still works). Unset SUDOCODE_INTERRUPT_QUEUE_MODE, or set it \
-             to `queue`, for the REPL that carries the receiver."
+            "warning: this session is attached to its machine's Nexus node, but this REPL \
+             mode cannot RECEIVE peer messages (sending still works). Unset \
+             SUDOCODE_INTERRUPT_QUEUE_MODE, or set it to `queue`, for the REPL that carries \
+             the receiver."
         );
     }
 
@@ -5548,6 +5545,8 @@ impl LiveCli {
         let latest = usage.current_turn_usage();
         let session = self.lifecycle.session_snapshot();
         let handle = self.lifecycle.session_handle();
+        let mut context = status_context(Some(&handle.path)).expect("status context should load");
+        context.peer = Some(engine_host::peer::status(&self.lifecycle.agent_name()));
         let report = format_status_report(
             &self.lifecycle.current_model(),
             StatusUsage {
@@ -5558,7 +5557,7 @@ impl LiveCli {
                 estimated_tokens: self.lifecycle.estimated_tokens(),
             },
             self.lifecycle.current_permission_mode().as_str(),
-            &status_context(Some(&handle.path)).expect("status context should load"),
+            &context,
             None, // #148: REPL /status doesn't carry flag provenance
             &self.lifecycle.current_billing_account().describe(),
         );

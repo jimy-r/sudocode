@@ -1,6 +1,6 @@
 # Nexus peer attach: one peer namespace per machine
 
-Status: in progress. S1 and S2 are implemented. S3, S4, S5 and S6 are designed but not built. The live coordination record for the nexus side is kept outside the repo.
+Status: in progress. S1 (rename), S2 (one peer namespace) and federated attach are implemented. S3, S4, S5 and S6 are designed but not built. The live coordination record for the nexus side is kept outside the repo.
 
 ## Goal
 
@@ -12,13 +12,12 @@ Target topology:
 
 ## Where a session's peers are
 
-The peer store depends on one durable fact, whether the node is enabled for the machine. Only the explicit disk→node switch (S3) writes that fact.
+The peer store depends on one durable fact: whether the machine publishes a node record (`<home>/.nexus/run/node.json`). The node owner writes it; `scode` only reads it.
 
-| Machine state | Peer store | When the store is unreachable |
+| Machine state | Peer store | When the store is unusable |
 |---|---|---|
-| Node never enabled | Same-machine pair root on disk (`local_pair_root()`) | n/a |
-| Node enabled, `role=none` | The supervisor's loopback `serve-local` node | Error. Never falls back to disk. |
-| `role=founder` / `role=joiner` | The federated node | Error. Never falls back to disk. |
+| No node record | Same-machine pair root on disk (`local_pair_root()`) | n/a |
+| Node record present | The machine's node | Error. Never falls back to disk. |
 
 `engine_host::peer::attach` is the only place this decision is made. The session build uses it for three things:
 - the system-prompt identity section;
@@ -28,6 +27,27 @@ The peer store depends on one durable fact, whether the node is enabled for the 
 A co-hosted agent never calls it, because its daemon injects the mailbox it lives in.
 
 There are no namespace qualifiers. `agent_list` returns bare names in `send_to`. `send` rejects `:`, `/`, `\` and `@` in a recipient, so a stale qualified name can't become a path segment.
+
+## Federated attach
+
+The node owner's bring-up publishes `<home>/.nexus/run/node.json` atomically once the node's TLS listener, agent authentication and subtree mounts are verified. `<home>` is `HOME`, else `USERPROFILE` (`runtime::user_paths::home_dir`). There is no other switch: no environment variable, no working-directory lookup, no per-agent override.
+
+| Field | Meaning |
+|---|---|
+| `version` | `1`. Any other value is an error. |
+| `endpoint` | `host:port` dialled over mTLS; no scheme. |
+| `agents_dir` | Absolute directory holding one credential bundle per agent name. |
+| `role`, `zone` | The node's deployment role and zone; `scode` does not read them. |
+
+A session attaches as its own resolved agent name (the `agentName` setting, else the name derived from its workspace):
+
+1. It loads `<agents_dir>/<name>/credential.json`. The manifest's `agent` must equal `<name>`.
+2. It dials `endpoint` with that credential. The server certificate is checked against the bundle's `server_name` and CA, not against the dial address.
+3. It reads `/agents` once. The client connects lazily, so without this probe an unreachable node, a failed handshake or a missing mount would only surface on the session's first message.
+
+Every failure names its cause and stops the session: an unreadable or malformed record, another version, an endpoint with a scheme, a relative `agents_dir`, no credential for this agent, a credential minted for another agent, or a failed probe. None of them falls back to disk. Credentials are minted by the node owner; `scode` never mints one.
+
+The attach decision is cached per agent name for the life of the process, so the session build and its receiver cannot disagree, and a host running sessions under several identities dials each with its own credential.
 
 ## Rename (S1)
 
@@ -47,9 +67,14 @@ Every receive path uses one loop: `runtime::mailbox::spawn_inbox_poller`. Delive
 - **Node.** The lock is a renewable lease.
   - A renewal thread independent of the sink keeps a hung-but-alive holder alive, so a slow model turn never causes a handoff.
   - A whole-process freeze longer than the lease can hand off. That opens the window S6 closes.
-- **One receiver per identity (PR-D).** An identity-level lease at `/agents/<name>/receiver`, built on `FsBackend::try_lock`, replaces per-conversation holder fields.
-  - It is unique only within one machine until nexus routes locks by zone (N1).
-  - PR-D also brings receiving to the synchronous REPL and to non-hosted ACP sessions.
+- **One receiver per agent.** A receiver tails nothing until it holds its agent's receiver seat, `agents/<name>/receiver.lock`, taken with `FsBackend::try_lock` on the same backend as the conversations.
+  - Until then it stands by and retries once per discovery interval, so a second instance of the agent takes over when the first stops, resuming at the read position.
+  - Losing the seat stops every tail before the receiver stands by again.
+  - Each conversation's reader seat stays as the guard on that conversation's read position, so a tail finishing a delivery while the agent seat changes hands can't be read twice.
+  - On the node the seat is unique only within one machine until nexus routes locks by zone (N1).
+  - `/status` and ACP's `_meta.sudocode.peer` report the agent, its namespace and whether this process is receiving, standing by, or running no receiver.
+  - An ACP process runs one receiver per agent it serves, on the mailbox that agent's tools send through: the hosted agent's, else the namespace the session attached to, which is the pair root when the machine has no node. A message goes to a session of the agent it was sent to, rebinding to another session of that agent if the first closes; the receiver stops, freeing the seat, once no session of the agent is left.
+  - Receiving in the synchronous REPL follows in a later PR-D step.
 
 ## Cursor fencing (S6)
 
