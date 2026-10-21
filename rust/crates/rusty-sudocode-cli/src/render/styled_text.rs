@@ -23,14 +23,19 @@ impl StyledText {
         Self::from_ansi_with_style(input, ContentStyle::default())
     }
 
+    /// Control bytes other than ordinary layout whitespace require decoding.
+    #[inline]
+    pub(crate) fn needs_decoding(input: &str) -> bool {
+        input
+            .bytes()
+            .any(|byte| byte == 0x1b || (byte < 0x20 && !matches!(byte, b'\n' | b'\r' | b'\t')))
+    }
+
     /// An initial style is content state, not a fallback applied after decoding.
     /// SGR 0 and 39 therefore restore the terminal default, even when the slot
     /// starts in a semantic label color.
     pub(crate) fn from_ansi_with_style(input: &str, initial_style: ContentStyle) -> Self {
-        if !input
-            .bytes()
-            .any(|byte| byte == 0x1b || (byte < 0x20 && !matches!(byte, b'\n' | b'\r' | b'\t')))
-        {
+        if !Self::needs_decoding(input) {
             let mut text = Self::default();
             text.push(initial_style, input);
             return text;

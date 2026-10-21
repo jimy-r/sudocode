@@ -2,7 +2,7 @@
 
 use std::{borrow::Cow, ops::Range};
 use unicode_segmentation::UnicodeSegmentation;
-use unicode_width::UnicodeWidthStr;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use super::styled_text::StyledText;
 
@@ -11,6 +11,23 @@ fn strip_ansi(input: &str) -> Cow<'_, str> {
         Cow::Owned(StyledText::from_ansi(input).text)
     } else {
         Cow::Borrowed(input)
+    }
+}
+
+/// Keep transient status descriptions on one row and discard terminal controls.
+#[inline]
+pub(crate) fn single_line(input: &str) -> Cow<'_, str> {
+    // Reuse the decoder's fast-path predicate: C0 controls also need removal
+    // when there is no ESC byte. Ordinary progress text stays borrowed.
+    let plain = if StyledText::needs_decoding(input) {
+        Cow::Owned(StyledText::from_ansi(input).text)
+    } else {
+        Cow::Borrowed(input)
+    };
+    if plain.contains(['\n', '\r', '\t']) {
+        Cow::Owned(plain.replace(['\n', '\r', '\t'], " "))
+    } else {
+        plain
     }
 }
 
@@ -123,8 +140,46 @@ pub(crate) fn wrap_ansi_with_indent(input: &str, width: usize, indent: usize) ->
         .collect()
 }
 
+/// Terminal strings use grapheme widths. The pinned iocraft canvas clips by
+/// scalar widths, so its adapter must reserve those columns without splitting
+/// a grapheme. Keep that compatibility decision separate from scrollback.
+#[derive(Clone, Copy)]
+pub(crate) enum ColumnMetric {
+    Terminal,
+    Canvas,
+}
+
+impl ColumnMetric {
+    #[inline]
+    pub(crate) fn width(self, input: &str) -> usize {
+        match self {
+            Self::Terminal => display_width(input),
+            Self::Canvas => strip_ansi(input)
+                .chars()
+                .map(|ch| {
+                    if ch == '\t' {
+                        1
+                    } else {
+                        ch.width().unwrap_or(0)
+                    }
+                })
+                .sum(),
+        }
+    }
+
+    #[inline]
+    pub(crate) fn truncate(self, input: &str, max_width: usize) -> String {
+        truncate(input, max_width, self)
+    }
+}
+
+#[inline]
 pub(crate) fn truncate_to_width(input: &str, max_width: usize) -> String {
-    if display_width(input) <= max_width {
+    ColumnMetric::Terminal.truncate(input, max_width)
+}
+
+fn truncate(input: &str, max_width: usize, metric: ColumnMetric) -> String {
+    if metric.width(input) <= max_width {
         return input.to_string();
     }
     if max_width == 0 {
@@ -134,7 +189,10 @@ pub(crate) fn truncate_to_width(input: &str, max_width: usize) -> String {
     let mut col = 0;
     let mut end = 0;
     for (offset, grapheme) in source.text.grapheme_indices(true) {
-        let cells = grapheme_width(grapheme, col);
+        let cells = match metric {
+            ColumnMetric::Terminal => grapheme_width(grapheme, col),
+            ColumnMetric::Canvas => metric.width(grapheme),
+        };
         if col + cells >= max_width {
             break;
         }

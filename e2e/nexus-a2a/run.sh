@@ -112,10 +112,6 @@ echo "== [deterministic] standalone A2A client round-trip =="
 NEXUS_A2A_TEST_ENDPOINT="$ENDPOINT" NEXUS_A2A_TEST_CERT_DIR="$CLIENT_BUNDLE" \
   "${CARGO_TEST[@]}" live_inbox_roundtrip -- --ignored --nocapture
 
-# One session on BOTH a local same-machine pair and this nexus daemon sees every
-# peer from both in ONE listing, each tagged with where it was found. The union
-# the Directory exists for, proven against a real daemon rather than a temp dir -
-# so a regression that silently drops a namespace from `agent_list` fails here.
 # /agents and /sessions are mounted from one zone; a router that drops the mount
 # prefix aliases them, and `readdir /agents` then returns session ids. The daemon
 # version comes from the nexus-vfs lock, so pin the invariant here: a bump or
@@ -124,10 +120,11 @@ echo "== [deterministic] /agents and /sessions are distinct namespaces =="
 NEXUS_A2A_TEST_ENDPOINT="$ENDPOINT" NEXUS_A2A_TEST_CERT_DIR="$CLIENT_BUNDLE" \
   "${CARGO_TEST[@]}" live_agents_and_sessions_are_not_the_same_namespace -- --ignored --nocapture
 
-echo "== [deterministic] agent_list unions local + nexus peers =="
+# Rename is the node's own Rename: a file is replaced in one step, and a stream
+# is refused rather than copied into a new regular file behind the caller's back.
+echo "== [deterministic] rename is native: files replace, streams refuse =="
 NEXUS_A2A_TEST_ENDPOINT="$ENDPOINT" NEXUS_A2A_TEST_CERT_DIR="$CLIENT_BUNDLE" \
-  "${CARGO_TEST[@]}" live_directory_unions_local_and_nexus_peers -- --ignored --nocapture
-
+  "${CARGO_TEST[@]}" live_rename_replaces_files_and_refuses_streams -- --ignored --nocapture
 # The seam the round-trip above leaves out. That one drives `Mailbox` directly,
 # so it proves the transport while saying nothing about whether the tool reaches
 # it, nor whether a receiver surfaces what arrives - and a `send` that wrote a

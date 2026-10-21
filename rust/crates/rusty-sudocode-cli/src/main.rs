@@ -3431,6 +3431,7 @@ fn run_repl_iocraft_dispatch(
     let engine_events = std::mem::replace(&mut cli.engine_handle.events, turn_rx);
     let completion_tx = coord_tx.clone();
     let task_ui = repl_ui_cmd.clone();
+    let activity = repl_spinner.clone();
     thread::Builder::new()
         .name("repl-engine-events".into())
         .spawn(move || {
@@ -3438,6 +3439,7 @@ fn run_repl_iocraft_dispatch(
                 // Background work keeps publishing while the parent is idle.
                 // Its UI uses the same seam as every other engine consumer.
                 match &event {
+                    EngineEvent::State(state) => activity.observe_engine_state(*state),
                     EngineEvent::BackgroundTask(event) => {
                         task_ui.background_task(event.clone());
                         continue;
@@ -3473,6 +3475,7 @@ fn run_repl_iocraft_dispatch(
                     return;
                 }
             }
+            activity.observe_engine_state(engine_events::EngineState::Idle);
         })
         .expect("spawn REPL engine event bridge");
     let cli_shared = Arc::new(Mutex::new(cli));
@@ -3491,40 +3494,20 @@ fn run_repl_iocraft_dispatch(
         })
         .expect("spawn input bridge");
 
-    // Both transports share the coordinator's delivery and shutdown boundary.
-    let mailbox_abort = runtime::HookAbortSignal::new();
-    let mut mailbox_pollers = Vec::new();
-    if let Ok(Some(a2a_session)) = engine_host::nexus_a2a::session() {
-        mailbox_pollers.push(engine_host::nexus_a2a::spawn_poller(
-            a2a_session,
-            mailbox_abort.clone(),
-            peer_turn_sink(coord_tx.clone(), mailbox_abort.clone()),
-        ));
-    }
-
-    // Local same-machine mailbox poller: picks up messages that a peer scode
-    // (or a sub-agent) writes to this process's inbox via the `send` tool.
-    // Rooted at the shared per-machine pair root and keyed by the name the LIVE
-    // SESSION answers to, so two scode processes started in different folders
-    // can converse. Complements the nexus A2A poller above — together they
-    // close the receive loop for both local and cross-machine messaging.
+    // The session's one receiver, on the same peer namespace its `send` tool
+    // writes through, sharing the coordinator's delivery and shutdown boundary.
     //
-    // The name comes from the session rather than being re-derived here: the
-    // session already resolved it (config `agentName`, else derived from its
-    // workspace) and signs outbound messages with it, and a second derivation
-    // from the process directory is how a peer's reply arrives at an inbox
-    // nothing is polling.
-    {
-        let self_name = session_agent_name;
-        let root = runtime::mailbox::local_pair_root();
-        mailbox_pollers.push(runtime::mailbox::spawn_local_poller(
-            root,
-            self_name,
-            mailbox_abort.clone(),
-            peer_turn_sink(coord_tx.clone(), mailbox_abort.clone()),
-        ));
-    }
-
+    // Keyed by the name the LIVE SESSION answers to rather than re-derived
+    // here: the session already resolved it (config `agentName`, else derived
+    // from its workspace) and signs outbound messages with it, and a second
+    // derivation from the process directory is how a peer's reply arrives at
+    // an inbox nothing is polling. `attach` reuses the node dial the session
+    // build already made, so it cannot newly fail here.
+    let mailbox_abort = runtime::HookAbortSignal::new();
+    let mailbox_receiver = engine_host::peer::attach(&session_agent_name)?.spawn_receiver(
+        mailbox_abort.clone(),
+        peer_turn_sink(coord_tx.clone(), mailbox_abort.clone()),
+    );
     // Coordinator loop on the current thread. All events arrive through
     // `coord_rx` — no timeout-based polling needed.
     let mut turn_active = false;
@@ -3948,9 +3931,7 @@ fn run_repl_iocraft_dispatch(
     mailbox_abort.abort();
     drop(coord_rx);
     coord.lock().unwrap().clear();
-    for poller in mailbox_pollers {
-        let _ = poller.join();
-    }
+    let _ = mailbox_receiver.join();
 
     // Persist the session before shutting down the REPL — the UI thread may
     // still be alive and the shared CLI mutex must remain accessible.
@@ -4018,7 +3999,7 @@ fn spawn_iocraft_turn(
     next: input_queue::NextTurn<mpsc::Sender<()>>,
     output: repl_ui::OutputSender,
     ui: repl_ui::UiCommandSender,
-    spinner: repl_ui::SpinnerState,
+    spinner: render::activity::ActivityState,
     pending_question_answer: PendingQuestionAnswer,
     done_tx: mpsc::Sender<CoordinatorEvent>,
 ) -> thread::JoinHandle<()> {
@@ -4881,7 +4862,7 @@ impl LiveCli {
         let token_budget = crate::render::parse_token_budget(input);
         let model = self.lifecycle.current_model();
         let mut spinner = SpinnerHandle::new(
-            "🦀 Thinking...",
+            render::activity::THINKING_LABEL,
             Some(model.as_str()),
             TerminalRenderer::new().color_theme(),
             token_budget,
@@ -5011,24 +4992,24 @@ impl LiveCli {
     }
 
     /// Run a turn using the iocraft REPL path. Output is routed through
-    /// `OutputSender` and the spinner is managed via the shared
-    /// `SpinnerState` atomics instead of indicatif.
+    /// `OutputSender`; the foreground activity projection owns the status
+    /// instead of indicatif.
     fn run_turn_iocraft(
         &mut self,
         input: &str,
         output: &repl_ui::OutputSender,
         ui: &repl_ui::UiCommandSender,
-        spinner_state: &repl_ui::SpinnerState,
+        spinner_state: &render::activity::ActivityState,
         pending_question_answer: PendingQuestionAnswer,
     ) -> Result<bool, Box<dyn std::error::Error>> {
         let turn_start = Instant::now();
         let token_budget = crate::render::parse_token_budget(input);
         let model = self.lifecycle.current_model();
 
-        // Activate the shared spinner state for the iocraft render loop, then
-        // bridge it into the SpinnerRef the renderer drives (bytes + thinking).
-        spinner_state.start_turn("\u{1f980} Thinking...", Some(model.as_str()), token_budget);
-        let spinner_ref = render::SpinnerRef::from_spinner_state(spinner_state);
+        // Prepare display metadata before submission. Engine events own the
+        // lifecycle; SpinnerRef updates only response progress and phase.
+        spinner_state.prepare_turn(model.as_str(), token_budget);
+        let spinner_ref = render::SpinnerRef::from_activity_state(spinner_state);
 
         let mut question_prompter =
             IocraftQuestionPrompter::new(ui.clone(), pending_question_answer);
@@ -5045,7 +5026,6 @@ impl LiveCli {
             &mut question_prompter,
             None,
         )?;
-        spinner_state.stop_turn();
 
         // Explicit cancellation finishes this input. The mailbox sink decides
         // whether the receiver is still running and can acknowledge delivery.
