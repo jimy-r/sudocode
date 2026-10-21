@@ -12,6 +12,7 @@
     clippy::unnecessary_wraps,
     clippy::unused_self
 )]
+mod background_completion;
 mod bash_mode;
 mod cancel;
 mod cli;
@@ -3432,6 +3433,10 @@ fn run_repl_iocraft_dispatch(
     thread::Builder::new()
         .name("repl-engine-events".into())
         .spawn(move || {
+            // Upstream dedupes sub-agent completions in the engine now
+            // (`SubagentCompletionReady`); background tasks have no such
+            // pre-deduped event, so that state stays here.
+            let mut background = background_completion::Completions::default();
             while let Ok(event) = engine_events.recv() {
                 // Background work keeps publishing while the parent is idle.
                 // Its UI uses the same seam as every other engine consumer.
@@ -3439,6 +3444,21 @@ fn run_repl_iocraft_dispatch(
                     EngineEvent::State(state) => activity.observe_engine_state(*state),
                     EngineEvent::BackgroundTask(event) => {
                         task_ui.background_task(event.clone());
+                        // The panel is for the human; the model is a second
+                        // consumer. A background shell or monitor the model
+                        // started must report when it ends, or "end your turn,
+                        // you will be notified" is a promise nothing keeps.
+                        if let Some(finished) = background.observe(event) {
+                            if completion_tx
+                                .send(CoordinatorEvent::SubagentCompleted {
+                                    prompt: finished.prompt,
+                                    display: finished.display,
+                                })
+                                .is_err()
+                            {
+                                return;
+                            }
+                        }
                         continue;
                     }
                     EngineEvent::BackgroundTaskError { message, .. } => {
