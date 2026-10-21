@@ -114,9 +114,9 @@ where
         .iter()
         .find(|repo| repo.alias == "workspace")
         .or_else(|| desc.repos.first());
-    let admission = KernelFsBackend::for_agent_descriptor(Arc::clone(kernel), desc, "/");
+    let context = runtime::agent_operation_context(&desc.owner_id, &desc.zone_id, &desc.name);
     let local_directory = primary_repo
-        .map(|repo| admission.workspace_directory(&repo.mount_path))
+        .map(|repo| kernel.local_workspace_directory(&repo.mount_path, &context))
         .transpose()
         .map_err(|error| format!("co-host: resolve project directory: {error:?}"))?
         .flatten();

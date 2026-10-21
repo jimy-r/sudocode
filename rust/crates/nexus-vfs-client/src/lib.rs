@@ -1,19 +1,4 @@
-//! nexus-vfs gRPC client (P1a zone-aware, SW-20260915-002 step-08).
-//! Design record: sudo-code-roadmap.html § Goal 4 → "Contract-zone P1a".
-
 pub mod proto {
-    // The generated surface, not ours to reword: prost/tonic doc phrasing
-    // trips `doc_markdown`, the derived structs legitimately pack bool flags
-    // (`struct_excessive_bools`), and the client trait's
-    // `Result<_, tonic::Status>` returns trip `result_large_err` on newer
-    // toolchains. All three are scoped to this module so the hand-written
-    // client below stays under the workspace's full lint set.
-    #![allow(
-        clippy::doc_markdown,
-        clippy::struct_excessive_bools,
-        clippy::result_large_err
-    )]
-
     tonic::include_proto!("nexus.grpc.vfs");
 }
 
@@ -45,29 +30,25 @@ pub struct VfsReadResult {
 /// `Setattr` when provisioning a mailbox DT_STREAM.
 const DT_STREAM: i32 = 4;
 
-/// `DT_DIR` entry-type code, for reading `Readdir` results back.
+/// DT_DIR entry-type code, for reading `Readdir` results back.
 const DT_DIR: u32 = 1;
 
-/// The same `DT_DIR` code as `Setattr` takes it. `Readdir` reports entry types as
+/// The same DT_DIR code as `Setattr` takes it. `Readdir` reports entry types as
 /// `u32` and `Setattr` accepts them as `i32`, so the one value needs both spellings;
 /// naming the second rather than casting at the call site keeps the cast off the
 /// path where a wrong entry type is a silent mis-provision (`DT_LINK = 3` and
 /// `DT_PIPE = 3` once cost this project a chat-list index that was a pipe).
-const DT_DIR_SETATTR: i32 = DT_DIR.cast_signed();
+const DT_DIR_SETATTR: i32 = DT_DIR as i32;
 
-/// `DT_LINK` entry-type code for `Setattr`.
+/// DT_LINK entry-type code for `Setattr`.
 ///
-/// **6, not 3.** 3 is `DT_PIPE`'s discriminant, and the A2A chat-list index was once
+/// **6, not 3.** 3 is DT_PIPE's discriminant, and the A2A chat-list index was once
 /// written with it: the syscall dispatches on the integer, so there was no compile
 /// error and no runtime error — the index was simply a pipe, while every
 /// path-composition test stayed green.
 const DT_LINK_SETATTR: i32 = 6;
 
 enum VfsOp {
-    Scoped {
-        request: Box<proto::ScopedFsRequest>,
-        resp: mpsc::SyncSender<io::Result<proto::ScopedFsResponse>>,
-    },
     Lock {
         request: LockRequest,
         resp: mpsc::SyncSender<io::Result<Option<String>>>,
@@ -134,10 +115,7 @@ enum VfsOp {
     /// directory differ only by the `entry_type` the kernel dispatches on, and a
     /// second arm would be the same request assembled a second way.
     EnsureEntry {
-        // Boxed: this is the widest variant by far (SetattrRequest is a whole
-        // prost message), and every queued VfsOp pays its largest variant's
-        // size — boxed, the queue messages sit near the second-largest arm.
-        request: Box<SetattrRequest>,
+        request: SetattrRequest,
         resp: mpsc::SyncSender<io::Result<bool>>,
     },
     /// `Stat` — the TYPED RPC, not the generic Call surface.
@@ -211,7 +189,6 @@ impl NexusVfsClient {
         )
     }
 
-    #[allow(clippy::too_many_lines)]
     fn connect_inner(endpoint: &str, tls: Option<TlsMaterial>) -> io::Result<Self> {
         // tonic's `Channel::from_shared` requires a URI scheme; accept a bare
         // `host:port` for ergonomics and supply the scheme the transport
@@ -288,12 +265,6 @@ impl NexusVfsClient {
                         // that as `Disconnected` -> `BrokenPipe`.
                         tokio::spawn(async move {
                             match op {
-                                VfsOp::Scoped { request, resp } => {
-                                    let deadline = scoped_deadline(request.operation.as_ref());
-                                    let result =
-                                        client.scoped_fs(deadlined(*request, deadline)).await;
-                                    let _ = resp.send(grpc_result(result, Ok));
-                                }
                                 VfsOp::Lock { request, resp } => {
                                     let result =
                                         client.lock(deadlined(request, LOCK_DEADLINE)).await;
@@ -511,7 +482,7 @@ impl NexusVfsClient {
                                     }));
                                 }
                                 VfsOp::EnsureEntry { request, resp } => {
-                                    let r = client.setattr(deadlined(*request, OP_DEADLINE)).await;
+                                    let r = client.setattr(deadlined(request, OP_DEADLINE)).await;
                                     let _ = resp.send(grpc_result(r, |r| {
                                         if r.is_error {
                                             Err(vfs_err(&r.error_payload))
@@ -634,32 +605,6 @@ impl NexusVfsClient {
             &resp_rx,
             tail_deadline(timeout_ms > 0, timeout_ms) + HANDOFF_GRACE,
         )
-    }
-
-    /// Execute a restricted operation without ever falling back to an old RPC.
-    pub fn scoped(
-        &self,
-        operation: proto::scoped_fs_request::Operation,
-        scope: &[u8],
-        auth_token: &str,
-    ) -> io::Result<proto::scoped_fs_response::Result> {
-        let (resp_tx, resp_rx) = mpsc::sync_channel(1);
-        let deadline = scoped_deadline(Some(&operation));
-        self.tx
-            .send(VfsOp::Scoped {
-                request: Box::new(proto::ScopedFsRequest {
-                    version: 1,
-                    auth_token: auth_token.to_owned(),
-                    resource_scope_json: scope.to_vec(),
-                    operation: Some(operation),
-                }),
-                resp: resp_tx,
-            })
-            .map_err(|_| broken_pipe())?;
-        let response = await_reply(&resp_rx, deadline + HANDOFF_GRACE)?;
-        response
-            .result
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing scoped result"))
     }
 
     /// Atomically acquire, or renew `lock_id`, through the existing lock RPC.
@@ -868,10 +813,7 @@ impl NexusVfsClient {
     pub fn setattr(&self, request: SetattrRequest) -> io::Result<bool> {
         let (resp, rx) = mpsc::sync_channel(1);
         self.tx
-            .send(VfsOp::EnsureEntry {
-                request: Box::new(request),
-                resp,
-            })
+            .send(VfsOp::EnsureEntry { request, resp })
             .map_err(|_| broken_pipe())?;
         await_reply(&rx, OP_DEADLINE + HANDOFF_GRACE)
     }
@@ -974,7 +916,7 @@ where
 }
 
 /// Preserve missing-entry and admission errors from the VFS response envelope.
-pub fn vfs_err(payload: &[u8]) -> io::Error {
+fn vfs_err(payload: &[u8]) -> io::Error {
     /// `FileNotFound` on the node's error enum (`transport/src/grpc.rs`).
     const FILE_NOT_FOUND: i64 = -32007;
     const PERMISSION_ERROR: i64 = -32003;
@@ -1049,15 +991,6 @@ const HANDOFF_GRACE: Duration = Duration::from_secs(2);
 /// Derived in ONE place because two callers need the same answer: the public
 /// method (to size its backstop) and the worker arm (to stamp the request). They
 /// computed it separately before, which is the same value with two definitions.
-fn scoped_deadline(op: Option<&proto::scoped_fs_request::Operation>) -> Duration {
-    match op {
-        Some(proto::scoped_fs_request::Operation::StreamReadAt(r)) => {
-            tail_deadline(r.blocking, r.timeout_ms)
-        }
-        _ => OP_DEADLINE,
-    }
-}
-
 fn tail_deadline(blocking: bool, timeout_ms: u64) -> Duration {
     if blocking {
         Duration::from_millis(timeout_ms) + TAIL_GRACE
@@ -1131,36 +1064,6 @@ fn await_reply<T>(resp_rx: &mpsc::Receiver<io::Result<T>>, budget: Duration) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn scoped_unsupported_never_falls_back_to_legacy_rpc() {
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        let worker = std::thread::spawn(move || {
-            match rx.blocking_recv().unwrap() {
-                VfsOp::Scoped { resp, .. } => resp
-                    .send(Err(io::Error::new(
-                        io::ErrorKind::Unsupported,
-                        "old server",
-                    )))
-                    .unwrap(),
-                _ => panic!("restricted request used legacy RPC"),
-            }
-            assert!(matches!(
-                rx.try_recv(),
-                Err(tokio::sync::mpsc::error::TryRecvError::Empty)
-            ));
-        });
-        let client = NexusVfsClient { tx };
-        let error = client
-            .scoped(
-                proto::scoped_fs_request::Operation::Write(WriteRequest::default()),
-                b"{}",
-                "token",
-            )
-            .unwrap_err();
-        assert_eq!(error.kind(), io::ErrorKind::Unsupported);
-        worker.join().unwrap();
-    }
 
     #[test]
     fn times_out_rather_than_parking_forever() {

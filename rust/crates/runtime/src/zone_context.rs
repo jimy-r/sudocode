@@ -225,16 +225,6 @@ impl HostZoneContext {
         &self.source
     }
 
-    pub(crate) fn has_resource_restriction(&self) -> bool {
-        self.resource_scope_present
-    }
-
-    pub(crate) fn resource_scope_bytes(&self) -> Option<Vec<u8>> {
-        self.resource_scope
-            .as_ref()
-            .map(|scope| serde_json::to_vec(scope).expect("resource scope serializes"))
-    }
-
     #[must_use]
     pub fn nexus_v2_base_url(&self) -> Option<&str> {
         self.nexus_v2_base_url.as_deref()

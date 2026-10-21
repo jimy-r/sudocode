@@ -28,7 +28,6 @@ mod file_ops;
 mod file_redirect;
 mod file_tracker;
 pub mod fs_backend;
-mod scoped_vfs;
 mod git_context;
 pub mod green_contract;
 mod hooks;
