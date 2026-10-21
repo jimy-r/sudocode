@@ -128,4 +128,6 @@ console.log('Full frozen review inspected.');});`);
     assert(host.state.exited, 'scode did not exit');
     assert.equal(host.state.exitCode, 0);
   } finally { await host.close(); }
-})().catch(error => { console.error(error); process.exitCode = 1; });
+// The pinned Windows host can retain ConPTY handles after the child exits.
+// Finish explicitly after assertions and host.close(), as the prose driver does.
+})().then(() => process.exit(0)).catch(error => { console.error(error); process.exit(1); });
