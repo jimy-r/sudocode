@@ -276,76 +276,105 @@ fn question_focus_surface_moves_without_recoloring_ordinary_text() {
         ("0;15", false, "Idx(234)", "Idx(255)", "Idx(94)", "Idx(241)"),
         ("15;0", true, "Default", "Default", "Default", "Default"),
     ] {
-        let env = TestEnv::new("question-focus-surface");
-        let mut sess = env.spawn_with_env(
-            &["--permission-mode", "workspace-write"],
-            &[
-                ("SUDOCODE_INTERRUPT_QUEUE_MODE", "queue"),
-                ("NO_COLOR", if no_color { "1" } else { "" }),
-                ("TERM", "xterm-256color"),
-                ("COLORTERM", "truecolor"),
-                ("COLORFGBG", background),
-            ],
-        );
-        sess.resize(40, 600).unwrap();
-        settle_chrome(&sess);
-        let input = serde_json::json!({
-            "title": "SurfaceQuestionTitle",
-            "question": "Choose a readable surface",
-            "options": ["FirstSurfaceChoice", "SecondSurfaceChoice"],
-        });
-        let calls = serde_json::json!([{
-            "id": "surface_question", "name": "AskUserQuestion", "input": input,
-        }]);
-        let prompt = if env.is_mock() {
-            format!("PARITY_SCENARIO:tool_concurrency TOOL_BATCH:{calls}")
-        } else {
-            format!("Call AskUserQuestion once with exactly this input, then answer briefly after I choose: {input}")
-        };
-        sess.send(&format!("\x1b[200~{prompt}\x1b[201~")).unwrap();
-        common::expect_input_line(
-            &sess,
-            &prompt,
-            common::LIVE_TURN_BUDGET,
-            "complete surface question prompt",
-        );
-        sess.send("\r").unwrap();
-        common::expect_screen(
-            &sess,
-            |screen| screen.contains("> [1] FirstSurfaceChoice"),
-            common::LIVE_TURN_BUDGET,
-            "initial selected surface",
-        );
-        sess.resize(40, 100).unwrap();
-        expect_style(&sess, "SurfaceQuestionTitle", (primary, false, false));
-        expect_style(&sess, "> [1]", (primary, !no_color, false));
-        expect_style(&sess, "navigate", (muted, false, false));
-        expect_surface(&sess, "Choose a readable surface", "Default", "Default");
-        expect_surface(&sess, "FirstSurfaceChoice", selected_fg, selected_bg);
-        expect_surface(&sess, "SecondSurfaceChoice", "Default", "Default");
-        sess.send("\x1b[B").unwrap();
-        expect_style(&sess, "> [2]", (primary, !no_color, false));
-        expect_surface(&sess, "FirstSurfaceChoice", "Default", "Default");
-        expect_surface(&sess, "SecondSurfaceChoice", selected_fg, selected_bg);
-        let marker = common::turn_status_marker(&sess);
-        sess.send("\r").unwrap();
-        common::expect_turn_complete_after(
-            &sess,
-            &marker,
-            common::LIVE_TURN_BUDGET,
-            "selected surface answer completes",
-        );
-        sess.send("NeutralAfterSurface").unwrap();
-        common::expect_input_line(
-            &sess,
-            "NeutralAfterSurface",
-            common::DEFAULT_TIMEOUT,
-            "draft after closing selected surface",
-        );
-        expect_surface(&sess, "NeutralAfterSurface", "Default", "Default");
-        sess.send("\x15").unwrap();
-        common::expect_input_line_cleared(&sess, common::DEFAULT_TIMEOUT, "clear neutral draft");
-        exit(&mut sess);
+        for option_count in [2, 10] {
+            let env = TestEnv::new("question-focus-surface");
+            let mut sess = env.spawn_with_env(
+                &["--permission-mode", "workspace-write"],
+                &[
+                    ("SUDOCODE_INTERRUPT_QUEUE_MODE", "queue"),
+                    ("NO_COLOR", if no_color { "1" } else { "" }),
+                    ("TERM", "xterm-256color"),
+                    ("COLORTERM", "truecolor"),
+                    ("COLORFGBG", background),
+                ],
+            );
+            sess.resize(40, 600).unwrap();
+            settle_chrome(&sess);
+            let mut options = vec![
+                "FirstSurfaceChoice".to_string(),
+                "SecondSurfaceChoice".to_string(),
+            ];
+            options.extend((2..option_count).map(|index| format!("OtherSurfaceChoice{index}")));
+            let input = serde_json::json!({
+                "title": "SurfaceQuestionTitle",
+                "question": "Choose a readable surface",
+                "options": options,
+            });
+            let calls = serde_json::json!([{
+                "id": "surface_question", "name": "AskUserQuestion", "input": input,
+            }]);
+            let prompt = if env.is_mock() {
+                format!("PARITY_SCENARIO:tool_concurrency TOOL_BATCH:{calls}")
+            } else {
+                format!("Call AskUserQuestion once with exactly this input, then answer briefly after I choose: {input}")
+            };
+            sess.send(&format!("\x1b[200~{prompt}\x1b[201~")).unwrap();
+            common::expect_input_line(
+                &sess,
+                &prompt,
+                common::LIVE_TURN_BUDGET,
+                "complete surface question prompt",
+            );
+            sess.send("\r").unwrap();
+            let first_marker = if option_count == 2 {
+                "> [1]"
+            } else {
+                "> FirstSurfaceChoice"
+            };
+            let second_marker = if option_count == 2 {
+                "> [2]"
+            } else {
+                "> SecondSurfaceChoice"
+            };
+            common::expect_screen(
+                &sess,
+                |screen| screen.contains(first_marker),
+                common::LIVE_TURN_BUDGET,
+                "initial selected surface",
+            );
+            sess.resize(40, 100).unwrap();
+            expect_style(&sess, "SurfaceQuestionTitle", (primary, false, false));
+            expect_style(&sess, first_marker, (primary, !no_color, false));
+            expect_style(
+                &sess,
+                if option_count == 2 {
+                    "navigate"
+                } else {
+                    "items"
+                },
+                (muted, false, false),
+            );
+            expect_surface(&sess, "Choose a readable surface", "Default", "Default");
+            expect_surface(&sess, "FirstSurfaceChoice", selected_fg, selected_bg);
+            expect_surface(&sess, "SecondSurfaceChoice", "Default", "Default");
+            sess.send("\x1b[B").unwrap();
+            expect_style(&sess, second_marker, (primary, !no_color, false));
+            expect_surface(&sess, "FirstSurfaceChoice", "Default", "Default");
+            expect_surface(&sess, "SecondSurfaceChoice", selected_fg, selected_bg);
+            let marker = common::turn_status_marker(&sess);
+            sess.send("\r").unwrap();
+            common::expect_turn_complete_after(
+                &sess,
+                &marker,
+                common::LIVE_TURN_BUDGET,
+                "selected surface answer completes",
+            );
+            sess.send("NeutralAfterSurface").unwrap();
+            common::expect_input_line(
+                &sess,
+                "NeutralAfterSurface",
+                common::DEFAULT_TIMEOUT,
+                "draft after closing selected surface",
+            );
+            expect_surface(&sess, "NeutralAfterSurface", "Default", "Default");
+            sess.send("\x15").unwrap();
+            common::expect_input_line_cleared(
+                &sess,
+                common::DEFAULT_TIMEOUT,
+                "clear neutral draft",
+            );
+            exit(&mut sess);
+        }
     }
 }
 
