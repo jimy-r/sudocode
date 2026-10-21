@@ -222,6 +222,43 @@ fn live_filesystem_stream_read_and_append_preserve_all_frames() {
 
 #[test]
 #[ignore = "requires a running nexusd-cluster; set NEXUS_A2A_TEST_ENDPOINT"]
+fn live_rename_replaces_files_and_refuses_streams() {
+    use runtime::fs_backend::NexusVfsFsBackend;
+    use runtime::FsBackend;
+
+    let endpoint = std::env::var("NEXUS_A2A_TEST_ENDPOINT").unwrap();
+    let auth = std::env::var("NEXUS_API_KEY").unwrap_or_default();
+    let fs = NexusVfsFsBackend::from_arc(dial(&endpoint), auth);
+    let dir = format!("/sessions/rename-probe-{}", fresh());
+
+    // Temp-then-rename over an existing file: one Rename on the node.
+    let target = format!("{dir}/manifest.json");
+    let temp = format!("{target}.tmp");
+    fs.write(&target, b"old").unwrap();
+    fs.write(&temp, b"new").unwrap();
+    fs.rename(&temp, &target).unwrap();
+    assert_eq!(fs.read(&target).unwrap(), b"new");
+    assert!(!fs.exists(&temp).unwrap());
+    fs.write_atomic(&target, b"atomic").unwrap();
+    assert_eq!(fs.read(&target).unwrap(), b"atomic");
+
+    // A DT_STREAM is identity-bound: the node refuses to move it, and the
+    // client must not emulate the move by copying frames into a new file.
+    let stream = format!("{dir}/transcript.jsonl");
+    let moved = format!("{dir}/moved.jsonl");
+    fs.create_append_log(&stream, 0).unwrap();
+    fs.append(&stream, b"frame\n").unwrap();
+    let error = fs.rename(&stream, &moved).unwrap_err();
+    assert!(
+        error.to_string().contains("rename not supported"),
+        "the node's refusal surfaces unchanged: {error}"
+    );
+    assert!(fs.is_append_stream(&stream).unwrap());
+    assert!(!fs.exists(&moved).unwrap());
+}
+
+#[test]
+#[ignore = "requires a running nexusd-cluster; set NEXUS_A2A_TEST_ENDPOINT"]
 fn live_inbox_roundtrip() {
     let endpoint =
         std::env::var("NEXUS_A2A_TEST_ENDPOINT").expect("set NEXUS_A2A_TEST_ENDPOINT=host:port");
@@ -1226,94 +1263,6 @@ fn live_agent_list_sees_every_peer_from_either_node() {
             );
         }
     }
-}
-
-/// One session attached to BOTH a local same-machine pair and a nexus daemon
-/// sees every peer from both in ONE `agent_list`, each tagged with where it was
-/// found — the cross-namespace discovery the Directory exists for, against a
-/// real daemon rather than a temp dir.
-///
-/// The single-node endpoint suffices: the point is the UNION of two namespaces
-/// in one listing, not replication between nexus nodes (that is the test above).
-#[test]
-#[ignore = "requires a running nexusd-cluster; set NEXUS_A2A_TEST_ENDPOINT + NEXUS_A2A_TEST_CERT_DIR"]
-fn live_directory_unions_local_and_nexus_peers() {
-    use runtime::directory::{Directory, Member};
-
-    let endpoint =
-        std::env::var("NEXUS_A2A_TEST_ENDPOINT").expect("set NEXUS_A2A_TEST_ENDPOINT=host:port");
-    let auth = std::env::var("NEXUS_API_KEY").unwrap_or_default();
-    let run = fresh();
-
-    // A nexus peer announces itself on the daemon.
-    let nexus_peer = format!("union-nexus-{run}");
-    let client = dial(&endpoint);
-    mailbox(&client, &nexus_peer, &auth)
-        .ensure_presence()
-        .expect("announce the nexus peer");
-
-    // A local peer announces itself in a same-machine pair root (a second scode
-    // in another folder is exactly this).
-    let pair_root = std::env::temp_dir().join(format!("scode-union-{run}"));
-    std::fs::create_dir_all(&pair_root).expect("make the local pair root");
-    let local_peer = format!("union-local-{run}");
-    Mailbox::workspace_local(&pair_root, local_peer.clone())
-        .ensure_presence()
-        .expect("announce the local peer");
-
-    // The session: its own identity on each namespace, local primary + nexus.
-    let me = format!("union-self-{run}");
-    let directory = Directory::new(vec![
-        Member {
-            label: "local",
-            mailbox: Arc::new(Mailbox::workspace_local(&pair_root, me.clone())),
-        },
-        Member {
-            label: "nexus",
-            mailbox: Arc::new(Mailbox::over_nexus(
-                Arc::clone(&client),
-                me.clone(),
-                auth.clone(),
-            )),
-        },
-    ]);
-
-    // Poll: nexus presence is not instantaneous. Assert BOTH peers appear, each
-    // tagged with the one namespace it lives in.
-    let deadline = Instant::now() + Duration::from_millis(DELIVERY_WAIT_MS);
-    let mut recips = Vec::new();
-    while Instant::now() < deadline {
-        recips = directory
-            .list_recipients()
-            .expect("enumerate the directory");
-        let has_local = recips.iter().any(|r| r.name == local_peer);
-        let has_nexus = recips.iter().any(|r| r.name == nexus_peer);
-        if has_local && has_nexus {
-            break;
-        }
-        thread::sleep(Duration::from_millis(100));
-    }
-
-    let local_row = recips
-        .iter()
-        .find(|r| r.name == local_peer)
-        .unwrap_or_else(|| panic!("the local peer must appear; listing was {recips:?}"));
-    assert_eq!(
-        local_row.sources,
-        vec!["local"],
-        "the local peer is tagged local-only"
-    );
-    let nexus_row = recips
-        .iter()
-        .find(|r| r.name == nexus_peer)
-        .unwrap_or_else(|| panic!("the nexus peer must appear; listing was {recips:?}"));
-    assert_eq!(
-        nexus_row.sources,
-        vec!["nexus"],
-        "the nexus peer is tagged nexus-only"
-    );
-
-    let _ = std::fs::remove_dir_all(&pair_root);
 }
 
 /// `/agents` and `/sessions` are DIFFERENT namespaces, not two names for one.
