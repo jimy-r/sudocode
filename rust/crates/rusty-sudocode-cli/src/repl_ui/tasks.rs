@@ -1,4 +1,5 @@
 //! Task browser with bounded, lazily decoded output and event-driven repaint.
+use super::choice_text::ChoiceText;
 use crate::render::{
     ansi_fg,
     styled_text::StyledText,
@@ -228,19 +229,21 @@ impl TaskBrowser {
         let available = width.saturating_sub(display_width(&label) + 3);
         let left = fit(base, available);
         let separator = if left.is_empty() { "" } else { " · " };
-        let (prefix, suffix) = if self.focus == TaskFocus::Footer {
-            ("\x1b[7m", RESET)
-        } else {
-            ("", "")
-        };
         let label = fit(
             &label,
             width.saturating_sub(display_width(&left) + display_width(separator)),
         );
-        format!(
-            "{left}{separator}{}{prefix}{label}{suffix}{RESET}",
-            ansi_fg(theme().muted)
-        )
+        let choice = ChoiceText::new(
+            theme(),
+            crate::render::ColorSupport::detect(),
+            self.focus == TaskFocus::Footer,
+        );
+        let label = if self.focus == TaskFocus::Footer {
+            choice.body(&label)
+        } else {
+            choice.muted(&label)
+        };
+        format!("{left}{separator}{label}")
     }
 
     /// Project inside InputSlot's allocation, not an independent terminal budget.
@@ -265,11 +268,11 @@ impl TaskBrowser {
             for id in self.rows.iter().skip(start).take(rows) {
                 let entry = &self.entries[id];
                 let task = &entry.task;
-                let marker = if self.selected.as_ref() == Some(id) {
-                    "❯"
-                } else {
-                    " "
-                };
+                let focused = self.selected.as_ref() == Some(id);
+                let marker = if focused { "❯" } else { " " };
+                let marker =
+                    ChoiceText::new(theme(), crate::render::ColorSupport::detect(), focused)
+                        .prefix(marker);
                 let kind = match task.kind {
                     BackgroundTaskKind::Terminal => "terminal",
                     BackgroundTaskKind::Agent => "agent",

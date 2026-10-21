@@ -3,7 +3,7 @@
 //! Brand accents remain amber. Transcript syntax and inline-code colors come
 //! from the same bundled Catppuccin assets as Codex, without local overrides.
 
-use crossterm::style::Color;
+use crossterm::style::{Color, ContentStyle};
 
 use super::{ansi_fg, code_theme, terminal_palette, ColorSupport};
 
@@ -137,6 +137,25 @@ impl ColorTheme {
             Self::light()
         } else {
             Self::dark()
+        }
+    }
+
+    /// A neutral selection surface with its own readable foreground. Ordinary
+    /// text stays on the terminal's default surface; limited-color terminals
+    /// keep the textual selector instead of assuming a background palette.
+    pub fn selection_style(&self, support: ColorSupport) -> ContentStyle {
+        if matches!(support, ColorSupport::TrueColor | ColorSupport::Ansi256) {
+            ContentStyle {
+                foreground_color: Some(Color::AnsiValue(if self.light_background {
+                    234
+                } else {
+                    255
+                })),
+                background_color: Some(Color::AnsiValue(self.code_bg)),
+                ..ContentStyle::default()
+            }
+        } else {
+            ContentStyle::default()
         }
     }
 

@@ -1890,6 +1890,17 @@ fallback. This does not add another palette or change amber activity accents.
 Real CLI regressions cover dark/light/no-color chrome, resize and neutral
 drafts, and explicit foreground/full resets inside a real question overlay.</p>
 
+<p>Question options and task focus share a neutral selection surface from
+<code>ColorTheme</code>. Amber identifies the selected marker and question
+heading; ordinary choice text keeps the default terminal foreground. Selected
+text uses a paired foreground/background, with muted hints at normal intensity.
+Dark/light selection text and accents retain at least 4.5:1 contrast against
+their surface. Limited-color terminals retain textual focus without a fill;
+<code>NO_COLOR</code> remains plain. Real PTY checks move focus between options
+and verify that the next input draft has no inherited selection background.
+Single-option questions advertise Enter confirmation without an inactive digit
+shortcut. This changes presentation, not slot allocation or input ownership.</p>
+
 <h4>Architecture context</h4>
 
 <table>

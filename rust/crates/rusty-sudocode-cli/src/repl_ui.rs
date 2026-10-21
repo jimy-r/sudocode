@@ -33,6 +33,7 @@ use crossterm::style::Color as TerminalColor;
 use iocraft::prelude::*;
 
 mod ansi_text;
+mod choice_text;
 mod input_history;
 mod layout;
 mod prompt_text;
@@ -41,6 +42,7 @@ mod tasks;
 use crate::render::output::{split_lines, OutputOp, Utf8Stream};
 use crate::render::styled_text::StyledText;
 use ansi_text::{row_text, AnsiText, RichText};
+use choice_text::ChoiceText;
 use layout::{ansi, ansi_with_style, ChromeLayout, InputLayout, Measurements, Slot};
 use prompt_text::PromptTextCache;
 pub(crate) mod prose_preview;
@@ -497,13 +499,24 @@ impl FuzzySelectState {
 
     fn format_panel(&self) -> String {
         let mut lines = Vec::new();
+        let theme = crate::render::theme();
+        let support = crate::render::ColorSupport::detect();
+        let caption = ChoiceText::new(theme, support, false);
         let total = self.filtered.len();
         if self.filter.is_empty() {
-            lines.push(format!("{} items  {}", total, self.question.prompt));
+            lines.push(format!(
+                "{}{}",
+                caption.muted(&format!("{total} items  ")),
+                self.question.prompt
+            ));
         } else {
             lines.push(format!(
-                "{total} match  {} (filter: {})",
-                self.question.prompt, self.filter
+                "{}{}{}{}{}",
+                caption.muted(&format!("{total} match  ")),
+                self.question.prompt,
+                caption.muted(" (filter: "),
+                self.filter,
+                caption.muted(")"),
             ));
         }
         let end = (self.scroll + FUZZY_WINDOW_SIZE).min(self.filtered.len());
@@ -511,19 +524,20 @@ impl FuzzySelectState {
             let abs_vi = self.scroll + vi;
             let option = &self.question.options[oi];
             let selector = if abs_vi == self.cursor { ">" } else { " " };
+            let choice = ChoiceText::new(theme, support, abs_vi == self.cursor);
             let marker = if option.recommended {
-                format!(
-                    " {}(recommended){}",
-                    crate::render::DIM,
-                    crate::render::RESET
-                )
+                choice.muted(" (recommended)")
             } else {
                 String::new()
             };
-            lines.push(format!("{selector} {}{marker}", option.label));
+            lines.push(format!(
+                "{}{}{marker}",
+                choice.prefix(&format!("{selector} ")),
+                choice.body(&option.label)
+            ));
         }
         if end < self.filtered.len() {
-            lines.push(format!("  … {} more", self.filtered.len() - end));
+            lines.push(caption.muted(&format!("  … {} more", self.filtered.len() - end)));
         }
         if self.question.allow_custom_input && !self.filter.is_empty() && self.filtered.is_empty() {
             let hint = self
@@ -532,11 +546,7 @@ impl FuzzySelectState {
                 .as_deref()
                 .filter(|hint| !hint.is_empty())
                 .unwrap_or("no match — press Enter to use what you typed");
-            lines.push(format!(
-                "{}  {hint}{}",
-                crate::render::DIM,
-                crate::render::RESET
-            ));
+            lines.push(caption.muted(&format!("  {hint}")));
         }
         lines.join("\n")
     }
@@ -881,14 +891,21 @@ fn format_question_panel(
     custom_input: &str,
 ) -> String {
     let mut lines = Vec::new();
+    let theme = crate::render::theme();
+    let support = crate::render::ColorSupport::detect();
+    let caption = ChoiceText::new(theme, support, false);
     lines.push(format!(
-        "{}/{}  {}",
-        question.index + 1,
-        question.total.max(1),
+        "{}{}",
+        caption.muted(&format!(
+            "{}/{}  ",
+            question.index + 1,
+            question.total.max(1)
+        )),
         question.prompt
     ));
     for (index, option) in question.options.iter().enumerate() {
         let selector = if index == selected_index { ">" } else { " " };
+        let choice = ChoiceText::new(theme, support, index == selected_index);
         let marker = if option.recommended {
             " (recommended)"
         } else {
@@ -900,11 +917,10 @@ fn format_question_panel(
             .filter(|description| !description.is_empty())
             .map_or(String::new(), |description| format!(" - {description}"));
         lines.push(format!(
-            "{selector} [{}] {}{}{}",
-            index + 1,
-            option.label,
-            marker,
-            description
+            "{}{}{}",
+            choice.prefix(&format!("{selector} [{}] ", index + 1)),
+            choice.body(&option.label),
+            choice.muted(&format!("{marker}{description}")),
         ));
     }
     let max_digit = question.options.len().min(9);
@@ -914,6 +930,7 @@ fn format_question_panel(
     // question did not opt in, the row is omitted.
     if question.allow_custom_input {
         let on_row = selected_index == question.options.len();
+        let choice = ChoiceText::new(theme, support, on_row);
         let selector = if on_row { ">" } else { " " };
         let body = if custom_input.is_empty() {
             let hint = question
@@ -923,20 +940,19 @@ fn format_question_panel(
                 .unwrap_or("type your own answer");
             if on_row {
                 // Show a caret so it reads as an active field once selected.
-                format!(
-                    "\u{2588} {}{hint}{}",
-                    crate::render::DIM,
-                    crate::render::RESET
-                )
+                format!("{}{}", choice.body("\u{2588} "), choice.muted(hint),)
             } else {
-                format!("{}{hint}{}", crate::render::DIM, crate::render::RESET)
+                choice.muted(hint)
             }
         } else if on_row {
-            format!("{custom_input}\u{2588}")
+            choice.body(&format!("{custom_input}\u{2588}"))
         } else {
-            custom_input.to_string()
+            choice.body(custom_input)
         };
-        lines.push(format!("{selector} [+] {body}"));
+        lines.push(format!(
+            "{}{body}",
+            choice.prefix(&format!("{selector} [+] "))
+        ));
     }
     let arrow_hint = if question.back_value.is_some() {
         "\u{2190}\u{2192} back/open \u{00b7} "
@@ -948,11 +964,14 @@ fn format_question_panel(
     } else {
         ""
     };
-    lines.push(format!(
-        "{}  {arrow_hint}\u{2191}\u{2193} navigate \u{00b7} 1-{max_digit} quick select{custom_hint} \u{00b7} Enter confirm{}",
-        crate::render::DIM,
-        crate::render::RESET,
-    ));
+    let digit_hint = if max_digit >= 2 {
+        format!(" \u{00b7} 1-{max_digit} quick select")
+    } else {
+        String::new()
+    };
+    lines.push(caption.muted(&format!(
+        "  {arrow_hint}\u{2191}\u{2193} navigate{digit_hint}{custom_hint} \u{00b7} Enter confirm",
+    )));
     lines.join("\n")
 }
 
@@ -2366,7 +2385,7 @@ fn ReplApp(mut hooks: Hooks) -> impl Into<AnyElement<'static>> {
     let chrome_border = chrome_has_color
         .then_some(chrome_theme.border)
         .and_then(ansi_text::ui_color);
-    let question_style = chrome_style(TerminalColor::Cyan);
+    let question_style = chrome_style(chrome_theme.primary);
     let status_text = match &status_slot {
         StatusSlot::Spinner(s) => ansi(s),
         StatusSlot::TurnResult(s) => s.clone(),
@@ -2394,7 +2413,7 @@ fn ReplApp(mut hooks: Hooks) -> impl Into<AnyElement<'static>> {
     let mut controls = if let Some(panel) = task_panel.clone() {
         ansi(panel)
     } else {
-        ansi_with_style(panel_text.unwrap_or_default(), question_style)
+        ansi(panel_text.unwrap_or_default())
     };
 
     // Match the editor's reserved cursor column and trailing empty lines.
@@ -2557,7 +2576,7 @@ fn ReplApp(mut hooks: Hooks) -> impl Into<AnyElement<'static>> {
             }))
             #((!reviewable && layout.input_rows > 0).then(|| element! {
                 View(height: row_height(layout.input_rows), flex_shrink: 0.0, overflow: Overflow::Hidden) {
-                    Text(content: input_warning.unwrap_or_default(), color: chrome_has_color.then_some(Color::Yellow))
+                    Text(content: input_warning.unwrap_or_default(), color: chrome_has_color.then_some(chrome_theme.warning).and_then(ansi_text::ui_color))
                 }
             }))
             #(row_text("heading", heading, visible.heading))
@@ -2953,10 +2972,22 @@ mod tests {
 
     #[test]
     fn question_panel_marks_selected_option() {
-        let panel = format_question_panel(&question_with_options(), 1, "");
+        let panel =
+            StyledText::from_ansi(&format_question_panel(&question_with_options(), 1, "")).text;
 
         assert!(panel.contains(" [1] Project (recommended)"));
         assert!(panel.contains("> [2] User"));
+    }
+
+    #[test]
+    fn question_hints_only_offer_active_digit_shortcuts() {
+        let mut question = question_with_options();
+        let panel = StyledText::from_ansi(&format_question_panel(&question, 0, "")).text;
+        assert!(panel.contains("1-2 quick select"));
+        question.options.truncate(1);
+        let panel = StyledText::from_ansi(&format_question_panel(&question, 0, "")).text;
+        assert!(!panel.contains("quick select"));
+        assert!(panel.contains("Enter confirm"));
     }
 
     #[test]
@@ -2968,7 +2999,12 @@ mod tests {
         // Cursor on the `[+]` row (index == options.len()) marks it; empty buffer
         // shows a caret + the hint. This is the row Up/Down reach and typing
         // fills in-place.
-        let panel = format_question_panel(&question, question.options.len(), "");
+        let panel = StyledText::from_ansi(&format_question_panel(
+            &question,
+            question.options.len(),
+            "",
+        ))
+        .text;
         assert!(panel.contains("> [+]"));
         assert!(panel.contains("type a comment"));
         assert!(panel.contains("  [1] Project"));
@@ -2982,9 +3018,14 @@ mod tests {
 
         // With a non-empty buffer, the `[+]` row renders the typed text (with a
         // caret when selected) instead of the hint — no slot switch needed.
-        let on_row = format_question_panel(&question, question.options.len(), "hi there");
+        let on_row = StyledText::from_ansi(&format_question_panel(
+            &question,
+            question.options.len(),
+            "hi there",
+        ))
+        .text;
         assert!(on_row.contains("> [+] hi there"));
-        let off_row = format_question_panel(&question, 0, "hi there");
+        let off_row = StyledText::from_ansi(&format_question_panel(&question, 0, "hi there")).text;
         assert!(off_row.contains("[+] hi there"));
         assert!(!off_row.contains("type your own answer"));
     }
