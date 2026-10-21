@@ -1528,6 +1528,25 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
             }),
             required_permission: PermissionMode::WorkspaceWrite,
         },
+        ToolSpec {
+            name: "set_tip",
+            description: "Show one concise, actionable tip in the current session footer. Choose priority explicitly: urgent = the user needs to act now; important = a useful recommendation; normal = optional guidance. Higher priorities take precedence. Use sparingly, not for routine progress or full answers. This does not request approval, ask a question, change configuration, or send a message to another person. Tips clear when the next turn starts; an empty message clears this priority now.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "priority": {
+                        "type": "string", "enum": ["urgent", "important", "normal"],
+                        "description": "urgent: immediate user action; important: actionable recommendation; normal: optional usage hint."
+                    },
+                    "message": {
+                        "type": "string", "maxLength": runtime::tips::MAX_TIP_CHARS,
+                        "description": "One plain-text line without control characters. Empty clears this priority."
+                    }
+                },
+                "required": ["priority", "message"], "additionalProperties": false
+            }),
+            required_permission: PermissionMode::ReadOnly,
+        },
         // ── pid.* tools ───────────────────────────────────────────────
         // Agent process control. `normalize_pid_input` accepts `task_id`
         // as a field alias for `pid` so older prompts still work.
@@ -1989,6 +2008,12 @@ fn execute_tool_with_enforcer(
         "AskUserQuestion" => {
             from_value::<AskUserQuestionInput>(input).and_then(run_ask_user_question)
         }
+        "set_tip" => {
+            maybe_enforce_permission_check(enforcer, name, input)?;
+            let tip: runtime::tips::Tip = from_value(input)?;
+            tip.validate()?;
+            Ok(json!({"tip": tip}).to_string())
+        }
         "TodoWrite" => {
             from_value::<TodoWriteInput>(input).and_then(|input| run_todo_write(input, fs))
         }
@@ -2244,6 +2269,14 @@ fn run_todo_write(input: TodoWriteInput, fs: &Arc<dyn FsBackend>) -> Result<Stri
 pub fn todos_from_tool_result(output: &str) -> Option<Vec<runtime::Todo>> {
     let value: Value = serde_json::from_str(output).ok()?;
     serde_json::from_value(value.get("todos")?.clone()).ok()
+}
+
+/// Decode the bounded result of `set_tip` through the existing tool-result seam.
+pub fn tip_from_tool_result(output: &str) -> Option<runtime::tips::Tip> {
+    let value: Value = serde_json::from_str(output).ok()?;
+    let tip: runtime::tips::Tip = serde_json::from_value(value.get("tip")?.clone()).ok()?;
+    tip.validate().ok()?;
+    Some(tip)
 }
 
 fn run_pid_status(input: Value, fs: &dyn FsBackend) -> Result<String, String> {
@@ -8607,6 +8640,7 @@ fn execute_tool_search(input: ToolSearchInput) -> ToolSearchOutput {
 /// [`GlobalToolRegistry::core_definitions`]), so the next request carries every
 /// schema and the model calls any of them directly.
 const CORE_TOOLS: &[&str] = &[
+    "set_tip",
     "bash",
     "read_file",
     "read_tool_output",
