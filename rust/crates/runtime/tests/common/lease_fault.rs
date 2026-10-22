@@ -14,7 +14,9 @@ use std::io;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use runtime::fs_backend::{FsBackend, FsDirEntry, FsLock, FsMetadata, ManagedRoot};
+use runtime::fs_backend::{
+    FsBackend, FsDirEntry, FsLock, FsMetadata, ManagedRoot, VersionToken, WriteOutcome,
+};
 
 /// What this boundary does to traffic right now.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -337,6 +339,22 @@ impl FsBackend for FaultyBackend {
             probe: Arc::clone(&self.probe),
             seat,
         })))
+    }
+    // Conditional writes are forwarded, not left to the trait's Unsupported
+    // default: this boundary injects only the faults named above, so it must
+    // not change what the backend underneath can do.
+    fn read_versioned(&self, path: &str) -> io::Result<Option<(Vec<u8>, VersionToken)>> {
+        self.reachable()?;
+        self.inner.read_versioned(path)
+    }
+    fn write_if_version(
+        &self,
+        path: &str,
+        expected: Option<&VersionToken>,
+        data: &[u8],
+    ) -> io::Result<WriteOutcome> {
+        self.reachable()?;
+        self.inner.write_if_version(path, expected, data)
     }
     fn read(&self, path: &str) -> io::Result<Vec<u8>> {
         self.reachable()?;
