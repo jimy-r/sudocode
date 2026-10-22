@@ -7293,29 +7293,34 @@ async fn acp_task_completions_interrupted_shell_and_encoded_budget() {
     client.shutdown().await;
     let mut client = spawn_stdio_client_danger(&workspace);
     initialize_task_completions(&mut client).await;
-    let (_, replay) = client
-        .send_request(
-            "_sudocode/task/replay",
-            json!({"sessionId":sid,"cwd":workspace.root,"storageRef":storage}),
-        )
-        .await;
-    assert_eq!(replay["result"]["executionUnconfirmed"], 1, "{replay}");
-    let (_, suppressed) = client.send_request("_sudocode/task/suppress", json!({"sessionId":sid,"cwd":workspace.root,"storageRef":storage,"originTraceId":"root:1"})).await;
-    assert_eq!(
-        suppressed["result"]["disposition"], "suppressed",
-        "{suppressed}"
-    );
-    let (_, replay) = client
-        .send_request(
-            "_sudocode/task/replay",
-            json!({"sessionId":sid,"cwd":workspace.root,"storageRef":storage}),
-        )
-        .await;
-    assert_eq!(replay["result"]["unresolved"], 0, "{replay}");
-    assert_eq!(
-        replay["result"]["executionUnconfirmed"], 1,
-        "suppression is not termination: {replay}"
-    );
+    // No deliverable completion keeps a cold route alive here. Repeated
+    // controls must cross its engine/writer teardown, without a test sleep or
+    // retry masking a transient same-process session_writer_busy.
+    for _ in 0..32 {
+        let (_, replay) = client
+            .send_request(
+                "_sudocode/task/replay",
+                json!({"sessionId":sid,"cwd":workspace.root,"storageRef":storage}),
+            )
+            .await;
+        assert_eq!(replay["result"]["executionUnconfirmed"], 1, "{replay}");
+        let (_, suppressed) = client.send_request("_sudocode/task/suppress", json!({"sessionId":sid,"cwd":workspace.root,"storageRef":storage,"originTraceId":"root:1"})).await;
+        assert_eq!(
+            suppressed["result"]["disposition"], "suppressed",
+            "{suppressed}"
+        );
+        let (_, replay) = client
+            .send_request(
+                "_sudocode/task/replay",
+                json!({"sessionId":sid,"cwd":workspace.root,"storageRef":storage}),
+            )
+            .await;
+        assert_eq!(replay["result"]["unresolved"], 0, "{replay}");
+        assert_eq!(
+            replay["result"]["executionUnconfirmed"], 1,
+            "suppression is not termination: {replay}"
+        );
+    }
     fs::write(workspace.root.join("release-unknown"), "go").unwrap();
     timeout(Duration::from_secs(5), async {
         while !workspace.root.join("unknown-exited").exists() {

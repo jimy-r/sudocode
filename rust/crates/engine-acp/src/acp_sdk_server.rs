@@ -1430,7 +1430,7 @@ pub fn new_session_registry() -> SharedSessionRegistry {
 #[derive(Default)]
 pub struct SessionRegistry {
     sessions: Mutex<HashMap<String, SessionEntry>>,
-    completion_routes: Mutex<HashMap<String, std::sync::Weak<Delivery>>>,
+    completion_routes: Mutex<HashMap<String, CompletionRoute>>,
     cwd_lease: Arc<WorkspaceCwdLease>,
     hosted_factory: Option<Arc<dyn HostedSessionFactory>>,
     /// The peer receiver running for each agent this process serves, by the
@@ -1486,7 +1486,64 @@ impl Drop for HostedTurnState {
 /// same session proceed.
 pub type SessionLaneGuard = tokio::sync::OwnedMutexGuard<()>;
 
+struct CompletionRoute {
+    driver: std::sync::Weak<Delivery>,
+    retirement: engine_core::CompletionRetirement,
+}
+
+struct CompletionRouteSlot<'a> {
+    routes: std::sync::MutexGuard<'a, HashMap<String, CompletionRoute>>,
+    driver: Option<Arc<Delivery>>,
+}
+
+impl CompletionRoute {
+    fn new(driver: &Arc<Delivery>) -> Self {
+        Self {
+            driver: Arc::downgrade(driver),
+            retirement: driver.completion_retirement(),
+        }
+    }
+
+    fn retained(&self) -> bool {
+        self.driver.strong_count() > 0 || !self.retirement.wait(std::time::Duration::ZERO)
+    }
+}
+
 impl SessionRegistry {
+    fn completion_route_slot(&self, session_id: &str) -> Result<CompletionRouteSlot<'_>, AcpError> {
+        loop {
+            let mut routes = self
+                .completion_routes
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            routes.retain(|_, route| route.retained());
+            let Some(route) = routes.get(session_id) else {
+                return Ok(CompletionRouteSlot {
+                    routes,
+                    driver: None,
+                });
+            };
+            if let Some(driver) = route.driver.upgrade() {
+                return Ok(CompletionRouteSlot {
+                    routes,
+                    driver: Some(driver),
+                });
+            }
+            // Weak::upgrade can fail before the detached engine drops its
+            // journal/native writer. Await that exact lifetime outside the
+            // registry lock, so other sessions can still be admitted.
+            let retirement = route.retirement.clone();
+            drop(routes);
+            if !retirement.wait(std::time::Duration::from_secs(30)) {
+                return Err(AcpError::internal(
+                    "completion engine teardown is not finished",
+                ));
+            }
+            // Another caller may have installed the successor while we waited.
+            // Recheck under the same lock rather than replace its ownership.
+        }
+    }
+
     pub fn with_hosted_factory(factory: Arc<dyn HostedSessionFactory>) -> Self {
         Self {
             hosted_factory: Some(factory),
@@ -1500,22 +1557,16 @@ impl SessionRegistry {
         cwd: &std::path::Path,
         create: bool,
     ) -> Result<Arc<Delivery>, AcpError> {
-        let mut routes = self
-            .completion_routes
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        routes.retain(|_, route| route.strong_count() > 0);
-        if let Some(route) = routes
-            .get(&session.session_id)
-            .and_then(std::sync::Weak::upgrade)
-        {
+        let CompletionRouteSlot { mut routes, driver } =
+            self.completion_route_slot(&session.session_id)?;
+        if let Some(route) = driver {
             route
                 .attach_session(session, cwd)
                 .map_err(AcpError::internal)?;
             return Ok(route);
         }
         let route = Delivery::open(session, cwd, create).map_err(AcpError::internal)?;
-        routes.insert(session.session_id.clone(), Arc::downgrade(&route));
+        routes.insert(session.session_id.clone(), CompletionRoute::new(&route));
         Ok(route)
     }
 
@@ -1524,13 +1575,11 @@ impl SessionRegistry {
         session: &runtime::Session,
         cwd: &std::path::Path,
     ) -> Result<(), AcpError> {
-        if let Some(route) = self
-            .completion_routes
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get(&session.session_id)
-            .and_then(std::sync::Weak::upgrade)
-        {
+        let CompletionRouteSlot {
+            routes: _routes,
+            driver,
+        } = self.completion_route_slot(&session.session_id)?;
+        if let Some(route) = driver {
             route
                 .attach_session(session, cwd)
                 .map_err(AcpError::internal)?;
@@ -1543,12 +1592,8 @@ impl SessionRegistry {
         session_id: &str,
         cwd: &std::path::Path,
     ) -> Result<Arc<Delivery>, AcpError> {
-        let mut routes = self
-            .completion_routes
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        routes.retain(|_, route| route.strong_count() > 0);
-        if let Some(route) = routes.get(session_id).and_then(std::sync::Weak::upgrade) {
+        let CompletionRouteSlot { mut routes, driver } = self.completion_route_slot(session_id)?;
+        if let Some(route) = driver {
             route
                 .control(CompletionAction::CheckBinding {
                     session_id: session_id.into(),
@@ -1558,7 +1603,7 @@ impl SessionRegistry {
             return Ok(route);
         }
         let route = Delivery::stored(session_id, cwd).map_err(AcpError::invalid_params)?;
-        routes.insert(session_id.into(), Arc::downgrade(&route));
+        routes.insert(session_id.into(), CompletionRoute::new(&route));
         Ok(route)
     }
 
