@@ -1727,7 +1727,7 @@ fn spawn_conversation_tail(
                                 eprintln!("[{label}] polling conversation with {peer}: {e}");
                                 record_delivery_stall(
                                     &peer,
-                                    &reader.reader.holder,
+                                    reader.cursor.holder(),
                                     reader.offset,
                                     None,
                                     DeliveryStall::PollFailed,
@@ -1745,7 +1745,7 @@ fn spawn_conversation_tail(
                                 eprintln!("[{label}] committing reader for {peer}: {e}");
                                 record_delivery_stall(
                                     &peer,
-                                    &reader.reader.holder,
+                                    reader.cursor.holder(),
                                     reader.offset,
                                     Some(next),
                                     DeliveryStall::CommitRefused,
@@ -1763,7 +1763,7 @@ fn spawn_conversation_tail(
                             stall_repeats = stall_repeats.saturating_add(1);
                             record_delivery_stall(
                                 &peer,
-                                &reader.reader.holder,
+                                reader.cursor.holder(),
                                 reader.offset,
                                 Some(next),
                                 DeliveryStall::ConsumerRefused,
