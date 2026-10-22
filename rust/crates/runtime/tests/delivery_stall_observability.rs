@@ -28,21 +28,40 @@ fn envelope(from: &str, to: &str, body: &str) -> MailboxEnvelope {
     }
 }
 
-fn temp_root(label: &str) -> std::path::PathBuf {
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_nanos());
-    let root = std::env::temp_dir().join(format!(
-        "delivery-stall-{label}-{nanos}-{}",
-        std::process::id()
-    ));
-    std::fs::create_dir_all(&root).expect("create temp root");
-    root
+/// A temp root that removes itself even when an assertion panics.
+///
+/// Cleanup used to be a `remove_dir_all` after the assertions, so every failing
+/// run left a whole mailbox tree in `$TMPDIR` — and a test for unbounded growth
+/// has no business growing unboundedly itself. A guard runs on unwind too.
+struct TempRoot(std::path::PathBuf);
+
+impl TempRoot {
+    fn new(label: &str) -> Self {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos());
+        let root = std::env::temp_dir().join(format!(
+            "delivery-stall-{label}-{nanos}-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).expect("create temp root");
+        Self(root)
+    }
+
+    fn path(&self) -> &std::path::Path {
+        &self.0
+    }
+}
+
+impl Drop for TempRoot {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
 }
 
 #[test]
 fn a_refused_batch_records_a_consumer_refused_stall_with_the_stuck_offset() {
-    let root = temp_root("refused");
+    let root = TempRoot::new("refused");
     let abort = runtime::HookAbortSignal::default();
     let handed_over = Arc::new(AtomicUsize::new(0));
 
@@ -50,7 +69,7 @@ fn a_refused_batch_records_a_consumer_refused_stall_with_the_stuck_offset() {
     // exactly the condition the fleet hit during a long turn.
     let seen = Arc::clone(&handed_over);
     let poller = runtime::mailbox::spawn_local_poller(
-        root.clone(),
+        root.path().to_path_buf(),
         "receiver-under-test".to_string(),
         abort.clone(),
         move |_envelope: &MailboxEnvelope| {
@@ -59,7 +78,7 @@ fn a_refused_batch_records_a_consumer_refused_stall_with_the_stuck_offset() {
         },
     );
 
-    let sender = runtime::mailbox::Mailbox::workspace_local(&root, "peer-sender".to_string());
+    let sender = runtime::mailbox::Mailbox::workspace_local(root.path(), "peer-sender".to_string());
     sender
         .send(envelope(
             "peer-sender",
@@ -105,8 +124,6 @@ fn a_refused_batch_records_a_consumer_refused_stall_with_the_stuck_offset() {
         stalls.iter().all(|e| !e.holder.is_empty()),
         "the stall is attributable to the reader that holds the lease"
     );
-
-    let _ = std::fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -114,13 +131,13 @@ fn an_accepted_batch_records_no_stall() {
     // The complement: with no failure injected, delivery advances and leaves
     // nothing behind. Without this, the test above would pass even if the code
     // recorded a stall on every poll.
-    let root = temp_root("accepted");
+    let root = TempRoot::new("accepted");
     let abort = runtime::HookAbortSignal::default();
     let accepted = Arc::new(AtomicUsize::new(0));
 
     let seen = Arc::clone(&accepted);
     let poller = runtime::mailbox::spawn_local_poller(
-        root.clone(),
+        root.path().to_path_buf(),
         "accepting-receiver".to_string(),
         abort.clone(),
         move |_envelope: &MailboxEnvelope| {
@@ -129,7 +146,7 @@ fn an_accepted_batch_records_no_stall() {
         },
     );
 
-    let sender = runtime::mailbox::Mailbox::workspace_local(&root, "quiet-peer".to_string());
+    let sender = runtime::mailbox::Mailbox::workspace_local(root.path(), "quiet-peer".to_string());
     sender
         .send(envelope(
             "quiet-peer",
@@ -159,6 +176,4 @@ fn an_accepted_batch_records_no_stall() {
             .any(|e| e.peer == "quiet-peer" && e.stall == DeliveryStall::ConsumerRefused),
         "an accepted batch must not record a stall"
     );
-
-    let _ = std::fs::remove_dir_all(&root);
 }
