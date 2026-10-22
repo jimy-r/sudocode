@@ -7,6 +7,7 @@ use std::{
     time::Instant,
 };
 
+use crossterm::style::SetForegroundColor;
 use engine_events::EngineState;
 
 use super::{spinner_progress::SpinnerProgress, text_layout, theme, RESET};
@@ -256,12 +257,12 @@ pub(super) fn progress_line(
     let reserved = metric.width(logo) + 1 + metric.width(&details);
     let label = text_layout::single_line(label);
     let label = metric.truncate(&label, width.saturating_sub(reserved));
-    let theme = theme();
+    let colors = theme().activity_colors(warning);
     let line = format!(
         "{}{logo}{} {label}{}{details}{RESET}",
-        theme.logo_fg(),
-        theme.spinner_fg(warning),
-        theme.muted_fg(),
+        SetForegroundColor(colors.logo),
+        SetForegroundColor(colors.label),
+        SetForegroundColor(colors.metadata),
     );
     // On extremely narrow terminals even metadata cannot fit. Keep one row.
     if reserved > width {
