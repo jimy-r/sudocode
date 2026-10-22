@@ -2096,6 +2096,14 @@ fn live_reader_commit_refused_on_renew_error_then_reacquired_from_durable_offset
         2,
         "m1 must be delivered once, refused at commit, and redelivered exactly once: {delivered:?}"
     );
+    // With m1 delivered exactly twice, m0 delivered exactly once pins where the
+    // re-acquired reader resumed: at the durable offset, neither before it
+    // (m0 again) nor after it (no second m1).
+    assert_eq!(
+        deliveries("m0 warm-up").len(),
+        1,
+        "the re-acquired reader must resume at the durable offset, not before it"
+    );
     let injected: Vec<_> = probe
         .reader_renewals()
         .into_iter()
@@ -2155,7 +2163,7 @@ fn live_reader_commit_refused_on_renew_error_then_reacquired_from_durable_offset
     );
 
     println!(
-        "BASELINE COMMIT OK: m1 delivered; ONE INJECTED reader renewal requested {:?} after that delivery and failed (the commit's confirm); commit refused, position held at {p0} in {} read-only samples; reader released {:?} and re-acquired {:?} after the failure (reached node: {reached_node}); m1 redelivered {:?} after the first delivery and committed, position {p0} -> {p1}; m1 delivered exactly twice; seat untouched",
+        "BASELINE COMMIT OK: m1 delivered; ONE INJECTED reader renewal requested {:?} after that delivery and failed (the commit's confirm); commit refused, position held at {p0} in {} read-only samples; reader released {:?} and re-acquired {:?} after the failure (reached node: {reached_node}); m1 redelivered {:?} after the first delivery and committed, position {p0} -> {p1}; m1 delivered exactly twice and m0 once (resumed at the durable offset); seat untouched",
         failed.requested.saturating_duration_since(delivered[0]),
         held.len(),
         released.saturating_duration_since(failed.returned),
