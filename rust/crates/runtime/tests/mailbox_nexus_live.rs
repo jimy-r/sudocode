@@ -1979,8 +1979,10 @@ fn live_reader_receipts_keep_unprocessed_messages_and_renew_while_blocked() {
 ///
 /// One instance of an agent over a real mTLS client, behind the test-only fault
 /// boundary (`common/lease_fault.rs`). Exactly ONE renewal of the reader's lock
-/// is failed (INJECTED: it never reaches the node); everything else is real.
-/// Asserted, with monotonic instants:
+/// is failed (INJECTED: it never reaches the node), and the re-claim that follows
+/// is held back (INJECTED delay) so the window in which the position must not
+/// move is long enough to observe; everything else is real. Asserted, with
+/// monotonic instants:
 ///
 /// - the failed renewal is the commit's own `confirm()`, after the message was
 ///   delivered, and the commit is refused: the durable read position stays put;
@@ -2073,6 +2075,8 @@ fn live_reader_commit_refused_on_renew_error_then_reacquired_from_durable_offset
 
     let acquired_before = probe.reader_acquisitions().len();
     let armed = Instant::now();
+    const CLAIM_DELAY: Duration = Duration::from_millis(800);
+    probe.delay_next_reader_claim(CLAIM_DELAY);
     probe.set(Fault::ReaderRenewFails(1));
     let body = "m1 committed under a failing renewal";
     send_to(&sender, peer, &agent, body, &auth).expect("send");
@@ -2126,14 +2130,19 @@ fn live_reader_commit_refused_on_renew_error_then_reacquired_from_durable_offset
         reacquired <= delivered[1],
         "m1 must be redelivered by the re-acquired reader"
     );
+    assert!(
+        reacquired.saturating_duration_since(released) >= CLAIM_DELAY,
+        "the INJECTED claim delay must have held the window open"
+    );
     let samples = samples.lock().unwrap().clone();
     let held: Vec<_> = samples
         .iter()
         .filter(|(start, end, _)| *start >= failed.returned && *end <= delivered[1])
         .collect();
     assert!(
-        !held.is_empty(),
-        "no position sample fell between the refused commit and the redelivery"
+        held.len() >= 3,
+        "too few position samples between the refused commit and the redelivery: {}",
+        held.len()
     );
     assert!(
         held.iter().all(|(_, _, p)| *p == Some(p0)),

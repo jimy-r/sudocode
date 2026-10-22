@@ -68,6 +68,9 @@ pub struct Probe {
     fault: Mutex<Fault>,
     seat: Mutex<Vec<LockEvent>>,
     reader: Mutex<Vec<LockEvent>>,
+    /// INJECTED, one shot: hold the next claim of a conversation reader's lock
+    /// this long before it reaches the node.
+    reader_claim_delay: Mutex<Option<Duration>>,
     /// Locks dropped while partitioned. Held, not released, so the node keeps
     /// them until their TTL runs out.
     leaked: Mutex<Vec<Arc<dyn FsLock>>>,
@@ -79,6 +82,7 @@ impl Probe {
             fault: Mutex::new(Fault::None),
             seat: Mutex::new(Vec::new()),
             reader: Mutex::new(Vec::new()),
+            reader_claim_delay: Mutex::new(None),
             leaked: Mutex::new(Vec::new()),
         })
     }
@@ -105,6 +109,11 @@ impl Probe {
             }
             _ => None,
         }
+    }
+
+    /// Arm a one-shot INJECTED delay on the next reader lock claim.
+    pub fn delay_next_reader_claim(&self, delay: Duration) {
+        *self.reader_claim_delay.lock().unwrap() = Some(delay);
     }
 
     /// Consume one armed reader renewal failure, if any.
@@ -313,6 +322,11 @@ impl FsBackend for FaultyBackend {
     }
     fn try_lock(&self, path: &str, ttl_ms: u64) -> io::Result<Option<Arc<dyn FsLock>>> {
         self.reachable()?;
+        if !is_seat(path) {
+            if let Some(delay) = self.probe.reader_claim_delay.lock().unwrap().take() {
+                std::thread::sleep(delay);
+            }
+        }
         let Some(lock) = self.inner.try_lock(path, ttl_ms)? else {
             return Ok(None);
         };
