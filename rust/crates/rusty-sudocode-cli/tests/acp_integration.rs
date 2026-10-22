@@ -3656,19 +3656,31 @@ async fn collect_until_finished(
     seen: &[Value],
     want: usize,
 ) -> Vec<Value> {
-    let mut more = Vec::new();
+    collect_until_subagent_condition(
+        client,
+        seen,
+        |updates| finished_count(updates) >= want,
+        &format!("{want} finished sub-agents"),
+    )
+    .await
+}
+
+async fn collect_until_subagent_condition(
+    client: &mut AcpTestClient,
+    seen: &[Value],
+    ready: impl Fn(&[Value]) -> bool,
+    goal: &str,
+) -> Vec<Value> {
+    let mut updates = seen.to_vec();
     let deadline = tokio::time::Instant::now() + SUBAGENT_EVENTS_WAIT;
-    while finished_count(seen) + finished_count(&more) < want {
+    while !ready(&updates) {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         let Ok(msg) = timeout(remaining, client.recv_inner()).await else {
-            panic!(
-                "only {} of {want} sub-agents finished within {SUBAGENT_EVENTS_WAIT:?}; after the prompt saw: {more:#?}",
-                finished_count(seen) + finished_count(&more)
-            );
+            panic!("did not observe {goal} within {SUBAGENT_EVENTS_WAIT:?}: {updates:#?}");
         };
-        more.push(msg);
+        updates.push(msg);
     }
-    more
+    updates.split_off(seen.len())
 }
 
 /// What one spawned agent looked like on the wire.
@@ -4090,11 +4102,16 @@ async fn acp_subagent_events_background_parallel() {
     let mut client = spawn_stdio_client_danger(&workspace);
     initialize_with_subagent_events(&mut client).await;
     let session_id = scenario_session_new(&mut client, &workspace.root).await;
-    let (during, _) = prompt_scenario(&mut client, &session_id, "subagent_events_background").await;
+    let release = workspace.root.join("release-background-children");
+    let scenario = format!(
+        "subagent_events_background SUBAGENT_RELEASE:{}",
+        json!(release.to_str().expect("fixture release path"))
+    );
+    let (during, _) = prompt_scenario(&mut client, &session_id, &scenario).await;
     assert_eq!(
         finished_count(&during),
         0,
-        "slow background children cannot have finished inside the turn"
+        "unreleased background children cannot have finished inside the turn"
     );
     for id in ["toolu_events_bg_1", "toolu_events_bg_2"] {
         let result = tool_result_named(&during, id);
@@ -4104,7 +4121,26 @@ async fn acp_subagent_events_background_parallel() {
             true
         );
     }
-    let after = collect_until_finished(&mut client, &during, 2).await;
+    // Observe real child streams before either can finish. Fixed response
+    // delays only made overlap probable and flaked under workspace build load.
+    // A serial executor cannot satisfy this barrier and still fails the test.
+    let before_release = collect_until_subagent_condition(
+        &mut client,
+        &during,
+        |updates| {
+            assert_eq!(finished_count(updates), 0, "child finished before release");
+            let active: std::collections::BTreeSet<_> = updates
+                .iter()
+                .filter_map(|n| sudocode_meta(n)["subagent"]["agentId"].as_str())
+                .collect();
+            active.len() == 2
+        },
+        "two active child streams before release",
+    )
+    .await;
+    let seen: Vec<Value> = during.iter().chain(&before_release).cloned().collect();
+    fs::write(release, "both child streams observed").expect("release real children");
+    let after = collect_until_finished(&mut client, &seen, 2).await;
     for n in &after {
         assert_eq!(
             n["method"], "session/update",
@@ -4112,7 +4148,7 @@ async fn acp_subagent_events_background_parallel() {
         );
         assert_eq!(n["params"]["sessionId"], session_id.as_str());
     }
-    let all: Vec<Value> = during.iter().chain(&after).cloned().collect();
+    let all: Vec<Value> = seen.iter().chain(&after).cloned().collect();
     dump_subagent_events("background", &all);
 
     let traces = assert_subagent_invariants(&all);
@@ -6780,6 +6816,194 @@ async fn acp_completions_sync_and_nested_do_not_auto_publish() {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Zone-contract subprocess scope (review acceptance: "real subprocess
+// scope-denial coverage")
+// ---------------------------------------------------------------------------
+
+/// Like [`spawn_stdio_client_danger`] but injects the subprocess runner env
+/// (`NEXUS_ZONE_ID` + `NEXUS_RESOURCE_SCOPE`) after `isolate_env`'s
+/// `env_clear`, standing in for the zone metadata a moss runner manifest
+/// would plant. `danger-full-access` keeps the tool layer out of the way so
+/// a denial can only come from the zone contract.
+fn spawn_stdio_client_danger_zone_env(
+    workspace: &TestWorkspace,
+    zone_id: &str,
+    resource_scope: &str,
+) -> AcpTestClient {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_scode"));
+    cmd.current_dir(&workspace.root);
+    isolate_env(&mut cmd, workspace);
+    cmd.args([
+        "--auth",
+        "api-key",
+        "--model",
+        "sonnet",
+        "--permission-mode",
+        "danger-full-access",
+        "acp",
+    ])
+    .env("NEXUS_ZONE_ID", zone_id)
+    .env("NEXUS_RESOURCE_SCOPE", resource_scope)
+    .stdin(Stdio::piped())
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped());
+
+    let mut child = cmd.spawn().expect("spawn scode acp stdio (danger+zone)");
+    let stdin = child.stdin.take().expect("stdin should be piped");
+    let stdout = child.stdout.take().expect("stdout should be piped");
+
+    AcpTestClient {
+        transport: Transport::Stdio {
+            child,
+            stdin,
+            stdout: BufReader::new(stdout),
+        },
+        next_id: 1,
+        last_available_commands: None,
+        raw_lines: Vec::new(),
+    }
+}
+
+/// The host-injected runner env must shape the CLI's file authorization
+/// (review finding 1): a real subprocess with a scoped zone writes inside
+/// its scope and is refused outside it, while the same operation in a
+/// genuinely env-less subprocess succeeds — the standalone-local exception
+/// is limited to that absence, and the refusal is attributable to the zone
+/// layer (the `ZoneAuthError::OutOfScope` message), not the tool layer.
+///
+/// The scope prefix is computed over the CANONICALIZED workspace root: the
+/// child canonicalizes the session cwd (`canonical_session_cwd`) before
+/// booting its kernel, and `path_is_within` is a plain string prefix match —
+/// an un-canonicalized `/tmp`-style path would diverge on macOS
+/// (`/private/tmp`) and 8.3-short-name Windows temp dirs.
+///
+/// Mock scenarios are fixed to write `generated/output.txt` /
+/// `generated/denied.txt`, so in-scope vs out-of-scope is chosen by the
+/// prefix the scope grants: `…/generated` includes the writes; `…/allowed`
+/// excludes them.
+#[tokio::test]
+async fn zone_scope_env_shapes_cli_subprocess_file_authorization() {
+    let server = MockAnthropicService::spawn()
+        .await
+        .expect("mock service should start");
+
+    let scope_json_for = |granted_prefix: &str| {
+        serde_json::json!({
+            "schema_version": 1,
+            "zone_id": "zone-scope-e2e",
+            "rules": [
+                {"capability": "zone.data.read", "resource_prefixes": [granted_prefix]},
+                {"capability": "zone.data.write", "resource_prefixes": [granted_prefix]}
+            ]
+        })
+        .to_string()
+    };
+
+    // Group 1 — in scope: the write under the granted prefix succeeds.
+    {
+        let workspace = TestWorkspace::new("zone-in-scope");
+        workspace.create();
+        workspace.write_sudocode_json(&server.base_url());
+        let canonical = fs::canonicalize(&workspace.root).expect("canonicalize root");
+        let ws_vfs = runtime::vfs_path_for_host_path(&canonical).expect("workspace VFS prefix");
+        let scope = scope_json_for(&format!("{ws_vfs}/generated"));
+
+        let mut client = spawn_stdio_client_danger_zone_env(&workspace, "zone-scope-e2e", &scope);
+        scenario_initialize(&mut client).await;
+        let session = scenario_session_new(&mut client, &workspace.root).await;
+        let (text, tools) = run_scenario_collect_text(
+            &mut client,
+            &session,
+            "write_file_allowed",
+            Duration::from_secs(30),
+            "zone in-scope write",
+        )
+        .await;
+        assert!(
+            text.contains("write_file succeeded"),
+            "in-scope write must succeed: text {text:?} tools {tools:?}"
+        );
+        assert!(
+            workspace.root.join("generated/output.txt").is_file(),
+            "in-scope write must land on disk"
+        );
+        client.shutdown().await;
+        workspace.cleanup();
+    }
+
+    // Group 2 — out of scope: the identical write shape is refused, nothing
+    // lands, and the refusal reason is the zone layer's OutOfScope.
+    {
+        let workspace = TestWorkspace::new("zone-out-of-scope");
+        workspace.create();
+        workspace.write_sudocode_json(&server.base_url());
+        let canonical = fs::canonicalize(&workspace.root).expect("canonicalize root");
+        let ws_vfs = runtime::vfs_path_for_host_path(&canonical).expect("workspace VFS prefix");
+        let scope = scope_json_for(&format!("{ws_vfs}/allowed"));
+
+        let mut client = spawn_stdio_client_danger_zone_env(&workspace, "zone-scope-e2e", &scope);
+        scenario_initialize(&mut client).await;
+        let session = scenario_session_new(&mut client, &workspace.root).await;
+        let (text, tools) = run_scenario_collect_text(
+            &mut client,
+            &session,
+            "write_file_denied",
+            Duration::from_secs(30),
+            "zone out-of-scope write",
+        )
+        .await;
+        assert!(
+            text.contains("write_file denied as expected"),
+            "out-of-scope write must be denied: text {text:?} tools {tools:?}"
+        );
+        assert!(
+            !workspace.root.join("generated/denied.txt").exists(),
+            "out-of-scope write must not land on disk"
+        );
+        let tool_text = tools
+            .iter()
+            .map(|tool| tool.to_string())
+            .collect::<String>();
+        assert!(
+            format!("{text}{tool_text}").contains("is outside runtime scope"),
+            "the refusal must be the zone layer's OutOfScope, not the tool \
+             layer's: text {text:?} tools {tool_text:?}"
+        );
+        client.shutdown().await;
+        workspace.cleanup();
+    }
+
+    // Group 3 — control, genuinely env-less: the same write the zone refused
+    // succeeds, proving the refusal came from the env-shaped authorization
+    // and not the tool layer or the mock. The mock's closing text is fixed
+    // ("denied as expected") regardless of the real outcome, so only the
+    // file on disk is the evidence here.
+    {
+        let workspace = TestWorkspace::new("zone-env-absent");
+        workspace.create();
+        workspace.write_sudocode_json(&server.base_url());
+
+        let mut client = spawn_stdio_client_danger(&workspace);
+        scenario_initialize(&mut client).await;
+        let session = scenario_session_new(&mut client, &workspace.root).await;
+        let _ = run_scenario_collect_text(
+            &mut client,
+            &session,
+            "write_file_denied",
+            Duration::from_secs(30),
+            "env-less control write",
+        )
+        .await;
+        assert!(
+            workspace.root.join("generated/denied.txt").is_file(),
+            "env-less control write must land on disk"
+        );
+        client.shutdown().await;
+        workspace.cleanup();
+    }
+}
+
 async fn initialize_task_completions(client: &mut AcpTestClient) {
     let (_, response) = client.send_request("initialize", json!({"protocolVersion":1,"clientCapabilities":{"_meta":{"sudocode":{"taskCompletions":{"version":1},"subagentCompletions":{"version":1}}}}})).await;
     assert_eq!(
@@ -7725,6 +7949,135 @@ $stamp = '{{0}}:{{1}}' -f $PID, (Get-Process -Id $PID).StartTime.ToUniversalTime
         "replay must not restart model or process work"
     );
     client.send_raw(&json!({"jsonrpc":"2.0","id":completion["id"],"result":{"completionId":completion["params"]["completionId"],"disposition":"stored"}})).await;
+    client.shutdown().await;
+    workspace.cleanup();
+}
+
+/// Pin the agent name a session started in `dir` answers to.
+fn pin_agent_name(dir: &Path, agent: &str) {
+    let settings = dir.join(".nexus").join("sudocode");
+    fs::create_dir_all(&settings).expect("create project settings");
+    fs::write(
+        settings.join("settings.json"),
+        json!({ "agentName": agent }).to_string(),
+    )
+    .expect("write project settings");
+}
+
+/// A non-hosted ACP process on a machine with no node receives its peers over
+/// the same-machine pair root, one receiver per agent it serves.
+///
+/// Two sessions in two workspaces are two agents. Each peer message reaches
+/// the session of the agent it was sent to, never the other one, and names its
+/// real sender. Each conversation's read position moves only once the turn the
+/// message started has finished.
+#[tokio::test]
+async fn acp_stdio_receives_peer_messages_on_the_pair_root() {
+    const FIRST: &str = "acp-pair-first";
+    const SECOND: &str = "acp-pair-second";
+    const PEER: &str = "acp-pair-peer";
+    let server = MockAnthropicService::spawn()
+        .await
+        .expect("mock service should start");
+    let workspace = TestWorkspace::new("stdio-pair-receive");
+    workspace.create();
+    workspace.write_sudocode_json(&server.base_url());
+    let second_dir = workspace.root.join("second");
+    fs::create_dir_all(&second_dir).expect("create the second workspace");
+    pin_agent_name(&workspace.root, FIRST);
+    pin_agent_name(&second_dir, SECOND);
+
+    let mut client = spawn_stdio_client(&workspace);
+    scenario_initialize(&mut client).await;
+    let mut sessions = Vec::new();
+    for (dir, agent) in [(&workspace.root, FIRST), (&second_dir, SECOND)] {
+        let (_, created) = client
+            .send_request(
+                "session/new",
+                json!({"cwd": dir.to_string_lossy(), "mcpServers": []}),
+            )
+            .await;
+        let peer = &created["result"]["_meta"]["sudocode"]["peer"];
+        assert_eq!(
+            peer["agent"], agent,
+            "session/new reports its agent: {created}"
+        );
+        assert_eq!(
+            peer["namespace"], "disk",
+            "with no node record the peers are on the pair root: {created}"
+        );
+        let id = created["result"]["sessionId"]
+            .as_str()
+            .unwrap_or_else(|| panic!("session/new returned no sessionId: {created}"))
+            .to_string();
+        sessions.push((agent, id));
+    }
+
+    let pair_root = runtime::mailbox::local_pair_root_in(&workspace.config_home);
+    let peer = runtime::mailbox::Mailbox::workspace_local(&pair_root, PEER.to_string());
+    for (agent, _) in &sessions {
+        peer.send(runtime::agent_mailbox::MailboxEnvelope {
+            from: PEER.to_string(),
+            to: (*agent).to_string(),
+            body: format!("for {agent} PARITY_SCENARIO:single_turn_text"),
+            summary: None,
+            timestamp: 0,
+            color: None,
+            kind: runtime::agent_mailbox::kinds::MESSAGE.to_string(),
+            request_id: None,
+        })
+        .expect("the peer writes on the pair root");
+    }
+
+    let mut delivered: Vec<Value> = Vec::new();
+    while delivered.len() < sessions.len() {
+        let (_, update) = client
+            .recv_until(Duration::from_secs(30), |msg| {
+                msg["method"] == "session/update"
+                    && msg["params"]["update"]["sessionUpdate"] == "user_message_chunk"
+                    && msg["params"]["_meta"]["sudocode"]["a2a"]["from"] == PEER
+            })
+            .await
+            .unwrap_or_else(|seen| {
+                panic!("a peer message never reached the client; saw {seen:#?}")
+            });
+        delivered.push(update);
+    }
+    for (agent, id) in &sessions {
+        let update = delivered
+            .iter()
+            .find(|update| update["params"]["sessionId"] == id.as_str())
+            .unwrap_or_else(|| {
+                panic!("nothing was delivered to {agent}'s session: {delivered:#?}")
+            });
+        let text = update["params"]["update"]["content"]["text"]
+            .as_str()
+            .unwrap_or_default();
+        assert!(
+            text.contains(&format!("for {agent} ")),
+            "{agent}'s session got another agent's message: {text}"
+        );
+    }
+
+    for (agent, _) in &sessions {
+        let inbox = runtime::mailbox::Mailbox::workspace_local(&pair_root, (*agent).to_string());
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            let position = inbox
+                .read_position(PEER)
+                .expect("read the agent's position")
+                .unwrap_or(0);
+            if position > 0 {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "{agent} never recorded the message after its turn finished"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+
     client.shutdown().await;
     workspace.cleanup();
 }

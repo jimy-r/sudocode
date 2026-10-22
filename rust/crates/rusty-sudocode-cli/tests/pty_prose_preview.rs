@@ -80,7 +80,7 @@ fn expect_finalized_with_draft(session: &PtySession, marker: &str, draft: &str) 
     common::expect_screen_settled(
         session,
         |screen| {
-            let status = common::turn_status_line(screen);
+            let status = common::turn_status_identity(screen);
             !status.is_empty() && status != marker && common::input_line_of(screen) == draft
         },
         common::DEFAULT_TIMEOUT,

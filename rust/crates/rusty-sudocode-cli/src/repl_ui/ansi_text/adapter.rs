@@ -81,11 +81,12 @@ impl Component for WidthText {
 }
 
 pub(super) fn contents(text: &StyledText) -> Vec<MixedTextContent> {
-    text.spans(0..text.text.len())
-        .map(|(style, text)| {
+    text.rich_spans(0..text.text.len())
+        .map(|(style, text, hyperlink)| {
             let has = |attr| style.attributes.has(attr);
             let mut span = MixedTextContent::default();
             span.text = text.replace('\t', " ").replace('\r', "");
+            span.hyperlink = hyperlink.map(ToString::to_string);
             span.color = style.foreground_color.and_then(ui_color);
             span.background_color = style.background_color.and_then(ui_color);
             span.weight = if has(Attribute::Bold) {

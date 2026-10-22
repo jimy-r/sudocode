@@ -6,6 +6,12 @@ const assert = require('node:assert/strict');
 exports.run = async function run(host, config) {
   const { child, terminal, snapshot, viewport, settle, frame, resize, onPresentation } = host;
   const hasSavedHistory = ['prose_resize', 'prose_finish_resize'].includes(config.scenario);
+function normalizedProse(text) {
+  // This fixture's URI suffix depends on terminal capabilities. Dedicated
+  // hyperlink acceptance checks the destination; retain all visible prose here.
+  return text.replace(/\s/g, '').normalize('NFC')
+    .replaceAll('link(https://example.com)', 'link');
+}
 function proseRows() {
   const lines = snapshot().split('\n');
   const start = lines.findIndex(line => line.includes('ProseStart'));
@@ -28,7 +34,7 @@ function proseRows() {
 }
 function checkProseHistory() {
   const text = snapshot();
-  const joined = text.replace(/\s/g, '');
+  const joined = normalizedProse(text);
   assert.equal(joined.split('ProseStart').length - 1, 1, text);
   assert.equal(joined.split('ProseDone.').length - 1, 1, text);
   if (hasSavedHistory) {
@@ -42,7 +48,7 @@ assert(config.draft.includes('👩🏽‍💻'), 'the native handoff must cover 
 let draft = config.draft;
 function inputAtWidth(cols) {
   const lines = viewport().split('\n');
-  const input = lines.findIndex(line => line.startsWith(`❯ ${draft}`));
+  const input = lines.findIndex(line => line === `❯ ${draft}`);
   const separator = '─'.repeat(cols);
   return input > 0 && lines[input - 1] === separator && lines[input + 1] === separator;
 }
@@ -78,9 +84,9 @@ async function prosePreview() {
     // presented, exercising history and live-frame placement in one update.
     resize(120, 40);
     fs.writeFileSync(path.join(config.root, 'prose-release'), 'release');
-    const expected = 'ProseStart中文é💻ordinarytextwithboldwords,inlinecode,andalink(https://example.com).Moreordinaryprosewrapsacrossseveralrowswhiletheinputstaysavailable.ProseDone.'.normalize('NFC');
+    const expected = normalizedProse('ProseStart中文é💻ordinarytextwithboldwords,inlinecode,andalink.Moreordinaryprosewrapsacrossseveralrowswhiletheinputstaysavailable.ProseDone.');
     await settle(() => viewport().includes('turn 2') && inputAtWidth(120)
-      && viewport().replace(/\s/g, '').normalize('NFC').includes(expected));
+      && normalizedProse(viewport()).includes(expected));
     checkProseHistory();
     child.write('\x15');
     await frame(() => !viewport().includes(draft));

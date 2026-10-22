@@ -55,6 +55,8 @@ enum ResponseKind {
     GeminiCapture,
     CapturePaced,
     CaptureBurst,
+    SplicedAttempts,
+    RetryUsageComplete,
 }
 
 impl ResponseKind {
@@ -178,6 +180,26 @@ impl StreamProvider {
                     response_body(!matches!(kind, ResponseKind::Interrupted), empty)
                 });
                 match kind {
+                    ResponseKind::SplicedAttempts | ResponseKind::RetryUsageComplete => {
+                        let fixture: Value = serde_json::from_str(include_str!(
+                            "../../../test-fixtures/retry_usage_stream.json"
+                        )).unwrap();
+                        let mut events = fixture["events"].as_array().unwrap().clone();
+                        if matches!(kind, ResponseKind::RetryUsageComplete) {
+                            events.remove(0);
+                        } else {
+                            // Partial progress from A must remain visible, but
+                            // must never be silently joined to response B.
+                            events.splice(1..1, [
+                                json!({"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}),
+                                json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"FAILED_ATTEMPT_PARTIAL"}}),
+                                json!({"type":"content_block_stop","index":0}),
+                            ]);
+                        }
+                        body = events.iter().map(|event| format!(
+                            "event: {}\ndata: {event}\n\n", event["type"].as_str().unwrap()
+                        )).collect();
+                    }
                     ResponseKind::GeminiCapture => body = "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"STREAM_BODY_VERIFIED\"}]},\"finishReason\":\"STOP\"}],\"usageMetadata\":{\"promptTokenCount\":12,\"candidatesTokenCount\":8}}\n\n".to_string(),
                     ResponseKind::SignedCapture => body = signed_capture_body(),
                     ResponseKind::CapturePaced => {
@@ -930,6 +952,16 @@ fn configure_peer(env: &TestEnv, provider: &StreamProvider, kind: ResponseKind) 
     std::fs::write(path, config.to_string()).unwrap();
 }
 
+#[test]
+fn spliced_attempts_preserve_partial_progress_without_mixing_cache_usage() {
+    check_response(ResponseKind::SplicedAttempts);
+}
+
+#[test]
+fn successful_start_with_zero_cache_creation_reaches_session_accounting() {
+    check_response(ResponseKind::RetryUsageComplete);
+}
+
 // render takes a closure over screens with different lifetimes.
 #[allow(clippy::redundant_closure_for_method_calls)]
 fn check_response(kind: ResponseKind) {
@@ -991,7 +1023,16 @@ fn check_response(kind: ResponseKind) {
         &cli,
         |screen| {
             if exit == 0 {
-                screen.contains("STREAM_BODY_VERIFIED")
+                screen.contains(
+                    if matches!(
+                        kind,
+                        ResponseKind::SplicedAttempts | ResponseKind::RetryUsageComplete
+                    ) {
+                        "RETRY_USAGE_SUCCESS"
+                    } else {
+                        "STREAM_BODY_VERIFIED"
+                    },
+                )
             } else {
                 common::screen_contains(screen, "runtime_error:")
             }
@@ -999,6 +1040,71 @@ fn check_response(kind: ResponseKind) {
         env.timeout(),
         "complete process output",
     );
+    if matches!(
+        kind,
+        ResponseKind::SplicedAttempts | ResponseKind::RetryUsageComplete
+    ) {
+        assert_eq!(
+            provider.requests.load(Ordering::SeqCst),
+            1,
+            "never replay a stream after partial progress escaped"
+        );
+        let store = runtime::SessionStore::from_cwd(env.workspace_root()).unwrap();
+        let path = store
+            .list_sessions()
+            .unwrap()
+            .into_iter()
+            .find(|session| session.message_count > 0)
+            .unwrap()
+            .path;
+        let session = runtime::Session::load_from_path(&path).unwrap();
+        let assistant = session
+            .messages
+            .iter()
+            .rev()
+            .find(|message| message.role == runtime::MessageRole::Assistant)
+            .unwrap();
+        let usage = assistant.usage.expect("retain the observed response usage");
+        assert_eq!(usage.input_tokens, 2);
+        if matches!(kind, ResponseKind::SplicedAttempts) {
+            assert_ne!(exit, 0, "a spliced stream must fail: {screen}");
+            assert!(
+                common::screen_contains(&screen, "multiple message_start"),
+                "{screen}"
+            );
+            let saved_text: String = assistant
+                .blocks
+                .iter()
+                .filter_map(|block| match block {
+                    runtime::ContentBlock::Text { text } => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                saved_text.lines().next(),
+                Some("FAILED_ATTEMPT_PARTIAL"),
+                "retain A before the runtime's interruption annotation"
+            );
+            assert!(
+                !saved_text.contains("RETRY_USAGE_SUCCESS"),
+                "B must never enter saved history"
+            );
+            assert!(
+                !screen.contains("RETRY_USAGE_SUCCESS"),
+                "never present B as A: {screen}"
+            );
+            assert_eq!(usage.cache_creation_input_tokens, 5235);
+            assert_eq!(usage.cache_read_input_tokens, 124_730);
+            assert_eq!(usage.output_tokens, 0);
+        } else {
+            assert_eq!(exit, 0, "{screen}");
+            assert!(screen.contains("RETRY_USAGE_SUCCESS"), "{screen}");
+            assert_eq!(usage.cache_creation_input_tokens, 0);
+            assert_eq!(usage.cache_read_input_tokens, 129_965);
+            assert_eq!(usage.output_tokens, 1569);
+        }
+        return;
+    }
     if is_missing_model {
         assert_ne!(exit, 0, "missing model must fail: {screen}");
         assert_eq!(

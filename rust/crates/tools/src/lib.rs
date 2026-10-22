@@ -1070,14 +1070,35 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
     let mut specs = vec![
         ToolSpec {
             name: "bash",
-            description: "Execute a shell command in the current workspace.",
+            description: concat!(
+                "Executes a bash command and returns its output.\n\n",
+                "- `timeout` is in milliseconds (default 120000 for a foreground command).\n",
+                "- `run_in_background` runs the command detached: it keeps running across ",
+                "turns and notifies you when it exits. No `&` needed. Use it when you do not ",
+                "need the result immediately — you will be told when it completes, and you ",
+                "can read its output file at any time.\n",
+                "- Avoid unnecessary `sleep` commands:\n",
+                "  - Do not sleep between commands that can run immediately — just run them.\n",
+                "  - If your command is long running and you would like to be notified when ",
+                "it finishes, use `run_in_background`. No sleep needed.\n",
+                "  - If waiting on a background task or monitor you started, end your turn: ",
+                "you will be notified when it finishes or fires — do not poll.\n",
+                "  - Do not retry failing commands in a sleep loop — diagnose the root cause.\n",
+                "  - Long leading `sleep` commands block the turn and everything queued ",
+                "behind it. To wait until a condition is met, use Monitor with a loop that ",
+                "exits when it holds (e.g. `until <check>; do sleep 2; done`) — you are ",
+                "notified when the loop exits. Do not chain shorter sleeps to work around ",
+                "this.\n",
+                "- Use the Monitor tool to watch a process or log; for a one-shot ",
+                "\"wait until done\", use `run_in_background` instead."
+            ),
             input_schema: json!({
                 "type": "object",
                 "properties": {
                     "command": { "type": "string" },
                     "timeout": { "type": "integer", "minimum": 1, "description": "Maximum milliseconds to wait before interrupting the command (default 120000)." },
                     "description": { "type": "string" },
-                    "run_in_background": { "type": "boolean" },
+                    "run_in_background": { "type": "boolean", "description": "Run the command detached: it keeps running across turns and notifies you when it exits. No `&` needed. Prefer this over sleeping or polling for long-running work." },
                     "dangerouslyDisableSandbox": { "type": "boolean" },
                     "namespaceRestrictions": { "type": "boolean" },
                     "isolateNetwork": { "type": "boolean" },
@@ -1085,6 +1106,33 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
                     "allowedMounts": { "type": "array", "items": { "type": "string" } }
                 },
                 "required": ["command"],
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::DangerFullAccess,
+        },
+        ToolSpec {
+            name: "Monitor",
+            description: concat!(
+                "Watch, monitor, or keep an eye on a process, log, or command. ",
+                "The call returns immediately with a task id and the watch keeps ",
+                "running across turns.\n\n",
+                "End your turn after starting one: you will be notified when it ",
+                "finishes or fires. Keep working — do not poll, sleep, or re-read ",
+                "its output while you wait. An event may arrive while you are ",
+                "waiting for the user; it is not their reply.\n\n",
+                "To wait until a condition is met, give it a loop that exits when ",
+                "the condition holds (e.g. `until grep -q \"Ready\" dev.log; do ",
+                "sleep 2; done`) — you are notified when the loop exits. For a ",
+                "one-shot \"wait until this command is done\", use bash with ",
+                "`run_in_background` instead."
+            ),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "command": { "type": "string", "description": "Shell command to watch. The watch ends when it exits." },
+                    "description": { "type": "string", "description": "Short label for this watch, shown in notifications and the task panel." }
+                },
+                "required": ["command", "description"],
                 "additionalProperties": false
             }),
             required_permission: PermissionMode::DangerFullAccess,
@@ -1480,6 +1528,25 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
             }),
             required_permission: PermissionMode::WorkspaceWrite,
         },
+        ToolSpec {
+            name: "set_tip",
+            description: "Show one concise, actionable tip in the current session footer. Choose priority explicitly: urgent = the user needs to act now; important = a useful recommendation; normal = optional guidance. Higher priorities take precedence. Use sparingly, not for routine progress or full answers. This does not request approval, ask a question, change configuration, or send a message to another person. Tips clear when the next turn starts; an empty message clears this priority now.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "priority": {
+                        "type": "string", "enum": ["urgent", "important", "normal"],
+                        "description": "urgent: immediate user action; important: actionable recommendation; normal: optional usage hint."
+                    },
+                    "message": {
+                        "type": "string", "maxLength": runtime::tips::MAX_TIP_CHARS,
+                        "description": "One plain-text line without control characters. Empty clears this priority."
+                    }
+                },
+                "required": ["priority", "message"], "additionalProperties": false
+            }),
+            required_permission: PermissionMode::ReadOnly,
+        },
         // ── pid.* tools ───────────────────────────────────────────────
         // Agent process control. `normalize_pid_input` accepts `task_id`
         // as a field alias for `pid` so older prompts still work.
@@ -1542,8 +1609,8 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
             name: "agent_list",
             description: concat!(
                 "List reachable peer Agents and this session's subagent tasks. ",
-                "Copy a row's `send_to` exactly into `send.to`. A peer address selects ",
-                "its namespace and queues messages durably, including while offline. ",
+                "Copy a row's `send_to` exactly into `send.to`. A peer address queues ",
+                "messages durably, including while that peer is offline. ",
                 "A subagent address selects that task; `task_id` is its task handle. ",
                 "An omitted `active` means runtime liveness is unknown. ",
                 "Read-only discovery; it starts nothing."
@@ -1859,6 +1926,16 @@ fn execute_tool_with_enforcer(
                 .as_ref(),
             )
         }
+        "Monitor" => {
+            let monitor_input: MonitorInput = from_value(input)?;
+            // A watch runs arbitrary shell, so it is gated exactly like bash.
+            let classified_mode = classify_bash_permission(&monitor_input.command);
+            maybe_enforce_permission_check_with_mode(enforcer, name, input, classified_mode)?;
+            run_monitor(
+                monitor_input,
+                ctx.and_then(|ctx| ctx.background_tasks.as_ref()),
+            )
+        }
         "read_file" => {
             maybe_enforce_permission_check(enforcer, name, input)?;
             from_value::<ReadFileInput>(input).and_then(|input| run_read_file(input, fs))
@@ -1930,6 +2007,12 @@ fn execute_tool_with_enforcer(
         }
         "AskUserQuestion" => {
             from_value::<AskUserQuestionInput>(input).and_then(run_ask_user_question)
+        }
+        "set_tip" => {
+            maybe_enforce_permission_check(enforcer, name, input)?;
+            let tip: runtime::tips::Tip = from_value(input)?;
+            tip.validate()?;
+            Ok(json!({"tip": tip}).to_string())
         }
         "TodoWrite" => {
             from_value::<TodoWriteInput>(input).and_then(|input| run_todo_write(input, fs))
@@ -2188,6 +2271,14 @@ pub fn todos_from_tool_result(output: &str) -> Option<Vec<runtime::Todo>> {
     serde_json::from_value(value.get("todos")?.clone()).ok()
 }
 
+/// Decode the bounded result of `set_tip` through the existing tool-result seam.
+pub fn tip_from_tool_result(output: &str) -> Option<runtime::tips::Tip> {
+    let value: Value = serde_json::from_str(output).ok()?;
+    let tip: runtime::tips::Tip = serde_json::from_value(value.get("tip")?.clone()).ok()?;
+    tip.validate().ok()?;
+    Some(tip)
+}
+
 fn run_pid_status(input: Value, fs: &dyn FsBackend) -> Result<String, String> {
     let pid = input
         .get("task_id")
@@ -2313,9 +2404,6 @@ pub struct AgentListRow {
     pub task_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub role: Option<String>,
-    /// The peer namespace for this address; subagent rows carry none.
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub sources: Vec<String>,
 }
 
 /// Collect the addressable agents this session can reach, plus the workers it
@@ -2333,12 +2421,13 @@ pub fn collect_agent_list(
     active_only: bool,
     fs: &dyn FsBackend,
 ) -> Result<Vec<AgentListRow>, String> {
-    let directory = runtime::mailbox::scoped_directory();
+    let mailbox = runtime::mailbox::sending_mailbox();
     // Surface an enumeration failure instead of swallowing it: `list_recipients`
     // returns `Err` precisely so "I could not read a namespace" stays distinct
-    // from "no one is there". Across every namespace the session is attached to,
-    // merged and tagged with where each was found.
-    let peers = directory.list_recipients()?;
+    // from "no one is there". The namespace reports presence including this
+    // session itself, and an agent is not its own peer.
+    let mut peers = mailbox.list_recipients()?;
+    peers.retain(|name| name != mailbox.self_id());
     // The sub-agent store is a local dir; a read failure there is soft — an empty
     // worker list is a reasonable degrade, and the peers above are the tool's point.
     let subagents = list_agent_snapshots_from_store_with(true, fs).unwrap_or_default();
@@ -2357,11 +2446,11 @@ pub fn collect_agent_list(
 }
 
 /// Pure core of [`collect_agent_list`], sources injected so it is testable
-/// without a real backend. `peers` are addressable recipients from the
-/// directory, which owns namespace identities and excludes self per namespace.
-/// `subagents` are saved snapshots; `active_tasks` supplies runtime evidence.
+/// without a real backend. `peers` are the addressable names in the session's
+/// peer namespace, self excluded. `subagents` are saved snapshots;
+/// `active_tasks` supplies runtime evidence.
 pub fn merge_agent_list(
-    peers: &[runtime::directory::Recipient],
+    peers: &[String],
     subagents: Vec<AgentSnapshot>,
     active_tasks: &std::collections::BTreeSet<String>,
     active_only: bool,
@@ -2372,23 +2461,19 @@ pub fn merge_agent_list(
     // Source 1: addressable peers in the mailbox namespace. Liveness is not
     // knowable from the namespace alone (a remote backend does not report it),
     // so `active` is left `None` — the row is addressable, not "running".
-    for recipient in peers {
-        if recipient.name.is_empty() {
+    for name in peers {
+        if name.is_empty() {
             continue;
         }
-        for source in &recipient.sources {
-            let send_to = format!("{source}:{}", recipient.name);
-            rows.entry(("peer".into(), send_to.clone()))
-                .or_insert_with(|| AgentListRow {
-                    name: recipient.name.clone(),
-                    send_to,
-                    active: None,
-                    kind: "peer".to_string(),
-                    task_id: None,
-                    role: None,
-                    sources: vec![(*source).to_string()],
-                });
-        }
+        rows.entry(("peer".into(), name.clone()))
+            .or_insert_with(|| AgentListRow {
+                name: name.clone(),
+                send_to: name.clone(),
+                active: None,
+                kind: "peer".to_string(),
+                task_id: None,
+                role: None,
+            });
     }
 
     // Source 2: sub-agents this process spawned (running/backgrounded).
@@ -2406,7 +2491,6 @@ pub fn merge_agent_list(
                 kind: "subagent".to_string(),
                 task_id: Some(snap.agent_id.clone()),
                 role,
-                sources: Vec::new(),
             });
     }
 
@@ -3125,20 +3209,20 @@ fn run_send_message(
     if input.to.trim().is_empty() {
         return Err("to must not be empty".to_string());
     }
-    if input.to.contains('@') {
-        return Err(
-            "to must be a bare teammate name or \"*\" — there is only one team per session"
-                .to_string(),
-        );
+    if input.to.contains(['@', ':', '/', '\\']) {
+        return Err(format!(
+            "to must be an agent name exactly as `agent_list` shows it in `send_to`, or \"*\"; \
+             got '{}'",
+            input.to
+        ));
     }
     // Resolve once: a task exiting after this decision must not change its
     // destination into the peer namespace during this send.
-    let task_root =
-        if input.to != "*" && runtime::directory::Directory::bare_name(&input.to) == input.to {
-            resolve_task_destination(&input.to, fs.as_ref())?
-        } else {
-            None
-        };
+    let task_root = if input.to == "*" {
+        None
+    } else {
+        resolve_task_destination(&input.to, fs.as_ref())?
+    };
 
     // Optional task-framing: when the caller supplied context/constraints/
     // acceptance (a task hand-off, not a chat message) and `message` is plain
@@ -3162,43 +3246,19 @@ fn run_send_message(
     // The standalone session mailbox lives under the config home so separate
     // scode processes can talk across workspaces; using it for a spawned pid
     // reports a successful send into a conversation the worker never drains.
-    let directory = runtime::mailbox::scoped_directory();
+    let peer = runtime::mailbox::sending_mailbox();
     let mailbox = if let Some(root) = task_root {
         // A running in-process subagent reads the workspace-local mailbox, not
-        // any addressable namespace — its task ID identifies this worker.
+        // the peer namespace — its task ID identifies this worker.
         std::sync::Arc::new(runtime::mailbox::Mailbox::workspace_at(
             Arc::clone(fs),
             std::path::Path::new(&root),
-            directory.self_id().to_string(),
+            peer.self_id().to_string(),
         ))
-    } else if input.to == "*" {
-        // Broadcast enumerates below through the primary's namespace; keep the
-        // primary mailbox as the handle its loop uses.
-        directory.primary_mailbox()
     } else {
-        // Route to the namespace that can address the recipient. A name in one
-        // namespace resolves there; a name in several must be qualified
-        // (`local:x` / `nexus:x`) so delivery is never silently to the wrong
-        // one; a name found nowhere falls to the primary, whose durable inbox
+        // A name with no presence yet still lands in its durable inbox, which
         // holds the message until that peer first runs.
-        use runtime::directory::Routed;
-        match directory.route(&input.to)? {
-            Routed::One(member) => {
-                input.to = runtime::directory::Directory::bare_name(&input.to).to_string();
-                std::sync::Arc::clone(&member.mailbox)
-            }
-            Routed::Ambiguous(labels) => {
-                return Err(format!(
-                    "'{}' is addressable in more than one namespace ({}). \
-                     Re-send with a qualifier, e.g. `{}:{}`.",
-                    input.to,
-                    labels.join(", "),
-                    labels[0],
-                    input.to
-                ));
-            }
-            Routed::NotFound => directory.primary_mailbox(),
-        }
+        peer
     };
     let sender = resolve_sender(&input, &mailbox);
 
@@ -3509,6 +3569,40 @@ fn from_value<T: for<'de> Deserialize<'de>>(input: &Value) -> Result<T, String> 
 /// Classify bash command permission based on command type and path.
 /// ROADMAP #50: Read-only commands targeting CWD paths get `WorkspaceWrite`,
 /// all others remain `DangerFullAccess`.
+/// Input for the `Monitor` tool.
+#[derive(Debug, Deserialize)]
+struct MonitorInput {
+    command: String,
+    description: String,
+}
+
+/// Start a watch and return immediately.
+///
+/// Reuses the same launcher the `bash` tool's `run_in_background` path uses, so
+/// a watch and a background command share one registry, one output owner, one
+/// cancellation contract and one process group. The only thing `Monitor` adds
+/// is the intent: the model is told to end its turn and wait to be notified.
+fn run_monitor(
+    input: MonitorInput,
+    tasks: Option<&runtime::background_tasks::BackgroundTasks>,
+) -> Result<String, String> {
+    let cwd = runtime::current_workspace_root_or_default();
+    let command = runtime::shell_command_in(&cwd, &input.command);
+    let (id, output_path) = runtime::launch_background_command(
+        command,
+        runtime::subagent_completion::ShellKind::Bash,
+        &input.command,
+        &input.description,
+        tasks,
+    )
+    .map_err(|error| format!("failed to start monitor: {error}"))?;
+    Ok(format!(
+        "Monitor started (task {id}, output {output_path}). You will be notified \
+         when it finishes or fires. Keep working — do not poll or sleep. An event \
+         may arrive while you are waiting for the user; it is not their reply."
+    ))
+}
+
 fn classify_bash_permission(command: &str) -> PermissionMode {
     // Read-only commands that are safe when targeting workspace paths
     const READ_ONLY_COMMANDS: &[&str] = &[
@@ -6262,9 +6356,7 @@ fn run_agent_job_returning_text(job: &AgentJob) -> Result<String, String> {
         runtime::mailbox::Mailbox::workspace(Arc::clone(&job.fs), job.manifest.agent_id.clone())
             .map_err(|error| error.to_string())?,
     );
-    let _directory = runtime::mailbox::MailboxScope::enter(Arc::new(
-        runtime::directory::Directory::single("local", Arc::clone(&mailbox)),
-    ));
+    let _mailbox = runtime::mailbox::MailboxScope::enter(Arc::clone(&mailbox));
     let mut conv_runtime =
         build_agent_runtime(job)?.with_max_iterations(DEFAULT_AGENT_MAX_ITERATIONS);
     // Accumulate telemetry across every multi-turn iteration so a
@@ -8279,7 +8371,7 @@ struct SubagentToolExecutor {
     /// is a standalone CLI's own disk; a co-hosted parent hands down its kernel,
     /// so a sub-agent's writes pass the same hooks its parent's do.
     fs: Arc<dyn FsBackend>,
-    directory: Arc<runtime::directory::Directory>,
+    mailbox: Arc<runtime::mailbox::Mailbox>,
 }
 
 impl SubagentToolExecutor {
@@ -8287,7 +8379,7 @@ impl SubagentToolExecutor {
         Self {
             allowed_tools,
             fs: runtime::host_fs_arc().clone(),
-            directory: runtime::mailbox::scoped_directory(),
+            mailbox: runtime::mailbox::sending_mailbox(),
             enforcer: None,
             abort_signal: None,
         }
@@ -8342,7 +8434,7 @@ impl ToolExecutor for SubagentToolExecutor {
         let fs = Arc::clone(&self.fs);
         let ctx = ctx.clone();
         let workspace = WorkspaceRootHandoff::capture();
-        let directory = Arc::clone(&self.directory);
+        let mailbox = Arc::clone(&self.mailbox);
         // Like the parent executor, keep blocking tools off the async polling
         // thread. Otherwise a batch of sub-agent reads still executes serially
         // and prevents cancellation from being observed during a slow call.
@@ -8353,7 +8445,7 @@ impl ToolExecutor for SubagentToolExecutor {
             if abort.as_ref().is_some_and(HookAbortSignal::is_aborted) {
                 return Err(ToolError::new("tool cancelled before execution"));
             }
-            let _directory = runtime::mailbox::MailboxScope::enter(directory);
+            let _mailbox = runtime::mailbox::MailboxScope::enter(mailbox);
             execute_tool_with_enforcer(
                 enforcer.as_ref(),
                 &tool_name,
@@ -8548,6 +8640,7 @@ fn execute_tool_search(input: ToolSearchInput) -> ToolSearchOutput {
 /// [`GlobalToolRegistry::core_definitions`]), so the next request carries every
 /// schema and the model calls any of them directly.
 const CORE_TOOLS: &[&str] = &[
+    "set_tip",
     "bash",
     "read_file",
     "read_tool_output",
@@ -10373,19 +10466,9 @@ mod tests {
 
     #[test]
     fn merge_agent_list_lists_peers_and_running_subagents() {
-        // Peers come from the directory (recipients tagged with their namespace),
-        // not a probed filename.
-        use runtime::directory::Recipient;
-        let peers = vec![
-            Recipient {
-                name: "alice".to_string(),
-                sources: vec!["local"],
-            },
-            Recipient {
-                name: "bob".to_string(),
-                sources: vec!["nexus"],
-            },
-        ];
+        // Peers are the names in the session's one peer namespace, not a probed
+        // filename.
+        let peers = vec!["alice".to_string(), "bob".to_string()];
 
         // one running sub-agent (own name, distinct from peers)
         let subagents = vec![super::AgentSnapshot {
@@ -10406,15 +10489,12 @@ mod tests {
         // A peer is addressable; liveness is unknown from the namespace → None.
         assert_eq!(by["alice"].active, None, "peer liveness unknown");
         assert_eq!(by["alice"].kind, "peer");
-        assert_eq!(
-            by["alice"].sources,
-            vec!["local".to_string()],
-            "peer carries its namespace"
-        );
-        assert_eq!(by["bob"].sources, vec!["nexus".to_string()]);
         assert!(by["alice"].task_id.is_none());
-        assert_eq!(by["alice"].send_to, "local:alice");
-        assert_eq!(by["bob"].send_to, "nexus:bob");
+        assert_eq!(
+            by["alice"].send_to, "alice",
+            "a peer is addressed by its bare name"
+        );
+        assert_eq!(by["bob"].send_to, "bob");
         assert_eq!(by["bob"].active, None);
         // A running sub-agent is positively active, with its pid + role.
         assert_eq!(by["researcher"].active, Some(true));

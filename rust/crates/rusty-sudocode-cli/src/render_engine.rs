@@ -201,7 +201,10 @@ impl EngineEventRenderer {
         } else {
             // Without an interactive live region, retain a bounded log line.
             let text = crate::render::text_layout::truncate_to_width(&text, query_terminal_width());
-            self.write_block(&text, OutputBlock::Activity);
+            self.write_block(
+                &format!("  {DIM}\u{27f3} {text}{RESET}"),
+                OutputBlock::Activity,
+            );
         }
         self.resume_spinner();
     }
@@ -242,12 +245,12 @@ impl EngineEventRenderer {
                 );
                 self.resume_spinner();
                 if let Some(spinner) = &self.spinner {
-                    spinner.set_retry(*attempt, *max_retries, reason.clone());
+                    spinner.set_retry(*attempt, *max_retries, reason);
                 }
             }
             RetryEvent::Resumed => {
                 if let Some(spinner) = &self.spinner {
-                    spinner.set_thinking(true);
+                    spinner.set_thinking(false);
                 }
             }
         }
@@ -445,6 +448,12 @@ impl EngineEventRenderer {
                 is_error,
             } => {
                 let input = self.tool_inputs.take(&id);
+                // Footer advice is rendered once in its slot; traces and
+                // headless/ACP tool results retain the complete tool record.
+                if !is_error && name == "set_tip" && self.output_writer.is_some() {
+                    self.resume_spinner();
+                    return RenderOutcome::Continue;
+                }
                 self.write_block(&format_tool_result(&name, &input, &output, is_error), OutputBlock::Tool);
                 self.resume_spinner();
                 RenderOutcome::Continue
@@ -517,8 +526,8 @@ impl EngineEventRenderer {
             }
             EngineEvent::PermissionRequest { id, request } => RenderOutcome::NeedPermission { id, request },
             EngineEvent::QuestionRequest { id, request } => RenderOutcome::NeedQuestion { id, request },
-            // No direct terminal effect: lifecycle/state/telemetry events. The
-            // spinner already tracks progress from the deltas above.
+            // No transcript output: the REPL event bridge projects lifecycle
+            // into live chrome; deltas above update response progress and phase.
             EngineEvent::PermissionDenied { .. }
             | EngineEvent::TurnStarted { .. }
             | EngineEvent::State(_)
@@ -560,11 +569,7 @@ impl Drop for EngineEventRenderer {
 /// (`ToolProgressEvent`) and the ANSI/glyph formatting lives here, above the
 /// seam. External output is text, never terminal cursor or screen control.
 fn format_tool_progress(progress: &ToolProgressEvent) -> String {
-    let summary = |text: &str| {
-        crate::render::styled_text::StyledText::from_ansi(text)
-            .text
-            .replace(['\r', '\n', '\t'], " ")
-    };
+    use crate::render::text_layout::single_line as summary;
     match progress {
         ToolProgressEvent::Bash {
             last_line,
@@ -577,7 +582,7 @@ fn format_tool_progress(progress: &ToolProgressEvent) -> String {
                 format!("{total_bytes} B")
             };
             format!(
-                "  {DIM}\u{27f3} {}  ({total_lines} lines, {bytes_display}){RESET}",
+                "{} ({total_lines} lines, {bytes_display})",
                 summary(last_line)
             )
         }
@@ -594,9 +599,9 @@ fn format_tool_progress(progress: &ToolProgressEvent) -> String {
                 _ => String::new(),
             };
             if let Some(msg) = message {
-                format!("  {DIM}\u{27f3} {}{status}{RESET}", summary(msg))
+                format!("{}{status}", summary(msg))
             } else {
-                format!("  {DIM}\u{27f3} progress: {progress:.0}{status}{RESET}")
+                format!("progress: {progress:.0}{status}")
             }
         }
     }
@@ -612,7 +617,7 @@ fn format_tool_progress(progress: &ToolProgressEvent) -> String {
 ///
 /// ```text
 /// [hook PreToolUse] bash: echo hook-observed
-/// ⠙ 🦀 Thinking... [claude-sonnet-4-6] (0.4s)          ] bash: echo hook-observed
+/// ⠙ 🦀 Working... [claude-sonnet-4-6] (0.4s)           ] bash: echo hook-observed
 /// ```
 ///
 /// Every other event in this renderer already went through `write_out`, which

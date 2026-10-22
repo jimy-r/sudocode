@@ -1186,6 +1186,11 @@ impl MessageStream {
                 return Ok(Some(event));
             }
 
+            if let Some(error) = self.parser.take_pending_error() {
+                self.done = true;
+                return Err(error);
+            }
+
             if self.done {
                 // The turn already ended (stop_reason or message_stop). If a
                 // trailing frame was truncated by a proxy dropping the
@@ -1200,6 +1205,7 @@ impl MessageStream {
                     Err(error @ ApiError::ProviderRefusal { .. }) => {
                         return Err(self.record_refusal(error))
                     }
+                    Err(error @ ApiError::InvalidSseFrame(_)) => return Err(error),
                     Err(_) if self.logically_complete => Vec::new(),
                     Err(error) => return Err(error),
                 };

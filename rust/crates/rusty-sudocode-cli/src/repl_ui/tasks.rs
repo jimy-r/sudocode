@@ -1,4 +1,5 @@
 //! Task browser with bounded, lazily decoded output and event-driven repaint.
+use super::choice_text::ChoiceText;
 use crate::render::{
     ansi_fg,
     styled_text::StyledText,
@@ -33,6 +34,7 @@ pub(super) struct TaskBrowser {
     entries: BTreeMap<String, Entry>,
     rows: Vec<String>,
     summary: String,
+    compact_summary: String,
     pub focus: TaskFocus,
     selected: Option<String>,
     scroll: usize,
@@ -132,6 +134,17 @@ impl TaskBrowser {
             ));
         }
         self.summary = parts.join(" · ");
+        let mut compact = Vec::new();
+        if terminals > 0 {
+            compact.push(format!("{terminals}t"));
+        }
+        if agents > 0 {
+            compact.push(format!("{agents}a"));
+        }
+        if unread > 0 {
+            compact.push(format!("+{unread}"));
+        }
+        self.compact_summary = compact.join(" ");
     }
 
     #[inline]
@@ -212,44 +225,30 @@ impl TaskBrowser {
             .cloned()
     }
 
-    pub fn footer(&self, base: &str, width: usize) -> String {
+    pub fn footer_label(&self, compact: bool) -> String {
         if !self.has_tasks() {
-            return fit(base, width);
+            return String::new();
         }
-        let compact = &self.summary;
-        let label = format!(
-            "{compact} · {}",
-            if self.focus == TaskFocus::Footer {
-                "Enter to view"
-            } else {
-                "↓ to view"
-            }
-        );
-        let available = width.saturating_sub(display_width(&label) + 3);
-        let left = fit(base, available);
-        let separator = if left.is_empty() { "" } else { " · " };
-        let (prefix, suffix) = if self.focus == TaskFocus::Footer {
-            ("\x1b[7m", RESET)
+        let summary = if compact {
+            &self.compact_summary
         } else {
-            ("", "")
+            &self.summary
         };
-        let label = fit(
-            &label,
-            width.saturating_sub(display_width(&left) + display_width(separator)),
-        );
-        format!(
-            "{left}{separator}{}{prefix}{label}{suffix}{RESET}",
-            ansi_fg(theme().muted)
-        )
+        if self.focus == TaskFocus::Footer {
+            format!("{summary} · Enter to view")
+        } else {
+            summary.clone()
+        }
     }
 
-    pub fn panel(&mut self, width: usize, height: usize) -> String {
-        let rows = height.saturating_sub(12).clamp(1, 18);
+    /// Project inside InputSlot's allocation, not an independent terminal budget.
+    pub fn panel(&mut self, width: usize, max_rows: usize) -> String {
         let mut lines = vec![format!(
             "{}Background tasks{RESET}",
             ansi_fg(theme().primary)
         )];
         if self.focus == TaskFocus::List {
+            let rows = max_rows.saturating_sub(2).clamp(1, 18);
             if self.rows.is_empty() {
                 lines.push("  No background tasks in this session".into());
             }
@@ -264,11 +263,11 @@ impl TaskBrowser {
             for id in self.rows.iter().skip(start).take(rows) {
                 let entry = &self.entries[id];
                 let task = &entry.task;
-                let marker = if self.selected.as_ref() == Some(id) {
-                    "❯"
-                } else {
-                    " "
-                };
+                let focused = self.selected.as_ref() == Some(id);
+                let marker = if focused { "❯" } else { " " };
+                let marker =
+                    ChoiceText::new(theme(), crate::render::ColorSupport::detect(), focused)
+                        .prefix(marker);
                 let kind = match task.kind {
                     BackgroundTaskKind::Terminal => "terminal",
                     BackgroundTaskKind::Agent => "agent",
@@ -346,6 +345,11 @@ impl TaskBrowser {
                 entry.wrapped_width = content_width;
             }
             let output_lines = &entry.wrapped;
+            // Fixed task metadata, optional full-output link and navigation
+            // remain outside the output viewport, just like question choices.
+            let rows = max_rows
+                .saturating_sub(lines.len() + usize::from(task.output_path.is_some()) + 1)
+                .clamp(1, 18);
             let end = output_lines
                 .len()
                 .saturating_sub(self.scroll.min(output_lines.len().saturating_sub(1)));
