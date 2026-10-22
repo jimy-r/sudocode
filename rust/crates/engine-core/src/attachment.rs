@@ -8,6 +8,47 @@ use runtime::{
     HookAbortSignal, PermissionPrompter, QuestionPrompter, RuntimeError, RuntimeObserver,
 };
 
+/// A non-owning barrier for the previous completion state's field teardown.
+/// A dead weak driver alone does not mean its engine has released storage.
+#[derive(Clone)]
+pub struct CompletionRetirement(Arc<Mutex<std::sync::mpsc::Receiver<()>>>);
+
+impl CompletionRetirement {
+    /// Wait for the state's storage fields to drop, without retaining them.
+    #[must_use]
+    pub fn wait(&self, timeout: std::time::Duration) -> bool {
+        matches!(
+            self.0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .recv_timeout(timeout),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected)
+        )
+    }
+}
+
+pub(crate) struct CompletionLifetime {
+    // Dropping this sender closes the barrier. No message is ever sent.
+    _alive: std::sync::mpsc::Sender<()>,
+    retirement: CompletionRetirement,
+}
+
+impl Default for CompletionLifetime {
+    fn default() -> Self {
+        let (alive, retired) = std::sync::mpsc::channel();
+        Self {
+            _alive: alive,
+            retirement: CompletionRetirement(Arc::new(Mutex::new(retired))),
+        }
+    }
+}
+
+impl CompletionLifetime {
+    pub(crate) fn retirement(&self) -> CompletionRetirement {
+        self.retirement.clone()
+    }
+}
+
 /// Installs the engine at composition time. All subsequent interaction uses
 /// the original `EngineHandle`, including cold replay followed by session/load.
 pub struct EngineAttachment {
@@ -16,6 +57,12 @@ pub struct EngineAttachment {
 }
 
 impl EngineAttachment {
+    /// Composition bookkeeping only; this does not keep an idle engine alive.
+    #[must_use]
+    pub fn completion_retirement(&self) -> CompletionRetirement {
+        self.completions.lifetime.retirement()
+    }
+
     pub fn attach(&self, delegate: Arc<dyn EngineDelegate>) -> Result<(), String> {
         let mut current = self
             .delegate

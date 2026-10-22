@@ -56,6 +56,10 @@ pub(crate) struct SessionDriver {
 }
 
 impl SessionDriver {
+    pub(crate) fn completion_retirement(&self) -> engine_core::CompletionRetirement {
+        self.attachment.completion_retirement()
+    }
+
     fn new(
         (mut handle, attachment): (EngineHandle, EngineAttachment),
         session_id: String,
