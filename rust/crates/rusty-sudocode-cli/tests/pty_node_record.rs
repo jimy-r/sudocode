@@ -1,10 +1,9 @@
 //! A machine's node record decides where a session's peers are.
 //!
 //! `scode` reads `<home>/.nexus/run/node.json` to find this machine's Nexus
-//! node. No record means the disk namespace. A valid record and credential
-//! keep the node namespace even while that node is offline: ordinary startup
-//! and resume still work, while a send reports its actual node error. An
-//! unusable record or credential is still a startup error in this slice.
+//! node. No record means the disk namespace. A present but unavailable record,
+//! credential or node keeps the node namespace: ordinary startup and resume
+//! still work, while A2A reports its actual error and the same receiver retries.
 //!
 //! Real CLI processes exercise both cases, including persisted history and a
 //! real failed send. No case may silently select a disk mailbox.
@@ -14,7 +13,7 @@ mod common;
 mod node_home;
 
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use common::TestEnv;
 
@@ -46,7 +45,7 @@ fn record(endpoint: &str, agents_dir: &Path) -> String {
 }
 
 #[test]
-fn an_unusable_node_record_stops_the_session_and_never_falls_back_to_disk() {
+fn unusable_node_configuration_leaves_the_session_usable_and_a2a_explicitly_unavailable() {
     type Case = (&'static str, fn(&TestEnv) -> String, &'static str);
     let cases: [Case; 6] = [
         (
@@ -99,39 +98,73 @@ fn an_unusable_node_record_stops_the_session_and_never_falls_back_to_disk() {
         let env = TestEnv::new("node-record");
         node_home::pin_agent_name(env.workspace_root(), SESSION_AGENT);
         let home = home_with_record(&env, &make_record(&env));
-        let home = home.to_string_lossy().into_owned();
-        let mut session = env.spawn_with_env(
-            &["--print", "hello"],
-            &[("HOME", home.as_str()), ("USERPROFILE", home.as_str())],
-        );
-        session.set_default_timeout(Duration::from_secs(30));
-        session.expect(expected).unwrap_or_else(|e| {
-            panic!("[{label}] the session must name the cause {expected:?}: {e}")
-        });
-        let code = session
-            .expect_eof()
-            .unwrap_or_else(|e| panic!("[{label}] the session must stop: {e}"));
-        assert_ne!(
-            code, 0,
-            "[{label}] an unusable node record must fail the session"
-        );
-        let pair_root = runtime::mailbox::local_pair_root_in(env.config_home());
-        assert!(
-            !pair_root.exists(),
-            "[{label}] the session fell back to the disk namespace at {}",
-            pair_root.display()
-        );
+        ordinary_task_with_unavailable_a2a(&env, &home, label, expected);
     }
+}
+
+fn ordinary_task_with_unavailable_a2a(env: &TestEnv, home: &Path, label: &str, expected: &str) {
+    let home = home.to_string_lossy();
+    let mut session = env.spawn_with_env(
+        &["--permission-mode", "read-only"],
+        &[
+            ("HOME", home.as_ref()),
+            ("USERPROFILE", home.as_ref()),
+            ("PAGER", ""),
+        ],
+    );
+    session.set_default_timeout(common::at_least(Duration::from_secs(30)));
+    session
+        .expect(expected)
+        .unwrap_or_else(|e| panic!("[{label}] the session must name the cause {expected:?}: {e}"));
+    common::expect_input_line_cleared(&session, Duration::from_secs(30), label);
+    session.send("/status\r").expect("inspect A2A status");
+    session
+        .expect("node (unavailable:")
+        .expect("selected node namespace, not disk");
+    common::expect_input_line_cleared(&session, Duration::from_secs(30), "status done");
+    let prompt = env.prompt(
+        "Reply with exactly NODE_CONFIG_TASK_OK.",
+        "single_turn_text",
+    );
+    let reply = if env.is_mock() {
+        "The answer is 4"
+    } else {
+        "NODE_CONFIG_TASK_OK"
+    };
+    session
+        .send(&format!("{prompt}\r"))
+        .expect("ordinary task while A2A unavailable");
+    session.expect(reply).expect("ordinary task completes");
+    wait_for_saved_reply(env, reply);
+    common::expect_input_line_cleared(&session, Duration::from_secs(30), "ordinary task done");
+    session.send("/exit\r").expect("normal exit");
+    assert_eq!(
+        session.expect_eof().expect("session exits normally"),
+        0,
+        "[{label}]"
+    );
+    assert_no_disk_namespace(env);
 }
 
 /// Both renderers must start and restore a real completed turn without a node.
 #[test]
 fn an_offline_node_does_not_block_startup_or_resume() {
+    startup_and_resume_with_credential(true);
+}
+
+#[test]
+fn an_unminted_agent_can_start_and_resume_without_a_disk_fallback() {
+    startup_and_resume_with_credential(false);
+}
+
+fn startup_and_resume_with_credential(has_credential: bool) {
     for mode in ["off", "queue"] {
         let env = TestEnv::new("offline-node-resume");
         node_home::pin_agent_name(env.workspace_root(), SESSION_AGENT);
         let agents = empty_agents_dir(&env);
-        node_home::write_unusable_credential(&agents, SESSION_AGENT);
+        if has_credential {
+            node_home::write_untrusted_credential(&agents, SESSION_AGENT);
+        }
         let home = home_with_record(&env, &record("127.0.0.1:1", &agents));
         let home = home.to_string_lossy();
         let vars = [
@@ -154,6 +187,7 @@ fn an_offline_node_does_not_block_startup_or_resume() {
         fresh
             .expect(reply)
             .expect("ordinary turn completes without Nexus");
+        wait_for_saved_reply(&env, reply);
         common::expect_input_line_cleared(&fresh, Duration::from_secs(30), "offline turn done");
         fresh.send("/exit\r").expect("exit fresh session");
         assert_eq!(fresh.expect_eof().expect("fresh session exits"), 0);
@@ -183,10 +217,71 @@ fn an_offline_node_does_not_block_startup_or_resume() {
 /// Reaching the prompt must not disguise a node failure as a local delivery.
 #[test]
 fn an_offline_node_send_fails_on_the_node_without_creating_a_disk_inbox() {
+    send_fails_without_disk(true, "connect");
+}
+
+#[test]
+fn an_unminted_agents_send_reports_the_missing_bundle_and_never_writes_to_disk() {
+    send_fails_without_disk(false, "ask the node owner to mint");
+}
+
+#[test]
+fn the_original_receiver_retries_a_new_bundle_without_a_restart_or_tool_call() {
+    let env = TestEnv::new_mock("pending-node-receiver");
+    node_home::pin_agent_name(env.workspace_root(), SESSION_AGENT);
+    let agents = empty_agents_dir(&env);
+    let home = home_with_record(&env, &record("127.0.0.1:1", &agents));
+    let home = home.to_string_lossy();
+    let mut session = env.spawn_with_env(
+        &["--permission-mode", "workspace-write"],
+        &[
+            ("HOME", home.as_ref()),
+            ("USERPROFILE", home.as_ref()),
+            ("PAGER", ""),
+            ("SUDOCODE_INTERRUPT_QUEUE_MODE", "queue"),
+        ],
+    );
+    session.set_default_timeout(common::at_least(Duration::from_secs(30)));
+    session
+        .expect("ask the node owner to mint")
+        .expect("receiver reports the missing credential");
+    common::expect_input_line_cleared(&session, Duration::from_secs(30), "pending receiver");
+
+    // No tool call or second CLI process triggers resolution. The original
+    // receiver must pick up the new files and reach the real offline transport.
+    node_home::write_untrusted_credential(&agents, SESSION_AGENT);
+    session
+        .expect("connect")
+        .expect("original receiver retries and reaches actual node IO");
+    session.send("/status\r").expect("inspect the same binding");
+    session
+        .expect("node 127.0.0.1:1")
+        .expect("receiver resolved the selected node binding");
+    session
+        .expect("unavailable; ordinary session remains usable")
+        .expect("offline is not falsely reported as another receiver");
+    common::expect_input_line_cleared(&session, Duration::from_secs(30), "resolved binding");
+
+    let prompt = env.prompt(
+        "Use send once to message team-lead: NEW_NODE_OPERATION. Report its error; do not retry.",
+        "unified_send_roundtrip",
+    );
+    session.send(&format!("{prompt}\r")).expect("one new send");
+    wait_for_saved_reply(&env, "unified send roundtrip complete");
+    common::expect_input_line_cleared(&session, Duration::from_secs(30), "node send done");
+    session.send("/exit\r").expect("normal exit");
+    assert_eq!(session.expect_eof().expect("original process exits"), 0);
+    assert_send_error(&env, "connect");
+    assert_no_disk_namespace(&env);
+}
+
+fn send_fails_without_disk(has_credential: bool, expected: &str) {
     let env = TestEnv::new("offline-node-send");
     node_home::pin_agent_name(env.workspace_root(), SESSION_AGENT);
     let agents = empty_agents_dir(&env);
-    node_home::write_unusable_credential(&agents, SESSION_AGENT);
+    if has_credential {
+        node_home::write_untrusted_credential(&agents, SESSION_AGENT);
+    }
     let home = home_with_record(&env, &record("127.0.0.1:1", &agents));
     let home = home.to_string_lossy();
     let prompt = env.prompt(
@@ -199,10 +294,21 @@ fn an_offline_node_send_fails_on_the_node_without_creating_a_disk_inbox() {
     );
     session.set_default_timeout(common::at_least(Duration::from_secs(30)));
     assert_eq!(session.expect_eof().expect("ordinary task finishes"), 0);
+    assert_send_error(&env, expected);
+    assert_no_disk_namespace(&env);
+}
 
+fn assert_send_error(env: &TestEnv, expected: &str) {
     let path = common::find_session_transcript(&env.workspace_root().join(".scode/sessions"))
         .expect("send result persisted");
     let saved = runtime::Session::load_from_path(&path).expect("load actual CLI history");
+    assert_eq!(
+        saved
+            .workspace_root()
+            .map(|path| path.canonicalize().unwrap()),
+        Some(env.workspace_root().canonicalize().unwrap()),
+        "the actual child session must use the private test workspace"
+    );
     let results: Vec<_> = saved
         .messages
         .iter()
@@ -231,13 +337,40 @@ fn an_offline_node_send_fails_on_the_node_without_creating_a_disk_inbox() {
         "offline send must not report success: {results:?}"
     );
     assert!(
-        results[0].0.contains("connect"),
-        "must reach the node transport: {results:?}"
+        results[0].0.contains(expected),
+        "must report the selected node's actual error {expected:?}: {results:?}"
     );
-    assert_no_disk_namespace(&env);
+}
+
+/// Do not accept the user's echoed prompt as evidence of a model reply.
+fn wait_for_saved_reply(env: &TestEnv, expected: &str) -> PathBuf {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        if let Some(path) =
+            common::find_session_transcript(&env.workspace_root().join(".scode/sessions"))
+        {
+            if let Ok(saved) = runtime::Session::load_from_path(&path) {
+                let replied = saved.messages.iter().any(|message| {
+                    message.role == runtime::MessageRole::Assistant
+                        && message.blocks.iter().any(|block| {
+                            matches!(block, runtime::ContentBlock::Text { text } if text.contains(expected))
+                        })
+                });
+                if replied {
+                    return path;
+                }
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "no durable assistant reply containing {expected:?}"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
 }
 
 fn assert_no_disk_namespace(env: &TestEnv) {
+    node_home::assert_no_disk_mailboxes_below(env.workspace_root());
     for root in [
         runtime::mailbox::local_pair_root_in(env.config_home()),
         env.workspace_root().join(".sudocode-inbox"),

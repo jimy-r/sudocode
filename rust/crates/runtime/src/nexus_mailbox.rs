@@ -227,12 +227,18 @@ impl Config {
     /// receive path renders) and prepends the nexus-specific network note.
     #[must_use]
     pub fn peer_system_prompt(&self) -> String {
-        let base = crate::agent_mailbox::repl_a2a_prompt_section(&self.agent);
-        format!(
-            "{base}\n\nThis conversation is on a nexus A2A network, so a peer may \
-             be on another machine; addressing it by name still reaches it."
-        )
+        peer_system_prompt(&self.agent)
     }
+}
+
+/// Stable node-namespace identity text, even before this agent has a credential.
+#[must_use]
+pub fn peer_system_prompt(agent: &str) -> String {
+    let base = crate::agent_mailbox::repl_a2a_prompt_section(agent);
+    format!(
+        "{base}\n\nThis conversation is on a nexus A2A network, so a peer may \
+         be on another machine; addressing it by name still reaches it."
+    )
 }
 
 #[cfg(test)]

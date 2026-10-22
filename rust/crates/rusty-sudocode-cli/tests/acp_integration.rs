@@ -12,6 +12,8 @@
 
 #[path = "common/isolated_env.rs"]
 mod isolated_env;
+#[path = "support/acp_node_binding.rs"]
+mod node_binding;
 #[path = "common/openai_compat_mock.rs"]
 mod openai_compat_mock;
 #[path = "common/python.rs"]

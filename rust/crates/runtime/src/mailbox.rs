@@ -223,13 +223,33 @@ impl InboxConvention {
     }
 }
 
+type BackendResolver = dyn Fn() -> Result<Arc<dyn FsBackend>, String> + Send + Sync;
+
+/// A fixed transport, or a host's still-unavailable binding to that transport.
+/// Resolving must keep the selected namespace and return the actual backend;
+/// it must never substitute a local filesystem after an error.
+#[derive(Clone)]
+enum MailboxBackend {
+    Fixed(Arc<dyn FsBackend>),
+    Resolving(Arc<BackendResolver>),
+}
+
+impl MailboxBackend {
+    fn resolve(&self) -> Result<Arc<dyn FsBackend>, String> {
+        match self {
+            Self::Fixed(backend) => Ok(Arc::clone(backend)),
+            Self::Resolving(resolve) => resolve(),
+        }
+    }
+}
+
 /// Transport-agnostic agent mailbox.
 ///
 /// Wraps an [`FsBackend`] + path convention, providing send/receive that
 /// works identically whether the underlying transport is a local JSONL
 /// file or a nexus DT_STREAM.
 pub struct Mailbox {
-    backend: Arc<dyn FsBackend>,
+    backend: MailboxBackend,
     self_id: String,
     convention: InboxConvention,
     /// Recipients whose inbox this mailbox has already created.
@@ -254,6 +274,10 @@ pub struct Mailbox {
 
 impl Mailbox {
     pub fn new(backend: Arc<dyn FsBackend>, self_id: String, convention: InboxConvention) -> Self {
+        Self::with_backend(MailboxBackend::Fixed(backend), self_id, convention)
+    }
+
+    fn with_backend(backend: MailboxBackend, self_id: String, convention: InboxConvention) -> Self {
         Self {
             backend,
             self_id,
@@ -287,6 +311,21 @@ impl Mailbox {
     #[must_use]
     pub fn daemon_absolute(backend: Arc<dyn FsBackend>, self_id: String) -> Self {
         Self::new(backend, self_id, InboxConvention::new(String::new()))
+    }
+
+    /// Keep a daemon namespace while its host prepares this agent's connection.
+    /// Every IO path, including the existing receiver, uses the same resolver.
+    /// A failed resolution is an explicit IO failure, never an empty scope.
+    #[must_use]
+    pub fn daemon_resolving(
+        self_id: String,
+        resolve: impl Fn() -> Result<Arc<dyn FsBackend>, String> + Send + Sync + 'static,
+    ) -> Self {
+        Self::with_backend(
+            MailboxBackend::Resolving(Arc::new(resolve)),
+            self_id,
+            InboxConvention::new(String::new()),
+        )
     }
 
     /// A mailbox rooted under a host directory: `self_id`'s conversations at
@@ -368,6 +407,7 @@ impl Mailbox {
     #[inline]
     fn backend_frames(&self, path: &str) -> Result<bool, String> {
         self.backend
+            .resolve()?
             .is_append_stream(path)
             .map_err(|error| format!("classify mailbox {path}: {error}"))
     }
@@ -523,6 +563,7 @@ impl Mailbox {
     pub fn ensure_presence(&self) -> Result<(), String> {
         let dir = self.convention.chat_list_dir(&self.self_id);
         self.backend
+            .resolve()?
             .create_dir_all(&dir)
             .map_err(|e| format!("announce {} at {dir}: {e}", self.self_id))
     }
@@ -550,10 +591,11 @@ impl Mailbox {
                 self.self_id
             ));
         }
+        let backend = self.backend.resolve()?;
         let root = self.convention.conversation_root(&self.self_id, peer);
         for (owner, other) in [(self.self_id.as_str(), peer), (peer, self.self_id.as_str())] {
             let dir = self.convention.chat_list_dir(owner);
-            self.backend
+            backend
                 .create_dir_all(&dir)
                 .map_err(|e| format!("create chat list {dir}: {e}"))?;
             // A link, which is what this is: an index pointing into the flat
@@ -572,12 +614,12 @@ impl Mailbox {
             // where a privilege-free symlink does not exist. `read_link` is the follow
             // half on both, so a caller resolving the index is backend-agnostic.
             let alias = self.convention.chat_list_path(owner, other);
-            self.backend
+            backend
                 .link(&alias, &root)
                 .map_err(|e| format!("index conversation for {owner} at {alias}: {e}"))?;
         }
         let path = self.transcript_path(peer);
-        self.backend
+        backend
             .create_append_log(&path, crate::agent_mailbox::DEFAULT_STREAM_CAPACITY)
             .map_err(|e| format!("ensure conversation with {peer} at {path}: {e}"))
     }
@@ -641,6 +683,7 @@ impl Mailbox {
         if self.backend_frames(&path)? {
             return self
                 .backend
+                .resolve()?
                 .append(&path, &envelope.to_bytes())
                 .map_err(|e| format!("mailbox send to {path}: {e}"));
         }
@@ -659,7 +702,7 @@ impl Mailbox {
         // that variant was describing a conversation (both parties reading and
         // writing one log) as if it were a special case, and with conventions
         // collapsed there is exactly one shape to write.
-        crate::agent_mailbox::append_envelope_via(self.backend.as_ref(), &path, envelope)
+        crate::agent_mailbox::append_envelope_via(self.backend.resolve()?.as_ref(), &path, envelope)
     }
 
     /// Read new messages from own inbox starting at `cursor`.
@@ -713,12 +756,12 @@ impl Mailbox {
         block_ms: u64,
     ) -> Result<(Vec<MailboxEnvelope>, u64), String> {
         let mut out = Vec::new();
+        let backend = self.backend.resolve()?;
         let mut first = true;
         loop {
             let blocking = first && block_ms > 0;
             first = false;
-            let (data, next, eof) = self
-                .backend
+            let (data, next, eof) = backend
                 .tail_read(path, cursor, if blocking { block_ms } else { 0 })
                 .map_err(|e| format!("mailbox poll {path}@{cursor}: {e}"))?;
             if eof {
@@ -752,7 +795,7 @@ impl Mailbox {
         } else {
             // Through the backend, for the same reason the write is: the
             // transcript of a kernel-backed conversation is not on host disk.
-            match self.backend.read(&path) {
+            match self.backend.resolve()?.read(&path) {
                 Ok(bytes) => Ok(crate::agent_mailbox::parse_envelope_lines(&bytes)),
                 // Nothing written yet is an empty conversation, not a failure.
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
@@ -774,7 +817,8 @@ impl Mailbox {
     /// has to remember to ask first.
     pub fn list_recipients(&self) -> Result<Vec<String>, String> {
         let dir = self.convention.agents_dir();
-        let entries = match self.backend.readdir(&dir) {
+        let backend = self.backend.resolve()?;
+        let entries = match backend.readdir(&dir) {
             Ok(entries) => entries,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
             Err(error) => return Err(format!("list recipients at {dir}: {error}")),
@@ -797,7 +841,7 @@ impl Mailbox {
                 continue;
             }
             let chat_list = self.convention.chat_list_dir(&entry.name);
-            if self.backend.exists(&chat_list).map_err(|e| {
+            if backend.exists(&chat_list).map_err(|e| {
                 format!(
                     "list recipients at {dir}: cannot tell whether {} announced presence \
                      ({chat_list}): {e}",
@@ -826,7 +870,7 @@ impl Mailbox {
     /// does not exist yet is not an error — see below.
     pub fn list_conversations(&self) -> Result<Vec<String>, String> {
         let dir = self.convention.chat_list_dir(&self.self_id);
-        match self.backend.readdir(&dir) {
+        match self.backend.resolve()?.readdir(&dir) {
             Ok(entries) => {
                 let mut peers: Vec<String> = entries.into_iter().map(|e| e.name).collect();
                 peers.sort();
@@ -962,7 +1006,7 @@ fn instance_id() -> String {
 
 /// A durable cursor guarded by the backend's atomic exclusive lock.
 pub struct ConversationReader {
-    backend: Arc<dyn FsBackend>,
+    backend: MailboxBackend,
     path: String,
     holder: String,
     agent: String,
@@ -972,19 +1016,20 @@ impl ConversationReader {
     /// The register as currently stored, or `None` if this agent has never read
     /// this conversation.
     fn load(&self) -> Result<Option<ReaderRegister>, String> {
-        crate::cursor_fence::load_plain(self.backend.as_ref(), &self.path)
+        crate::cursor_fence::load_plain(self.backend.resolve()?.as_ref(), &self.path)
     }
 
     /// Hold the conversation's lock, then claim its register through
     /// [`crate::cursor_fence`]. `None` while another instance holds either.
     fn acquire(self) -> Result<Option<OwnedReader>, String> {
-        let Some(lease) = HeldLease::try_acquire(&self.backend, &format!("{}.lock", self.path))
+        let backend = self.backend.resolve()?;
+        let Some(lease) = HeldLease::try_acquire(&backend, &format!("{}.lock", self.path))
             .map_err(|e| format!("claim reader {}: {e}", self.path))?
         else {
             return Ok(None);
         };
         let Some((cursor, offset)) = crate::cursor_fence::RegisterCursor::claim(
-            Arc::clone(&self.backend),
+            backend,
             self.path,
             self.holder,
             now_ms() + READER_LEASE_MS,
@@ -1168,7 +1213,7 @@ impl Mailbox {
             path: self
                 .convention
                 .reader_path(&self.self_id, peer, &self.self_id),
-            backend: Arc::clone(&self.backend),
+            backend: self.backend.clone(),
             holder: instance_id(),
             agent: self.self_id.clone(),
         }
@@ -1185,7 +1230,7 @@ impl Mailbox {
             self.convention.agents_dir(),
             self.self_id
         );
-        HeldLease::try_acquire(&self.backend, &path).map_err(|e| {
+        HeldLease::try_acquire(&self.backend.resolve()?, &path).map_err(|e| {
             format!(
                 "claim the receiver seat for {} at {path}: {e}",
                 self.self_id
@@ -1197,6 +1242,8 @@ impl Mailbox {
 /// What a receiver in this process is doing for its agent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReceiverState {
+    /// Configuration or transport IO has not made the receiver usable yet.
+    Unavailable,
     /// Another instance of the agent holds its receiver seat; this one waits to
     /// take over.
     Standby,
@@ -1209,6 +1256,7 @@ impl ReceiverState {
     #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {
+            Self::Unavailable => "unavailable",
             Self::Standby => "standby",
             Self::Receiving => "receiving",
         }
@@ -1221,12 +1269,12 @@ impl ReceiverState {
 pub struct PeerStatus {
     /// The agent name the session answers to.
     pub agent: String,
-    /// `"node"` or `"disk"`; `None` when attaching failed.
+    /// The selected `"node"` or `"disk"` namespace, even when unavailable.
     pub namespace: Option<&'static str>,
     /// The node's `host:port`, when attached to one.
     pub endpoint: Option<String>,
-    /// `"receiving"`, `"standby"`, or `"none"` when this process runs no
-    /// receiver for the agent.
+    /// `"receiving"`, `"standby"`, `"unavailable"`, or `"none"` when this
+    /// process runs no receiver for the agent.
     pub receiver: &'static str,
     /// When a received message runs: `"automatic"` as soon as the session is
     /// idle, or `"next_prompt"` in the synchronous REPL, which runs it once the
@@ -1237,7 +1285,7 @@ pub struct PeerStatus {
     /// [`crate::cursor_fence::CursorGuarantee`]), or `"none"` until this
     /// process has claimed a conversation for the agent.
     pub cursor: &'static str,
-    /// Why attaching failed, when it did.
+    /// The last local node-binding error, when it could not yet be resolved.
     pub error: Option<String>,
 }
 
@@ -1267,14 +1315,31 @@ pub fn cursor_guarantee(agent: &str) -> Option<crate::cursor_fence::CursorGuaran
         .copied()
 }
 
-/// Receivers running in this process: per agent name, how many are standing
-/// by and how many are receiving.
+#[derive(Default)]
+struct ReceiverCounts {
+    unavailable: usize,
+    standby: usize,
+    receiving: usize,
+}
+
+impl ReceiverCounts {
+    fn count_mut(&mut self, state: ReceiverState) -> &mut usize {
+        match state {
+            ReceiverState::Unavailable => &mut self.unavailable,
+            ReceiverState::Standby => &mut self.standby,
+            ReceiverState::Receiving => &mut self.receiving,
+        }
+    }
+}
+
+/// Receiver state in this process, per agent. These are runtime observations,
+/// not persisted delivery positions or proof that a remote peer is online.
 static RECEIVER_STATES: std::sync::OnceLock<
-    std::sync::Mutex<std::collections::HashMap<String, (usize, usize)>>,
+    std::sync::Mutex<std::collections::HashMap<String, ReceiverCounts>>,
 > = std::sync::OnceLock::new();
 
 fn receiver_states(
-) -> std::sync::MutexGuard<'static, std::collections::HashMap<String, (usize, usize)>> {
+) -> std::sync::MutexGuard<'static, std::collections::HashMap<String, ReceiverCounts>> {
     RECEIVER_STATES
         .get_or_init(std::sync::Mutex::default)
         .lock()
@@ -1286,8 +1351,9 @@ fn receiver_states(
 #[must_use]
 pub fn receiver_state(agent: &str) -> Option<ReceiverState> {
     match receiver_states().get(agent) {
-        Some((_, receiving)) if *receiving > 0 => Some(ReceiverState::Receiving),
-        Some((standby, _)) if *standby > 0 => Some(ReceiverState::Standby),
+        Some(counts) if counts.receiving > 0 => Some(ReceiverState::Receiving),
+        Some(counts) if counts.standby > 0 => Some(ReceiverState::Standby),
+        Some(counts) if counts.unavailable > 0 => Some(ReceiverState::Unavailable),
         _ => None,
     }
 }
@@ -1305,15 +1371,10 @@ impl ReceiverStateEntry {
         }
         let mut states = receiver_states();
         let counts = states.entry(self.agent.clone()).or_default();
-        match self.state.replace(state) {
-            Some(ReceiverState::Standby) => counts.0 -= 1,
-            Some(ReceiverState::Receiving) => counts.1 -= 1,
-            None => {}
+        if let Some(previous) = self.state.replace(state) {
+            *counts.count_mut(previous) -= 1;
         }
-        match state {
-            ReceiverState::Standby => counts.0 += 1,
-            ReceiverState::Receiving => counts.1 += 1,
-        }
+        *counts.count_mut(state) += 1;
     }
 }
 
@@ -1321,12 +1382,10 @@ impl Drop for ReceiverStateEntry {
     fn drop(&mut self) {
         let mut states = receiver_states();
         if let Some(counts) = states.get_mut(&self.agent) {
-            match self.state {
-                Some(ReceiverState::Standby) => counts.0 -= 1,
-                Some(ReceiverState::Receiving) => counts.1 -= 1,
-                None => {}
+            if let Some(previous) = self.state {
+                *counts.count_mut(previous) -= 1;
             }
-            if *counts == (0, 0) {
+            if counts.unavailable == 0 && counts.standby == 0 && counts.receiving == 0 {
                 states.remove(&self.agent);
             }
         }
@@ -1388,21 +1447,32 @@ pub fn spawn_inbox_poller(
     std::thread::Builder::new()
         .name(format!("{label}-inbox"))
         .spawn(move || {
-            // Announce before listening. A receiver that only becomes visible
-            // once someone has written to it cannot be found by whoever wants
-            // to write, and cannot be observed to be running at all.
-            if let Err(e) = mailbox.ensure_presence() {
-                eprintln!("[{label}] announcing this agent failed: {e}");
-            }
+            // Credential or node availability may arrive after startup. Keep
+            // retrying the same mailbox, including its presence announcement,
+            // before claiming the receiver seat. No second receiver is needed.
+            let mut announced = false;
+            let mut announce_error = None;
             let mut state = ReceiverStateEntry {
                 agent: mailbox.self_id().to_string(),
                 state: None,
             };
             while !abort.is_aborted() {
-                state.set(ReceiverState::Standby);
+                state.set(ReceiverState::Unavailable);
+                if !announced {
+                    if let Err(e) = mailbox.ensure_presence() {
+                        if announce_error.as_ref() != Some(&e) {
+                            eprintln!("[{label}] announcing this agent failed: {e}");
+                            announce_error = Some(e);
+                        }
+                        sleep_unless_aborted(&abort, CONVERSATION_DISCOVERY_MS);
+                        continue;
+                    }
+                    announced = true;
+                }
                 let seat = match mailbox.claim_receiver() {
                     Ok(Some(seat)) => seat,
                     Ok(None) => {
+                        state.set(ReceiverState::Standby);
                         sleep_unless_aborted(&abort, CONVERSATION_DISCOVERY_MS);
                         continue;
                     }
