@@ -124,6 +124,96 @@ fn a_refused_batch_records_a_consumer_refused_stall_with_the_stuck_offset() {
         stalls.iter().all(|e| !e.holder.is_empty()),
         "the stall is attributable to the reader that holds the lease"
     );
+    assert!(
+        stalls.iter().all(|e| e.tail > e.offset),
+        "tail is past the stuck offset, so the pending bytes are known: {:?}",
+        stalls
+            .iter()
+            .map(|e| (e.offset, e.tail))
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn a_peer_appending_during_a_refusal_moves_tail_but_not_offset() {
+    // The case `offset` alone cannot describe, driven for real rather than
+    // asserted: the consumer refuses throughout, so the cursor is pinned while
+    // the peer appends. A reader of the records must be able to see that new
+    // content arrived without the cursor moving — otherwise "transport re-hand"
+    // and "peer said something else" are indistinguishable, which is the one
+    // question this recorder exists to answer.
+    let root = TempRoot::new("appending");
+    let abort = runtime::HookAbortSignal::default();
+    let handed_over = Arc::new(AtomicUsize::new(0));
+
+    let seen = Arc::clone(&handed_over);
+    let poller = runtime::mailbox::spawn_local_poller(
+        root.path().to_path_buf(),
+        "pinned-receiver".to_string(),
+        abort.clone(),
+        move |_envelope: &MailboxEnvelope| {
+            seen.fetch_add(1, Ordering::Release);
+            false
+        },
+    );
+
+    let sender = runtime::mailbox::Mailbox::workspace_local(root.path(), "chatty-peer".to_string());
+    sender
+        .send(envelope("chatty-peer", "pinned-receiver", "first"))
+        .expect("send first");
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while handed_over.load(Ordering::Acquire) < 1 && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    let tail_before = runtime::mailbox::delivery_events()
+        .into_iter()
+        .filter(|e| e.peer == "chatty-peer")
+        .map(|e| e.tail)
+        .max()
+        .expect("a stall was recorded for the first message");
+
+    // Append while the consumer is still refusing.
+    sender
+        .send(envelope(
+            "chatty-peer",
+            "pinned-receiver",
+            "second, sent while the first was still being refused",
+        ))
+        .expect("send second");
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    let mut tail_after = tail_before;
+    while tail_after <= tail_before && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        tail_after = runtime::mailbox::delivery_events()
+            .into_iter()
+            .filter(|e| e.peer == "chatty-peer")
+            .map(|e| e.tail)
+            .max()
+            .unwrap_or(tail_before);
+    }
+    abort.abort();
+    let _ = poller.join();
+
+    let stalls: Vec<_> = runtime::mailbox::delivery_events()
+        .into_iter()
+        .filter(|e| e.peer == "chatty-peer" && e.stall == DeliveryStall::ConsumerRefused)
+        .collect();
+
+    assert!(
+        tail_after > tail_before,
+        "the appended message must show up as a larger tail: {tail_before} -> {tail_after}"
+    );
+    assert!(
+        stalls.iter().all(|e| e.offset == 0),
+        "the cursor never advanced, because nothing was ever accepted: {:?}",
+        stalls.iter().map(|e| e.offset).collect::<Vec<_>>()
+    );
+    assert!(
+        stalls.iter().map(|e| e.tail).min() < stalls.iter().map(|e| e.tail).max(),
+        "so tail is the only field that moved, and it is recorded"
+    );
 }
 
 #[test]
