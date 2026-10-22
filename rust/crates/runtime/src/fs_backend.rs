@@ -202,6 +202,11 @@ pub trait FsBackend: Send + Sync + 'static {
         ))
     }
     fn read(&self, path: &str) -> io::Result<Vec<u8>>;
+    /// Read a complete view coordinated with backend record writers.
+    /// Atomic object and framed-stream backends use their ordinary read.
+    fn read_snapshot(&self, path: &str) -> io::Result<Vec<u8>> {
+        self.read(path)
+    }
     fn write(&self, path: &str, data: &[u8]) -> io::Result<()>;
     fn append(&self, path: &str, data: &[u8]) -> io::Result<()>;
     fn delete(&self, path: &str) -> io::Result<()>;
@@ -544,6 +549,9 @@ impl FsBackend for Arc<dyn FsBackend> {
     fn read(&self, path: &str) -> io::Result<Vec<u8>> {
         (**self).read(path)
     }
+    fn read_snapshot(&self, path: &str) -> io::Result<Vec<u8>> {
+        (**self).read_snapshot(path)
+    }
     fn write(&self, path: &str, data: &[u8]) -> io::Result<()> {
         (**self).write(path, data)
     }
@@ -844,6 +852,9 @@ impl FsBackend for StdFsBackend {
     }
     fn read(&self, path: &str) -> io::Result<Vec<u8>> {
         std::fs::read(path)
+    }
+    fn read_snapshot(&self, path: &str) -> io::Result<Vec<u8>> {
+        record_log::read_native_snapshot(path)
     }
 
     /// A real OS link where the platform gives one without privilege, else a small

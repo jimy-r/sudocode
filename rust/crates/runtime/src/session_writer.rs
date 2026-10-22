@@ -93,7 +93,7 @@ impl SessionWriter {
         if fs.exists(&path).map_err(|error| error.to_string())?
             && fs.stat(&path).map_err(|error| error.to_string())?.len > 0
         {
-            let bytes = fs.read(&path).map_err(|error| error.to_string())?;
+            let bytes = fs.read_snapshot(&path).map_err(|error| error.to_string())?;
             let contents =
                 crate::session_history::decode(&bytes).map_err(|error| error.to_string())?;
             let shared = crate::Session::shared_history_suffix(contents)?.is_some();
@@ -185,7 +185,7 @@ impl SessionWriter {
         }
         let path = transcript.to_string_lossy();
         let mode = if fs.exists(&path).map_err(|error| error.to_string())? {
-            let bytes = fs.read(&path).map_err(|error| error.to_string())?;
+            let bytes = fs.read_snapshot(&path).map_err(|error| error.to_string())?;
             if !crate::session::history::is_record_history(&bytes) {
                 if !native {
                     return Err("session history initialization binding missing".into());

@@ -7793,13 +7793,17 @@ async fn acp_completions_keep_live_contexts_independent_during_replay_and_load()
         .await
         .unwrap();
     let transcript = find_session_transcript(&workspace.root, &sid);
+    let read_transcript = || {
+        runtime::FsBackend::read_snapshot(&runtime::StdFsBackend, &transcript.to_string_lossy())
+            .unwrap()
+    };
     let journal = completion_context_path(&workspace, &sid);
     // The question can reach ACP before the provider's final usage update is
     // persisted. Wait for that durable boundary while the question keeps the
     // turn open; otherwise the owner itself can change our byte snapshot.
     timeout(Duration::from_secs(10), async {
         loop {
-            let saved = fs::read_to_string(&transcript).unwrap();
+            let saved = String::from_utf8(read_transcript()).unwrap();
             let graph = runtime::history::HistoryGraph::decode(saved.as_bytes()).unwrap();
             let record: runtime::history::HistoryRecord =
                 serde_json::from_str(saved.lines().last().unwrap()).unwrap();
@@ -7822,7 +7826,7 @@ async fn acp_completions_keep_live_contexts_independent_during_replay_and_load()
     })
     .await
     .expect("owner persisted the final provider response before waiting for the user");
-    let before_transcript = fs::read(&transcript).unwrap();
+    let before_transcript = read_transcript();
     let before_journal = fs::read(&journal).unwrap();
     let state: Value = serde_json::from_slice(&before_journal).unwrap();
     assert_eq!(state["active_trace"], "live-owner");
@@ -7842,9 +7846,7 @@ async fn acp_completions_keep_live_contexts_independent_during_replay_and_load()
             "competing {method} changed journal"
         );
         assert!(
-            fs::read(&transcript)
-                .unwrap()
-                .starts_with(&before_transcript),
+            read_transcript().starts_with(&before_transcript),
             "competing {method} replaced durable history"
         );
     }
@@ -7872,9 +7874,7 @@ async fn acp_completions_keep_live_contexts_independent_during_replay_and_load()
         .await;
     assert!(replay.get("result").is_some(), "{replay}");
     assert!(
-        fs::read(&transcript)
-            .unwrap()
-            .starts_with(&before_transcript),
+        read_transcript().starts_with(&before_transcript),
         "replay replaced durable history"
     );
     assert_eq!(fs::read(&journal).unwrap(), before_journal);
@@ -7888,9 +7888,7 @@ async fn acp_completions_keep_live_contexts_independent_during_replay_and_load()
         .await;
     assert!(loaded.get("result").is_some(), "{loaded}");
     assert!(
-        fs::read(&transcript)
-            .unwrap()
-            .starts_with(&before_transcript),
+        read_transcript().starts_with(&before_transcript),
         "loading must preserve the original interrupted history"
     );
     let (_, continued) = competitor
@@ -7903,7 +7901,7 @@ async fn acp_completions_keep_live_contexts_independent_during_replay_and_load()
         )
         .await;
     assert_eq!(continued["result"]["stopReason"], "end_turn", "{continued}");
-    let continued_transcript = fs::read(&transcript).unwrap();
+    let continued_transcript = read_transcript();
     assert!(
         String::from_utf8_lossy(&continued_transcript)
             .contains("Side effects may already have occurred"),
@@ -7928,9 +7926,7 @@ async fn acp_completions_keep_live_contexts_independent_during_replay_and_load()
         .await;
     assert!(loaded_again.get("result").is_some(), "{loaded_again}");
     assert!(
-        fs::read(&transcript)
-            .unwrap()
-            .starts_with(&continued_transcript),
+        read_transcript().starts_with(&continued_transcript),
         "a further restart must retain both contexts and append history"
     );
     competitor.shutdown().await;

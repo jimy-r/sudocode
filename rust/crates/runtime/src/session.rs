@@ -784,7 +784,7 @@ impl Session {
         let path_str = path.to_string_lossy();
         let existing = self.backend().exists(&path_str)?;
         let record_history =
-            existing && history::is_record_history(&self.backend().read(&path_str)?);
+            existing && history::is_record_history(&self.backend().read_snapshot(&path_str)?);
         if record_history
             || ((!existing || self.backend().fenced_locks())
                 && crate::experiments::is_enabled(
@@ -829,7 +829,7 @@ impl Session {
                 SessionWriterState::Unopened => {}
             }
             let legacy = if self.backend().fenced_locks() {
-                match self.backend().read(&path.to_string_lossy()) {
+                match self.backend().read_snapshot(&path.to_string_lossy()) {
                     Ok(bytes) => !bytes.is_empty() && !history::is_record_history(&bytes),
                     Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
                     Err(error) => return Err(error.into()),
@@ -858,7 +858,7 @@ impl Session {
         let Some(path) = self.persistence_path() else {
             return Ok(None);
         };
-        let bytes = match self.backend().read(&path.to_string_lossy()) {
+        let bytes = match self.backend().read_snapshot(&path.to_string_lossy()) {
             Ok(bytes) => Some(bytes),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
             Err(error) => return Err(error.into()),
@@ -894,7 +894,7 @@ impl Session {
         let Some(path) = self.persistence_path() else {
             return Ok((None, Vec::new()));
         };
-        let bytes = match self.backend().read(&path.to_string_lossy()) {
+        let bytes = match self.backend().read_snapshot(&path.to_string_lossy()) {
             Ok(bytes) => bytes,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 return Ok((Some(durable_bytes_revision(None)), Vec::new()));
@@ -1231,7 +1231,7 @@ impl Session {
         let path = path.as_ref();
         let writer = self.writer_for(path)?;
         let _write = writer.write().map_err(SessionError::Format)?;
-        let durable = match self.backend().read(&path.to_string_lossy()) {
+        let durable = match self.backend().read_snapshot(&path.to_string_lossy()) {
             Ok(bytes) => Some(bytes),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
             Err(error) => return Err(error.into()),
@@ -1285,7 +1285,7 @@ impl Session {
         path: impl AsRef<Path>,
     ) -> Result<Self, SessionError> {
         let path = path.as_ref();
-        let bytes = fs.read(&path.to_string_lossy())?;
+        let bytes = fs.read_snapshot(&path.to_string_lossy())?;
         let contents = crate::session_history::decode(&bytes)?;
         let session =
             Self::from_persisted_contents(contents)?.with_persistence_path(path.to_path_buf());
@@ -1770,7 +1770,7 @@ impl Session {
         path: &Path,
         head: Option<&str>,
     ) -> Result<Self, SessionError> {
-        let bytes = fs.read(&path.to_string_lossy())?;
+        let bytes = fs.read_snapshot(&path.to_string_lossy())?;
         if history::is_record_history(&bytes) {
             let revision = head.ok_or_else(|| {
                 SessionError::Format("shared history context revision missing".into())
