@@ -11,35 +11,57 @@ use runtime::{
 /// A non-owning barrier for the previous completion state's field teardown.
 /// A dead weak driver alone does not mean its engine has released storage.
 #[derive(Clone)]
-pub struct CompletionRetirement(Arc<Mutex<std::sync::mpsc::Receiver<()>>>);
+pub struct CompletionRetirement(Arc<RetirementState>);
+
+struct RetirementState {
+    retired: Mutex<bool>,
+    changed: std::sync::Condvar,
+}
 
 impl CompletionRetirement {
     /// Wait for the state's storage fields to drop, without retaining them.
     #[must_use]
     pub fn wait(&self, timeout: std::time::Duration) -> bool {
-        matches!(
-            self.0
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .recv_timeout(timeout),
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected)
-        )
+        let retired = self
+            .0
+            .retired
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Condvar releases the mutex while waiting: another session's
+        // nonblocking retirement probe never queues behind this timeout.
+        let (retired, _) = self
+            .0
+            .changed
+            .wait_timeout_while(retired, timeout, |retired| !*retired)
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *retired
     }
 }
 
 pub(crate) struct CompletionLifetime {
-    // Dropping this sender closes the barrier. No message is ever sent.
-    _alive: std::sync::mpsc::Sender<()>,
     retirement: CompletionRetirement,
 }
 
 impl Default for CompletionLifetime {
     fn default() -> Self {
-        let (alive, retired) = std::sync::mpsc::channel();
         Self {
-            _alive: alive,
-            retirement: CompletionRetirement(Arc::new(Mutex::new(retired))),
+            retirement: CompletionRetirement(Arc::new(RetirementState {
+                retired: Mutex::new(false),
+                changed: std::sync::Condvar::new(),
+            })),
         }
+    }
+}
+
+impl Drop for CompletionLifetime {
+    fn drop(&mut self) {
+        *self
+            .retirement
+            .0
+            .retired
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = true;
+        self.retirement.0.changed.notify_all();
     }
 }
 
