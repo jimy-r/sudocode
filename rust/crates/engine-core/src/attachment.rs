@@ -191,7 +191,7 @@ impl EngineDelegate for DeferredDelegate {
         name: &str,
         input: &str,
         prompter: &mut dyn PermissionPrompter,
-    ) -> Result<(String, bool), String> {
+    ) -> Result<runtime::external_a2a::ExternalToolResult, String> {
         self.get()?.run_direct_tool(name, input, prompter)
     }
     fn set_trace_id(&self, trace: &str) {

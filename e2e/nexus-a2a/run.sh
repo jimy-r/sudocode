@@ -139,6 +139,12 @@ NEXUS_A2A_TEST_ENDPOINT="$ENDPOINT" \
   cargo_in_workspace test --manifest-path "$RUST_DIR/Cargo.toml" -q -p rusty-sudocode-cli \
   --test pty_agent_duet -- --nocapture
 
+echo "== [deterministic] direct ACP uses no model; pause and lost reply use real mTLS =="
+NEXUS_A2A_TEST_ENDPOINT="$ENDPOINT" NEXUS_A2A_TEST_CERT_DIR="$CLIENT_BUNDLE" \
+  NEXUS_A2A_TEST_DIRECT_CREDENTIAL="$(authon_mint "direct-acp-probe")" \
+  cargo_in_workspace test --manifest-path "$RUST_DIR/Cargo.toml" -q -p rusty-sudocode-cli \
+  --test acp_integration live_direct_a2a_ -- --ignored --test-threads=1 --nocapture
+
 echo "== [deterministic] a silent connection errors, then recovers =="
 NEXUS_A2A_TEST_ENDPOINT="$ENDPOINT" NEXUS_A2A_TEST_CERT_DIR="$CLIENT_BUNDLE" \
   "${CARGO_TEST[@]}" live_a_silent_transport_errors_and_then_recovers -- --ignored --nocapture

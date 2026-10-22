@@ -1164,7 +1164,7 @@ impl engine_core::EngineDelegate for SessionEngine {
         name: &str,
         input: &str,
         prompter: &mut dyn runtime::PermissionPrompter,
-    ) -> Result<(String, bool), String> {
+    ) -> Result<runtime::external_a2a::ExternalToolResult, String> {
         let mut session = self.lock_session();
         let _scope = runtime::WorkspaceRootScope::enter(&session.cwd);
         let runtime = session
@@ -1172,7 +1172,12 @@ impl engine_core::EngineDelegate for SessionEngine {
             .runtime_mut()
             .ok_or("the session runtime is not available")?;
         self.rt()
-            .block_on(runtime.run_tool_call(name, input, Some(prompter)))
+            .block_on(runtime.run_tool_call(
+                name,
+                input,
+                Some(prompter),
+                self.background_tasks.clone(),
+            ))
             .map_err(|error| error.to_string())
     }
 

@@ -643,6 +643,17 @@ coverage starts fresh and is tracked here as the single source.</p>
   </tbody>
 </table>
 
+<p><strong>Direct ACP A2A hardening (source in progress).</strong>
+<code>_sudocode/a2a/send</code> and <code>agent_list</code> keep the existing
+engine command lane and scheduler, with no model inference or invented model
+history. The follow-up adds typed pre-submission refusals, unique native command
+IDs bound to the actual executor mailbox, and the session operation registry
+covering hooks, approval and blocking Node work. Native result metadata remains
+separate from the transcript; timeout/disconnect remains Unknown. Real stdio
+hook/allowlist cases and isolated TLS-daemon pause/withheld-reply cases are wired
+to CI; source preparation is not deployment or cross-host callback acceptance.
+See <a href="docs/acp.md#direct-a2a-requests">the wire contract and test limits</a>.</p>
+
 <h4>2. Tool usage — file operations</h4>
 <table>
   <thead><tr><th>Feature</th><th>Hacker Priority</th><th>Status</th><th>Test</th><th>Notes</th></tr></thead>

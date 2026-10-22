@@ -170,6 +170,80 @@ A direct request never waits: if the session is in a turn or another request,
 or its tools are paused, it is refused before anything runs. `isError: true`
 reports a failed call; it does not prove that nothing was delivered, so do not
 retry it blindly.
+
+`directA2a.errorOutcomes == 1` adds a typed refusal contract. Only an error with
+code `-32070` and `error.data.sudocode.directA2a` containing
+`{ "version": 1, "outcome": "not_submitted", "reason": "..." }` attests that
+the host rejected the request before tool submission. Reasons are
+`invalid_params`, `unknown_session`, `busy`, `paused` and `session_changed`.
+After admission, driver or response failures use `-32071` with `outcome:
+"unknown"` and `reason: "after_admission"`. Generic JSON-RPC errors, opaque
+`isError` results, timeout and disconnect do not prove that no append occurred.
+Keep the original request for reconciliation; do not retry or fall back to a
+prompt automatically.
+
+`directA2a.hostAudit == 1` adds
+`result._meta.sudocode.directA2a.audit`: version, unique `commandId`, native
+`sessionId`, actual executor mailbox `actor` and `namespaceRoot`, tool,
+`requestedInputSha256`, optional `effectiveInputSha256` and `resultSha256`.
+The first hash binds the requested fields before hooks; the effective hash is
+present only after the real executor has validated the rewritten invocation.
+The result hash binds content and `isError` before adding metadata. The host checks the
+effective call after hooks against its actual mailbox and unique command ID;
+hooks cannot insert a sender override or structured control message, change
+tools or dispatch a shadowing MCP tool. A plain text rewrite still uses the
+ordinary scheduler, hooks, policy and real executor.
+
+Audit metadata is returned on this connection, separate from model history; it
+is not a durable journal or a delivery receipt. An empty namespace root denotes
+the daemon's logical namespace, not proof of a healthy connection or verified
+remote identity. The receiving node's authenticated envelope is the independent
+identity evidence. Hosts retaining an audit must save the native result and
+its call ID themselves, without putting a fabricated model tool call into the
+transcript. `hostAudit:1` is specifically metadata on a returned tool result,
+including an opaque `isError` result. A driver exception, cancellation without
+a result, or transport loss may have no audit receipt; `-32071` still means
+Unknown and does not promise command/actor correlation. There is no all-command
+provenance claim. Inspect the real node envelope to reconcile an uncertain
+append.
+
+Hash encoding is independent of JSON property order and has no Unicode
+normalization. `frame(x)` means an unsigned 64-bit big-endian byte length,
+followed by UTF-8 bytes. Digests are SHA-256, lowercase hexadecimal:
+
+```text
+input:  ASCII("sudocode.direct-a2a.input.v1") || NUL || frame(tool)
+        || u64be(number of fields)
+        || for each ASCII field name in sorted order:
+             frame(name) || type || value
+        string: type=1, value=frame(text)
+        false:  type=2, no value bytes
+        true:   type=3, no value bytes
+result: ASCII("sudocode.direct-a2a.result.v1") || NUL
+        || one byte (isError ? 1 : 0) || frame(content)
+```
+
+Input fields use native tool names: `to`, `message`, optional `summary`, or
+optional `active_only`. Omitted and false are distinct. No audit field or RPC
+`sessionId` participates in those hashes; native session/actor remain separate
+audit fields. The public schemas bound the field count and types. A hook's
+effective hash does not disclose its body; the real envelope is needed to
+verify the final recipient and text.
+
+Direct calls share the session's operation registry, including the lease held
+by an actual blocking Node worker. Cancelling the scheduler does not stop that
+worker immediately. `pause_tools` acknowledges quiescence only after the worker
+has drained; a timeout keeps the fence. An accepted append can still become
+visible at the node after the caller loses its ACP reply.
+
+The normal stdio tests check typed refusals, hook rewriting, mailbox binding
+and absence from model history. `e2e/nexus-a2a/run.sh` also runs
+`acp_direct_fences::live_direct_a2a_*` against its isolated real TLS daemon:
+opaque TCP traffic is held while pause cancels a request, and a post-execution
+hook withholds a reply while the node already holds the message. Their model
+endpoint refuses every inference request and must record zero calls. This is
+not a cross-host idle callback or production deployment acceptance.
+
 ### Per-session system prompt (`_meta.sudocode.*`)
 
 `session/new` and `session/load` accept two optional, orthogonal keys under

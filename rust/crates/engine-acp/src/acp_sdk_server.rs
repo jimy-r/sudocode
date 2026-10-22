@@ -323,6 +323,46 @@ struct DirectAgentListRequest {
 struct DirectA2aResponse {
     content: String,
     is_error: bool,
+    #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
+    meta: Option<serde_json::Value>,
+}
+
+/// Only host pre-admission checks can attest that no tool was submitted.
+/// Every driver, hook, executor or result failure after admission is Unknown.
+struct DirectA2aFailure {
+    not_submitted: bool,
+    reason: &'static str,
+    message: String,
+}
+
+impl DirectA2aFailure {
+    fn refused(reason: &'static str, message: impl Into<String>) -> Self {
+        Self {
+            not_submitted: true,
+            reason,
+            message: message.into(),
+        }
+    }
+
+    fn unknown(message: impl Into<String>) -> Self {
+        Self {
+            not_submitted: false,
+            reason: "after_admission",
+            message: message.into(),
+        }
+    }
+
+    fn into_sdk(self) -> Error {
+        Error::new(
+            if self.not_submitted { -32070 } else { -32071 },
+            self.message,
+        )
+        .data(json!({ "sudocode": { "directA2a": {
+                "version": 1,
+                "outcome": if self.not_submitted { "not_submitted" } else { "unknown" },
+                "reason": self.reason,
+            } } }))
+    }
 }
 
 /// `_meta.sudocode` key a client sets in `clientCapabilities` (and scode
@@ -1013,7 +1053,12 @@ fn initialize_meta(subagent_events: Option<u64>) -> Map<String, serde_json::Valu
     sudocode_ns.insert("systemPromptAppend".to_string(), json!(true));
     sudocode_ns.insert("toolPause".to_string(), json!({ "version": 1 }));
     // `_sudocode/a2a/send` and `_sudocode/a2a/agent_list`.
-    sudocode_ns.insert("directA2a".to_string(), json!({ "version": 1 }));
+    sudocode_ns.insert(
+        "directA2a".to_string(),
+        json!({
+            "version": 1, "errorOutcomes": 1, "hostAudit": 1,
+        }),
+    );
     // `session/new` accepts `_meta.sudocode.forkFrom` (see
     // `fork_source_from_meta`): a client that forks a conversation into a
     // new directory gates on this instead of probing.
@@ -2079,9 +2124,10 @@ fn answer_permission(
 /// The session, tool and tool input a direct A2A request asks for.
 fn direct_a2a_call(
     message: agent_client_protocol::UntypedMessage,
-) -> Result<(String, &'static str, serde_json::Value), AcpError> {
+) -> Result<(String, &'static str, serde_json::Value), DirectA2aFailure> {
     let (method, params) = message.into_parts();
-    let invalid = |error: serde_json::Error| AcpError::invalid_params(error.to_string());
+    let invalid =
+        |error: serde_json::Error| DirectA2aFailure::refused("invalid_params", error.to_string());
     if method == DIRECT_SEND_METHOD {
         let request: DirectSendRequest = serde_json::from_value(params).map_err(invalid)?;
         let mut input = json!({ "to": request.to, "message": request.message });
@@ -2111,18 +2157,23 @@ async fn drive_direct_tool(
     name: &'static str,
     input: serde_json::Value,
     cx: ConnectionTo<Client>,
-) -> Result<DirectA2aResponse, AcpError> {
-    let admitted = registry
-        .engine(&session_id)
-        .ok_or_else(|| AcpError::invalid_params(format!("unknown sessionId: {session_id}")))?;
+) -> Result<DirectA2aResponse, DirectA2aFailure> {
+    let admitted = registry.engine(&session_id).ok_or_else(|| {
+        DirectA2aFailure::refused(
+            "unknown_session",
+            format!("unknown sessionId: {session_id}"),
+        )
+    })?;
     let (admitted_epoch, is_paused) = admitted.tool_control();
     if is_paused {
-        return Err(AcpError::invalid_params(
+        return Err(DirectA2aFailure::refused(
+            "paused",
             "Tool execution is paused by the user",
         ));
     }
     let Some(_lane) = registry.try_enter_lane(&session_id) else {
-        return Err(AcpError::invalid_params(
+        return Err(DirectA2aFailure::refused(
+            "busy",
             "The session is busy; nothing was sent",
         ));
     };
@@ -2131,16 +2182,17 @@ async fn drive_direct_tool(
         !is_paused && epoch == admitted_epoch && Arc::ptr_eq(&engine, &admitted)
     });
     if !unchanged {
-        return Err(AcpError::invalid_params(
+        return Err(DirectA2aFailure::refused(
+            "session_changed",
             "Session control changed while the request was admitted",
         ));
     }
-    let driver = registry
-        .driver(&session_id)
-        .ok_or_else(|| AcpError::internal("missing engine session driver"))?;
+    let driver = registry.driver(&session_id).ok_or_else(|| {
+        DirectA2aFailure::refused("session_changed", "missing engine session driver")
+    })?;
     let abort = registry
         .abort_signal(&session_id)
-        .ok_or_else(|| AcpError::invalid_params("Unknown session"))?;
+        .ok_or_else(|| DirectA2aFailure::refused("session_changed", "Unknown session"))?;
     let (_listener, mut events) = driver.listen(cx.clone());
     let reply = driver.direct_tool(name, input.to_string());
     tokio::pin!(reply);
@@ -2160,8 +2212,8 @@ async fn drive_direct_tool(
             },
         }
     };
-    let value = value.map_err(AcpError::invalid_params)?;
-    serde_json::from_value(value).map_err(|e| AcpError::internal(e.to_string()))
+    let value = value.map_err(DirectA2aFailure::unknown)?;
+    serde_json::from_value(value).map_err(|e| DirectA2aFailure::unknown(e.to_string()))
 }
 
 /// Build an ACP `RequestPermissionRequest` from a runtime `PermissionRequest`.
@@ -3199,9 +3251,9 @@ pub(crate) async fn run_acp_on_transport(
                                 result
                                     .and_then(|response| {
                                         serde_json::to_value(response)
-                                            .map_err(|e| AcpError::internal(e.to_string()))
+                                            .map_err(|e| DirectA2aFailure::unknown(e.to_string()))
                                     })
-                                    .map_err(|error| acp_error_to_sdk(&error)),
+                                    .map_err(DirectA2aFailure::into_sdk),
                             )?;
                             Ok(())
                         })?;

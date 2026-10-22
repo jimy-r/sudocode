@@ -122,7 +122,7 @@ pub trait EngineDelegate: Send + Sync + 'static {
         _name: &str,
         _input: &str,
         _prompter: &mut dyn PermissionPrompter,
-    ) -> Result<(String, bool), String> {
+    ) -> Result<runtime::external_a2a::ExternalToolResult, String> {
         Err("this engine does not run direct tool calls".into())
     }
 
@@ -724,9 +724,10 @@ async fn run_direct_tool(
             result = &mut handle => {
                 table.cancel_all();
                 let result = match result {
-                    Ok(Ok((content, is_error))) => Ok(serde_json::json!({
-                        "content": content,
-                        "isError": is_error,
+                    Ok(Ok(result)) => Ok(serde_json::json!({
+                        "content": result.content,
+                        "isError": result.is_error,
+                        "_meta": { "sudocode": { "directA2a": { "audit": result.audit } } },
                     })),
                     Ok(Err(error)) => Err(error),
                     Err(join_error) => Err(format!("direct tool call panicked: {join_error}")),

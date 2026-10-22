@@ -30,6 +30,7 @@ impl<C: ApiClient, T: ToolExecutor> ConversationRuntime<C, T> {
                 .as_deref()
                 .and_then(RuntimeObserver::background_tasks),
             tool_use_id: None,
+            external_a2a: None,
             parent_permission_mode: Some(self.permission_policy.active_mode()),
             permission_sink: prompter
                 .as_deref()
@@ -246,16 +247,32 @@ impl<C: ApiClient, T: ToolExecutor> ConversationRuntime<C, T> {
         name: &str,
         input: &str,
         mut prompter: Option<&mut dyn PermissionPrompter>,
-    ) -> Result<(String, bool), RuntimeError> {
-        const CALL_ID: &str = "direct";
+        tasks: crate::background_tasks::BackgroundTasks,
+    ) -> Result<crate::external_a2a::ExternalToolResult, RuntimeError> {
+        // This outer operation covers hooks and approval waits. The executor
+        // also clones a lease into its actual blocking worker, so cancellation
+        // cannot make pause acknowledge while that worker is still running.
+        let _operation = tasks.begin_operation().map_err(RuntimeError::new)?;
         let abort = self.hook_abort_signal.for_current_turn();
         self.tool_executor_mut().set_abort_signal(abort.clone());
         let no_observer: Option<&mut dyn RuntimeObserver> = None;
-        let context = self.dispatch_context(&no_observer, &prompter);
+        let mut context = self.dispatch_context(&no_observer, &prompter);
         let executor = Arc::clone(&self.tool_executor);
         let executor = executor
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let binding = executor
+            .external_a2a_binding()
+            .ok_or_else(|| RuntimeError::new("the actual executor has no bound A2A mailbox"))?;
+        let call = crate::external_a2a::ExternalA2aCall::new(
+            &self.session.session_id,
+            binding,
+            name,
+            input,
+        )
+        .map_err(RuntimeError::new)?;
+        context.background_tasks = Some(tasks);
+        context.external_a2a = Some(call.clone());
         let mut scheduler = tool_execution::ToolScheduler::new(
             &*executor,
             self.hook_runner.clone(),
@@ -265,12 +282,12 @@ impl<C: ApiClient, T: ToolExecutor> ConversationRuntime<C, T> {
         );
         scheduler.initialize_context(context);
         let parent = ConversationMessage::assistant(vec![ContentBlock::ToolUse {
-            id: CALL_ID.into(),
+            id: call.command_id.clone(),
             name: name.into(),
             input: input.into(),
             thought_signature: None,
         }]);
-        scheduler.enqueue(CALL_ID.into(), name.into(), input.into(), parent)?;
+        scheduler.enqueue(call.command_id.clone(), name.into(), input.into(), parent)?;
         let completed = loop {
             tokio::select! {
                 biased;
@@ -301,6 +318,7 @@ impl<C: ApiClient, T: ToolExecutor> ConversationRuntime<C, T> {
                 } => Some((output, is_error)),
                 _ => None,
             })
+            .map(|(output, is_error)| call.report(output, is_error))
             .ok_or_else(|| RuntimeError::new("the tool call produced no result"))
     }
 }
