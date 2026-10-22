@@ -1522,6 +1522,121 @@ fn receive_while_seated(
 }
 /// One conversation's tail: hold the reader seat, park on the transcript,
 /// deliver, commit.
+/// Why a delivery attempt left the reader where it was.
+///
+/// Recorded because the interesting case was previously invisible. Three of
+/// these only reached an `eprintln!` on a stderr nobody captures, and
+/// [`DeliveryStall::ConsumerRefused`] — the one that actually re-hands a batch
+/// to a consumer and so produces duplicate deliveries — was logged nowhere at
+/// all. Six agents then had to argue from inference about whether a repeat was
+/// transport or a peer saying something twice, which is the distinction
+/// [`MailboxEnvelope::timestamp`] is documented to settle but which nothing
+/// persisted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeliveryStall {
+    /// The consumer did not accept every message in the batch, so the whole
+    /// batch is re-read from the same offset. This is the DESIGNED
+    /// at-least-once boundary, not a fault — it is recorded so that a repeat
+    /// can be attributed instead of guessed at.
+    ConsumerRefused,
+    /// The batch was accepted but `commit` refused to store the new offset, so
+    /// the accepted work will be handed over again.
+    CommitRefused,
+    /// The reader could not be claimed at all.
+    ClaimFailed,
+    /// Reading the conversation failed.
+    PollFailed,
+}
+
+/// One delivery attempt that did not advance a reader.
+///
+/// Carries only what attributes the stall — peer, holder, offset — and never
+/// message bodies: the transcript already holds those, and a diagnostic has no
+/// business copying them.
+#[derive(Debug, Clone)]
+pub struct DeliveryEvent {
+    pub peer: String,
+    pub holder: String,
+    /// The offset that did NOT advance. With `peer`, this identifies the exact
+    /// frames that will be handed over again.
+    pub offset: u64,
+    pub stall: DeliveryStall,
+    /// Consecutive stalls observed at this same offset, so a single hiccup is
+    /// distinguishable from a consumer that has refused the same batch for a
+    /// long time.
+    pub repeats: u32,
+    pub at_ms: u64,
+}
+
+/// Bounded so a long-lived agent cannot accumulate these without limit.
+const DELIVERY_EVENT_CAP: usize = 256;
+
+/// A bounded record of delivery stalls.
+///
+/// A type rather than loose statics so it can be exercised in isolation: the
+/// process-wide instance is just one of these, and a test gets its own instead
+/// of racing its peers through shared state.
+#[derive(Default)]
+struct DeliveryLog {
+    events: std::sync::Mutex<std::collections::VecDeque<DeliveryEvent>>,
+}
+
+impl DeliveryLog {
+    /// Infallible and side-effect-free with respect to delivery: recording must
+    /// never influence whether a batch is acknowledged.
+    fn record(&self, peer: &str, holder: &str, offset: u64, stall: DeliveryStall, repeats: u32) {
+        let mut events = self
+            .events
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if events.len() == DELIVERY_EVENT_CAP {
+            events.pop_front();
+        }
+        events.push_back(DeliveryEvent {
+            peer: peer.to_string(),
+            holder: holder.to_string(),
+            offset,
+            stall,
+            repeats,
+            at_ms: now_ms(),
+        });
+    }
+
+    fn events(&self) -> Vec<DeliveryEvent> {
+        self.events
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .cloned()
+            .collect()
+    }
+}
+
+fn global_delivery_log() -> &'static DeliveryLog {
+    static LOG: std::sync::OnceLock<DeliveryLog> = std::sync::OnceLock::new();
+    LOG.get_or_init(DeliveryLog::default)
+}
+
+fn record_delivery_stall(
+    peer: &str,
+    holder: &str,
+    offset: u64,
+    stall: DeliveryStall,
+    repeats: u32,
+) {
+    global_delivery_log().record(peer, holder, offset, stall, repeats);
+}
+
+/// Delivery stalls observed by this process, oldest first.
+///
+/// Process-scoped by design: the question being answered is "what is happening
+/// on this receiver", and draining to disk from the tail thread would add a new
+/// failure mode to the delivery path for a diagnostic's sake.
+#[must_use]
+pub fn delivery_events() -> Vec<DeliveryEvent> {
+    global_delivery_log().events()
+}
+
 fn spawn_conversation_tail(
     mailbox: Arc<Mailbox>,
     peer: String,
@@ -1542,30 +1657,61 @@ fn spawn_conversation_tail(
                     }
                     Err(e) => {
                         eprintln!("[{label}] claiming reader for {peer}: {e}");
+                        record_delivery_stall(&peer, "", 0, DeliveryStall::ClaimFailed, 0);
                         sleep_unless_aborted(&abort, block_ms.max(1));
                         continue;
                     }
                 };
                 let mut retry_delay_ms = DELIVERY_RETRY_INITIAL_MS;
+                let mut stall_repeats = 0_u32;
                 while !abort.is_aborted() && reader.is_valid() {
                     let (msgs, next) =
                         match mailbox.poll_conversation(&peer, reader.offset, block_ms) {
                             Ok(batch) => batch,
                             Err(e) => {
                                 eprintln!("[{label}] polling conversation with {peer}: {e}");
+                                record_delivery_stall(
+                                    &peer,
+                                    &reader.reader.holder,
+                                    reader.offset,
+                                    DeliveryStall::PollFailed,
+                                    0,
+                                );
                                 sleep_unless_aborted(&abort, block_ms.max(1));
                                 continue;
                             }
                         };
                     if msgs.iter().all(|m| reader.is_valid() && sink(m)) {
                         retry_delay_ms = DELIVERY_RETRY_INITIAL_MS;
+                        stall_repeats = 0;
                         if next > reader.offset {
                             if let Err(e) = reader.commit(next) {
                                 eprintln!("[{label}] committing reader for {peer}: {e}");
+                                record_delivery_stall(
+                                    &peer,
+                                    &reader.reader.holder,
+                                    reader.offset,
+                                    DeliveryStall::CommitRefused,
+                                    0,
+                                );
                                 break;
                             }
                         }
                     } else {
+                        // The batch is re-read from this same offset, so every
+                        // message in it is handed over again. Recorded: this is
+                        // the path that produces a byte-identical redelivery,
+                        // and it used to leave no trace whatsoever.
+                        if !msgs.is_empty() {
+                            stall_repeats = stall_repeats.saturating_add(1);
+                            record_delivery_stall(
+                                &peer,
+                                &reader.reader.holder,
+                                reader.offset,
+                                DeliveryStall::ConsumerRefused,
+                                stall_repeats,
+                            );
+                        }
                         sleep_unless_aborted(&abort, retry_delay_ms);
                         retry_delay_ms = retry_delay_ms.saturating_mul(2).min(READER_RENEW_MS);
                     }
@@ -1720,6 +1866,90 @@ mod tests {
             last_renewed_ms: Arc::new(std::sync::atomic::AtomicU64::new(last_renewed_ms)),
             renewer: None,
         }
+    }
+
+    #[test]
+    fn delivery_stall_is_recorded_with_attribution() {
+        // The acceptance: a stall must be attributable to a conversation, a
+        // reader and the offset that did NOT advance — read back from the
+        // record, not inferred from a print having happened. Its own log
+        // instance, so this is order-independent of the other tests.
+        let log = DeliveryLog::default();
+        log.record(
+            "peer-x",
+            "holder-7",
+            4096,
+            DeliveryStall::ConsumerRefused,
+            3,
+        );
+        let events = log.events();
+        assert_eq!(events.len(), 1, "the stall was recorded");
+        let only = &events[0];
+        assert_eq!(only.peer, "peer-x");
+        assert_eq!(only.holder, "holder-7");
+        assert_eq!(only.offset, 4096, "the offset that did not advance");
+        assert_eq!(only.stall, DeliveryStall::ConsumerRefused);
+        assert_eq!(only.repeats, 3, "consecutive stalls at this offset");
+        assert!(
+            only.at_ms > 0,
+            "stamped so it can be correlated with a send"
+        );
+    }
+
+    #[test]
+    fn redelivery_is_distinguishable_from_a_peer_resend() {
+        // Re-handing the SAME frames stalls at one offset with a rising repeat
+        // count; a peer saying something again appends, so the next stall sits
+        // at a LATER offset with the count reset. That is the distinction the
+        // fleet previously had to argue about with no record to consult.
+        let log = DeliveryLog::default();
+        log.record("peer-y", "h", 100, DeliveryStall::ConsumerRefused, 1);
+        log.record("peer-y", "h", 100, DeliveryStall::ConsumerRefused, 2);
+        log.record("peer-y", "h", 220, DeliveryStall::ConsumerRefused, 1);
+        let events = log.events();
+        let repeats_at_100: Vec<u32> = events
+            .iter()
+            .filter(|e| e.offset == 100)
+            .map(|e| e.repeats)
+            .collect();
+        assert_eq!(
+            repeats_at_100,
+            vec![1, 2],
+            "the same batch re-handed twice shows as a rising count at one offset"
+        );
+        assert!(
+            events.iter().any(|e| e.offset == 220 && e.repeats == 1),
+            "new content stalls at a later offset with the count reset"
+        );
+    }
+
+    #[test]
+    fn the_delivery_record_is_bounded_and_keeps_the_newest() {
+        // A long-lived agent must not accumulate these without limit, and when
+        // it evicts it must keep the most recent — the oldest stall is the
+        // least useful one to still have.
+        let log = DeliveryLog::default();
+        for i in 0..(DELIVERY_EVENT_CAP + 32) {
+            log.record("peer-cap", "h", i as u64, DeliveryStall::CommitRefused, 0);
+        }
+        let events = log.events();
+        assert_eq!(events.len(), DELIVERY_EVENT_CAP, "capped");
+        assert_eq!(
+            events.last().expect("newest").offset,
+            (DELIVERY_EVENT_CAP + 31) as u64,
+            "the newest stall is retained"
+        );
+        assert_eq!(events[0].offset, 32, "the oldest were evicted");
+    }
+
+    #[test]
+    fn the_process_wide_log_is_reachable() {
+        // The global path the tail loop actually uses.
+        record_delivery_stall("peer-global", "h", 7, DeliveryStall::PollFailed, 0);
+        assert!(
+            delivery_events().iter().any(|e| e.peer == "peer-global"),
+            "the tail loop's recorder reaches the readable log"
+        );
     }
 
     #[test]

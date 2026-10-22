@@ -1,0 +1,164 @@
+//! A refused batch is re-read, and that re-read is now observable.
+//!
+//! Drives the REAL tail loop over a REAL filesystem rather than calling the
+//! recorder directly: the unit tests prove the record holds what it claims, and
+//! this proves the delivery path actually reaches it. Those are different
+//! claims, and only this one would have caught the loop never being wired up.
+//!
+//! Motivation: when six agents saw the same message delivered repeatedly, the
+//! consumer-refused re-read — the path that produces a byte-identical repeat —
+//! was logged nowhere, so the cause had to be recorded as UNKNOWN.
+
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
+
+use runtime::agent_mailbox::MailboxEnvelope;
+use runtime::mailbox::{delivery_events, DeliveryStall};
+
+fn envelope(from: &str, to: &str, body: &str) -> MailboxEnvelope {
+    MailboxEnvelope {
+        from: from.to_string(),
+        to: to.to_string(),
+        body: body.to_string(),
+        summary: None,
+        timestamp: 0,
+        color: None,
+        kind: "message".to_string(),
+        request_id: None,
+    }
+}
+
+fn temp_root(label: &str) -> std::path::PathBuf {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
+    let root = std::env::temp_dir().join(format!(
+        "delivery-stall-{label}-{nanos}-{}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&root).expect("create temp root");
+    root
+}
+
+#[test]
+fn a_refused_batch_records_a_consumer_refused_stall_with_the_stuck_offset() {
+    let root = temp_root("refused");
+    let abort = runtime::HookAbortSignal::default();
+    let handed_over = Arc::new(AtomicUsize::new(0));
+
+    // A consumer that always refuses: the real at-least-once boundary, which is
+    // exactly the condition the fleet hit during a long turn.
+    let seen = Arc::clone(&handed_over);
+    let poller = runtime::mailbox::spawn_local_poller(
+        root.clone(),
+        "receiver-under-test".to_string(),
+        abort.clone(),
+        move |_envelope: &MailboxEnvelope| {
+            seen.fetch_add(1, Ordering::Release);
+            false
+        },
+    );
+
+    let sender = runtime::mailbox::Mailbox::workspace_local(&root, "peer-sender".to_string());
+    sender
+        .send(envelope(
+            "peer-sender",
+            "receiver-under-test",
+            "a message that will not be accepted",
+        ))
+        .expect("send");
+
+    // Wait for the loop to hand the batch over at least twice, which is what
+    // "re-read without advancing" means in observable terms.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while handed_over.load(Ordering::Acquire) < 2 && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    let handovers = handed_over.load(Ordering::Acquire);
+    abort.abort();
+    let _ = poller.join();
+
+    assert!(
+        handovers >= 2,
+        "the refused batch should be handed over again; saw {handovers}"
+    );
+
+    let stalls: Vec<_> = delivery_events()
+        .into_iter()
+        .filter(|e| e.peer == "peer-sender" && e.stall == DeliveryStall::ConsumerRefused)
+        .collect();
+    assert!(
+        !stalls.is_empty(),
+        "the re-read must be recorded, not silent"
+    );
+    assert!(
+        stalls.iter().all(|e| e.offset == 0),
+        "every stall sits at the offset that did not advance: {:?}",
+        stalls.iter().map(|e| e.offset).collect::<Vec<_>>()
+    );
+    assert!(
+        stalls.iter().any(|e| e.repeats >= 2),
+        "consecutive refusals at one offset are counted: {:?}",
+        stalls.iter().map(|e| e.repeats).collect::<Vec<_>>()
+    );
+    assert!(
+        stalls.iter().all(|e| !e.holder.is_empty()),
+        "the stall is attributable to the reader that holds the lease"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn an_accepted_batch_records_no_stall() {
+    // The complement: with no failure injected, delivery advances and leaves
+    // nothing behind. Without this, the test above would pass even if the code
+    // recorded a stall on every poll.
+    let root = temp_root("accepted");
+    let abort = runtime::HookAbortSignal::default();
+    let accepted = Arc::new(AtomicUsize::new(0));
+
+    let seen = Arc::clone(&accepted);
+    let poller = runtime::mailbox::spawn_local_poller(
+        root.clone(),
+        "accepting-receiver".to_string(),
+        abort.clone(),
+        move |_envelope: &MailboxEnvelope| {
+            seen.fetch_add(1, Ordering::Release);
+            true
+        },
+    );
+
+    let sender = runtime::mailbox::Mailbox::workspace_local(&root, "quiet-peer".to_string());
+    sender
+        .send(envelope(
+            "quiet-peer",
+            "accepting-receiver",
+            "accepted first time",
+        ))
+        .expect("send");
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while accepted.load(Ordering::Acquire) < 1 && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    // Give the loop room to poll again after committing, so a spurious stall
+    // would have a chance to appear.
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    abort.abort();
+    let _ = poller.join();
+
+    assert_eq!(
+        accepted.load(Ordering::Acquire),
+        1,
+        "an accepted message is delivered exactly once"
+    );
+    assert!(
+        !delivery_events()
+            .iter()
+            .any(|e| e.peer == "quiet-peer" && e.stall == DeliveryStall::ConsumerRefused),
+        "an accepted batch must not record a stall"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
