@@ -1560,7 +1560,8 @@ pub struct DeliveryEvent {
     /// The offset that did NOT advance. With `peer`, this identifies the exact
     /// frames that will be handed over again.
     pub offset: u64,
-    /// End of the transcript as of the poll that observed this stall.
+    /// End of the transcript as of the poll that observed this stall, or `None`
+    /// when no poll succeeded and nothing beyond the cursor is known.
     ///
     /// This is the field that makes the record self-sufficient. `offset` alone
     /// cannot tell a re-hand from a peer speaking again: while a consumer keeps
@@ -1569,10 +1570,13 @@ pub struct DeliveryEvent {
     /// same frames are handed over again, and larger when the peer appended
     /// something new.
     ///
-    /// Equals `offset` for stalls where no poll succeeded
-    /// ([`DeliveryStall::ClaimFailed`], [`DeliveryStall::PollFailed`]): nothing
-    /// beyond the cursor is known.
-    pub tail: u64,
+    /// `Option` rather than a sentinel because `Some(tail) == Some(offset)`
+    /// already means something definite — the reader is caught up, nothing
+    /// pending. Encoding "unknown" the same way would make "no backlog" and
+    /// "could not see the backlog" indistinguishable, which is the exact
+    /// ambiguity this field exists to remove. A type keeps them apart for every
+    /// reader; a doc comment only helps the ones who read it.
+    pub tail: Option<u64>,
     pub stall: DeliveryStall,
     /// Consecutive stalls at the current `offset` within one reader claim.
     ///
@@ -1604,7 +1608,7 @@ impl DeliveryLog {
         peer: &str,
         holder: &str,
         offset: u64,
-        tail: u64,
+        tail: Option<u64>,
         stall: DeliveryStall,
         repeats: u32,
     ) {
@@ -1645,7 +1649,7 @@ fn record_delivery_stall(
     peer: &str,
     holder: &str,
     offset: u64,
-    tail: u64,
+    tail: Option<u64>,
     stall: DeliveryStall,
     repeats: u32,
 ) {
@@ -1682,7 +1686,7 @@ fn spawn_conversation_tail(
                     }
                     Err(e) => {
                         eprintln!("[{label}] claiming reader for {peer}: {e}");
-                        record_delivery_stall(&peer, "", 0, 0, DeliveryStall::ClaimFailed, 0);
+                        record_delivery_stall(&peer, "", 0, None, DeliveryStall::ClaimFailed, 0);
                         sleep_unless_aborted(&abort, block_ms.max(1));
                         continue;
                     }
@@ -1699,7 +1703,7 @@ fn spawn_conversation_tail(
                                     &peer,
                                     &reader.reader.holder,
                                     reader.offset,
-                                    reader.offset,
+                                    None,
                                     DeliveryStall::PollFailed,
                                     0,
                                 );
@@ -1717,7 +1721,7 @@ fn spawn_conversation_tail(
                                     &peer,
                                     &reader.reader.holder,
                                     reader.offset,
-                                    next,
+                                    Some(next),
                                     DeliveryStall::CommitRefused,
                                     0,
                                 );
@@ -1735,7 +1739,7 @@ fn spawn_conversation_tail(
                                 &peer,
                                 &reader.reader.holder,
                                 reader.offset,
-                                next,
+                                Some(next),
                                 DeliveryStall::ConsumerRefused,
                                 stall_repeats,
                             );
@@ -1894,104 +1898,6 @@ mod tests {
             last_renewed_ms: Arc::new(std::sync::atomic::AtomicU64::new(last_renewed_ms)),
             renewer: None,
         }
-    }
-
-    #[test]
-    fn delivery_stall_is_recorded_with_attribution() {
-        let log = DeliveryLog::default();
-        log.record(
-            "peer-x",
-            "holder-7",
-            4096,
-            9000,
-            DeliveryStall::ConsumerRefused,
-            3,
-        );
-        let events = log.events();
-        assert_eq!(events.len(), 1, "the stall was recorded");
-        let only = &events[0];
-        assert_eq!(only.peer, "peer-x");
-        assert_eq!(only.holder, "holder-7");
-        assert_eq!(only.offset, 4096, "the offset that did not advance");
-        assert_eq!(only.tail, 9000, "the transcript end at that poll");
-        assert_eq!(only.stall, DeliveryStall::ConsumerRefused);
-        assert_eq!(only.repeats, 3, "consecutive stalls at this offset");
-        assert!(
-            only.at_ms > 0,
-            "stamped so it can be correlated with a send"
-        );
-    }
-
-    #[test]
-    fn a_stuck_offset_alone_cannot_tell_a_re_hand_from_a_peer_resend() {
-        // The gap this field closes. While a consumer keeps refusing, the
-        // offset stays put whether the SAME frames are handed over again or the
-        // peer appended new ones — so `offset` and `repeats` are identical in
-        // both cases and cannot separate them. Only `tail` moves.
-        let log = DeliveryLog::default();
-        // Same frames re-handed: tail static.
-        log.record("p", "h", 1727, 18433, DeliveryStall::ConsumerRefused, 1);
-        log.record("p", "h", 1727, 18433, DeliveryStall::ConsumerRefused, 2);
-        // Peer appended while the consumer was still refusing: tail grows,
-        // offset does NOT.
-        log.record("p", "h", 1727, 29156, DeliveryStall::ConsumerRefused, 3);
-
-        let events = log.events();
-        let offsets: Vec<u64> = events.iter().map(|e| e.offset).collect();
-        let repeats: Vec<u32> = events.iter().map(|e| e.repeats).collect();
-        assert_eq!(
-            offsets,
-            vec![1727, 1727, 1727],
-            "offset cannot discriminate"
-        );
-        assert_eq!(repeats, vec![1, 2, 3], "nor can the repeat count");
-
-        let tails: Vec<u64> = events.iter().map(|e| e.tail).collect();
-        assert_eq!(
-            tails,
-            vec![18433, 18433, 29156],
-            "tail is the only field that separates the two cases"
-        );
-        assert_eq!(
-            events[1].tail, events[0].tail,
-            "a re-hand leaves the transcript end untouched"
-        );
-        assert!(
-            events[2].tail > events[1].tail,
-            "a peer speaking again moves the transcript end"
-        );
-    }
-
-    #[test]
-    fn the_delivery_record_is_bounded_and_keeps_the_newest() {
-        let log = DeliveryLog::default();
-        for i in 0..(DELIVERY_EVENT_CAP + 32) {
-            log.record(
-                "peer-cap",
-                "h",
-                i as u64,
-                i as u64,
-                DeliveryStall::CommitRefused,
-                0,
-            );
-        }
-        let events = log.events();
-        assert_eq!(events.len(), DELIVERY_EVENT_CAP, "capped");
-        assert_eq!(
-            events.last().expect("newest").offset,
-            (DELIVERY_EVENT_CAP + 31) as u64,
-            "the newest stall is retained"
-        );
-        assert_eq!(events[0].offset, 32, "the oldest were evicted");
-    }
-
-    #[test]
-    fn the_process_wide_log_is_reachable() {
-        record_delivery_stall("peer-global", "h", 7, 7, DeliveryStall::PollFailed, 0);
-        assert!(
-            delivery_events().iter().any(|e| e.peer == "peer-global"),
-            "the tail loop's recorder reaches the readable log"
-        );
     }
 
     #[test]

@@ -125,8 +125,10 @@ fn a_refused_batch_records_a_consumer_refused_stall_with_the_stuck_offset() {
         "the stall is attributable to the reader that holds the lease"
     );
     assert!(
-        stalls.iter().all(|e| e.tail > e.offset),
-        "tail is past the stuck offset, so the pending bytes are known: {:?}",
+        stalls
+            .iter()
+            .all(|e| e.tail.is_some_and(|tail| tail > e.offset)),
+        "tail is known and past the stuck offset, so the pending bytes are: {:?}",
         stalls
             .iter()
             .map(|e| (e.offset, e.tail))
@@ -169,7 +171,7 @@ fn a_peer_appending_during_a_refusal_moves_tail_but_not_offset() {
     let tail_before = runtime::mailbox::delivery_events()
         .into_iter()
         .filter(|e| e.peer == "chatty-peer")
-        .map(|e| e.tail)
+        .filter_map(|e| e.tail)
         .max()
         .expect("a stall was recorded for the first message");
 
@@ -189,7 +191,7 @@ fn a_peer_appending_during_a_refusal_moves_tail_but_not_offset() {
         tail_after = runtime::mailbox::delivery_events()
             .into_iter()
             .filter(|e| e.peer == "chatty-peer")
-            .map(|e| e.tail)
+            .filter_map(|e| e.tail)
             .max()
             .unwrap_or(tail_before);
     }
@@ -211,7 +213,7 @@ fn a_peer_appending_during_a_refusal_moves_tail_but_not_offset() {
         stalls.iter().map(|e| e.offset).collect::<Vec<_>>()
     );
     assert!(
-        stalls.iter().map(|e| e.tail).min() < stalls.iter().map(|e| e.tail).max(),
+        stalls.iter().filter_map(|e| e.tail).min() < stalls.iter().filter_map(|e| e.tail).max(),
         "so tail is the only field that moved, and it is recorded"
     );
 }
