@@ -4,7 +4,8 @@
 //! node. No record means the disk namespace. A valid record and credential
 //! keep the node namespace even while that node is offline: ordinary startup
 //! and resume still work, while a send reports its actual node error. An
-//! unusable record or credential is still a startup error in this slice.
+//! record or credential that cannot be loaded is still a startup error in
+//! this slice. A loadable but untrusted certificate is a different condition.
 //!
 //! Real CLI processes exercise both cases, including persisted history and a
 //! real failed send. No case may silently select a disk mailbox.
@@ -14,7 +15,7 @@ mod common;
 mod node_home;
 
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use common::TestEnv;
 
@@ -131,7 +132,7 @@ fn an_offline_node_does_not_block_startup_or_resume() {
         let env = TestEnv::new("offline-node-resume");
         node_home::pin_agent_name(env.workspace_root(), SESSION_AGENT);
         let agents = empty_agents_dir(&env);
-        node_home::write_unusable_credential(&agents, SESSION_AGENT);
+        node_home::write_untrusted_credential(&agents, SESSION_AGENT);
         let home = home_with_record(&env, &record("127.0.0.1:1", &agents));
         let home = home.to_string_lossy();
         let vars = [
@@ -154,6 +155,7 @@ fn an_offline_node_does_not_block_startup_or_resume() {
         fresh
             .expect(reply)
             .expect("ordinary turn completes without Nexus");
+        wait_for_saved_reply(&env, reply);
         common::expect_input_line_cleared(&fresh, Duration::from_secs(30), "offline turn done");
         fresh.send("/exit\r").expect("exit fresh session");
         assert_eq!(fresh.expect_eof().expect("fresh session exits"), 0);
@@ -186,7 +188,7 @@ fn an_offline_node_send_fails_on_the_node_without_creating_a_disk_inbox() {
     let env = TestEnv::new("offline-node-send");
     node_home::pin_agent_name(env.workspace_root(), SESSION_AGENT);
     let agents = empty_agents_dir(&env);
-    node_home::write_unusable_credential(&agents, SESSION_AGENT);
+    node_home::write_untrusted_credential(&agents, SESSION_AGENT);
     let home = home_with_record(&env, &record("127.0.0.1:1", &agents));
     let home = home.to_string_lossy();
     let prompt = env.prompt(
@@ -203,6 +205,13 @@ fn an_offline_node_send_fails_on_the_node_without_creating_a_disk_inbox() {
     let path = common::find_session_transcript(&env.workspace_root().join(".scode/sessions"))
         .expect("send result persisted");
     let saved = runtime::Session::load_from_path(&path).expect("load actual CLI history");
+    assert_eq!(
+        saved
+            .workspace_root()
+            .map(|path| path.canonicalize().unwrap()),
+        Some(env.workspace_root().canonicalize().unwrap()),
+        "the actual child session must use the private test workspace"
+    );
     let results: Vec<_> = saved
         .messages
         .iter()
@@ -237,7 +246,35 @@ fn an_offline_node_send_fails_on_the_node_without_creating_a_disk_inbox() {
     assert_no_disk_namespace(&env);
 }
 
+/// Do not accept the user's echoed prompt as evidence of a model reply.
+fn wait_for_saved_reply(env: &TestEnv, expected: &str) -> PathBuf {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        if let Some(path) =
+            common::find_session_transcript(&env.workspace_root().join(".scode/sessions"))
+        {
+            if let Ok(saved) = runtime::Session::load_from_path(&path) {
+                let replied = saved.messages.iter().any(|message| {
+                    message.role == runtime::MessageRole::Assistant
+                        && message.blocks.iter().any(|block| {
+                            matches!(block, runtime::ContentBlock::Text { text } if text.contains(expected))
+                        })
+                });
+                if replied {
+                    return path;
+                }
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "no durable assistant reply containing {expected:?}"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
 fn assert_no_disk_namespace(env: &TestEnv) {
+    node_home::assert_no_disk_mailboxes_below(env.workspace_root());
     for root in [
         runtime::mailbox::local_pair_root_in(env.config_home()),
         env.workspace_root().join(".sudocode-inbox"),
