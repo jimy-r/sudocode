@@ -2147,6 +2147,9 @@ fn live_reader_commit_refused_on_renew_error_then_reacquired_from_durable_offset
         .iter()
         .filter(|(start, end, _)| *start >= failed.returned && *end <= delivered[1])
         .collect();
+    // Three is an empirical floor, not an invariant: the 800ms window yields
+    // dozens of samples, and three is enough to show the position held across
+    // it rather than in one lucky read.
     assert!(
         held.len() >= 3,
         "too few position samples between the refused commit and the redelivery: {}",
