@@ -258,9 +258,10 @@ pub(super) fn progress_line(
     let label = metric.truncate(&label, width.saturating_sub(reserved));
     let theme = theme();
     let line = format!(
-        "{}{logo}{} {label}{details}{RESET}",
+        "{}{logo}{} {label}{}{details}{RESET}",
         theme.logo_fg(),
         theme.spinner_fg(warning),
+        theme.muted_fg(),
     );
     // On extremely narrow terminals even metadata cannot fit. Keep one row.
     if reserved > width {

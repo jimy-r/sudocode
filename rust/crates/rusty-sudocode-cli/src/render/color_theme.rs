@@ -270,7 +270,7 @@ impl ColorTheme {
     /// ANSI escape for the muted color.
     #[inline]
     pub fn muted_fg(&self) -> String {
-        ansi_fg(self.muted)
+        ansi_fg(ColorSupport::detect().color(self.muted))
     }
 
     /// ANSI escape for the shell-mode background.
