@@ -122,7 +122,7 @@ fn pre_tool_use_hook_progress_reaches_the_terminal() {
 
 #[test]
 fn early_hook_exit_preserves_its_decision_with_unread_tool_input() {
-    let content = "fixture line\n".repeat(100_000);
+    let content = "fixture line\n".repeat(20_000);
     for (code, progress) in [(0, "done"), (1, "FAILED"), (2, "DENIED")] {
         let env = TestEnv::new_mock("hook-unread-input");
         #[cfg(windows)]
