@@ -861,9 +861,11 @@ impl Mailbox {
     }
 }
 
-/// An agent's durable position in one conversation. Legacy holder fields are
-/// retained for compatibility; exclusive ownership comes from the backend lock,
-/// never from reading and overwriting this register.
+/// An agent's durable position in one conversation. Exclusive ownership comes
+/// from the backend lock. Where that lock is an expiring lease, writes to this
+/// register are additionally fenced by a conditional write when the backend has
+/// one ([`crate::cursor_fence`]), so a holder that outlived its lease cannot
+/// overwrite a newer holder's position.
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ReaderRegister {
     /// The instance tailing this conversation for this agent, empty if the seat
@@ -877,6 +879,16 @@ pub struct ReaderRegister {
     /// Offset past the last envelope this agent has taken responsibility for.
     #[serde(default)]
     pub read_offset: u64,
+    /// Which claim wrote this register, on a backend whose writes are
+    /// conditional (see [`crate::cursor_fence`]). Zero, and left out of the
+    /// stored form, everywhere else.
+    #[serde(default, skip_serializing_if = "is_unfenced")]
+    pub epoch: u64,
+}
+
+#[allow(clippy::trivially_copy_pass_by_ref)] // serde's skip_serializing_if signature
+fn is_unfenced(epoch: &u64) -> bool {
+    *epoch == 0
 }
 
 /// How long a claimed seat stays claimed without being renewed.
@@ -953,51 +965,37 @@ pub struct ConversationReader {
     backend: Arc<dyn FsBackend>,
     path: String,
     holder: String,
+    agent: String,
 }
 
 impl ConversationReader {
     /// The register as currently stored, or `None` if this agent has never read
     /// this conversation.
     fn load(&self) -> Result<Option<ReaderRegister>, String> {
-        match self.backend.read(&self.path) {
-            Ok(raw) if raw.is_empty() => Ok(None),
-            Ok(raw) => serde_json::from_slice(&raw)
-                .map(Some)
-                .map_err(|e| format!("reader register {}: {e}", self.path)),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(e) => Err(format!("read reader register {}: {e}", self.path)),
-        }
+        crate::cursor_fence::load_plain(self.backend.as_ref(), &self.path)
     }
 
-    fn store(&self, register: &ReaderRegister) -> Result<(), String> {
-        // Cursor replacement must not replace the inode holding the OS lock.
-        if let Some((dir, _)) = self.path.rsplit_once('/') {
-            self.backend
-                .create_dir_all(dir)
-                .map_err(|e| format!("create reader directory {dir}: {e}"))?;
-        }
-        let raw = serde_json::to_vec(register)
-            .map_err(|e| format!("encode reader register {}: {e}", self.path))?;
-        self.backend
-            .write_atomic(&self.path, &raw)
-            .map_err(|e| format!("write reader register {}: {e}", self.path))
-    }
-
+    /// Hold the conversation's lock, then claim its register through
+    /// [`crate::cursor_fence`]. `None` while another instance holds either.
     fn acquire(self) -> Result<Option<OwnedReader>, String> {
         let Some(lease) = HeldLease::try_acquire(&self.backend, &format!("{}.lock", self.path))
             .map_err(|e| format!("claim reader {}: {e}", self.path))?
         else {
             return Ok(None);
         };
-        let offset = self.load()?.map_or(0, |r| r.read_offset);
-        self.store(&ReaderRegister {
-            holder: self.holder.clone(),
-            lease_expires_at: now_ms() + READER_LEASE_MS,
-            read_offset: offset,
-        })?;
+        let Some((cursor, offset)) = crate::cursor_fence::RegisterCursor::claim(
+            Arc::clone(&self.backend),
+            self.path,
+            self.holder,
+            now_ms() + READER_LEASE_MS,
+        )?
+        else {
+            return Ok(None);
+        };
+        record_cursor_guarantee(&self.agent, cursor.guarantee());
         Ok(Some(OwnedReader {
-            reader: self,
             lease,
+            cursor,
             offset,
         }))
     }
@@ -1010,51 +1008,10 @@ impl ConversationReader {
 /// block for longer than the lease. Once a renewal fails the lease stays
 /// invalid and the holder must stop acting on it. Dropping stops the renewal
 /// thread first and only then releases the lock.
-/// What one renewal attempt means for a lease that is currently held.
-///
-/// The three-way split exists because [`crate::fs_backend::FsLock`]'s contract
-/// gives exactly one ownership-loss signal — "renewal returning false means
-/// ownership was lost" — while an `Err` is an I/O failure that says nothing
-/// about ownership. Collapsing the two destroyed leases that were never lost:
-/// a single transient error marked the lease invalid for good AND killed the
-/// renewal worker, so the in-flight batch could never be committed and was
-/// replayed on every re-acquire (observed as ~9-17 identical redeliveries).
-#[derive(Debug, PartialEq, Eq)]
-enum LeaseRenewal {
-    /// Renewed; ownership still ours.
-    Held,
-    /// Ownership is gone, or can no longer be asserted truthfully.
-    Lost,
-    /// The attempt failed without proving anything; try again next tick.
-    Retry,
-}
-
-/// Classify a renewal result, given how long it has been since a renewal last
-/// actually succeeded.
-///
-/// An `Err` is retryable only while the lease's TTL has not elapsed since the
-/// last successful renewal: past that point this process cannot honestly claim
-/// to still hold the lock, so it reports `Lost` rather than keep writing. The
-/// bound is `READER_LEASE_MS` — the TTL the lock was taken with — rather than a
-/// separate retry count, so the rule states the real invariant.
-fn classify_renewal(result: &std::io::Result<bool>, since_last_renew_ms: u64) -> LeaseRenewal {
-    match result {
-        Ok(true) => LeaseRenewal::Held,
-        Err(_) if since_last_renew_ms < READER_LEASE_MS => LeaseRenewal::Retry,
-        // `Ok(false)` is the contract's ownership-loss signal; an `Err` that has
-        // outlived the TTL means ownership can no longer be asserted truthfully.
-        Ok(false) | Err(_) => LeaseRenewal::Lost,
-    }
-}
-
 struct HeldLease {
     lock: Arc<dyn crate::fs_backend::FsLock>,
     stop: Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
     valid: Arc<std::sync::atomic::AtomicBool>,
-    /// `now_ms()` of the last renewal that actually succeeded. Shared with the
-    /// renewal worker so both it and [`HeldLease::confirm`] judge a transient
-    /// failure against the same instant.
-    last_renewed_ms: Arc<std::sync::atomic::AtomicU64>,
     renewer: Option<std::thread::JoinHandle<()>>,
 }
 
@@ -1073,11 +1030,9 @@ impl HeldLease {
         };
         let stop = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
         let valid = Arc::new(std::sync::atomic::AtomicBool::new(true));
-        let last_renewed_ms = Arc::new(std::sync::atomic::AtomicU64::new(now_ms()));
         let worker_stop = Arc::clone(&stop);
         let worker_valid = Arc::clone(&valid);
         let worker_lock = Arc::clone(&lock);
-        let worker_last_renewed = Arc::clone(&last_renewed_ms);
         let renewer = std::thread::Builder::new()
             .name("mailbox-lease".into())
             .spawn(move || {
@@ -1097,23 +1052,9 @@ impl HeldLease {
                         break;
                     }
                     drop(stopped);
-                    let result = worker_lock.renew();
-                    let since = now_ms().saturating_sub(
-                        worker_last_renewed.load(std::sync::atomic::Ordering::Acquire),
-                    );
-                    match classify_renewal(&result, since) {
-                        LeaseRenewal::Held => {
-                            worker_last_renewed
-                                .store(now_ms(), std::sync::atomic::Ordering::Release);
-                        }
-                        // Transient: prove nothing, keep the worker alive, and
-                        // try again on the next tick. Exiting here was the bug —
-                        // it stranded a lease that was never lost.
-                        LeaseRenewal::Retry => {}
-                        LeaseRenewal::Lost => {
-                            worker_valid.store(false, std::sync::atomic::Ordering::Release);
-                            break;
-                        }
+                    if !matches!(worker_lock.renew(), Ok(true)) {
+                        worker_valid.store(false, std::sync::atomic::Ordering::Release);
+                        break;
                     }
                 }
             })
@@ -1122,7 +1063,6 @@ impl HeldLease {
             lock,
             stop,
             valid,
-            last_renewed_ms,
             renewer: Some(renewer),
         }))
     }
@@ -1133,39 +1073,16 @@ impl HeldLease {
 
     /// Renew now, ahead of a write that relies on still holding the lock.
     /// `Ok(false)` means it was lost and marks the lease invalid for good.
-    ///
-    /// A failing *probe* is not ownership loss: the background worker owns
-    /// renewal, so while the lease TTL has not elapsed since the last
-    /// successful renewal this reports held rather than failing the caller's
-    /// commit. Turning a hiccup into a refused commit is what discarded an
-    /// already-accepted batch's offset and replayed it.
     fn confirm(&self) -> std::io::Result<bool> {
         if !self.is_valid() {
             return Ok(false);
         }
-        let result = self.lock.renew();
-        let since = now_ms().saturating_sub(
-            self.last_renewed_ms
-                .load(std::sync::atomic::Ordering::Acquire),
-        );
-        match classify_renewal(&result, since) {
-            LeaseRenewal::Held => {
-                self.last_renewed_ms
-                    .store(now_ms(), std::sync::atomic::Ordering::Release);
-                Ok(true)
-            }
-            LeaseRenewal::Retry => Ok(true),
-            LeaseRenewal::Lost => {
-                self.valid
-                    .store(false, std::sync::atomic::Ordering::Release);
-                match result {
-                    // Ownership genuinely gone.
-                    Ok(_) => Ok(false),
-                    // Unprovable for longer than the TTL: surface the cause.
-                    Err(error) => Err(error),
-                }
-            }
+        let held = self.lock.renew()?;
+        if !held {
+            self.valid
+                .store(false, std::sync::atomic::Ordering::Release);
         }
+        Ok(held)
     }
 }
 
@@ -1184,8 +1101,8 @@ impl Drop for HeldLease {
 }
 
 struct OwnedReader {
-    reader: ConversationReader,
     lease: HeldLease,
+    cursor: crate::cursor_fence::RegisterCursor,
     offset: u64,
 }
 
@@ -1202,11 +1119,7 @@ impl OwnedReader {
         {
             return Err("reader ownership lost; delivery remains unacknowledged".into());
         }
-        self.reader.store(&ReaderRegister {
-            holder: self.reader.holder.clone(),
-            lease_expires_at: now_ms() + READER_LEASE_MS,
-            read_offset: offset,
-        })?;
+        self.cursor.commit(offset, now_ms() + READER_LEASE_MS)?;
         self.offset = offset;
         Ok(())
     }
@@ -1257,6 +1170,7 @@ impl Mailbox {
                 .reader_path(&self.self_id, peer, &self.self_id),
             backend: Arc::clone(&self.backend),
             holder: instance_id(),
+            agent: self.self_id.clone(),
         }
     }
 
@@ -1318,8 +1232,39 @@ pub struct PeerStatus {
     /// idle, or `"next_prompt"` in the synchronous REPL, which runs it once the
     /// user hands the prompt back.
     pub delivery: &'static str,
+    /// What keeps a resumed holder from moving a read position back:
+    /// `"fenced"`, `"fenced_cas"` or `"at_least_once"` (see
+    /// [`crate::cursor_fence::CursorGuarantee`]), or `"none"` until this
+    /// process has claimed a conversation for the agent.
+    pub cursor: &'static str,
     /// Why attaching failed, when it did.
     pub error: Option<String>,
+}
+
+/// The cursor guarantee each agent's readers got in this process, as decided
+/// when a conversation was last claimed.
+static CURSOR_GUARANTEES: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<String, crate::cursor_fence::CursorGuarantee>>,
+> = std::sync::OnceLock::new();
+
+fn record_cursor_guarantee(agent: &str, guarantee: crate::cursor_fence::CursorGuarantee) {
+    CURSOR_GUARANTEES
+        .get_or_init(std::sync::Mutex::default)
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(agent.to_string(), guarantee);
+}
+
+/// What protects `agent`'s read positions in this process: `None` until one of
+/// its conversations has been claimed here.
+#[must_use]
+pub fn cursor_guarantee(agent: &str) -> Option<crate::cursor_fence::CursorGuarantee> {
+    CURSOR_GUARANTEES
+        .get_or_init(std::sync::Mutex::default)
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(agent)
+        .copied()
 }
 
 /// Receivers running in this process: per agent name, how many are standing
@@ -1453,20 +1398,29 @@ pub fn spawn_inbox_poller(
                 agent: mailbox.self_id().to_string(),
                 state: None,
             };
+            // Keep retrying an offline node without repainting the terminal
+            // with the same error on every discovery tick. A changed error or
+            // a new outage after a successful receiver-seat check is reported again.
+            let mut last_claim_error = None;
             while !abort.is_aborted() {
                 state.set(ReceiverState::Standby);
                 let seat = match mailbox.claim_receiver() {
                     Ok(Some(seat)) => seat,
                     Ok(None) => {
+                        last_claim_error = None;
                         sleep_unless_aborted(&abort, CONVERSATION_DISCOVERY_MS);
                         continue;
                     }
                     Err(e) => {
-                        eprintln!("[{label}] {e}");
+                        if last_claim_error.as_ref() != Some(&e) {
+                            eprintln!("[{label}] {e}");
+                            last_claim_error = Some(e);
+                        }
                         sleep_unless_aborted(&abort, CONVERSATION_DISCOVERY_MS);
                         continue;
                     }
                 };
+                last_claim_error = None;
                 state.set(ReceiverState::Receiving);
                 receive_while_seated(&mailbox, &seat, block_ms, label, &abort, &sink);
             }
@@ -1673,113 +1627,6 @@ pub fn sending_mailbox() -> Arc<Mailbox> {
 mod tests {
     use super::*;
     use crate::fs_backend::StdFsBackend;
-
-    /// An `FsLock` whose `renew()` answers from a script, so the lease rules can
-    /// be exercised without a backend or a 15s worker tick.
-    struct ScriptedLock {
-        answers: std::sync::Mutex<std::collections::VecDeque<bool>>,
-        errors: std::sync::Mutex<std::collections::VecDeque<bool>>,
-    }
-
-    impl ScriptedLock {
-        /// Each entry: `Some(held)` -> `Ok(held)`, `None` -> a transient `Err`.
-        fn new(script: &[Option<bool>]) -> Arc<Self> {
-            Arc::new(Self {
-                answers: std::sync::Mutex::new(script.iter().map(|s| s.unwrap_or(false)).collect()),
-                errors: std::sync::Mutex::new(script.iter().map(Option::is_none).collect()),
-            })
-        }
-    }
-
-    impl crate::fs_backend::FsLock for ScriptedLock {
-        fn renew(&self) -> std::io::Result<bool> {
-            let is_err = self
-                .errors
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .pop_front()
-                .unwrap_or(false);
-            let held = self
-                .answers
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .pop_front()
-                .unwrap_or(true);
-            if is_err {
-                return Err(std::io::Error::other("transient renew failure"));
-            }
-            Ok(held)
-        }
-    }
-
-    fn lease_with(lock: Arc<dyn crate::fs_backend::FsLock>, last_renewed_ms: u64) -> HeldLease {
-        HeldLease {
-            lock,
-            stop: Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new())),
-            valid: Arc::new(std::sync::atomic::AtomicBool::new(true)),
-            last_renewed_ms: Arc::new(std::sync::atomic::AtomicU64::new(last_renewed_ms)),
-            renewer: None,
-        }
-    }
-
-    #[test]
-    fn transient_renew_error_keeps_the_lease_valid() {
-        // The regression: one `Err` used to mark the lease invalid for good and
-        // kill the renewal worker, so an already-accepted batch never committed.
-        assert_eq!(
-            classify_renewal(&Err(std::io::Error::other("hiccup")), 0),
-            LeaseRenewal::Retry
-        );
-        assert_eq!(
-            classify_renewal(&Ok(true), READER_LEASE_MS * 10),
-            LeaseRenewal::Held,
-            "a successful renewal is held regardless of how long the last one was"
-        );
-    }
-
-    #[test]
-    fn genuine_loss_invalidates_immediately() {
-        // The safety property: `Ok(false)` is the contract's only ownership-loss
-        // signal and must stop writes at once, however fresh the lease is.
-        assert_eq!(classify_renewal(&Ok(false), 0), LeaseRenewal::Lost);
-        let lease = lease_with(ScriptedLock::new(&[Some(false)]), now_ms());
-        assert!(
-            !lease.confirm().expect("confirm"),
-            "genuine loss reports not-held"
-        );
-        assert!(!lease.is_valid(), "a lost lease stays invalid");
-    }
-
-    #[test]
-    fn renew_failing_past_the_ttl_invalidates() {
-        // No unbounded optimism: once the TTL has elapsed since the last
-        // successful renewal, ownership can no longer be asserted truthfully.
-        assert_eq!(
-            classify_renewal(&Err(std::io::Error::other("down")), READER_LEASE_MS),
-            LeaseRenewal::Lost
-        );
-        let stale = now_ms().saturating_sub(READER_LEASE_MS + 1);
-        let lease = lease_with(ScriptedLock::new(&[None]), stale);
-        assert!(
-            lease.confirm().is_err(),
-            "the cause is surfaced, not masked"
-        );
-        assert!(!lease.is_valid());
-    }
-
-    #[test]
-    fn confirm_tolerates_a_transient_error_within_ttl() {
-        // `commit()` calls `confirm()` right before storing the offset; a failed
-        // probe inside the TTL must not refuse the commit.
-        let lease = lease_with(ScriptedLock::new(&[None]), now_ms());
-        assert!(
-            lease
-                .confirm()
-                .expect("a transient probe failure is not loss"),
-            "confirm must report held so the offset is stored"
-        );
-        assert!(lease.is_valid(), "the lease survives a hiccup");
-    }
 
     fn temp_workspace(label: &str) -> String {
         let nanos = std::time::SystemTime::now()
