@@ -77,20 +77,35 @@ async fn direct_a2a_pause_cancels_an_outstanding_approval() {
         "_sudocode/a2a/send",
         json!({"sessionId": sid, "to": "pending-approval-peer", "message": "MUST_NOT_APPEND", "summary": "pending approval"}),
     ).await;
-    let (_, permission) = client.recv_until(Duration::from_secs(10), |message| {
-        is_server_request(message, "session/request_permission")
-    }).await.unwrap();
-    let pause = client.send_request_no_wait(
-        "_sudocode/session/pause_tools", json!({"sessionId": sid}),
-    ).await;
-    let (seen, cancelled) = client.recv_until(Duration::from_secs(10), |message| {
-        is_response_to(message, send)
-    }).await.unwrap();
-    assert_eq!(cancelled["error"]["data"]["outcome"], "unknown", "{cancelled}");
+    let (_, permission) = client
+        .recv_until(Duration::from_secs(10), |message| {
+            is_server_request(message, "session/request_permission")
+        })
+        .await
+        .unwrap();
+    let pause = client
+        .send_request_no_wait("_sudocode/session/pause_tools", json!({"sessionId": sid}))
+        .await;
+    let (seen, cancelled) = client
+        .recv_until(Duration::from_secs(10), |message| {
+            is_response_to(message, send)
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        cancelled["error"]["data"]["outcome"], "unknown",
+        "{cancelled}"
+    );
     let paused = if let Some(reply) = seen.iter().find(|message| is_response_to(message, pause)) {
         reply.clone()
     } else {
-        client.recv_until(Duration::from_secs(10), |message| is_response_to(message, pause)).await.unwrap().1
+        client
+            .recv_until(Duration::from_secs(10), |message| {
+                is_response_to(message, pause)
+            })
+            .await
+            .unwrap()
+            .1
     };
     assert_eq!(paused["result"]["isQuiescent"], true, "{paused}");
     // A late answer to the original approval must not revive cancelled work.
@@ -100,10 +115,12 @@ async fn direct_a2a_pause_cancels_an_outstanding_approval() {
         json!({"sessionId": sid, "to": "pending-approval-peer", "message": "ALSO_MUST_NOT_APPEND", "summary": "paused"}),
     ).await;
     assert_direct_not_submitted(&refused, "paused after approval cancellation");
-    let (_, resumed) = client.send_request(
-        "_sudocode/session/resume_tools",
-        json!({"sessionId": sid, "pauseEpoch": paused["result"]["pauseEpoch"]}),
-    ).await;
+    let (_, resumed) = client
+        .send_request(
+            "_sudocode/session/resume_tools",
+            json!({"sessionId": sid, "pauseEpoch": paused["result"]["pauseEpoch"]}),
+        )
+        .await;
     assert!(resumed.get("result").is_some(), "{resumed}");
     client.shutdown().await;
     assert!(conversation_log(&root, "pending-approval-peer", "pending-approval-actor").is_empty());
