@@ -96,13 +96,11 @@ impl Probe {
     }
 
     /// Fail only this exact register's writes, leaving all locks and reads real.
-    pub fn fail_register_writes(&self, path: &str, fail: bool) {
-        self.register_writes
-            .lock()
-            .unwrap()
-            .entry(path.into())
-            .or_default()
-            .0 = fail;
+    pub fn fail_register_writes(&self, path: &str, fail: bool) -> u64 {
+        let mut writes = self.register_writes.lock().unwrap();
+        let (active, attempts) = writes.entry(path.into()).or_default();
+        *active = fail;
+        *attempts
     }
 
     pub fn register_write_attempts(&self, path: &str) -> u64 {

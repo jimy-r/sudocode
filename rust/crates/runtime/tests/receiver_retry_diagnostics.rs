@@ -84,15 +84,26 @@ fn child_receiver() {
     wait_for("both actual claim paths retried", || {
         paths.iter().all(|p| probe.register_write_attempts(p) >= 4)
     });
-    probe.fail_register_writes(&paths[0], false);
+    let failure_started = Instant::now();
+    let first_failures = probe.fail_register_writes(&paths[0], false);
     wait_for("first peer delivered", || seen.lock().unwrap().len() == 1);
     // Keep the second real reader failing past the recovery quiet period.
     let attempts = probe.register_write_attempts(&paths[1]);
     wait_for("second reader continues retrying", || {
         probe.register_write_attempts(&paths[1]) >= attempts + 50
     });
+    if std::env::var_os("SCODE_RETRY_FIXTURE_REMINDER").is_some() {
+        // Exercise the real production minute, not a shortened test policy.
+        while failure_started.elapsed() < Duration::from_secs(63) {
+            std::thread::sleep(Duration::from_millis(25));
+        }
+    }
     eprintln!("FIXTURE_PARTIAL_RECOVERY");
-    probe.fail_register_writes(&paths[1], false);
+    let second_failures = probe.fail_register_writes(&paths[1], false);
+    println!(
+        "FIXTURE_EXPECTED_FAILURES {}",
+        serde_json::json!({"peer-a":first_failures,"peer-b":second_failures})
+    );
     wait_for("both original messages delivered", || {
         seen.lock().unwrap().len() == 2
     });
@@ -218,13 +229,68 @@ fn a_log_write_failure_does_not_create_a_second_stderr_retry_loop() {
     std::fs::remove_dir_all(root).unwrap();
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn a_real_minute_reminder_counts_only_the_actually_suppressed_failures() {
+    let root = std::env::temp_dir().join(format!("receiver-retry-minute-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&root).unwrap();
+    let log = root.join("diagnostics.jsonl");
+    let output = fixture_command(&root, &log)
+        .env("SCODE_RETRY_FIXTURE_REMINDER", "1")
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        output.status.success(),
+        "{stderr}\n{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert_eq!(
+        stderr.matches("Message receiving is interrupted;").count(),
+        2,
+        "{stderr}"
+    );
+    assert_eq!(
+        stderr.matches("Message receive checks recovered.").count(),
+        1,
+        "{stderr}"
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let (_, expected) = stdout.split_once("FIXTURE_EXPECTED_FAILURES ").unwrap();
+    let expected: serde_json::Value =
+        serde_json::from_str(expected.lines().next().unwrap()).unwrap();
+    let records = read_records(&log);
+    for peer in ["peer-a", "peer-b"] {
+        let observed: u64 = records
+            .iter()
+            .filter_map(|record| {
+                let props = &record["attributes"];
+                (props["scope"] == format!("conversation with {peer}")).then(|| {
+                    props["suppressed_repeats"].as_u64().unwrap()
+                        + u64::from(props["action"] == "background_retry")
+                })
+            })
+            .sum();
+        assert_eq!(
+            observed,
+            expected[peer].as_u64().unwrap(),
+            "{peer}: each failed write must be counted once"
+        );
+    }
+    std::fs::remove_dir_all(root).unwrap();
+}
+
 fn run_fixture(root: &Path, log: &Path) -> std::process::Output {
-    Command::new(std::env::current_exe().unwrap())
+    fixture_command(root, log).output().unwrap()
+}
+
+fn fixture_command(root: &Path, log: &Path) -> Command {
+    let mut command = Command::new(std::env::current_exe().unwrap());
+    command
         .args(["--exact", "child_receiver", "--nocapture"])
         .env("SCODE_RETRY_FIXTURE_ROOT", root.to_str().unwrap())
-        .env("SCODE_LOG_PATH", log)
-        .output()
-        .unwrap()
+        .env("SCODE_LOG_PATH", log);
+    command
 }
 
 fn read_records(path: &Path) -> Vec<serde_json::Value> {

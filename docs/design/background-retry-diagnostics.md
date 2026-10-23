@@ -55,6 +55,10 @@ original messages after the fault clears. This reaches the reader-claim error
 branch; it is not a claim of a real TLS outage or a lease-renewal test.
 Additional process cases refuse the log open and, on Linux, fail the actual
 write through `/dev/full`, guarding against a second stderr spam loop.
+A Linux process case holds the real register fault beyond one production
+minute and reconciles the backend's exact failed-write count with the initial,
+reminder and recovery records. The reminder's own logged attempt is not a
+suppressed repeat. No production interval is shortened for this test.
 
 The offline CLI PTY workflow additionally checks that the original node error
 is retained in the diagnostic log while a real model turn, input and original

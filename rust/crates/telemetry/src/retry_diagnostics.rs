@@ -104,8 +104,8 @@ impl RetryDiagnostics {
             let suppressed = match state.failures.get_mut(scope) {
                 Some(failure) => {
                     if failure.detail == error && failure.context == context {
-                        failure.suppressed = failure.suppressed.saturating_add(1);
                         if now.duration_since(failure.last_log) < REMINDER_INTERVAL {
+                            failure.suppressed = failure.suppressed.saturating_add(1);
                             None
                         } else {
                             let count = std::mem::take(&mut failure.suppressed);
