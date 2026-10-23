@@ -3,6 +3,14 @@
 `scode` speaks the **Agent Communication Protocol (ACP)** natively, in two
 transports that share a single handler chain.
 
+## TypeScript client and MCP bridge
+
+The [shared TypeScript package](../sdk/typescript/README.md) provides the ACP
+connection, direct A2A helpers, a standalone stdio MCP bridge and an optional
+Codex callback adapter. It can be installed independently of Hydra and uses
+the full scode executable. The package guide owns installation, config,
+source/checksum receipts and existing-thread handoff limits.
+
 ## Transports
 
 ```bash
@@ -179,6 +187,10 @@ A direct request never waits. It fails in one of two ways:
 
 `isError: true` is the tool's own failure; it does not prove that nothing was
 delivered either.
+
+A direct call takes the same operation fence as a turn's tools: paused tools
+refuse it, and `pause_tools` reports control only after its worker has
+finished.
 ### Per-session system prompt (`_meta.sudocode.*`)
 
 `session/new` and `session/load` accept two optional, orthogonal keys under
