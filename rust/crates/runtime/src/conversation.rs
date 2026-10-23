@@ -733,7 +733,9 @@ pub struct ToolDispatchContext {
     /// The `tool_use` id of this invocation, including concurrent calls.
     pub tool_use_id: Option<String>,
     /// Host provenance for a direct A2A invocation, kept out of model history.
-    pub external_a2a: Option<crate::external_a2a::ExternalA2aCall>,
+    /// Keep this cold state shared: ordinary model calls must not carry its
+    /// strings inline through every scheduler context and async frame.
+    pub external_a2a: Option<Arc<crate::external_a2a::ExternalA2aCall>>,
     /// The parent session's active permission mode. A spawned sub-agent runs
     /// under this mode rather than an unconditional full-access policy, so a
     /// read-only session spawns read-only workers and a workspace-write
