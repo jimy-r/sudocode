@@ -1834,12 +1834,10 @@ fn live_cohost_session_resume() {
         "",
     )
     .unwrap();
-    // The restored history carries the first turn's `send` tool result, so on
-    // the rebased line the scenario's mock calls `send` again: the reply the
-    // operator's mailbox must see is the "PONG" body the scenario sends. Poll
-    // the operator transcript from the start — the full replay is what resume
-    // is for.
-    let mut op_cursor = 0u64;
+    // Only a new mailbox reply proves that the restored runtime processed
+    // this turn. Replaying from zero can accept the pre-restart PONG while
+    // the new runtime is still ready and has not appended any messages.
+    let mut op_cursor = cursor;
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         let (received, next) = mb
