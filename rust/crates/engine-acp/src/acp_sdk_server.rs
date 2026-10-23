@@ -324,6 +324,8 @@ struct DirectAgentListRequest {
 struct DirectA2aResponse {
     content: String,
     is_error: bool,
+    #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
+    meta: Option<serde_json::Value>,
 }
 
 /// `_meta.sudocode` key a client sets in `clientCapabilities` (and scode
@@ -1062,7 +1064,12 @@ fn initialize_meta(subagent_events: Option<u64>) -> Map<String, serde_json::Valu
     sudocode_ns.insert("systemPromptAppend".to_string(), json!(true));
     sudocode_ns.insert("toolPause".to_string(), json!({ "version": 1 }));
     // `_sudocode/a2a/send` and `_sudocode/a2a/agent_list`.
-    sudocode_ns.insert("directA2a".to_string(), json!({ "version": 1 }));
+    sudocode_ns.insert(
+        "directA2a".to_string(),
+        json!({
+            "version": 1, "errorOutcomes": 1, "hostAudit": 1,
+        }),
+    );
     // `session/new` accepts `_meta.sudocode.forkFrom` (see
     // `fork_source_from_meta`): a client that forks a conversation into a
     // new directory gates on this instead of probing.
@@ -2197,12 +2204,17 @@ fn direct_a2a_call(
 /// message may have been sent, so the client must not resend it blindly.
 fn direct_a2a_error(error: &DirectToolError) -> Error {
     match error {
-        DirectToolError::Refused(reason) => {
-            acp_error_to_sdk(&AcpError::invalid_params(reason.clone()))
-        }
+        DirectToolError::Refused(reason) => acp_error_to_sdk(&AcpError::invalid_params(
+            reason.clone(),
+        ))
+        .data(json!({ "sudocode": { "directA2a": {
+                    "version": 1, "outcome": "not_submitted"
+                } } })),
         DirectToolError::Unknown(detail) => {
-            let mut error =
-                Error::internal_error().data(json!({ "outcome": "unknown", "detail": detail }));
+            let mut error = Error::internal_error().data(json!({
+                "outcome": "unknown", "detail": detail,
+                "sudocode": { "directA2a": { "version": 1, "outcome": "unknown" } }
+            }));
             error.message = "The call may have run; its outcome is unknown".into();
             error
         }

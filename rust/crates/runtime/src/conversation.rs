@@ -732,6 +732,8 @@ pub struct ToolDispatchContext {
     pub background_tasks: Option<crate::background_tasks::BackgroundTasks>,
     /// The `tool_use` id of this invocation, including concurrent calls.
     pub tool_use_id: Option<String>,
+    /// Host provenance for a direct A2A invocation, kept out of model history.
+    pub external_a2a: Option<crate::external_a2a::ExternalA2aCall>,
     /// The parent session's active permission mode. A spawned sub-agent runs
     /// under this mode rather than an unconditional full-access policy, so a
     /// read-only session spawns read-only workers and a workspace-write
@@ -774,6 +776,12 @@ impl ToolDispatchContext {
 /// state (spinner, prompter) lives behind single-threaded interior mutability
 /// in the impl.
 pub trait ToolExecutor: Send {
+    /// The mailbox actually installed in this executor. A direct A2A call
+    /// requires this binding instead of resolving an unscoped disk default.
+    fn external_a2a_binding(&self) -> Option<crate::external_a2a::MailboxBinding> {
+        None
+    }
+
     /// Scheduling capability of the effective (post-hook) invocation.
     /// Dynamic executors may add metadata-backed tools without changing the
     /// conversation scheduler. Permission checks remain independent.

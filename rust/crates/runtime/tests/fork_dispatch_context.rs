@@ -95,6 +95,7 @@ fn assistant_only_history_is_not_inside_fork_child() {
         parent_requires_model_mount: false,
         subagent_sink: None,
         tool_use_id: None,
+        external_a2a: None,
         parent_permission_mode: None,
         permission_sink: None,
         parent_session_messages: vec![
@@ -118,6 +119,7 @@ fn user_without_boilerplate_is_not_inside_fork_child() {
         parent_requires_model_mount: false,
         subagent_sink: None,
         tool_use_id: None,
+        external_a2a: None,
         parent_permission_mode: None,
         permission_sink: None,
         parent_session_messages: vec![
@@ -144,6 +146,7 @@ fn user_with_boilerplate_tag_is_inside_fork_child() {
         parent_requires_model_mount: false,
         subagent_sink: None,
         tool_use_id: None,
+        external_a2a: None,
         parent_permission_mode: None,
         permission_sink: None,
         parent_session_messages: vec![user_text(&seeded_directive)],
@@ -169,6 +172,7 @@ fn boilerplate_in_any_prior_user_message_is_detected() {
         parent_requires_model_mount: false,
         subagent_sink: None,
         tool_use_id: None,
+        external_a2a: None,
         parent_permission_mode: None,
         permission_sink: None,
         parent_session_messages: vec![
@@ -202,6 +206,7 @@ fn parent_assistant_message_is_preserved_verbatim() {
         parent_requires_model_mount: false,
         subagent_sink: None,
         tool_use_id: None,
+        external_a2a: None,
         parent_permission_mode: None,
         permission_sink: None,
         parent_session_messages: vec![],
