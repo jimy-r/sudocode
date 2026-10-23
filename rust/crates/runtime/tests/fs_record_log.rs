@@ -7,8 +7,12 @@ use std::process::{Child, Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use runtime::fs_backend::{FsBackend, NexusVfsFsBackend, RecordLog, RecordLogMode, StdFsBackend};
+use runtime::fs_backend::{FsBackend, RecordLog, RecordLogMode, StdFsBackend};
 use serde_json::{json, Value};
+
+#[path = "common/live_nexus.rs"]
+mod live_nexus;
+use live_nexus::backend as live_backend;
 
 const WORKER_DIR: &str = "SCODE_RECORD_LOG_WORKER_DIR";
 const WORKER_ID: &str = "SCODE_RECORD_LOG_WORKER_ID";
@@ -194,24 +198,6 @@ fn native_record_recovery_preserves_commits_after_process_death() {
     assert!(log.append(b"{\"partial\":true}").is_err());
     assert!(log.append(b"{}\n{}\n").is_err());
     assert_eq!(log.read(next).unwrap(), (Vec::new(), next));
-}
-
-fn live_backend() -> NexusVfsFsBackend {
-    let credential = runtime::nexus_mailbox::AgentCredential::load(
-        &std::env::var("NEXUS_A2A_TEST_CERT_DIR").expect("test credential directory"),
-    )
-    .expect("load mTLS credential");
-    let client = runtime::nexus_mailbox::Config {
-        endpoint: std::env::var("NEXUS_A2A_TEST_ENDPOINT").expect("test daemon endpoint"),
-        agent: credential.agent,
-        tls: credential.tls,
-    }
-    .connect()
-    .expect("connect to real daemon");
-    NexusVfsFsBackend::new(
-        std::sync::Arc::try_unwrap(client).unwrap_or_else(|_| panic!("unshared test client")),
-        std::env::var("NEXUS_API_KEY").unwrap_or_default(),
-    )
 }
 
 fn read_wal_records(log: &dyn RecordLog, count: usize) -> (Vec<Value>, u64) {

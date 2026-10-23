@@ -37,6 +37,9 @@ const WAIT: Duration = Duration::from_secs(20);
 #[path = "shared_history_records/nexus.rs"]
 mod nexus;
 
+#[path = "common/live_nexus.rs"]
+mod live_nexus;
+
 #[cfg(target_os = "linux")]
 #[path = "shared_history_records/flush.rs"]
 mod flush;

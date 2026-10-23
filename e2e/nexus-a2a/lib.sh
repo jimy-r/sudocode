@@ -98,6 +98,7 @@ cargo_in_workspace() {
 # binary from AUTHON_NEXUSD_BIN.
 authon_boot() {
   local env_lines
+  export NEXUS_A2A_ZONE="$AUTHON_ZONE"
   AUTHON_LOG_OFFSET=0
   if [ -f "$AUTHON_DATA_DIR/daemon.log" ]; then
     AUTHON_LOG_OFFSET="$(wc -c <"$AUTHON_DATA_DIR/daemon.log")"

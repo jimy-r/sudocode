@@ -7,7 +7,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
-use runtime::fs_backend::{FsBackend, NexusVfsFsBackend, StdFsBackend};
+use runtime::fs_backend::{FsBackend, StdFsBackend};
 use runtime::history::HistoryGraph;
 use runtime::workspace_root::WorkspaceRootScope;
 use runtime::{
@@ -22,25 +22,14 @@ const RECEIPT: &str = "NEXUS_RUNTIME_HISTORY_RECEIPT";
 const WAIT: Duration = Duration::from_secs(30);
 type Requests = Arc<Mutex<Vec<Vec<ConversationMessage>>>>;
 
+#[path = "common/live_nexus.rs"]
+mod live_nexus;
+
 fn backend(nexus: bool) -> Arc<dyn FsBackend> {
     if !nexus {
         return Arc::new(StdFsBackend);
     }
-    let credential = runtime::nexus_mailbox::AgentCredential::load(
-        &std::env::var("NEXUS_A2A_TEST_CERT_DIR").expect("test credential directory"),
-    )
-    .unwrap();
-    let client = runtime::nexus_mailbox::Config {
-        endpoint: std::env::var("NEXUS_A2A_TEST_ENDPOINT").expect("test endpoint"),
-        agent: credential.agent,
-        tls: credential.tls,
-    }
-    .connect()
-    .unwrap();
-    Arc::new(NexusVfsFsBackend::new(
-        Arc::try_unwrap(client).unwrap_or_else(|_| panic!("unshared test connection")),
-        std::env::var("NEXUS_API_KEY").unwrap_or_default(),
-    ))
+    Arc::new(live_nexus::backend())
 }
 
 fn load(path: &Path, nexus: bool) -> Session {

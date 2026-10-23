@@ -1,34 +1,16 @@
 //! The same context boundaries over real mTLS clients and daemon restart.
 use std::path::Path;
-use std::sync::Arc;
 
-use runtime::fs_backend::{FsBackend, NexusVfsFsBackend, RecordLogMode};
+use runtime::fs_backend::{FsBackend, RecordLogMode};
 use runtime::history::{HistoryLog, HistoryRecord};
 use runtime::{ContentBlock, ConversationMessage, Session};
 use serde_json::{json, Value};
 
+use super::live_nexus::backend as live_backend;
 use super::{
     append, assistant, commit, finish_turn, payloads, text, wait_for, with_selected_messages,
     Fixture, ToolChild,
 };
-
-fn live_backend() -> NexusVfsFsBackend {
-    let credential = runtime::nexus_mailbox::AgentCredential::load(
-        &std::env::var("NEXUS_A2A_TEST_CERT_DIR").expect("test credential directory"),
-    )
-    .unwrap();
-    let client = runtime::nexus_mailbox::Config {
-        endpoint: std::env::var("NEXUS_A2A_TEST_ENDPOINT").expect("test endpoint"),
-        agent: credential.agent,
-        tls: credential.tls,
-    }
-    .connect()
-    .unwrap();
-    NexusVfsFsBackend::new(
-        Arc::try_unwrap(client).unwrap_or_else(|_| panic!("unshared test connection")),
-        std::env::var("NEXUS_API_KEY").unwrap_or_default(),
-    )
-}
 
 fn seed(log: &mut HistoryLog) -> Session {
     let mut prefix = Session::new();
