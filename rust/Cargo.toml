@@ -65,11 +65,16 @@ module_name_repetitions = "allow"
 missing_panics_doc = "allow"
 missing_errors_doc = "allow"
 
-# The daemon links the kernel and hosted session engine. Optimize across crate
-# boundaries and remove release symbols so it fits the existing artifact limits.
+# CLI instances share memory with local inference. Optimize the release code
+# footprint across crates; rendering performance CI checks RSS and responsiveness.
+[profile.release]
+opt-level = "s"
+lto = "thin"
+
+# Hosted engines prioritize throughput and strip symbols for distribution.
 [profile.cohost-release]
 inherits = "release"
-lto = "thin"
+opt-level = 3
 strip = "symbols"
 
 # ThinLTO with full speed optimization increases the Windows PE image. Size
