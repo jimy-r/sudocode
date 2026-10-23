@@ -163,9 +163,15 @@ protocol/log/receipt evidence and always stops its own daemon. It installs the
 archive offline, creates then reloads the sender's original SID through the
 actual MCP bridge, verifies an actual mTLS Node append and native actor audit,
 and requires zero inference requests while send/list run with an offline
-recipient. It then restores the recipient and checks exact durable delivery.
+recipient. It then starts the recipient for the first time and checks exact durable delivery.
 The recipient's ordinary response inference is measured separately: it is not
 part of the direct send and must not be silently counted as zero. Earlier
 all-participant zero assertions exposed this distinction during bring-up.
 In-flight blocking-worker pause, lost responses and original Codex thread
 active/idle callbacks remain separate native acceptance gates.
+
+The first native fixture also tried starting and immediately closing/reloading
+the recipient before the send; one run did not deliver within its unchanged
+30-second budget. That unresolved receiver-reentry observation is retained as
+a separate native lifetime/lease concern. The append fixture avoids that
+unnecessary setup and does not claim to validate same-agent cold handoff.

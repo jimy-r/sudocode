@@ -44,8 +44,6 @@ let a,b,client,transport;
     workspace:actor.workspace, env:{...actor.env}, stderrLog:path.join(config.root,actor.name+'.stderr.log'),
     startupTimeoutMs:30000, closeTimeoutMs:2000,
     onProtocol:(direction,message)=>wire.push({actor:actor.name,direction,message})});
-  b=await sdk.connectScode(acp(config.actors[1]));
-  const recipientSid=b.sessionId; await b.close(); b=undefined;
   a=await sdk.connectScode(acp(config.actors[0]));
   const sid=a.sessionId; await a.close(); a=undefined;
   const runtime = {...acp(config.actors[0]),acpSessionId:sid,version:1,
@@ -59,7 +57,7 @@ let a,b,client,transport;
   const status=await client.callTool({name:'scode_status',arguments:{}});
   const nativeStatus=JSON.parse(status.content[0].text);
   assert.equal(nativeStatus.acpSessionId,sid);assert.equal(nativeStatus.directA2a.version,1);
-  const message='ROOT_NATIVE_NODE_PAIR ??? ??\nexact plain text '+config.marker;
+  const message='ROOT_NATIVE_NODE_PAIR \u96f6\u6a21\u578b \u{1f9ea}\nexact\0plain text '+config.marker;
   const sent=await client.callTool({name:'scode_send',arguments:{to:config.actors[1].name,message,summary:'Isolated native pair acceptance'}});
   assert.equal(sent.isError,false,JSON.stringify(sent));
   const audit=sent._meta.sudocode.directA2a.audit;
@@ -75,9 +73,9 @@ let a,b,client,transport;
   const calls=fs.readFileSync(path.join(config.root,'mcp-protocol.jsonl'),'utf8').trim().split('\n').map(JSON.parse).filter(x=>x.direction==='outgoing');
   assert.equal(calls.filter(x=>x.message?.method==='_sudocode/a2a/send').length,1);
   assert.equal(calls.filter(x=>x.message?.method==='session/prompt').length,0);
-  // Restart the receiver only after the direct-operation zero-inference gate.
+  // Start the recipient for the first time only after the direct-operation gate.
   // Its ordinary response model is a distinct later activity, never a send translator.
-  b=await sdk.connectScode({...acp(config.actors[1]),acpSessionId:recipientSid},n=>notices.push(n));
+  b=await sdk.connectScode(acp(config.actors[1]),n=>notices.push(n));
   await wait(()=>notices.some(n=>JSON.stringify(n).includes(config.marker)),'real Node delivery to recipient');
   const delivered=notices.filter(n=>JSON.stringify(n).includes(config.marker));
   assert.equal(delivered.length,1,JSON.stringify(delivered));
