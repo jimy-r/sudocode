@@ -1050,6 +1050,89 @@ fn mark_renewed(
     }
 }
 
+/// Where a lease was found not to be fresh.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LeaseSite {
+    /// The background renewal worker.
+    Worker,
+    /// The renewal ahead of a write that relies on still holding the lock.
+    Confirm,
+}
+
+/// Why a lease stopped being trusted: the first renewal that did not prove it
+/// fresh, or belief lapsing while none answered.
+///
+/// Recorded so that a delivery that did not advance can say which, and so that
+/// a transient renewal error, if one ever happens in production, is counted
+/// rather than inferred.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LeaseLoss {
+    /// The renewal returned an error `elapsed_ms` after it was requested.
+    RenewFailed {
+        site: LeaseSite,
+        kind: std::io::ErrorKind,
+        elapsed_ms: u64,
+    },
+    /// The backend answered that the lock is no longer held.
+    NotHeld { site: LeaseSite, elapsed_ms: u64 },
+    /// The backend answered that the lock is held, but too long after the
+    /// request for that to count.
+    LateSuccess { site: LeaseSite, elapsed_ms: u64 },
+    /// No renewal answered in time: the last successful one was requested
+    /// `since_ms` ago.
+    Lapsed { since_ms: u64 },
+}
+
+impl std::fmt::Display for LeaseLoss {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::RenewFailed {
+                site,
+                kind,
+                elapsed_ms,
+            } => write!(
+                f,
+                "{site:?} renewal failed ({kind:?}) {elapsed_ms}ms after it was requested"
+            ),
+            Self::NotHeld { site, elapsed_ms } => write!(
+                f,
+                "{site:?} renewal found the lock no longer held {elapsed_ms}ms after it was requested"
+            ),
+            Self::LateSuccess { site, elapsed_ms } => write!(
+                f,
+                "{site:?} renewal succeeded {elapsed_ms}ms after it was requested, too late to count"
+            ),
+            Self::Lapsed { since_ms } => write!(
+                f,
+                "no renewal answered in time; the last successful one was requested {since_ms}ms ago"
+            ),
+        }
+    }
+}
+
+/// What one renewal requested at `requested` says about the lease: `None` if
+/// it proved the lease fresh.
+fn renewal_loss(
+    site: LeaseSite,
+    result: &std::io::Result<bool>,
+    expiring: bool,
+    requested: std::time::Instant,
+) -> Option<LeaseLoss> {
+    let elapsed_ms = elapsed_ms(requested);
+    match result {
+        Err(e) => Some(LeaseLoss::RenewFailed {
+            site,
+            kind: e.kind(),
+            elapsed_ms,
+        }),
+        Ok(false) => Some(LeaseLoss::NotHeld { site, elapsed_ms }),
+        Ok(true) if !within_grace(request_age_ms(expiring, requested)) => {
+            Some(LeaseLoss::LateSuccess { site, elapsed_ms })
+        }
+        Ok(true) => None,
+    }
+}
+
 /// An exclusive backend lock, renewed on its own thread for as long as this
 /// value lives.
 ///
@@ -1072,6 +1155,8 @@ struct HeldLease {
     /// When the last renewal that actually succeeded was *requested*, on the
     /// monotonic clock, shared by the worker and [`HeldLease::confirm`].
     last_renewed: Arc<std::sync::Mutex<std::time::Instant>>,
+    /// The first reason this lease stopped being trusted, once it has.
+    loss: Arc<std::sync::OnceLock<LeaseLoss>>,
     renewer: Option<std::thread::JoinHandle<()>>,
 }
 
@@ -1101,10 +1186,12 @@ impl HeldLease {
         let stop = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
         let valid = Arc::new(std::sync::atomic::AtomicBool::new(true));
         let last_renewed = Arc::new(std::sync::Mutex::new(requested));
+        let loss = Arc::new(std::sync::OnceLock::new());
         let worker_stop = Arc::clone(&stop);
         let worker_valid = Arc::clone(&valid);
         let worker_lock = Arc::clone(&lock);
         let worker_last_renewed = Arc::clone(&last_renewed);
+        let worker_loss = Arc::clone(&loss);
         let renewer = std::thread::Builder::new()
             .name("mailbox-lease".into())
             .spawn(move || {
@@ -1129,9 +1216,11 @@ impl HeldLease {
                     }
                     drop(stopped);
                     let requested = std::time::Instant::now();
-                    let fresh = matches!(worker_lock.renew(), Ok(true))
-                        && within_grace(request_age_ms(expiring, requested));
-                    if !fresh {
+                    let result = worker_lock.renew();
+                    if let Some(lost) =
+                        renewal_loss(LeaseSite::Worker, &result, expiring, requested)
+                    {
+                        let _ = worker_loss.set(lost);
                         worker_valid.store(false, std::sync::atomic::Ordering::Release);
                         break;
                     }
@@ -1146,6 +1235,7 @@ impl HeldLease {
             valid,
             expiring,
             last_renewed,
+            loss,
             renewer: Some(renewer),
         }))
     }
@@ -1157,14 +1247,26 @@ impl HeldLease {
     /// the flag, so belief must also lapse on its own once the last successful
     /// renewal was requested longer ago than the grace allows.
     fn is_valid(&self) -> bool {
-        self.valid.load(std::sync::atomic::Ordering::Acquire)
-            && within_grace(request_age_ms(
-                self.expiring,
-                *self
-                    .last_renewed
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner),
-            ))
+        if !self.valid.load(std::sync::atomic::Ordering::Acquire) {
+            return false;
+        }
+        let since_ms = request_age_ms(
+            self.expiring,
+            *self
+                .last_renewed
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
+        if within_grace(since_ms) {
+            return true;
+        }
+        let _ = self.loss.set(LeaseLoss::Lapsed { since_ms });
+        false
+    }
+
+    /// The first reason this lease stopped being trusted, if it has.
+    fn loss(&self) -> Option<LeaseLoss> {
+        self.loss.get().copied()
     }
 
     /// Renew now, ahead of a write that relies on still holding the lock.
@@ -1176,7 +1278,13 @@ impl HeldLease {
             return Ok(false);
         }
         let requested = std::time::Instant::now();
-        let held = self.lock.renew()? && within_grace(request_age_ms(self.expiring, requested));
+        let result = self.lock.renew();
+        let lost = renewal_loss(LeaseSite::Confirm, &result, self.expiring, requested);
+        if let Some(lost) = lost {
+            let _ = self.loss.set(lost);
+        }
+        result?;
+        let held = lost.is_none();
         if held {
             mark_renewed(&self.last_renewed, requested);
         } else {
@@ -1558,6 +1666,9 @@ fn receive_while_seated(
         }
         sleep_unless_aborted(abort, CONVERSATION_DISCOVERY_MS);
     }
+    if let Some(loss) = seat.loss() {
+        eprintln!("[{label}] receiver seat lost: {loss}");
+    }
     // Joining is what makes the receiver's handle mean "the receiver has
     // stopped". Without it the caller's join returns while N tails are still
     // delivering into a sink it believes is finished with.
@@ -1615,6 +1726,9 @@ fn spawn_conversation_tail(
                         sleep_unless_aborted(&abort, retry_delay_ms);
                         retry_delay_ms = retry_delay_ms.saturating_mul(2).min(READER_RENEW_MS);
                     }
+                }
+                if let Some(loss) = reader.lease.loss() {
+                    eprintln!("[{label}] reader for {peer} lost: {loss}");
                 }
             }
         })
