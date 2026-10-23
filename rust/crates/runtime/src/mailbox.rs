@@ -1269,7 +1269,8 @@ impl HeldLease {
         false
     }
 
-    /// The first reason this lease stopped being trusted, if it has.
+    /// The first reason this lease stopped being trusted, if it has. Set
+    /// exactly when [`HeldLease::is_valid`] turns false, and before it does.
     fn loss(&self) -> Option<LeaseLoss> {
         self.loss.get().copied()
     }
@@ -1277,7 +1278,10 @@ impl HeldLease {
     /// Renew now, ahead of a write that relies on still holding the lock.
     /// `Ok(false)` means it was lost and marks the lease invalid for good; a
     /// success that took too long to come back counts as lost too. An `Err`
-    /// refuses the write without touching the lease.
+    /// refuses the write and ends the lease the same way, as a failed renewal
+    /// in the worker does: every caller lets go of a lease whose write was
+    /// refused, and a lease left valid after a failed renewal would carry a
+    /// reason for a loss that had not happened.
     fn confirm(&self) -> std::io::Result<bool> {
         if !self.is_valid() {
             return Ok(false);
@@ -1287,14 +1291,13 @@ impl HeldLease {
         let lost = renewal_loss(LeaseSite::Confirm, &result, self.expiring, requested);
         if let Some(lost) = lost {
             let _ = self.loss.set(lost);
+            self.valid
+                .store(false, std::sync::atomic::Ordering::Release);
         }
         result?;
         let held = lost.is_none();
         if held {
             mark_renewed(&self.last_renewed, requested);
-        } else {
-            self.valid
-                .store(false, std::sync::atomic::Ordering::Release);
         }
         Ok(held)
     }
