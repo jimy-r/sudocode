@@ -2660,6 +2660,16 @@ mod tests {
         (ctx, input_rx)
     }
 
+    fn mock_terminal_config(
+        events: impl Iterator<Item = TerminalEvent> + Send + 'static,
+    ) -> MockTerminalConfig {
+        // A headless runner has no terminal geometry to inherit. Resize also
+        // presents the editor before the immediately ready keyboard batch.
+        MockTerminalConfig::with_events(futures::stream::iter(
+            std::iter::once(TerminalEvent::Resize(100, 30)).chain(events),
+        ))
+    }
+
     #[test]
     fn tasks_command_does_not_reuse_submit_as_a_detail_key() {
         use engine_events::{BackgroundTask, BackgroundTaskEvent, BackgroundTaskKind};
@@ -2693,9 +2703,7 @@ mod tests {
                     let mut view = element! {
                         ContextProvider(value: Context::owned(ctx)) { ReplApp }
                     };
-                    let mut frames = view.mock_terminal_render_loop(
-                        MockTerminalConfig::with_events(futures::stream::iter(keys)),
-                    );
+                    let mut frames = view.mock_terminal_render_loop(mock_terminal_config(keys));
                     while frames.next().await.is_some() {
                         let focus = tasks.lock().unwrap().focus;
                         if focus != TaskFocus::Input {
@@ -2730,17 +2738,24 @@ mod tests {
                 },
             ))
         });
-        smol::block_on(
-            element! {
-                ContextProvider(value: Context::owned(ctx)) {
-                    ReplApp
+        smol::block_on(smol::future::or(
+            async {
+                element! {
+                    ContextProvider(value: Context::owned(ctx)) {
+                        ReplApp
+                    }
                 }
-            }
-            .mock_terminal_render_loop(MockTerminalConfig::with_events(futures::stream::iter(
-                events.chain(std::iter::once(TerminalEvent::Key(close))),
-            )))
-            .collect::<Vec<_>>(),
-        );
+                .mock_terminal_render_loop(mock_terminal_config(
+                    events.chain(std::iter::once(TerminalEvent::Key(close))),
+                ))
+                .collect::<Vec<_>>()
+                .await;
+            },
+            async {
+                smol::Timer::after(Duration::from_secs(10)).await;
+                panic!("batched input did not exit after Ctrl-D");
+            },
+        ));
         let submitted: Vec<_> = input_rx.try_iter().collect();
         assert_eq!(
             submitted,
