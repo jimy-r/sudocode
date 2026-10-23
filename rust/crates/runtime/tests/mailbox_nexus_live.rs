@@ -2220,10 +2220,15 @@ fn stall_cause_mid_batch(consumer_accepts: bool) {
     const GATE: &str = "s0 gate";
     const M1: &str = "s1 first of the batch";
     const M2: &str = "s2 second of the batch";
-    // The worker marks the lease invalid on its own thread just after the
-    // failed renewal returns, and the probe sees that return first. Marking
-    // late could only make this test fail (the batch would go on to a refused
-    // commit), never pass, so the margin cannot hide a regression.
+    // The consumer decides only once the INJECTED renewal has been recorded,
+    // and then waits this much longer: the worker marks the lease invalid on
+    // its own thread a few instructions after that renewal returns, and the
+    // probe sees the return first. This test cannot observe the flag itself.
+    // Were the worker held off past the margin, the accepting case would fail
+    // (the batch would go on to a refused commit) rather than pass, but the
+    // refusing case's negative control (a classifier that asks `is_valid()`
+    // again afterwards) could then still see a valid lease and pass. So the
+    // margin is what makes that control fail, not luck in a narrow window.
     const SETTLE: Duration = Duration::from_millis(300);
 
     let endpoint = std::env::var("NEXUS_A2A_TEST_ENDPOINT").expect("set daemon endpoint");
@@ -2353,6 +2358,14 @@ fn stall_cause_mid_batch(consumer_accepts: bool) {
     assert_eq!(
         recorded[0].offset, p_gate,
         "the stall is recorded at the batch's offset"
+    );
+    // Both messages were in the stalled batch: otherwise m1 alone would have
+    // gone on to a commit, and the second message would have met the lost
+    // lease in a batch of its own, which is a different path.
+    assert_eq!(
+        recorded[0].tail,
+        Some(p_gate + 2),
+        "the stalled batch held m1 and m2: {recorded:?}"
     );
 
     let armed = armed_at
