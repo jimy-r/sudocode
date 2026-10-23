@@ -68,6 +68,22 @@ mod input {
             written.recv_timeout(Duration::from_millis(100)),
             Err(mpsc::RecvTimeoutError::Timeout)
         ));
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsFd;
+            // Confirm kernel backpressure, rather than inferring a full pipe
+            // from a thread which might simply not have been scheduled yet.
+            let stderr = std::io::stderr();
+            let mut descriptors = [nix::poll::PollFd::new(
+                stderr.as_fd(),
+                nix::poll::PollFlags::POLLOUT,
+            )];
+            let deadline = std::time::Instant::now() + BUDGET;
+            while nix::poll::poll(&mut descriptors, 0u16).unwrap() != 0 {
+                assert!(std::time::Instant::now() < deadline, "pipe never filled");
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
 
         // Restoring fd/handle 2 does not retarget an already-blocked write.
         // Suspension must return while that writer still owns stderr.
