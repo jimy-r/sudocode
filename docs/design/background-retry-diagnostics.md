@@ -58,6 +58,9 @@ disconnects the print queue, then restores stderr before joining.
 The receiver only queues display text, so a blocked terminal print cannot
 hold up receiver shutdown. The sync capture is active only around readline;
 turns and external terminal programs inherit the original stderr target.
+Rearming waits for an in-flight stderr writer before taking the capture mutex;
+the forwarder can still drain that writer's old pipe. Suspension does not wait
+for stderr, since changing fd/handle 2 cannot retarget an already-blocked write.
 
 The classic path pins [rustyline 19.0.0](https://github.com/kkawakam/rustyline/releases/tag/v19.0.0),
 which includes [the upstream buffered-input fix](https://github.com/kkawakam/rustyline/pull/977).
@@ -109,5 +112,10 @@ The existing long UTF-8 diagnostic PTY case now runs in both modes on all three
 platforms and requires a clean input line afterward. The sync peer PTY preserves
 a Unicode draft and its middle cursor across the real waiting notice, then
 processes a control-key burst before its original peer-turn assertions.
+A separate subprocess regression gates the actual forwarder, fills the real
+capture pipe with an 8 MiB Rust stderr write, suspends capture, then rearms it
+while the writer is still in flight. Releasing the gate must allow both the
+writer and rearm to finish. This isolates pipe/lock ordering with a controlled
+printer; it does not replace the native-editor PTY assertions.
 Exact-head CI and platform results are reported in the PR;
 source preparation alone does not constitute runtime rollout or acceptance.

@@ -93,15 +93,17 @@ impl StderrOutput {
 
     #[inline]
     pub(super) fn set_active(&self, active: bool) -> std::io::Result<()> {
+        // A writer may still hold stderr while blocked on the old capture
+        // pipe after suspension. Keep the redirect mutex available to the
+        // drain worker until that writer releases stderr.
+        let _stderr = active.then(|| std::io::stderr().lock());
         let redirect = self
             .redirect
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if active {
             // Finish any write to the uncaptured terminal before readline
-            // paints its prompt. Suspend stays unlocked so an in-flight pipe
-            // writer can still be drained by the forwarding worker.
-            let _stderr = std::io::stderr().lock();
+            // paints its prompt. Suspension never waits for stderr.
             redirect.resume()
         } else {
             redirect.suspend()
