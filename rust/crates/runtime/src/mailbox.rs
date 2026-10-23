@@ -906,6 +906,19 @@ const READER_LEASE_MS: u64 = 30_000;
 /// `block_ms` per conversation, most of them carrying no new information.
 const READER_RENEW_MS: u64 = READER_LEASE_MS / 2;
 
+/// How far ahead of the lease TTL a holder stops acting on a lease it last
+/// proved a while ago.
+///
+/// The backend expires the lock `READER_LEASE_MS` after it *received* the last
+/// renewal, so every age here is measured from when a renewal was *requested*.
+/// The margin bounds how old a successful renewal may be and still count, and
+/// how long belief in the last one lasts while the next is still out. It is a
+/// scheduling heuristic, not a guarantee: a process that is suspended can still
+/// deliver or commit after the backend handed the seat to a standby. Only a
+/// fenced register write closes the commit side, and delivery cannot be fenced
+/// at all.
+const LEASE_SAFETY_MARGIN_MS: u64 = 10_000;
+
 /// How often a receiver re-lists its chat list looking for conversations it is
 /// not yet tailing.
 ///
@@ -1001,17 +1014,64 @@ impl ConversationReader {
     }
 }
 
+/// Whether a lease last proven `elapsed_ms` ago may still be acted on: it has to
+/// leave [`LEASE_SAFETY_MARGIN_MS`] before the TTL the lock was taken with.
+fn within_grace(elapsed_ms: u64) -> bool {
+    elapsed_ms.saturating_add(LEASE_SAFETY_MARGIN_MS) < READER_LEASE_MS
+}
+
+/// Milliseconds elapsed since `at`.
+fn elapsed_ms(at: std::time::Instant) -> u64 {
+    u64::try_from(at.elapsed().as_millis()).unwrap_or(u64::MAX)
+}
+
+/// How old a renewal requested at `requested` is, as far as the lease goes: a
+/// lock that cannot expire under its holder never ages.
+fn request_age_ms(expiring: bool, requested: std::time::Instant) -> u64 {
+    if expiring {
+        elapsed_ms(requested)
+    } else {
+        0
+    }
+}
+
+/// Record a renewal that succeeded, as of when it was requested. Never moves the
+/// record back: the worker and a commit can renew concurrently and return out of
+/// order.
+fn mark_renewed(
+    last_renewed: &std::sync::Mutex<std::time::Instant>,
+    requested: std::time::Instant,
+) {
+    let mut at = last_renewed
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if requested > *at {
+        *at = requested;
+    }
+}
+
 /// An exclusive backend lock, renewed on its own thread for as long as this
 /// value lives.
 ///
 /// Renewal is independent of what the holder is doing, because a model turn can
-/// block for longer than the lease. Once a renewal fails the lease stays
-/// invalid and the holder must stop acting on it. Dropping stops the renewal
-/// thread first and only then releases the lock.
+/// block for longer than the lease. A renewal proves ownership only as of when
+/// it was requested: a success that comes back too late counts as lost, the
+/// next renewal is timed from the last successful request, and belief in the
+/// lease lapses on its own once that request is older than the grace allows.
+/// Once a renewal fails the lease stays invalid and the holder must stop acting
+/// on it. Dropping stops the renewal thread first and only then releases the
+/// lock.
 struct HeldLease {
     lock: Arc<dyn crate::fs_backend::FsLock>,
     stop: Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
     valid: Arc<std::sync::atomic::AtomicBool>,
+    /// Whether the backend can expire this lock under its holder (a TTL lease)
+    /// rather than holding it until the holder exits. Only then does the age of
+    /// a renewal matter.
+    expiring: bool,
+    /// When the last renewal that actually succeeded was *requested*, on the
+    /// monotonic clock, shared by the worker and [`HeldLease::confirm`].
+    last_renewed: Arc<std::sync::Mutex<std::time::Instant>>,
     renewer: Option<std::thread::JoinHandle<()>>,
 }
 
@@ -1022,21 +1082,37 @@ impl HeldLease {
                 .create_dir_all(dir)
                 .map_err(|e| format!("create directory {dir}: {e}"))?;
         }
+        let requested = std::time::Instant::now();
         let Some(lock) = backend
             .try_lock(lock_path, READER_LEASE_MS)
             .map_err(|e| e.to_string())?
         else {
             return Ok(None);
         };
+        // `fenced_locks` means the lock holds until its holder exits; anything
+        // else is a lease the backend can expire under us.
+        let expiring = !backend.fenced_locks();
+        if !within_grace(request_age_ms(expiring, requested)) {
+            // The grant came back too late to act on. Release it (dropping the
+            // lock does) rather than start delivering on a lease that may
+            // already be near expiry; the caller retries as for a held seat.
+            return Ok(None);
+        }
         let stop = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
         let valid = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let last_renewed = Arc::new(std::sync::Mutex::new(requested));
         let worker_stop = Arc::clone(&stop);
         let worker_valid = Arc::clone(&valid);
         let worker_lock = Arc::clone(&lock);
+        let worker_last_renewed = Arc::clone(&last_renewed);
         let renewer = std::thread::Builder::new()
             .name("mailbox-lease".into())
             .spawn(move || {
                 let (mutex, wake) = &*worker_stop;
+                // Every renewal is timed from when the last successful one was
+                // requested, never from when its reply came back: a slow reply
+                // must not push the next renewal past the TTL.
+                let mut wait_ms = READER_RENEW_MS.saturating_sub(elapsed_ms(requested));
                 loop {
                     let stopped = mutex
                         .lock()
@@ -1044,7 +1120,7 @@ impl HeldLease {
                     let (stopped, _) = wake
                         .wait_timeout_while(
                             stopped,
-                            std::time::Duration::from_millis(READER_RENEW_MS),
+                            std::time::Duration::from_millis(wait_ms),
                             |stopped| !*stopped,
                         )
                         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -1052,10 +1128,15 @@ impl HeldLease {
                         break;
                     }
                     drop(stopped);
-                    if !matches!(worker_lock.renew(), Ok(true)) {
+                    let requested = std::time::Instant::now();
+                    let fresh = matches!(worker_lock.renew(), Ok(true))
+                        && within_grace(request_age_ms(expiring, requested));
+                    if !fresh {
                         worker_valid.store(false, std::sync::atomic::Ordering::Release);
                         break;
                     }
+                    mark_renewed(&worker_last_renewed, requested);
+                    wait_ms = READER_RENEW_MS.saturating_sub(elapsed_ms(requested));
                 }
             })
             .map_err(|e| format!("start lease renewal: {e}"))?;
@@ -1063,22 +1144,42 @@ impl HeldLease {
             lock,
             stop,
             valid,
+            expiring,
+            last_renewed,
             renewer: Some(renewer),
         }))
     }
 
+    /// Whether the holder may still act on this lease.
+    ///
+    /// The flag records a renewal that failed; the age check covers one that has
+    /// not answered at all. While a renewal is in flight the worker cannot clear
+    /// the flag, so belief must also lapse on its own once the last successful
+    /// renewal was requested longer ago than the grace allows.
     fn is_valid(&self) -> bool {
         self.valid.load(std::sync::atomic::Ordering::Acquire)
+            && within_grace(request_age_ms(
+                self.expiring,
+                *self
+                    .last_renewed
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+            ))
     }
 
     /// Renew now, ahead of a write that relies on still holding the lock.
-    /// `Ok(false)` means it was lost and marks the lease invalid for good.
+    /// `Ok(false)` means it was lost and marks the lease invalid for good; a
+    /// success that took too long to come back counts as lost too. An `Err`
+    /// refuses the write without touching the lease.
     fn confirm(&self) -> std::io::Result<bool> {
         if !self.is_valid() {
             return Ok(false);
         }
-        let held = self.lock.renew()?;
-        if !held {
+        let requested = std::time::Instant::now();
+        let held = self.lock.renew()? && within_grace(request_age_ms(self.expiring, requested));
+        if held {
+            mark_renewed(&self.last_renewed, requested);
+        } else {
             self.valid
                 .store(false, std::sync::atomic::Ordering::Release);
         }
