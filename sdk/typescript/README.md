@@ -138,3 +138,34 @@ installation. Fixtures are protocol peers, not a real scode/Node/model backend.
 They do not establish native worker pause/cancellation, mTLS policy, a real
 Node append, actual idle wakeup or safe live migration. Those paired acceptance
 receipts must identify the full CLI binary/source and each actual device.
+
+### Real paired process acceptance
+
+`test/nativeFixture.py` drives an installed archive against a separately
+verified full scode and matching Nexus daemon, with fresh fixture identities.
+It boots/stops only its own throwaway founder, uses its existing offline mint
+CLI, and deletes fixture keys/database/workspaces after stopping the daemon.
+No running node, existing identity or shared launcher is used. Python 3 is a
+test prerequisite only; the installed bridge requires Node alone.
+
+After `npm test` and `npm run pack:runtime`, provide these environment values:
+
+- `SCODE_TEST_BIN`, `SCODE_TEST_SHA256`, `SCODE_TEST_SOURCE`: absolute full CLI,
+  its verified hash and source receipt.
+- `NEXUSD_BIN`, `NEXUSD_SHA256`, `NEXUSD_TEST_TAG`: absolute matching daemon,
+  its verified hash and pinned release tag.
+- `npm_execpath`, `npm_node_execpath`: the npm CLI JavaScript and Node paths
+  (npm supplies these to scripts).
+- Optional `SCODE_NATIVE_TEST_ROOT`: a private evidence directory.
+
+Run `python3 test/nativeFixture.py` (`python` on Windows). The fixture keeps
+protocol/log/receipt evidence and always stops its own daemon. It installs the
+archive offline, creates then reloads the sender's original SID through the
+actual MCP bridge, verifies an actual mTLS Node append and native actor audit,
+and requires zero inference requests while send/list run with an offline
+recipient. It then restores the recipient and checks exact durable delivery.
+The recipient's ordinary response inference is measured separately: it is not
+part of the direct send and must not be silently counted as zero. Earlier
+all-participant zero assertions exposed this distinction during bring-up.
+In-flight blocking-worker pause, lost responses and original Codex thread
+active/idle callbacks remain separate native acceptance gates.
