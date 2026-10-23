@@ -61,6 +61,56 @@ impl Drop for NoInference {
     }
 }
 
+#[tokio::test]
+async fn direct_a2a_pause_cancels_an_outstanding_approval() {
+    let model = NoInference::start().await;
+    let workspace = TestWorkspace::new("direct-pending-approval");
+    workspace.create();
+    workspace.write_sudocode_json(&model.url);
+    pin_agent_name(&workspace.root, "pending-approval-actor");
+    let root = runtime::mailbox::local_pair_root_in(&workspace.config_home);
+    let mut client = spawn_stdio_client(&workspace);
+    scenario_initialize(&mut client).await;
+    let sid = open_direct_session(&mut client, &workspace.root).await;
+    set_session_mode(&mut client, &sid, "prompt").await;
+    let send = client.send_request_no_wait(
+        "_sudocode/a2a/send",
+        json!({"sessionId": sid, "to": "pending-approval-peer", "message": "MUST_NOT_APPEND", "summary": "pending approval"}),
+    ).await;
+    let (_, permission) = client.recv_until(Duration::from_secs(10), |message| {
+        is_server_request(message, "session/request_permission")
+    }).await.unwrap();
+    let pause = client.send_request_no_wait(
+        "_sudocode/session/pause_tools", json!({"sessionId": sid}),
+    ).await;
+    let (seen, cancelled) = client.recv_until(Duration::from_secs(10), |message| {
+        is_response_to(message, send)
+    }).await.unwrap();
+    assert_eq!(cancelled["error"]["data"]["outcome"], "unknown", "{cancelled}");
+    let paused = if let Some(reply) = seen.iter().find(|message| is_response_to(message, pause)) {
+        reply.clone()
+    } else {
+        client.recv_until(Duration::from_secs(10), |message| is_response_to(message, pause)).await.unwrap().1
+    };
+    assert_eq!(paused["result"]["isQuiescent"], true, "{paused}");
+    // A late answer to the original approval must not revive cancelled work.
+    allow_permission(&mut client, &permission["id"]).await;
+    let (_, refused) = client.send_request(
+        "_sudocode/a2a/send",
+        json!({"sessionId": sid, "to": "pending-approval-peer", "message": "ALSO_MUST_NOT_APPEND", "summary": "paused"}),
+    ).await;
+    assert_direct_not_submitted(&refused, "paused after approval cancellation");
+    let (_, resumed) = client.send_request(
+        "_sudocode/session/resume_tools",
+        json!({"sessionId": sid, "pauseEpoch": paused["result"]["pauseEpoch"]}),
+    ).await;
+    assert!(resumed.get("result").is_some(), "{resumed}");
+    client.shutdown().await;
+    assert!(conversation_log(&root, "pending-approval-peer", "pending-approval-actor").is_empty());
+    model.assert_unused();
+    workspace.cleanup();
+}
+
 fn python_hook(script: &str) -> String {
     #[cfg(windows)]
     let interpreter = "%SCODE_DIRECT_FIXTURE_PYTHON%".to_string();
