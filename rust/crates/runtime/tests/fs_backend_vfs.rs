@@ -23,6 +23,7 @@ use kernel::core::agents::registry::AgentDescriptor;
 use kernel::kernel::{Kernel, KernelError, OperationContext};
 use kernel::meta_store::DT_LINK;
 use kernel::{Permission, PermissionProvider};
+use runtime::fs_backend::RecordLogMode;
 use runtime::zone_context::{
     ContextSource, HostZoneContext, ResourceAccessKind, RuntimeResourceAuthorizer,
     ENV_NEXUS_DELEGATION_REF, ENV_NEXUS_RESOURCE_SCOPE,
@@ -384,6 +385,21 @@ fn write_then_read_round_trips_through_the_vfs() {
 }
 
 #[test]
+fn record_log_requires_wal_and_preserves_regular_files() {
+    let kernel = kernel_with_root_backend();
+    let fs = vfs_backend(&kernel);
+    let path = "/ws/atomic-records";
+    // This real kernel has no Raft coordinator. An explicit WAL request must
+    // fail, with neither a memory stream nor a regular-file fallback.
+    assert!(fs.record_log(path, RecordLogMode::CreateNew).is_err());
+    assert!(kernel.sys_stat(path, "root").is_none());
+    fs.write(path, b"original regular file").unwrap();
+    assert!(fs.record_log(path, RecordLogMode::CreateNew).is_err());
+    assert!(fs.record_log(path, RecordLogMode::Existing).is_err());
+    assert_eq!(fs.read(path).unwrap(), b"original regular file");
+}
+
+#[test]
 fn edit_file_mutates_vfs_content() {
     let kernel = kernel_with_root_backend();
     let fs = vfs_backend(&kernel);
@@ -544,6 +560,9 @@ fn oversized_tool_output_offloads_onto_the_vfs() {
     // The VFS root (where sessions/offload live) is chosen here on the
     // sudocode side — nexus only stores what it is told.
     let kernel = kernel_with_root_backend();
+    kernel
+        .create_stream("/ws/sessions/sid-1.jsonl", 64 * 1024)
+        .expect("explicit atomic stream in the non-federated fixture");
     let fs: Arc<dyn FsBackend> = Arc::new(vfs_backend(&kernel));
 
     let session = Session::new()
@@ -2001,6 +2020,8 @@ fn metadata_and_lock_share_scope_with_positive_lifecycle_controls() {
     permission_denied(restricted.stat("/private/alias"));
     permission_denied(restricted.read_link("/private/alias"));
     permission_denied(restricted.try_lock("/private/lease", 1000));
+    permission_denied(restricted.record_log("/private/history", RecordLogMode::CreateNew));
+    permission_denied(restricted.record_log("/private/target", RecordLogMode::Existing));
     assert_eq!(restricted.read_link("/ws/alias").unwrap(), "/ws/target");
     assert!(restricted.stat("/ws/alias").unwrap().is_symlink);
     let lease = restricted.try_lock("/ws/lease", 1000).unwrap().unwrap();
@@ -2032,6 +2053,7 @@ fn links_cannot_redirect_scoped_io_or_rename_to_private_content() {
     permission_denied(restricted.write("/ws/escape", b"changed"));
     permission_denied(restricted.append("/ws/escape", b"changed"));
     permission_denied(restricted.tail_read("/ws/escape", 0, 0));
+    permission_denied(restricted.record_log("/ws/escape", RecordLogMode::Existing));
     permission_denied(restricted.rename("/ws/escape", "/ws/copy"));
     permission_denied(restricted.rename("/ws/file", "/private/copy"));
     // The follow guard admits links as a whole: reading even the METADATA of
@@ -2176,9 +2198,12 @@ fn scoped_mtls_transport_early_denies_out_of_scope_targets() {
     permission_denied(remote.read("/private/target"));
     permission_denied(remote.read_link("/private/alias"));
     permission_denied(remote.try_lock("/private/lease", 1000));
+    permission_denied(remote.record_log("/private/history", RecordLogMode::CreateNew));
+    permission_denied(remote.record_log("/private/target", RecordLogMode::Existing));
     // A link whose ALIAS is in scope but whose TARGET is not is refused whole
     // by the follow guard — metadata included.
     permission_denied(remote.read("/ws/escape"));
+    permission_denied(remote.record_log("/ws/escape", RecordLogMode::Existing));
     permission_denied(remote.write("/ws/escape", b"changed"));
     permission_denied(remote.read_link("/ws/escape"));
     permission_denied(remote.rename("/ws/escape", "/ws/copy"));

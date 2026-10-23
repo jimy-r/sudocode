@@ -1269,13 +1269,12 @@ async fn scenario_slash_compact(
     );
 
     // Persisted right away, not at the end of the next turn.
-    let after = read_session_transcript(&workspace.root, &session_id);
-    assert!(
-        after.contains("\"type\":\"compaction\""),
-        "compaction metadata should be on disk right after /compact"
-    );
     let compacted = runtime::Session::load_from_path(&transcript_path)
         .expect("compacted transcript should load immediately after /compact");
+    assert!(
+        compacted.compaction.is_some(),
+        "compaction metadata should be on disk right after /compact"
+    );
     let report = compacted
         .last_compaction_report
         .as_ref()
@@ -1417,7 +1416,7 @@ async fn scenario_slash_compact_cancel(
 fn assert_cancelled_compaction_persisted(transcript_path: &Path, source: &runtime::Session) {
     let restored = runtime::Session::load_from_path(transcript_path)
         .expect("cancelled compaction transcript should load");
-    assert_eq!(restored.messages, source.messages);
+    assert_eq!(restored.messages(), source.messages());
     assert_eq!(restored.compaction, source.compaction);
     assert_eq!(
         restored.compaction_achievement,
@@ -1871,7 +1870,7 @@ async fn acp_stdio_long_history_is_compacted_instead_of_rejected() {
     let transcript_path = find_session_transcript(&workspace.root, &session_id);
     let mut session =
         runtime::Session::load_from_path(&transcript_path).expect("seed transcript should load");
-    session.messages.clear();
+    session = session.with_messages(Vec::new());
     let filler_line = "The conversation went on about the migration plan for a long while. ";
     let filler = filler_line.repeat(30_000 / filler_line.len()); // ~30 KB per message
     for turn in 0..10 {
@@ -1971,13 +1970,13 @@ async fn acp_stdio_long_history_is_compacted_instead_of_rejected() {
     let reloaded =
         runtime::Session::load_from_path(&transcript_path).expect("compacted transcript loads");
     assert!(
-        reloaded.compaction.is_some() && reloaded.messages.len() < 20,
+        reloaded.compaction.is_some() && reloaded.messages().len() < 20,
         "transcript on disk should be compacted: compaction={:?} messages={}",
         reloaded
             .compaction
             .as_ref()
             .map(|c| c.removed_message_count),
-        reloaded.messages.len()
+        reloaded.messages().len()
     );
 
     client.shutdown().await;
@@ -2022,7 +2021,7 @@ async fn seed_filler_history(
     let transcript_path = find_session_transcript(&workspace.root, &session_id);
     let mut session =
         runtime::Session::load_from_path(&transcript_path).expect("seed transcript should load");
-    session.messages.clear();
+    session = session.with_messages(Vec::new());
     for turn in 0..pairs {
         session
             .push_user_text(format!(
@@ -2146,12 +2145,12 @@ async fn acp_stdio_context_limit_rejection_is_compacted_and_retried() {
     assert!(report.after_history <= report.safe_history_budget);
     assert!(
         reloaded
-            .messages
+            .messages()
             .last()
             .is_some_and(|message| message.role == runtime::MessageRole::Assistant),
         "the answered turn should be persisted after the compacted history: {:?}",
         reloaded
-            .messages
+            .messages()
             .iter()
             .map(|message| message.role)
             .collect::<Vec<_>>()
@@ -4984,6 +4983,31 @@ async fn acp_session_new_system_prompt_override_and_append_reach_model() {
         "session/load override + append must reach the model; body: {body}"
     );
 
+    // A failed rebuild retains the live writer and its previous prompt options.
+    let config_path = workspace.config_home.join("sudocode.json");
+    let valid_config = fs::read(&config_path).unwrap();
+    let before_failed_reload = server.captured_requests().await.len();
+    fs::write(&config_path, "{invalid reload configuration").unwrap();
+    let (_, failed_reload) = client
+        .send_request(
+            "session/load",
+            json!({
+                "sessionId": plain, "cwd": root.to_string_lossy(), "mcpServers": [],
+                "_meta": {"sudocode": {"systemPrompt": "FAILED_RELOAD_MUST_STAY_PRIVATE"}},
+            }),
+        )
+        .await;
+    fs::write(&config_path, valid_config).unwrap();
+    assert!(failed_reload.get("error").is_some(), "{failed_reload}");
+    assert_eq!(server.captured_requests().await.len(), before_failed_reload);
+    let body = last_model_request_after_prompt(&mut client, &server, &plain, "p4").await;
+    assert!(
+        body.contains(LOAD_OVERRIDE)
+            && body.contains(APPEND)
+            && !body.contains("FAILED_RELOAD_MUST_STAY_PRIVATE"),
+        "failed reload changed the live context: {body}"
+    );
+
     // Validation: empty / non-string values are invalid_params for either key.
     assert_bad_prompt_meta_rejected(&mut client, &root, OVERRIDE).await;
 
@@ -5930,7 +5954,7 @@ async fn acp_compaction_failure_is_terminal_and_preserves_history() {
         .contains("上下文压缩失败，本次对话已停止"));
     assert!(text.contains("上下文压缩失败，本次对话已停止"), "{text}");
     let restored = runtime::Session::load_from_path(&path).unwrap();
-    assert_eq!(restored.messages, before.messages);
+    assert_eq!(restored.messages(), before.messages());
     assert_eq!(restored.compaction, before.compaction);
     assert_eq!(
         restored.compaction_achievement,
@@ -6240,8 +6264,141 @@ impl Drop for CompletionFixtureRelease {
     }
 }
 
+/// Locate the sole context in fixtures that open one completion writer.
+fn completion_context_path(workspace: &TestWorkspace, sid: &str) -> PathBuf {
+    let transcript = find_session_transcript(&workspace.root, sid);
+    let binding = transcript.with_extension("completions.json");
+    let saved: Value = serde_json::from_slice(&fs::read(&binding).unwrap()).unwrap();
+    if saved["sources"].is_object() {
+        return binding;
+    }
+    let contexts: Vec<_> = fs::read_dir(transcript.with_extension("completions"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| {
+            path.extension()
+                .is_some_and(|extension| extension == "json")
+        })
+        .collect();
+    assert_eq!(
+        contexts.len(),
+        1,
+        "expected one completion context: {contexts:?}"
+    );
+    contexts.into_iter().next().unwrap()
+}
+
+/// Bind the v2 journal capture to a real ACP context, including its prompt snapshot.
+fn seed_legacy_completion(workspace: &TestWorkspace, sid: &str, context: &Value) -> Value {
+    use sha2::{Digest, Sha256};
+
+    let cwd = fs::canonicalize(&workspace.root).unwrap();
+    let path = find_session_transcript(&workspace.root, sid);
+    let session = runtime::Session::load_from_path(&path).unwrap();
+    let mut meta: Value = serde_json::from_str(&session.to_json().unwrap().render()).unwrap();
+    let messages = meta.as_object_mut().unwrap().remove("messages").unwrap();
+    meta["type"] = json!("session_meta");
+    let mut records = vec![meta.to_string()];
+    for mut message in messages.as_array().unwrap().iter().cloned() {
+        message.as_object_mut().unwrap().remove("history");
+        records.push(json!({"type":"message","message":message}).to_string());
+    }
+    let transcript = records.join("\n") + "\n";
+    let mut journal: Value =
+        serde_json::from_str(include_str!("fixtures/completion_v2/journal.json")).unwrap();
+    let binding: Value =
+        serde_json::from_slice(&fs::read(path.with_extension("completions.json")).unwrap())
+            .unwrap();
+    journal["session_id"] = json!(sid);
+    journal["cwd"] = json!(cwd);
+    journal["storage_ref"] = binding["storage_ref"].clone();
+    journal["context"] = context.clone();
+    journal["context"]["digest"] = json!(format!("{:x}", Sha256::digest(transcript.as_bytes())));
+    let directory = path.with_extension("completions");
+    assert!(fs::canonicalize(&directory).unwrap().starts_with(&cwd));
+    fs::remove_dir_all(directory).unwrap();
+    fs::write(&path, transcript).unwrap();
+    fs::write(path.with_extension("completions.json"), journal.to_string()).unwrap();
+    journal["context"].clone()
+}
+
+#[tokio::test]
+async fn acp_legacy_completion_upgrade_preserves_context_and_model_history() {
+    let server = MockAnthropicService::spawn().await.unwrap();
+    let workspace = TestWorkspace::new("legacy-completion-upgrade");
+    workspace.create();
+    workspace.write_sudocode_json(&server.base_url());
+    let spawn = || {
+        spawn_stdio_client_with_args_and_env(
+            &workspace,
+            &["--permission-mode", "danger-full-access"],
+            &[("SUDOCODE_EXPERIMENT_SHARED_SESSION_HISTORY", "0")],
+        )
+    };
+    let mut producer = spawn();
+    initialize_task_completions(&mut producer).await;
+    let sid = scenario_session_new(&mut producer, &workspace.root).await;
+    let (_, previous) = producer
+        .send_request(
+            "session/prompt",
+            json!({"sessionId":sid,"_meta":{"traceId":"legacy-prefix"},
+                "prompt":[{"type":"text","text":format!(
+                    "LEGACY_COMPLETION_PREFIX {SCENARIO_PREFIX}streaming_text")}]}),
+        )
+        .await;
+    assert_eq!(previous["result"]["stopReason"], "end_turn", "{previous}");
+    let context = previous["result"]["_meta"]["sudocode"]["contextRef"].clone();
+    producer.shutdown().await;
+    let previous_context = seed_legacy_completion(&workspace, &sid, &context);
+    let binding: Value = serde_json::from_slice(
+        &fs::read(
+            find_session_transcript(&workspace.root, &sid).with_extension("completions.json"),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let before_load = server.captured_requests().await.len();
+    let mut resumed = spawn();
+    initialize_task_completions(&mut resumed).await;
+    let (_, loaded) = resumed
+        .send_request(
+            "session/load",
+            json!({"sessionId":sid,"cwd":workspace.root,"mcpServers":[]}),
+        )
+        .await;
+    assert!(loaded.get("result").is_some(), "{loaded}");
+    let metadata = &loaded["result"]["_meta"]["sudocode"];
+    assert_eq!(metadata["storageRef"], binding["storage_ref"]);
+    assert_eq!(
+        metadata["contextRef"]["revision"],
+        previous_context["revision"]
+    );
+    assert_eq!(
+        metadata["contextRef"]["lastTraceId"],
+        previous_context["lastTraceId"]
+    );
+    assert_eq!(server.captured_requests().await.len(), before_load);
+    let (_, continued) = resumed
+        .send_request(
+            "session/prompt",
+            json!({"sessionId":sid,"_meta":{"traceId":"after-upgrade"},
+                "prompt":[{"type":"text","text":format!("{SCENARIO_PREFIX}streaming_text")}]}),
+        )
+        .await;
+    assert_eq!(continued["result"]["stopReason"], "end_turn", "{continued}");
+    assert!(server
+        .captured_requests()
+        .await
+        .last()
+        .unwrap()
+        .raw_body
+        .contains("LEGACY_COMPLETION_PREFIX"));
+    resumed.shutdown().await;
+    workspace.cleanup();
+}
+
 async fn frozen_completion_sources(workspace: &TestWorkspace, sid: &str, count: usize) -> Value {
-    let path = find_session_transcript(&workspace.root, sid).with_extension("completions.json");
+    let path = completion_context_path(workspace, sid);
     timeout(Duration::from_secs(15), async {
         loop {
             let saved: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
@@ -6403,8 +6560,28 @@ async fn acp_completions_retry_ack_and_exact_context() {
     );
     let transcript = find_session_transcript(&workspace.root, &sid);
     let saved = fs::read(&transcript).unwrap();
-    let mut changed = saved.clone();
-    changed.push(b'\n');
+    let saved_text = String::from_utf8(saved.clone()).unwrap();
+    let records: Vec<Value> = saved_text
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let text = records
+        .iter()
+        .filter_map(|record| record["message"]["blocks"].as_array())
+        .flatten()
+        .find(|block| block["type"] == "text")
+        .expect("saved history contains text");
+    let changed = saved_text
+        .replace(
+            &text["text"].to_string(),
+            &json!(format!(
+                "{} externally edited",
+                text["text"].as_str().unwrap()
+            ))
+            .to_string(),
+        )
+        .into_bytes();
     fs::write(&transcript, &changed).unwrap();
     let (_, unconfirmed) = client
         .send_request(
@@ -6575,7 +6752,7 @@ async fn acp_completion_rebind_ignores_late_receipts_and_quarantines_bad_ack() {
     );
     client.send_raw(&json!({"jsonrpc":"2.0","id":second["id"],"result":{"completionId":"wrong-current-identity","disposition":"stored"}})).await;
     // Wait for the durable receipt boundary before replay rebinds the sender.
-    let journal = find_session_transcript(&workspace.root, &sid).with_extension("completions.json");
+    let journal = completion_context_path(&workspace, &sid);
     timeout(Duration::from_secs(10), async {
         loop {
             let state: Value = serde_json::from_slice(&fs::read(&journal).unwrap()).unwrap();
@@ -7018,6 +7195,221 @@ async fn initialize_task_completions(client: &mut AcpTestClient) {
         .is_none());
 }
 
+/// Independent ACP processes retain completion ownership while they append to
+/// one SID, including a provider call ID reused within the first process.
+#[tokio::test]
+async fn acp_shared_sid_scopes_background_results_and_protects_live_contexts() {
+    let server = MockAnthropicService::spawn().await.unwrap();
+    // Resolve before isolate_env replaces Unix PATH with /usr/bin:/bin.
+    let node = std::process::Command::new("node")
+        .args(["-p", "process.execPath"])
+        .output()
+        .expect("Node.js is required for the terminal completion fixture");
+    assert!(node.status.success(), "{node:?}");
+    let node = String::from_utf8(node.stdout).expect("Node executable path is UTF-8");
+    let node = node.trim();
+    assert!(Path::new(node).is_absolute(), "{node}");
+    let node = if cfg!(windows) {
+        format!("& '{}'", node.replace('\'', "''"))
+    } else {
+        format!("'{}'", node.replace('\'', "'\"'\"'"))
+    };
+    let workspace = TestWorkspace::new("shared-sid-completion-owners");
+    workspace.create();
+    workspace.write_sudocode_json(&server.base_url());
+    fs::write(
+        workspace.root.join("completion-gate.cjs"),
+        r#"
+const fs = require('node:fs');
+const label = process.argv[2];
+fs.writeFileSync(label + '.ready', label);
+const timer = setInterval(() => {
+  if (!fs.existsSync(label + '.release')) return;
+  clearInterval(timer);
+  fs.writeFileSync(label + '.effect', label + ' durable effect');
+  process.stdout.write(label + ' completed');
+}, 10);
+"#,
+    )
+    .unwrap();
+    let spawn = || {
+        spawn_stdio_client_with_args_and_env(
+            &workspace,
+            &["--permission-mode", "danger-full-access"],
+            &[("SUDOCODE_EXPERIMENT_SHARED_SESSION_HISTORY", "1")],
+        )
+    };
+    let mut producer = spawn();
+    initialize_task_completions(&mut producer).await;
+    let sid = scenario_session_new(&mut producer, &workspace.root).await;
+    let (_, previous) = producer
+        .send_request(
+            "session/prompt",
+            json!({
+                "sessionId":sid,"_meta":{"traceId":"legacy-prefix"},"prompt":[{"type":"text",
+                "text":format!("LEGACY_SHARED_PREFIX {SCENARIO_PREFIX}streaming_text")}]
+            }),
+        )
+        .await;
+    assert_eq!(previous["result"]["stopReason"], "end_turn", "{previous}");
+    let context = previous["result"]["_meta"]["sudocode"]["contextRef"].clone();
+    producer.shutdown().await;
+    let previous_context = context;
+    let mut first = spawn();
+    initialize_task_completions(&mut first).await;
+    let (_, migrated) = first
+        .send_request(
+            "session/load",
+            json!({
+                "sessionId":sid,"cwd":workspace.root,"mcpServers":[]
+            }),
+        )
+        .await;
+    assert!(migrated.get("error").is_none(), "{migrated}");
+    let migrated_context = &migrated["result"]["_meta"]["sudocode"]["contextRef"];
+    assert_eq!(
+        migrated_context["revision"], previous_context["revision"],
+        "{migrated}"
+    );
+    assert_eq!(
+        migrated_context["lastTraceId"], previous_context["lastTraceId"],
+        "{migrated}"
+    );
+    let mut second = spawn();
+    initialize_task_completions(&mut second).await;
+    let (_, loaded) = second
+        .send_request(
+            "session/load",
+            json!({
+                "sessionId":sid,"cwd":workspace.root,"mcpServers":[]
+            }),
+        )
+        .await;
+    assert!(loaded.get("error").is_none(), "{loaded}");
+    let storage = loaded["result"]["_meta"]["sudocode"]["storageRef"].clone();
+    assert!(storage.is_string(), "{loaded}");
+    for label in ["A1", "B1", "A2"] {
+        let client = if label == "B1" {
+            &mut second
+        } else {
+            &mut first
+        };
+        let shell = if cfg!(windows) { "PowerShell" } else { "Bash" };
+        let calls = json!([{"id":"call_1","name":shell,"input":{
+            "command":format!("{node} completion-gate.cjs {label}"),"run_in_background":true
+        }}]);
+        let (events, response) = client
+            .send_request(
+                "session/prompt",
+                json!({
+                    "sessionId":sid,"_meta":{"traceId":label},"prompt":[{"type":"text",
+                    "text":format!("{SCENARIO_PREFIX}tool_concurrency TOOL_BATCH:{calls}")}]
+                }),
+            )
+            .await;
+        assert_eq!(response["result"]["stopReason"], "end_turn", "{response}");
+        assert!(
+            events
+                .iter()
+                .all(|event| event["method"] != "_sudocode/task/completed"),
+            "{label} completed before its release gate: {events:?}"
+        );
+        timeout(Duration::from_secs(10), async {
+            while !workspace.root.join(format!("{label}.ready")).exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("background process reached its gate");
+    }
+    let (_, rejected) = first
+        .send_request(
+            "_sudocode/task/purge",
+            json!({
+                "sessionId":sid,"cwd":workspace.root,"storageRef":storage,"cleanupId":"live-peer"
+            }),
+        )
+        .await;
+    assert!(
+        rejected["error"]
+            .to_string()
+            .contains("session_writer_busy"),
+        "{rejected}"
+    );
+    for label in ["B1", "A2", "A1"] {
+        let client = if label == "B1" {
+            &mut second
+        } else {
+            &mut first
+        };
+        fs::write(workspace.root.join(format!("{label}.release")), "release").unwrap();
+        let (_, event) = client
+            .recv_until(SUBAGENT_EVENTS_WAIT, |event| {
+                event["method"] == "_sudocode/task/completed"
+            })
+            .await
+            .expect("durable terminal notification");
+        assert_eq!(event["params"]["originTraceId"], label, "{event}");
+        assert_eq!(event["params"]["parentToolCallId"], "call_1", "{event}");
+        assert!(
+            event["params"]["message"].as_str().unwrap().contains(label),
+            "{event}"
+        );
+        assert_eq!(
+            fs::read_to_string(workspace.root.join(format!("{label}.effect"))).unwrap(),
+            format!("{label} durable effect")
+        );
+        client
+            .send_raw(&json!({"jsonrpc":"2.0","id":event["id"],"result":{
+                "completionId":event["params"]["completionId"],"disposition":"stored"
+            }}))
+            .await;
+    }
+    for (client, expected) in [(&mut first, 2), (&mut second, 1)] {
+        let (_, status) = client
+            .send_request(
+                "_sudocode/task/replay",
+                json!({
+                    "sessionId":sid,"cwd":workspace.root,"storageRef":storage
+                }),
+            )
+            .await;
+        assert_eq!(status["result"]["settled"], expected, "{status}");
+        assert_eq!(status["result"]["pending"], 0, "{status}");
+    }
+    first.shutdown().await;
+    second.shutdown().await;
+    let mut restored = spawn();
+    initialize_task_completions(&mut restored).await;
+    let (_, loaded) = restored
+        .send_request(
+            "session/load",
+            json!({
+                "sessionId":sid,"cwd":workspace.root,"mcpServers":[]
+            }),
+        )
+        .await;
+    assert!(loaded.get("error").is_none(), "{loaded}");
+    let (_, status) = restored
+        .send_request(
+            "_sudocode/task/replay",
+            json!({
+                "sessionId":sid,"cwd":workspace.root,"storageRef":storage
+            }),
+        )
+        .await;
+    assert_eq!(
+        status["result"]["settled"], 2,
+        "latest context restores A's journal: {status}"
+    );
+    let (_,purged) = restored.send_request("_sudocode/task/purge",json!({
+        "sessionId":sid,"cwd":workspace.root,"storageRef":storage,"cleanupId":"finished-contexts"
+    })).await;
+    assert_eq!(purged["result"]["disposition"], "purged", "{purged}");
+    restored.shutdown().await;
+    workspace.cleanup();
+}
+
 #[tokio::test]
 async fn acp_task_storage_and_workspace_metadata_coexist() {
     let server = MockAnthropicService::spawn().await.unwrap();
@@ -7362,15 +7754,22 @@ async fn acp_task_completions_interrupted_shell_and_encoded_budget() {
     workspace.cleanup();
 }
 
-/// Competing ACP processes must not retire the live owner or overwrite its
-/// transcript/ACKs. Process death releases native ownership before takeover.
+/// Concurrent ACP contexts append to the same SID while retaining separate
+/// completion ownership. A sibling never repairs another context's live tool.
 #[tokio::test]
-async fn acp_completions_exclude_live_writer_before_replay_or_load() {
+async fn acp_completions_keep_live_contexts_independent_during_replay_and_load() {
     let server = MockAnthropicService::spawn().await.unwrap();
     let workspace = TestWorkspace::new("completion-writer");
     workspace.create();
     workspace.write_sudocode_json(&server.base_url());
-    let mut owner = spawn_stdio_client_danger(&workspace);
+    let spawn = || {
+        spawn_stdio_client_with_args_and_env(
+            &workspace,
+            &["--permission-mode", "danger-full-access"],
+            &[("SUDOCODE_EXPERIMENT_SHARED_SESSION_HISTORY", "1")],
+        )
+    };
+    let mut owner = spawn();
     initialize_with_completions(&mut owner).await;
     let sid = scenario_session_new(&mut owner, &workspace.root).await;
     owner.send_request_no_wait("session/prompt", json!({
@@ -7384,21 +7783,28 @@ async fn acp_completions_exclude_live_writer_before_replay_or_load() {
         .await
         .unwrap();
     let transcript = find_session_transcript(&workspace.root, &sid);
-    let journal = transcript.with_extension("completions.json");
+    let journal = completion_context_path(&workspace, &sid);
     // The question can reach ACP before the provider's final usage update is
     // persisted. Wait for that durable boundary while the question keeps the
     // turn open; otherwise the owner itself can change our byte snapshot.
     timeout(Duration::from_secs(10), async {
         loop {
             let saved = fs::read_to_string(&transcript).unwrap();
-            if saved.lines().any(|line| {
-                serde_json::from_str::<Value>(line).is_ok_and(|record| {
-                    record["type"] == "assistant_update"
-                        && record["message"]["usage"]["output_tokens"]
-                            .as_u64()
-                            .is_some_and(|tokens| tokens > 0)
+            let graph = runtime::history::HistoryGraph::decode(saved.as_bytes()).unwrap();
+            let record: runtime::history::HistoryRecord =
+                serde_json::from_str(saved.lines().last().unwrap()).unwrap();
+            if graph
+                .context_session(record.context_id())
+                .unwrap()
+                .messages()
+                .iter()
+                .any(|message| {
+                    message
+                        .usage
+                        .as_ref()
+                        .is_some_and(|usage| usage.output_tokens > 0)
                 })
-            }) {
+            {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
@@ -7410,9 +7816,9 @@ async fn acp_completions_exclude_live_writer_before_replay_or_load() {
     let before_journal = fs::read(&journal).unwrap();
     let state: Value = serde_json::from_slice(&before_journal).unwrap();
     assert_eq!(state["active_trace"], "live-owner");
-    assert_eq!(state["version"], 2);
+    assert_eq!(state["version"], 3);
 
-    let mut competitor = spawn_stdio_client_danger(&workspace);
+    let mut competitor = spawn();
     initialize_with_completions(&mut competitor).await;
     for method in ["_sudocode/subagent/replay", "session/load"] {
         let mut params = json!({"sessionId":sid, "cwd":workspace.root});
@@ -7420,22 +7826,31 @@ async fn acp_completions_exclude_live_writer_before_replay_or_load() {
             params["mcpServers"] = json!([]);
         }
         let (_, response) = competitor.send_request(method, params).await;
-        assert!(
-            response["error"]
-                .to_string()
-                .contains("session_writer_busy"),
-            "{response}"
-        );
+        assert!(response.get("result").is_some(), "{response}");
         assert!(
             fs::read(&journal).unwrap() == before_journal,
             "competing {method} changed journal"
         );
         assert!(
-            fs::read(&transcript).unwrap() == before_transcript,
-            "competing {method} changed transcript"
+            fs::read(&transcript)
+                .unwrap()
+                .starts_with(&before_transcript),
+            "competing {method} replaced durable history"
         );
     }
-    // SIGKILL + wait is actual owner exit, not a timeout-based assumption.
+    let contexts = fs::read_dir(transcript.with_extension("completions"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| {
+            path.extension()
+                .is_some_and(|extension| extension == "json")
+        })
+        .count();
+    assert!(
+        contexts >= 2,
+        "each live writer must own a separate context"
+    );
+    // Kill + wait proves exit; no timeout substitutes for process ownership.
     owner.shutdown().await;
     let (_, replay) = competitor
         .send_request(
@@ -7447,11 +7862,12 @@ async fn acp_completions_exclude_live_writer_before_replay_or_load() {
         .await;
     assert!(replay.get("result").is_some(), "{replay}");
     assert!(
-        fs::read(&transcript).unwrap() == before_transcript,
-        "takeover changed transcript"
+        fs::read(&transcript)
+            .unwrap()
+            .starts_with(&before_transcript),
+        "replay replaced durable history"
     );
-    let state: Value = serde_json::from_slice(&fs::read(&journal).unwrap()).unwrap();
-    assert!(state["active_trace"].is_null());
+    assert_eq!(fs::read(&journal).unwrap(), before_journal);
     let (_, loaded) = competitor
         .send_request(
             "session/load",
@@ -7461,10 +7877,11 @@ async fn acp_completions_exclude_live_writer_before_replay_or_load() {
         )
         .await;
     assert!(loaded.get("result").is_some(), "{loaded}");
-    assert_eq!(
-        fs::read(&transcript).unwrap(),
-        before_transcript,
-        "loading must project the interrupted result without rewriting history"
+    assert!(
+        fs::read(&transcript)
+            .unwrap()
+            .starts_with(&before_transcript),
+        "loading must preserve the original interrupted history"
     );
     let (_, continued) = competitor
         .send_request(
@@ -7476,24 +7893,22 @@ async fn acp_completions_exclude_live_writer_before_replay_or_load() {
         )
         .await;
     assert_eq!(continued["result"]["stopReason"], "end_turn", "{continued}");
-    let repaired_transcript = fs::read(&transcript).unwrap();
+    let continued_transcript = fs::read(&transcript).unwrap();
     assert!(
-        String::from_utf8_lossy(&repaired_transcript)
+        !String::from_utf8_lossy(&continued_transcript)
             .contains("Side effects may already have occurred"),
-        "the new owner must persist the interrupted tool's uncertain outcome"
+        "a sibling must not repair another runtime's interrupted tool"
     );
+    let requests = server.captured_requests().await;
+    let request = &requests.last().unwrap().raw_body;
     assert!(
-        server
-            .captured_requests()
-            .await
-            .last()
-            .unwrap()
-            .raw_body
-            .contains("Side effects may already have occurred"),
-        "the resumed model must receive the persisted uncertainty about prior effects"
+        !request.contains("Side effects may already have occurred")
+            && !request.contains(&format!("{SCENARIO_PREFIX}ask_user_question_roundtrip")),
+        "the resumed model must exclude the sibling's unfinished turn: {request}"
     );
     competitor.shutdown().await;
-    let mut competitor = spawn_stdio_client_danger(&workspace);
+    assert_eq!(fs::read(&journal).unwrap(), before_journal);
+    let mut competitor = spawn();
     initialize_with_completions(&mut competitor).await;
     let (_, loaded_again) = competitor
         .send_request(
@@ -7502,19 +7917,21 @@ async fn acp_completions_exclude_live_writer_before_replay_or_load() {
         )
         .await;
     assert!(loaded_again.get("result").is_some(), "{loaded_again}");
-    assert_eq!(
-        fs::read(&transcript).unwrap(),
-        repaired_transcript,
-        "a further process restart must retain the repair without rewriting history"
+    assert!(
+        fs::read(&transcript)
+            .unwrap()
+            .starts_with(&continued_transcript),
+        "a further restart must retain both contexts and append history"
     );
     competitor.shutdown().await;
 
     // Unreleased, non-locking v1 records require explicit offline handling.
-    let mut legacy: Value = serde_json::from_slice(&fs::read(&journal).unwrap()).unwrap();
+    let binding = transcript.with_extension("completions.json");
+    let mut legacy: Value = serde_json::from_slice(&fs::read(&binding).unwrap()).unwrap();
     legacy["version"] = json!(1);
     let bytes = serde_json::to_vec(&legacy).unwrap();
-    fs::write(&journal, &bytes).unwrap();
-    let mut reader = spawn_stdio_client_danger(&workspace);
+    fs::write(&binding, &bytes).unwrap();
+    let mut reader = spawn();
     initialize_with_completions(&mut reader).await;
     let (_, response) = reader
         .send_request(
@@ -7530,7 +7947,7 @@ async fn acp_completions_exclude_live_writer_before_replay_or_load() {
             .contains("legacy_writer_unconfirmed"),
         "{response}"
     );
-    assert_eq!(fs::read(&journal).unwrap(), bytes);
+    assert_eq!(fs::read(&binding).unwrap(), bytes);
     reader.shutdown().await;
     workspace.cleanup();
 }
