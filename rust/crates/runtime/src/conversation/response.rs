@@ -268,17 +268,15 @@ impl<C: ApiClient, T: ToolExecutor> ConversationRuntime<C, T> {
         let binding = executor
             .external_a2a_binding()
             .ok_or_else(|| RuntimeError::new("the actual executor has no bound A2A mailbox"))?;
-        let call = Arc::new(
-            crate::external_a2a::ExternalA2aCall::new(
-                &self.session.session_id,
-                binding,
-                name,
-                input,
-            )
-            .map_err(RuntimeError::new)?,
-        );
+        let call = crate::external_a2a::ExternalA2aCall::new(
+            &self.session.session_id,
+            binding,
+            name,
+            input,
+        )
+        .map_err(RuntimeError::new)?;
         context.background_tasks = Some(tasks);
-        context.external_a2a = Some(Arc::clone(&call));
+        context.external_a2a = Some(Arc::new(call.clone()));
         let mut scheduler = tool_execution::ToolScheduler::new(
             &*executor,
             self.hook_runner.clone(),
