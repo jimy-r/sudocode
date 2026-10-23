@@ -147,6 +147,15 @@ async fn a_full_capture_pipe_can_drain_while_the_next_prompt_rearms() {
         input::exercise_rearm(std::path::Path::new(&log));
         return;
     }
+    // Informational layouts from the actual compiler/target. These do not
+    // measure retained states or attribute the rendering workload's RSS.
+    println!(
+        "layout bytes: CompletionState={} RetryDiagnostics={} inlineOnceLock={} boxedOnceLock={}",
+        std::mem::size_of::<engine_core::subagent_completion::CompletionState>(),
+        std::mem::size_of::<telemetry::RetryDiagnostics>(),
+        std::mem::size_of::<std::sync::OnceLock<telemetry::RetryDiagnostics>>(),
+        std::mem::size_of::<std::sync::OnceLock<Box<telemetry::RetryDiagnostics>>>(),
+    );
     // Keep process-global stderr replacement out of the parallel test runner.
     // Kill a deadlocked child on timeout instead of hanging the workspace job.
     let log = tempfile::NamedTempFile::new().unwrap();
