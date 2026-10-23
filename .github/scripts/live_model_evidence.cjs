@@ -20,4 +20,18 @@ function writeEvidence(output, report) {
   return serialized;
 }
 
-module.exports = { clean, writeEvidence };
+function providerFailure(status, error) {
+  status = Number.parseInt(status, 10);
+  if (status >= 200 && status < 300) return undefined;
+  const details = typeof error === 'string' ? error : `${error?.code ?? ''} ${error?.message ?? ''}`;
+  if (/pre_consume_token_quota_failed|insufficient_quota|quota_exceeded|额度不足/i.test(details)) return 'quota';
+  if (status === 401) return 'authentication';
+  if (status === 403) return 'authorization';
+  if (status === 429) return 'rate_limit';
+  if (status >= 500 && status < 600) return 'service';
+  if (/model_not_found|no_available_channel|可用渠道不存在/i.test(details)) return 'configuration';
+  if (/^(AbortError|TimeoutError|TypeError)$/.test(details)) return 'transport';
+  return undefined;
+}
+
+module.exports = { clean, writeEvidence, providerFailure };

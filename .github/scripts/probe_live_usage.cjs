@@ -1,5 +1,5 @@
 // Record usage and scrubbed provider errors; exclude generated content and credentials.
-const { clean, writeEvidence } = require('./live_model_evidence.cjs');
+const { clean, writeEvidence, providerFailure } = require('./live_model_evidence.cjs');
 
 function numericFields(value) {
   const result = {};
@@ -29,6 +29,9 @@ async function main() {
     { model: process.env.SCODE_NATIVE_MODEL, token: nativeToken, profile: 'native' },
     { model: process.env.SCODE_AZURE_MODEL, token: azureToken, profile: 'azure' },
   ].filter(target => target.model);
+  if (process.argv.includes('--require-ready') && targets.length === 0) {
+    throw new Error('At least one model is required for provider preflight');
+  }
   const errorDetails = body => {
     const error = body?.error ?? body;
     return { type: clean(error?.type), code: typeof error?.code === 'number' ? error.code : clean(error?.code), message: clean(error?.message ?? error?.msg) };
@@ -84,13 +87,18 @@ async function main() {
           if (data === '[DONE]') { done = true; break; }
           let frame;
           try { frame = JSON.parse(data); } catch { continue; }
+          if (['error', 'response.failed'].includes(frame.type)) {
+            item.providerError = errorDetails(frame.error ?? frame.response?.error);
+            done = true;
+            break;
+          }
           const usage = frame.usage ?? frame.message?.usage ?? frame.response?.usage;
           if (usage) {
             item.usage.push({ event: frame.type, keys: Object.keys(usage),
               source: usage.billing_usage?.source, semantic: usage.billing_usage?.semantic,
               counts: numericFields(usage) });
           }
-          if (['message_stop', 'response.completed', 'response.failed'].includes(frame.type)) {
+          if (['message_stop', 'response.completed'].includes(frame.type)) {
             done = true; break;
           }
         }
@@ -101,6 +109,19 @@ async function main() {
       item.error = error.name;
     }
   }
+  for (const item of report) {
+    item.failureCategory = providerFailure(item.providerError && item.status === 200 ? undefined : item.status,
+      item.providerError ?? item.error);
+  }
   console.log(writeEvidence(process.argv[2], report));
+  if (process.argv.includes('--require-ready')) {
+    for (const { model, profile } of targets) {
+      const routes = report.filter(item => item.model === model && item.profile === profile);
+      if (routes.some(item => item.status >= 200 && item.status < 300 && item.terminalSeen && !item.providerError)) continue;
+      const category = routes.find(item => item.failureCategory)?.failureCategory ?? 'protocol';
+      console.error(`::error title=Live provider preflight (${category})::${clean(profile)}/${clean(model)} has no completed provider route. See the retained provider evidence; model acceptance has not passed.`);
+      process.exitCode = 1;
+    }
+  }
 }
 main().catch(error => { console.error(error.message); process.exitCode = 1; });

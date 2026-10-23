@@ -164,6 +164,7 @@ test('the workflow gives the Azure CLI profile the same scoped credential as its
   assert.equal(generators.length, 1);
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'scode-provider-probe-'));
   const env = { ...process.env, SUDO_CODE_CONFIG_HOME: directory,
+    PROXY_BASE_URL: 'https://fixture-provider.invalid/v1',
     PROXY_AUTH_TOKEN: 'fixture-default-provider-12345678',
     AZURE_PROXY_AUTH_TOKEN: 'fixture-scoped-azure-provider-87654321', SCODE_AZURE_CHANNEL: '18' };
   try {
@@ -173,10 +174,104 @@ test('the workflow gives the Azure CLI profile the same scoped credential as its
     assert.equal(config.auth_modes.proxy.sudorouter.apiKey, env.PROXY_AUTH_TOKEN);
     assert.equal(config.auth_modes.proxy['sudorouter-azure'].apiKey, env.AZURE_PROXY_AUTH_TOKEN);
     assert.equal(config.auth_modes.proxy['sudorouter-azure'].baseUrl, config.auth_modes.proxy.sudorouter.baseUrl);
+    assert.equal(config.auth_modes.proxy.sudorouter.baseUrl, env.PROXY_BASE_URL);
     await assert.rejects(promisify(execFile)(process.execPath, ['-e', generators[0][1]], {
       env: { ...env, AZURE_PROXY_AUTH_TOKEN: '' }, timeout: 15000, windowsHide: true,
     }), error => error.stderr.includes('AZURE_PROXY_AUTH_TOKEN is required')
       && !error.stderr.includes(env.AZURE_PROXY_AUTH_TOKEN));
+  } finally {
+    removeFixture(directory);
+  }
+});
+
+test('provider preflight fails clearly on quota, auth and service errors and requires a completed route', async () => {
+  const credential = 'fixture-preflight-secret-12345678';
+  let fixture;
+  const server = http.createServer((request, response) => {
+    if (request.url === '/v1/models') {
+      response.writeHead(200, { 'content-type': 'application/json' });
+      response.end(JSON.stringify({ data: [{ id: 'fixture-model' }] }));
+      return;
+    }
+    if (fixture.streamFailure) {
+      response.writeHead(200, { 'content-type': 'text/event-stream' });
+      response.end(`data: ${JSON.stringify({type: 'error', error: {code: fixture.code, message: credential}})}\n\n`);
+      return;
+    }
+    if ((fixture.ready && request.url === '/v1/chat/completions') || fixture.incomplete) {
+      response.writeHead(200, { 'content-type': 'text/event-stream' });
+      response.end('data: {"usage":{"prompt_tokens":3}}\n\n' + (fixture.ready ? 'data: [DONE]\n\n' : ''));
+      return;
+    }
+    response.writeHead(fixture.status, { 'content-type': 'application/json' });
+    response.end(JSON.stringify({ error: { code: fixture.code, message: credential } }));
+  });
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'scode-provider-probe-'));
+  try {
+    for (fixture of [
+      { category: 'quota', status: 403, code: 'pre_consume_token_quota_failed' },
+      { category: 'authentication', status: 401, code: 'invalid_api_key' },
+      { category: 'service', status: 503, code: 'unavailable' },
+      { category: 'quota', streamFailure: true, code: 'insufficient_quota' },
+      { category: 'protocol', incomplete: true },
+      { category: 'ready', ready: true, status: 400, code: 'model_not_found' },
+    ]) {
+      const output = path.join(directory, `${fixture.category}.json`);
+      let result;
+      try {
+        result = await promisify(execFile)(process.execPath,
+          [path.join(__dirname, 'probe_live_usage.cjs'), output, '--require-ready'], {
+            env: { ...process.env, PROXY_AUTH_TOKEN: credential,
+              PROXY_BASE_URL: `http://127.0.0.1:${server.address().port}/v1`,
+              SCODE_LIVE_MODEL: 'fixture-model', SCODE_NATIVE_MODEL: '', SCODE_AZURE_MODEL: '' },
+            timeout: 15000, windowsHide: true,
+          });
+        assert.equal(fixture.category, 'ready');
+      } catch (error) {
+        result = error;
+        assert.equal(error.code, 1);
+        assert.ok(error.stderr.includes(`Live provider preflight (${fixture.category})`), error.stderr);
+        assert.ok(error.stderr.includes('model acceptance has not passed'));
+      }
+      const evidence = fs.readFileSync(output, 'utf8');
+      assert.ok(!evidence.includes(credential));
+      assert.ok(!result.stderr.includes(credential));
+      assert.ok(!result.stdout.includes(credential));
+      if (!fixture.ready && !fixture.incomplete) {
+        assert.ok(JSON.parse(evidence).filter(item => item.model)
+          .every(item => item.failureCategory === fixture.category));
+      }
+    }
+  } finally {
+    server.closeAllConnections();
+    await new Promise(resolve => server.close(resolve));
+    removeFixture(directory);
+  }
+});
+
+test('trace evidence identifies quota failures without labelling a successful retry as failed', async () => {
+  const credential = 'fixture-trace-secret-12345678';
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'scode-provider-probe-'));
+  try {
+    const input = path.join(directory, 'trace.jsonl');
+    const output = path.join(directory, 'evidence.json');
+    fs.writeFileSync(input, ['failed', 'recovered'].flatMap(request_id => [
+      { event: 'request_debug', attributes: { request_id, url: 'https://example.invalid/v1/messages', body: { model: 'fixture' } } },
+      { event: 'response_debug', attributes: { request_id, status: request_id === 'failed' ? 403 : 200 } },
+      { event: 'request_failed', attributes: { request_id, error: `pre_consume_token_quota_failed ${credential}` } },
+    ]).map(event => JSON.stringify(event)).join('\n'));
+    const result = await promisify(execFile)(process.execPath,
+      [path.join(__dirname, 'summarize_live_model_trace.cjs'), input, output], {
+        env: { ...process.env, PROXY_AUTH_TOKEN: credential }, timeout: 15000, windowsHide: true,
+      });
+    assert.equal(result.stderr.match(/Live provider failure \(quota\)/g)?.length, 1);
+    const serialized = fs.readFileSync(output, 'utf8');
+    assert.ok(!serialized.includes(credential));
+    assert.ok(!result.stderr.includes(credential));
+    const evidence = JSON.parse(serialized);
+    assert.equal(evidence.requests[0].providerFailure, 'quota');
+    assert.equal(evidence.requests[1].providerFailure, undefined);
   } finally {
     removeFixture(directory);
   }

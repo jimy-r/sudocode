@@ -73,6 +73,10 @@ on:
         description: 'Run genuine ACP and Linux/Windows model acceptance only; normal PR gates remain unchanged'
         type: boolean
         default: false
+      live_extended:
+        description: 'Also run the expanded provider and PTY compatibility suite'
+        type: boolean
+        default: false
 
 concurrency:
   group: rust-ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
@@ -203,6 +207,8 @@ jobs:
     if: *standard_ci
     name: cargo test --workspace (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    env:
+      SCODE_TEST_BACKEND: mock
     strategy:
       fail-fast: false
       matrix:
@@ -213,6 +219,9 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
       - name: Reuse unchanged CLI builds and refresh Git metadata
         env:
           BUILD_METADATA_EVIDENCE: ${{ runner.temp }}/scode-build-metadata
@@ -254,6 +263,8 @@ jobs:
         env:
           SCODE_TEST_BACKEND: mock
         run: cargo test -p rusty-sudocode-cli --test pty_model_flag_priority -- --test-threads=1 --nocapture
+      - name: PTY cancellation, descendant cleanup and next-turn recovery
+        run: cargo test -p rusty-sudocode-cli --test pty_bash_process_tree -- --test-threads=1 --nocapture
       - name: Run workspace tests
         # Keep panic diagnostics visible if a Windows PTY aborts before libtest
         # can print its captured failure output.
@@ -626,8 +637,9 @@ jobs:
           NATIVE_PROXY_AUTH_TOKEN: &native_key ${{ vars.SUDOROUTER_NATIVE_CHANNEL && format('{0}-{1}', secrets.SUDOROUTER_CI_API_KEY, vars.SUDOROUTER_NATIVE_CHANNEL) || secrets.SUDOROUTER_CI_API_KEY }}
           AZURE_PROXY_AUTH_TOKEN: &azure_key ${{ vars.SUDOROUTER_AZURE_CHANNEL && format('{0}-{1}', secrets.SUDOROUTER_CI_API_KEY, vars.SUDOROUTER_AZURE_CHANNEL) || '' }}
           PROXY_BASE_URL: https://api.sudorouter.ai/v1
-        run: node .github/scripts/probe_live_usage.cjs "${{ runner.temp }}/provider-usage-contract.json"
+        run: node .github/scripts/probe_live_usage.cjs "${{ runner.temp }}/provider-usage-contract.json" --require-ready
       - name: Save provider evidence before model acceptance
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: live-provider-contract
@@ -636,9 +648,7 @@ jobs:
       - name: Run live API smoke tests
         working-directory: rust
         env:
-          # Proxy-mode credential: a dedicated unlimited sudorouter New-API key
-          # (secret SUDOROUTER_CI_API_KEY), not a personal subscription OAuth
-          # token that expires/gets suspended and takes this job red on main.
+          # The dedicated CI credential owns this acceptance run's quota.
           PROXY_AUTH_TOKEN: ${{ secrets.SUDOROUTER_CI_API_KEY }}
           PROXY_BASE_URL: https://api.sudorouter.ai/v1
         run: cargo test -p rusty-sudocode-cli --test acp_live_smoke -- --test-threads=1
@@ -687,8 +697,8 @@ jobs:
           node-version: '22'
       - run: node --test .github/scripts/probe_live_usage.test.cjs
 
-  live-bash-process-tree:
-    name: Live Bash process tree (${{ matrix.os }})
+  live-model-pty:
+    name: Live model PTY (${{ matrix.os }})
     if: >-
       !inputs.render_performance &&
       (github.event_name == 'workflow_dispatch' ||
@@ -699,6 +709,17 @@ jobs:
         os: [ubuntu-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
+    env:
+      SUDO_CODE_CONFIG_HOME: ${{ runner.temp }}/scode-live-config
+      PROXY_BASE_URL: https://api.sudorouter.ai/v1
+      SCODE_TEST_BACKEND: live
+      SUDOCODE_API_READ_TIMEOUT: *live_idle_seconds
+      SCODE_LIVE_MODEL: gpt-5.4-mini
+      SCODE_AZURE_MODEL: *azure_model
+      SCODE_LIVE_AUTH_PROFILE: sudorouter
+      SCODE_AZURE_CHANNEL: ${{ vars.SUDOROUTER_AZURE_CHANNEL }}
+      SCODE_LOG_PATH: ${{ runner.temp }}/scode-live-model-trace.jsonl
+      SCODE_LIVE_ARTIFACTS: ${{ runner.temp }}/scode-live-requests
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -708,33 +729,24 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: rust -> target
-      - name: Run live PTY input editing and process-tree tests
+      - name: Configure the live provider profiles
         shell: bash
         env:
-          SUDO_CODE_CONFIG_HOME: ${{ runner.temp }}/scode-process-tree-config
           PROXY_AUTH_TOKEN: ${{ secrets.SUDOROUTER_CI_API_KEY }}
-          SCODE_TEST_BACKEND: live
-          SUDOCODE_API_READ_TIMEOUT: *live_idle_seconds
-          SCODE_LIVE_MODEL: gpt-5.4-mini
-          SCODE_AZURE_MODEL: *azure_model
-          SCODE_LIVE_AUTH_PROFILE: sudorouter
-          SCODE_AZURE_CHANNEL: ${{ vars.SUDOROUTER_AZURE_CHANNEL }}
           AZURE_PROXY_AUTH_TOKEN: *azure_key
-          SCODE_LOG_PATH: ${{ runner.temp }}/scode-live-model-trace.jsonl
-          SCODE_LIVE_ARTIFACTS: ${{ runner.temp }}/scode-live-requests
         run: |
           node - <<'NODE'
           const fs = require('fs');
           const path = require('path');
           const key = process.env.PROXY_AUTH_TOKEN;
-          if (!key) throw new Error('SUDOROUTER_CI_API_KEY is required for live PTY tests');
+          if (!key) throw new Error('SUDOROUTER_CI_API_KEY is required for live model acceptance');
           const azureChannel = process.env.SCODE_AZURE_CHANNEL;
           if (!/^[1-9][0-9]*$/.test(azureChannel || '')) {
             throw new Error('SUDOROUTER_AZURE_CHANNEL must identify the Azure acceptance channel');
           }
           const azureKey = process.env.AZURE_PROXY_AUTH_TOKEN;
           if (!azureKey) throw new Error('AZURE_PROXY_AUTH_TOKEN is required for Azure acceptance');
-          const baseUrl = 'https://api.sudorouter.ai/v1';
+          const baseUrl = process.env.PROXY_BASE_URL;
           const dir = process.env.SUDO_CODE_CONFIG_HOME;
           fs.mkdirSync(dir, { recursive: true });
           fs.writeFileSync(path.join(dir, 'sudocode.json'), JSON.stringify({
@@ -745,12 +757,27 @@ jobs:
             models: {}
           }), { mode: 0o600 });
           NODE
-          # Keep file/tool interaction within its fixed turn budget. API and
-          # mailbox acceptance retain the independent GPT usage-contract model.
+      - name: Check live provider routes before model acceptance
+        shell: bash
+        working-directory: .
+        env:
+          PROXY_AUTH_TOKEN: ${{ secrets.SUDOROUTER_CI_API_KEY }}
+          AZURE_PROXY_AUTH_TOKEN: *azure_key
+        run: node .github/scripts/probe_live_usage.cjs "$RUNNER_TEMP/pty-provider-contract.json" --require-ready
+      - name: Run core model and tool journeys through the real PTY
+        shell: bash
+        run: |
+          cargo test -p rusty-sudocode-cli --test pty_headless interactive_file_reads_updated_contents_after_resume -- --test-threads=1 --nocapture
+          cargo test -p rusty-sudocode-cli --test pty_bash_process_tree esc_reaps_bash_descendants_and_next_turn_works -- --test-threads=1 --nocapture
+          cargo test -p rusty-sudocode-cli --test pty_agent_permission_bubble permission_prompt_from_subagent_bubbles_to_parent_terminal -- --test-threads=1 --nocapture
+          SCODE_LIVE_AUTH_PROFILE=sudorouter-azure SCODE_LIVE_MODEL="$SCODE_AZURE_MODEL" cargo test -p rusty-sudocode-cli --test pty_azure_inline_reasoning azure_live_file_roundtrip_has_a_final_answer -- --test-threads=1 --nocapture
+      - name: Run extended model compatibility journeys
+        if: github.event_name == 'workflow_dispatch' && inputs.live_extended
+        shell: bash
+        run: |
           cargo test -p rusty-sudocode-cli --test pty_step_budget live_step_budget_preserves_results_across_turns -- --test-threads=1 --nocapture
           cargo test -p rusty-sudocode-cli --test pty_edit_uniqueness live_model_recovers_with_unique_context -- --test-threads=1 --nocapture
           cargo test -p rusty-sudocode-cli --test pty_headless -- --test-threads=1 --nocapture
-          SCODE_LIVE_AUTH_PROFILE=sudorouter-azure SCODE_LIVE_MODEL="$SCODE_AZURE_MODEL" cargo test -p rusty-sudocode-cli --test pty_azure_inline_reasoning azure_live_file_roundtrip_has_a_final_answer -- --test-threads=1 --nocapture
           cargo test -p rusty-sudocode-cli --test pty_model_flag_priority configured_model_reads_updated_file_after_resume -- --test-threads=1 --nocapture
           cargo test -p rusty-sudocode-cli --test pty_a2a_overlay queued_and_offline_messages_survive_receiver_restart -- --test-threads=1 --nocapture
           cargo test -p rusty-sudocode-cli --test pty_a2a_overlay pending_batch_and_two_runtimes_share_one_durable_reader -- --test-threads=1 --nocapture
@@ -776,11 +803,10 @@ jobs:
           name: live-model-evidence-${{ matrix.os }}
           path: |
             ${{ runner.temp }}/scode-live-model-evidence.json
+            ${{ runner.temp }}/pty-provider-contract.json
             ${{ runner.temp }}/scode-live-requests/**/*.json
           retention-days: 7
-      - name: Remove process-tree test credentials
+      - name: Remove live test credentials
         if: always()
-        env:
-          SUDO_CODE_CONFIG_HOME: ${{ runner.temp }}/scode-process-tree-config
         run: |
           node -e "require('fs').rmSync(require('path').join(process.env.SUDO_CODE_CONFIG_HOME, 'sudocode.json'), { force: true })"
