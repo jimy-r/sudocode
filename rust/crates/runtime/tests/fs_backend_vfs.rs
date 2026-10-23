@@ -683,6 +683,90 @@ fn rename_replaces_a_file_in_one_step_and_refuses_a_stream() {
 }
 
 #[test]
+fn stream_links_preserve_complete_reads_and_append_payloads() {
+    let kernel = kernel_with_root_backend();
+    let target = "/ws/linked-stream.jsonl";
+    let alias = "/ws/stream-alias";
+    kernel.create_stream(target, 64 * 1024).unwrap();
+    let fs = vfs_backend(&kernel);
+    fs.append(target, b"first\n").unwrap();
+    fs.append(target, b"second\n").unwrap();
+    fs.link(alias, target).unwrap();
+    fs.link("/ws/stream-directory", "/ws").unwrap();
+    let directory_alias = "/ws/stream-directory/linked-stream.jsonl";
+    for path in [alias, directory_alias] {
+        assert!(fs.is_append_stream(path).unwrap());
+        assert_eq!(fs.read(path).unwrap(), b"first\nsecond\n");
+    }
+    fs.append(alias, b"third\n").unwrap();
+    fs.append(directory_alias, b"fourth\n").unwrap();
+    assert_eq!(fs.read(target).unwrap(), b"first\nsecond\nthird\nfourth\n");
+}
+
+#[test]
+fn regular_file_aliases_retain_byte_tail_cursors() {
+    let kernel = kernel_with_root_backend();
+    assert_regular_alias_tails(&vfs_backend(&kernel));
+}
+
+fn assert_regular_alias_tails(fs: &dyn FsBackend) {
+    let target = "/ws/tail-file";
+    let paths = [target, "/ws/tail-alias", "/ws/tail-directory/tail-file"];
+    fs.write(target, b"first\n").unwrap();
+    fs.link(paths[1], target).unwrap();
+    fs.link("/ws/tail-directory", "/ws").unwrap();
+    for path in paths {
+        assert_eq!(
+            fs.tail_read(path, 0, 0).unwrap(),
+            (b"first\n".to_vec(), 6, false),
+            "{path}"
+        );
+    }
+    fs.append(target, b"second\n").unwrap();
+    for path in paths {
+        assert_eq!(
+            fs.tail_read(path, 6, 0).unwrap(),
+            (b"second\n".to_vec(), 13, false),
+            "{path}"
+        );
+        assert_eq!(
+            fs.tail_read(path, 13, 0).unwrap(),
+            (Vec::new(), 13, true),
+            "{path}"
+        );
+    }
+}
+
+#[test]
+fn stream_link_append_needs_no_read_grant_and_rechecks_the_target() {
+    let kernel = kernel_with_root_backend();
+    let target = "/ws/write-only-stream";
+    let alias = "/ws/write-only-alias";
+    kernel.create_stream(target, 4096).unwrap();
+    let fs = vfs_backend(&kernel);
+    fs.link(alias, target).unwrap();
+    let policy = install_file_policy(&kernel);
+    policy
+        .read_denied
+        .lock()
+        .unwrap()
+        .extend([target.into(), alias.into()]);
+    fs.append(alias, b"accepted\n").unwrap();
+    assert_eq!(
+        fs.read(alias).unwrap_err().kind(),
+        io::ErrorKind::PermissionDenied
+    );
+    policy.deny(target);
+    assert_eq!(
+        fs.append(alias, b"denied\n").unwrap_err().kind(),
+        io::ErrorKind::PermissionDenied
+    );
+    policy.denied.lock().unwrap().clear();
+    policy.read_denied.lock().unwrap().clear();
+    assert_eq!(fs.read(target).unwrap(), b"accepted\n");
+}
+
+#[test]
 fn kernel_backend_imposes_flat_sessions_root_and_can_link() {
     let kernel = kernel_with_root_backend();
     let fs = vfs_backend(&kernel);
@@ -2141,4 +2225,76 @@ fn scoped_mtls_transport_early_denies_out_of_scope_targets() {
     assert_eq!(local.read("/private/target").unwrap(), b"private");
     assert!(!local.exists("/ws/copy").unwrap());
     assert!(!local.exists("/private/lease").unwrap());
+    assert_directory_alias_scope(&local, &remote);
+}
+
+#[test]
+fn scoped_directory_aliases_cannot_read_or_create_outside_their_resource_scope() {
+    let kernel = kernel_with_root_backend();
+    let owner = vfs_backend(&kernel);
+    let scoped = KernelFsBackend::for_agent_descriptor(
+        Arc::clone(&kernel),
+        &scoped_descriptor("/ws", true),
+        "/ws",
+    );
+    assert_directory_alias_scope(&owner, &scoped);
+}
+
+fn assert_directory_alias_scope(owner: &dyn FsBackend, scoped: &dyn FsBackend) {
+    owner.write("/private/secret", b"private fixture").unwrap();
+    owner.link("/ws/directory-escape", "/private").unwrap();
+    permission_denied(scoped.read("/ws/directory-escape/secret"));
+    permission_denied(scoped.stat("/ws/directory-escape/secret"));
+    permission_denied(scoped.tail_read("/ws/directory-escape/secret", 0, 0));
+    permission_denied(scoped.write("/ws/directory-escape/new", b"must be denied"));
+    permission_denied(scoped.append("/ws/directory-escape/new", b"must be denied"));
+    assert!(!owner.exists("/private/new").unwrap());
+    assert_eq!(owner.read("/private/secret").unwrap(), b"private fixture");
+    owner.create_dir_all("/ws/inside").unwrap();
+    owner.link("/ws/shortcut", "/ws/inside").unwrap();
+    scoped.write("/ws/shortcut/new", b"allowed").unwrap();
+    assert_eq!(scoped.read("/ws/shortcut/new").unwrap(), b"allowed");
+    assert_eq!(owner.read("/ws/inside/new").unwrap(), b"allowed");
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn remote_stream_aliases_preserve_payloads_with_write_only_append() {
+    let kernel = kernel_with_root_backend();
+    let local = vfs_backend(&kernel);
+    local.write("/ws/ready.txt", b"ready").unwrap();
+    kernel.create_stream("/ws/stream", 65536).unwrap();
+    local.link("/ws/stream-alias", "/ws/stream").unwrap();
+    local.link("/ws/stream-directory", "/ws").unwrap();
+    let policy = install_file_policy(&kernel);
+    let (remote, _host, client) = remote_backend(&kernel);
+    assert_regular_alias_tails(&remote);
+    for path in ["/ws/stream-alias", "/ws/stream-directory/stream"] {
+        assert!(remote.is_append_stream(path).unwrap());
+        remote.append(path, b"frame\n").unwrap();
+    }
+    assert_eq!(remote.read("/ws/stream-alias").unwrap(), b"frame\nframe\n");
+    let scope = scoped_descriptor("/ws", false)
+        .labels
+        .remove(ENV_NEXUS_RESOURCE_SCOPE)
+        .unwrap();
+    let write_only =
+        NexusVfsFsBackend::from_arc_mtls_with_scope(client, "agent-key".into(), "root", &scope);
+    policy
+        .read_denied
+        .lock()
+        .unwrap()
+        .extend(["/ws/stream".into(), "/ws/stream-alias".into()]);
+    write_only
+        .append("/ws/stream-alias", b"write only\n")
+        .unwrap();
+    permission_denied(write_only.read("/ws/stream-alias"));
+    policy.deny("/ws/stream");
+    permission_denied(write_only.append("/ws/stream-alias", b"denied\n"));
+    policy.denied.lock().unwrap().clear();
+    policy.read_denied.lock().unwrap().clear();
+    assert_eq!(
+        remote.read("/ws/stream-directory/stream").unwrap(),
+        b"frame\nframe\nwrite only\n"
+    );
 }

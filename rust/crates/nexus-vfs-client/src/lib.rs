@@ -9,9 +9,9 @@ pub mod proto {
 
 use proto::nexus_vfs_service_client::NexusVfsServiceClient;
 use proto::{
-    CallRequest, DeleteRequest, LockRequest, ReadRequest, ReaddirRequest, RenameRequest,
-    SetattrRequest, StatRequest, StreamReadAtRequest, StreamWriteRequest, UnlockRequest,
-    WriteRequest,
+    CallRequest, DeleteRequest, InspectTargetRequest, LockRequest, ReadRequest, ReaddirRequest,
+    RenameRequest, SetattrRequest, StatRequest, StreamReadAtRequest, StreamWriteRequest,
+    UnlockRequest, WriteRequest,
 };
 use std::io;
 use std::sync::mpsc;
@@ -30,6 +30,14 @@ pub struct VfsReadResult {
     pub entry_type: i32,
     pub next_offset: Option<u64>,
 }
+
+/// A resolved path and optional entry classification, without content metadata.
+pub struct VfsIoTarget {
+    pub path: String,
+    pub entry_type: Option<i32>,
+}
+
+pub use proto::inspect_target_request::Access as TargetAccess;
 
 /// `DT_STREAM` entry-type code (mirrors the kernel `entry_type`), passed to
 /// `Setattr` when provisioning a mailbox `DT_STREAM`.
@@ -132,6 +140,10 @@ enum VfsOp {
         path: String,
         auth_token: String,
         resp: mpsc::SyncSender<io::Result<VfsStat>>,
+    },
+    InspectTarget {
+        request: InspectTargetRequest,
+        resp: mpsc::SyncSender<io::Result<VfsIoTarget>>,
     },
     /// `Readdir` — the TYPED RPC, not the generic Call surface.
     Readdir {
@@ -509,16 +521,15 @@ impl NexusVfsClient {
                                     auth_token,
                                     resp,
                                 } => {
-                                    let r = client
-                                        .stat(deadlined(
-                                            StatRequest {
-                                                path,
-                                                auth_token,
-                                                ..Default::default()
-                                            },
-                                            OP_DEADLINE,
-                                        ))
-                                        .await;
+                                    let request = deadlined(
+                                        StatRequest {
+                                            path,
+                                            auth_token,
+                                            ..Default::default()
+                                        },
+                                        OP_DEADLINE,
+                                    );
+                                    let r = client.stat(request).await;
                                     let _ = resp.send(grpc_result(r, |r| {
                                         if r.is_error {
                                             Err(vfs_err(&r.error_payload))
@@ -537,6 +548,26 @@ impl NexusVfsClient {
                                                 io::ErrorKind::NotFound,
                                                 format!("{}: not found", r.path),
                                             ))
+                                        }
+                                    }));
+                                }
+                                VfsOp::InspectTarget { request, resp } => {
+                                    let result = client
+                                        .inspect_target(deadlined(request, OP_DEADLINE))
+                                        .await;
+                                    let _ = resp.send(grpc_result(result, |target| {
+                                        if target.is_error {
+                                            Err(vfs_err(&target.error_payload))
+                                        } else if target.path.is_empty() {
+                                            Err(io::Error::new(
+                                                io::ErrorKind::InvalidData,
+                                                "target inspection returned no path",
+                                            ))
+                                        } else {
+                                            Ok(VfsIoTarget {
+                                                path: target.path,
+                                                entry_type: target.entry_type,
+                                            })
                                         }
                                     }));
                                 }
@@ -849,9 +880,7 @@ impl NexusVfsClient {
         await_reply(&resp_rx, OP_DEADLINE + HANDOFF_GRACE)
     }
 
-    /// Stat a path via the generic Call RPC.
-    ///
-    /// Returns `(size, is_directory)` on success.
+    /// Inspect a directory entry through the typed Stat RPC.
     pub fn stat(&self, path: &str, auth_token: &str) -> io::Result<VfsStat> {
         let (resp_tx, resp_rx) = mpsc::sync_channel(1);
         self.tx
@@ -862,6 +891,29 @@ impl NexusVfsClient {
             })
             .map_err(|_| broken_pipe())?;
         await_reply(&resp_rx, OP_DEADLINE + HANDOFF_GRACE)
+    }
+
+    /// Inspect the authorized I/O target for an operation, including creation.
+    /// A node without this RPC reports Unsupported.
+    pub fn inspect_target(
+        &self,
+        path: &str,
+        access: TargetAccess,
+        auth_token: &str,
+    ) -> io::Result<VfsIoTarget> {
+        let (resp, rx) = mpsc::sync_channel(1);
+        self.tx
+            .send(VfsOp::InspectTarget {
+                request: InspectTargetRequest {
+                    path: path.to_owned(),
+                    access: access as i32,
+                    auth_token: auth_token.to_owned(),
+                    ..Default::default()
+                },
+                resp,
+            })
+            .map_err(|_| broken_pipe())?;
+        await_reply(&rx, OP_DEADLINE + HANDOFF_GRACE)
     }
 
     /// List directory entries.
@@ -924,6 +976,7 @@ where
                     io::ErrorKind::PermissionDenied
                 }
                 tonic::Code::DeadlineExceeded => io::ErrorKind::TimedOut,
+                tonic::Code::Unimplemented => io::ErrorKind::Unsupported,
                 _ => io::ErrorKind::Other,
             };
             Err(io::Error::new(kind, status.to_string()))
