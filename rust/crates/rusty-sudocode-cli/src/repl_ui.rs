@@ -50,7 +50,7 @@ pub(crate) mod prose_preview;
 use prose_preview::{PreviewUpdate, ProsePreview};
 use tasks::{TaskBrowser, TaskFocus};
 
-mod stderr_redirect;
+use crate::stderr_capture as stderr_redirect;
 
 // ── ChromeSlot enums ──────────────────────────────────────────────────
 

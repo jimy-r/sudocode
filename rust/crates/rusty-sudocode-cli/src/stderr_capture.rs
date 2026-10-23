@@ -1,10 +1,10 @@
-//! Capture process stderr while the inline canvas owns the terminal.
+//! Capture process stderr for the current terminal owner.
 //!
-//! The existing UI tick drains bytes through its output handle and UTF-8
-//! decoder. External terminal owners suspend capture; drop restores stderr.
+//! Renderers drain these bytes through their own output handle and the shared
+//! UTF-8 decoder. External terminal owners suspend capture; drop restores stderr.
 
 #[cfg(any(unix, windows))]
-pub(super) use platform::StderrRedirect;
+pub(crate) use platform::StderrRedirect;
 
 /// Unix pipe-based stderr redirect: replaces fd 2 with a pipe so that
 /// any library writing to stderr (e.g. tracing, nix, openssl) does not
@@ -199,7 +199,7 @@ mod platform {
 }
 
 #[cfg(not(any(unix, windows)))]
-pub(super) struct StderrRedirect;
+pub(crate) struct StderrRedirect;
 
 #[cfg(not(any(unix, windows)))]
 impl StderrRedirect {

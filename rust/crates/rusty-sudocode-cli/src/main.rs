@@ -24,6 +24,7 @@ mod render;
 mod render_engine;
 mod repl_ui;
 mod startup;
+mod stderr_capture;
 mod windows_console;
 
 use engine_acp::AcpError;
@@ -2348,22 +2349,23 @@ fn run_repl_loop(mut cli: LiveCli) -> Result<(), Box<dyn std::error::Error>> {
         },
         peer_abort.clone(),
     );
-    // The notice is written straight to the terminal rather than through
-    // rustyline's external printer. On Unix that printer makes rustyline
-    // `select()` on the raw tty before every key while its own read buffer
-    // already holds the rest of a fast burst of input, so typed or pasted text
-    // stalls after its first character.
+    // The same native output handle preserves the current input for notices
+    // and stderr. Rustyline 19 checks already-buffered input before selecting,
+    // fixing the fast-burst stall that previously ruled this printer out.
+    let notice_printer = editor.borrow().background_printer();
     let peer_receiver = engine_host::peer::attach(&cli.lifecycle.agent_name())?.spawn_receiver(
         peer_abort.clone(),
         move |message| {
-            let mut out = io::stdout().lock();
-            let _ = write!(
-                out,
-                "\r\nMessage from {} is waiting; it runs before the next prompt (press Enter)\r\n",
+            let notice = format!(
+                "Message from {} is waiting; it runs before the next prompt (press Enter)\n",
                 message.from
             );
-            let _ = out.flush();
-            drop(out);
+            if let Some(printer) = &notice_printer {
+                let _ = printer.print(notice);
+            } else {
+                // Noninteractive/unsupported terminals have no active editor.
+                let _ = write!(io::stdout().lock(), "{notice}");
+            }
             deliver(message)
         },
     );

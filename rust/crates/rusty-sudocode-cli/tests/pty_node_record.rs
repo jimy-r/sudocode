@@ -151,7 +151,11 @@ fn an_offline_node_does_not_block_startup_or_resume() {
         };
         let mut fresh = env.spawn_with_env(&["--permission-mode", "read-only"], &vars);
         fresh.set_default_timeout(common::at_least(Duration::from_secs(30)));
-        common::expect_input_line_cleared(&fresh, Duration::from_secs(30), "offline fresh");
+        common::expect_input_line_cleared(
+            &fresh,
+            Duration::from_secs(30),
+            &format!("offline {mode} fresh"),
+        );
         fresh
             .send(&format!("{prompt}\r"))
             .expect("send ordinary prompt");
@@ -159,7 +163,11 @@ fn an_offline_node_does_not_block_startup_or_resume() {
             .expect(reply)
             .expect("ordinary turn completes without Nexus");
         wait_for_saved_reply(&env, reply);
-        common::expect_input_line_cleared(&fresh, Duration::from_secs(30), "offline turn done");
+        common::expect_input_line_cleared(
+            &fresh,
+            Duration::from_secs(30),
+            &format!("offline {mode} turn done"),
+        );
         // Startup/model input must be usable before the receiver finishes IO.
         // Keep this live process open until its actual background failure is
         // logged; Windows can complete the fast mock turn before connect fails.
@@ -167,7 +175,7 @@ fn an_offline_node_does_not_block_startup_or_resume() {
         common::expect_input_line_cleared(
             &fresh,
             Duration::from_secs(30),
-            "offline diagnostic shown",
+            &format!("offline {mode} diagnostic shown"),
         );
         fresh.send("/exit\r").expect("exit fresh session");
         assert_eq!(fresh.expect_eof().expect("fresh session exits"), 0);
@@ -187,7 +195,11 @@ fn an_offline_node_does_not_block_startup_or_resume() {
         resumed
             .expect(reply)
             .expect("restored reply from original transcript");
-        common::expect_input_line_cleared(&resumed, Duration::from_secs(30), "offline resume");
+        common::expect_input_line_cleared(
+            &resumed,
+            Duration::from_secs(30),
+            &format!("offline {mode} resume"),
+        );
         resumed.send("/exit\r").expect("exit resumed session");
         assert_eq!(resumed.expect_eof().expect("resumed session exits"), 0);
         assert_no_disk_namespace(&env);

@@ -49,8 +49,24 @@ send retry or second background reconnect loop to aggregate.
 
 ## Terminal ownership
 
-A bounded notice still must not write over live input. The REPL's existing
-stderr capture drains through its inline renderer and streaming UTF-8 decoder.
+A bounded notice still must not write over live input. Both terminal owners
+use the same process stderr capture and streaming UTF-8 decoder. The iocraft
+tick drains into its output handle. The synchronous LineEditor forwards into
+its native external printer, which preserves the draft and cursor; peer-waiting
+notices use that same handle. Its forwarding worker stops after the editor
+disconnects the print queue, then restores stderr before joining.
+The receiver only queues display text, so a blocked terminal print cannot
+hold up receiver shutdown. The sync capture is active only around readline;
+turns and external terminal programs inherit the original stderr target.
+
+The classic path pins [rustyline 19.0.0](https://github.com/kkawakam/rustyline/releases/tag/v19.0.0),
+which includes [the upstream buffered-input fix](https://github.com/kkawakam/rustyline/pull/977).
+Versions 15, 17 and 18 check the raw input descriptor before already-buffered
+keys when the external printer is enabled. That stalled fast bursts after the
+first character and explains why the old classic path bypassed the printer.
+The upstream fix keeps input ownership in rustyline; no local cursor painter,
+fork or second decoding policy is introduced.
+
 Unix keeps its nonblocking-pipe implementation. Windows now captures the real
 Win32 stderr handle through the already-locked `filedescriptor` dependency;
 one pipe reader feeds a bounded queue, and the UI tick drains without waiting
@@ -84,8 +100,14 @@ remain applicable. After the original startup and completed-turn readiness
 assertions, the PTY keeps that process alive until its actual background IO
 failure appears in the log; a fast Windows mock turn can otherwise exit before
 the connection attempt reports a result. The original input/turn deadlines are
-unchanged. This caught a real Windows canvas defect when a late stderr
-notice overwrote the ready input line; the input assertion remains intact.
-The existing long UTF-8 diagnostic PTY case now runs on Windows too and also
-requires a clean input line afterward. Exact-head CI and platform results are reported in the PR;
+unchanged. The original Windows failure and the later Linux #1032 failure
+both show raw stderr appended to the ready prompt. The initial capture fix
+covered only iocraft; the classic path did not install it. Those failures are
+retained, and test context now identifies the actual mode. The input assertion
+remains intact.
+The existing long UTF-8 diagnostic PTY case now runs in both modes on all three
+platforms and requires a clean input line afterward. The sync peer PTY preserves
+a Unicode draft and its middle cursor across the real waiting notice, then
+processes a control-key burst before its original peer-turn assertions.
+Exact-head CI and platform results are reported in the PR;
 source preparation alone does not constitute runtime rollout or acceptance.
