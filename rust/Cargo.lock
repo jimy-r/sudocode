@@ -4603,6 +4603,7 @@ dependencies = [
  "engine-core",
  "engine-events",
  "engine-host",
+ "filedescriptor",
  "flate2",
  "futures",
  "futures-util",

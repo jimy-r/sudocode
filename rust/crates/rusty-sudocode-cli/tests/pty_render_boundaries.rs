@@ -87,7 +87,6 @@ fn assert_ordered_response(screen: &str) {
     }
 }
 
-#[cfg(unix)]
 #[test]
 fn captured_diagnostics_preserve_utf8_across_pipe_reads() {
     let env = TestEnv::new_mock("render-stderr-framing");
@@ -120,6 +119,11 @@ fn captured_diagnostics_preserve_utf8_across_pipe_reads() {
         "diagnostic was split or decoded before its bytes were complete: {screen}"
     );
     assert!(!screen.contains('�'), "corrupted UTF-8: {screen}");
+    common::expect_input_line_cleared(
+        &sess,
+        common::DEFAULT_TIMEOUT,
+        "input after captured diagnostic",
+    );
     assert_eq!(env.captured_message_count(), 0);
     finish(&mut sess);
 }

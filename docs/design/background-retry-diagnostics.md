@@ -44,6 +44,18 @@ an independent draft; it is not a second implementation in this source tree.
 | Telemetry sink write/rotation failures | Reuse a fallible writer | The regular sink keeps its fallback. The retry reporter calls the same serializer/rotation path through `try_record`, and owns a bounded terminal fallback if opening or writing the log fails; it does not recursively report a log failure through that log. |
 | CLI commands, examples, build/install and test harness scripts | Keep command output | Their failure output is the requested command result, not unsolicited background noise. |
 
+## Terminal ownership
+
+A bounded notice still must not write over live input. The REPL's existing
+stderr capture drains through its inline renderer and streaming UTF-8 decoder.
+Unix keeps its nonblocking-pipe implementation. Windows now captures the real
+Win32 stderr handle through the already-locked `filedescriptor` dependency;
+one pipe reader feeds a bounded queue, and the UI tick drains without waiting
+for IO. No workspace `unsafe` exception or engine/renderer channel is added.
+Terminal handoff restores the original stderr target and resume reinstalls
+capture. Teardown closes its queue and pipe without waiting for a library's
+retained stderr clone. Headless/ACP output ownership is unchanged.
+
 ## Validation
 
 The receiver process fixture uses the existing fault-boundary backend with
@@ -67,5 +79,8 @@ remain applicable. After the original startup and completed-turn readiness
 assertions, the PTY keeps that process alive until its actual background IO
 failure appears in the log; a fast Windows mock turn can otherwise exit before
 the connection attempt reports a result. The original input/turn deadlines are
-unchanged. Exact-head CI and platform results are reported in the PR;
+unchanged. This caught a real Windows canvas defect when a late stderr
+notice overwrote the ready input line; the input assertion remains intact.
+The existing long UTF-8 diagnostic PTY case now runs on Windows too and also
+requires a clean input line afterward. Exact-head CI and platform results are reported in the PR;
 source preparation alone does not constitute runtime rollout or acceptance.

@@ -68,6 +68,8 @@ tokio = { version = "1", features = ["rt-multi-thread"] }
 tokio-tungstenite = "0.29"
 
 [target.'cfg(windows)'.dependencies]
+# Safe process stderr capture for the inline renderer (already in Cargo.lock).
+filedescriptor = "=0.8.3"
 # The one crate allowed to contain `unsafe` — see its docs for why the
 # workspace's `unsafe_code = "forbid"` is kept absolute everywhere else.
 stdin-peek = { path = "../stdin-peek" }
