@@ -185,6 +185,14 @@ refuse it, and `pause_tools` reports control only after its worker has
 finished.
 ### Per-session system prompt (`_meta.sudocode.*`)
 
+When the last session for an agent closes, the server stops and joins that
+agent's real receiver worker before replying to `session/close`. Closing one
+of several sessions keeps the shared receiver running. A replacement receiver
+waits for a retiring worker rather than treating its stop signal as completed
+cleanup. The join includes the worker's lock-release attempts; a failed remote
+unlock can still require backend TTL recovery. This changes no lease, cursor,
+delivery acknowledgement or retry policy.
+
 `session/new` and `session/load` accept two optional, orthogonal keys under
 the request's `_meta.sudocode` object. Both are plain strings, passed to the
 model verbatim — no truncation, no escaping, no size cap beyond the model's
