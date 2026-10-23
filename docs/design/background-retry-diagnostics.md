@@ -30,8 +30,10 @@ standby and process exit are not successful delivery.
 The audit inspected tracked Rust, TypeScript/JavaScript and shell sources,
 then followed error output and retry/reconnect/backoff matches into their
 callers. Generated artifacts, vendored dependencies and test-only output were
-excluded from production candidates. The TypeScript ACP extraction was still
-an independent draft; it is not a second implementation in this source tree.
+excluded from production candidates. The initial scan preceded the TypeScript ACP extraction. After normally
+merging main, its seven production modules were reviewed too: native failures
+and per-notification callback failures remain explicit; there is no automatic
+send retry or second background reconnect loop to aggregate.
 
 | Area | Decision | Reason |
 |---|---|---|
@@ -39,6 +41,7 @@ an independent draft; it is not a second implementation in this source tree.
 | `engine-core/src/subagent_completion.rs` and `subagent_completion/control.rs`: terminal persistence | Share one reporter per completion state | The observation and delivery paths report the same retained terminal events. Scope is the real tool-call ID; reporting does not change qualification, persistence, retries or receipts. |
 | `api/src/http_transport.rs`, request scope and renderer retry events | Keep existing mechanism | Finite provider retries already have their own budget, lifecycle logs and UI notifier. Adding another reporter would duplicate progress and could obscure request failure. |
 | `runtime/src/mcp_server_manager.rs`, MCP transports/lifecycle | Keep existing mechanism | Initialization limits, connection state, typed refusal and explicit reconnect already belong to the manager. There is no matching unbounded per-tick stderr loop to replace. |
+| `sdk/typescript/src`: canonical ACP/MCP/callback host | Keep explicit protocol errors | The child stderr has its own configured local file. Per-command audit errors and per-notification callback errors are separate outcomes; no automatic send/reconnect retry exists. Adding a TypeScript copy of the Rust reporter would duplicate policy without a matching loop. |
 | `nexus-vfs-client/src/lib.rs` | Keep error propagation | The transport returns errors to its caller and repairs its channel; the receiver is the reporting owner. Logging again here would duplicate the same incident. |
 | `runtime/src/bash.rs`, tools, todo/config persistence, startup and ACP reply-send errors | Keep explicit errors | These report an individual operation or an uncertain result, rather than an owned background retry loop. In particular an uncertain send must never acquire automatic retry. |
 | Telemetry sink write/rotation failures | Reuse a fallible writer | The regular sink keeps its fallback. The retry reporter calls the same serializer/rotation path through `try_record`, and owns a bounded terminal fallback if opening or writing the log fails; it does not recursively report a log failure through that log. |
