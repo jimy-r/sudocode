@@ -165,6 +165,7 @@ test('the workflow gives the Azure CLI profile the same scoped credential as its
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'scode-provider-probe-'));
   const env = { ...process.env, SUDO_CODE_CONFIG_HOME: directory,
     PROXY_BASE_URL: 'https://fixture-provider.invalid/v1',
+    RUNNER_TEMP: directory, GITHUB_ENV: path.join(directory, 'github-env'),
     PROXY_AUTH_TOKEN: 'fixture-default-provider-12345678',
     AZURE_PROXY_AUTH_TOKEN: 'fixture-scoped-azure-provider-87654321', SCODE_AZURE_CHANNEL: '18' };
   try {
@@ -175,6 +176,11 @@ test('the workflow gives the Azure CLI profile the same scoped credential as its
     assert.equal(config.auth_modes.proxy['sudorouter-azure'].apiKey, env.AZURE_PROXY_AUTH_TOKEN);
     assert.equal(config.auth_modes.proxy['sudorouter-azure'].baseUrl, config.auth_modes.proxy.sudorouter.baseUrl);
     assert.equal(config.auth_modes.proxy.sudorouter.baseUrl, env.PROXY_BASE_URL);
+    const exported = fs.readFileSync(env.GITHUB_ENV, 'utf8');
+    assert.ok(exported.includes(`SUDO_CODE_CONFIG_HOME=${directory}\n`));
+    assert.ok(exported.includes(`SCODE_LOG_PATH=${path.join(directory, 'scode-live-model-trace.jsonl')}\n`));
+    assert.ok(!exported.includes(env.PROXY_AUTH_TOKEN));
+    assert.ok(!exported.includes(env.AZURE_PROXY_AUTH_TOKEN));
     await assert.rejects(promisify(execFile)(process.execPath, ['-e', generators[0][1]], {
       env: { ...env, AZURE_PROXY_AUTH_TOKEN: '' }, timeout: 15000, windowsHide: true,
     }), error => error.stderr.includes('AZURE_PROXY_AUTH_TOKEN is required')

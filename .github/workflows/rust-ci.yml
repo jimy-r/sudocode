@@ -710,7 +710,6 @@ jobs:
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     env:
-      SUDO_CODE_CONFIG_HOME: ${{ runner.temp }}/scode-live-config
       PROXY_BASE_URL: https://api.sudorouter.ai/v1
       SCODE_TEST_BACKEND: live
       SUDOCODE_API_READ_TIMEOUT: *live_idle_seconds
@@ -718,8 +717,6 @@ jobs:
       SCODE_AZURE_MODEL: *azure_model
       SCODE_LIVE_AUTH_PROFILE: sudorouter
       SCODE_AZURE_CHANNEL: ${{ vars.SUDOROUTER_AZURE_CHANNEL }}
-      SCODE_LOG_PATH: ${{ runner.temp }}/scode-live-model-trace.jsonl
-      SCODE_LIVE_ARTIFACTS: ${{ runner.temp }}/scode-live-requests
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -747,7 +744,14 @@ jobs:
           const azureKey = process.env.AZURE_PROXY_AUTH_TOKEN;
           if (!azureKey) throw new Error('AZURE_PROXY_AUTH_TOKEN is required for Azure acceptance');
           const baseUrl = process.env.PROXY_BASE_URL;
-          const dir = process.env.SUDO_CODE_CONFIG_HOME;
+          const dir = process.env.SUDO_CODE_CONFIG_HOME || path.join(process.env.RUNNER_TEMP, 'scode-live-config');
+          const paths = {
+            SUDO_CODE_CONFIG_HOME: dir,
+            SCODE_LOG_PATH: path.join(process.env.RUNNER_TEMP, 'scode-live-model-trace.jsonl'),
+            SCODE_LIVE_ARTIFACTS: path.join(process.env.RUNNER_TEMP, 'scode-live-requests')
+          };
+          fs.appendFileSync(process.env.GITHUB_ENV,
+            Object.entries(paths).map(([key, value]) => `${key}=${value}\n`).join(''));
           fs.mkdirSync(dir, { recursive: true });
           fs.writeFileSync(path.join(dir, 'sudocode.json'), JSON.stringify({
             auth_modes: { proxy: {
@@ -809,4 +813,4 @@ jobs:
       - name: Remove live test credentials
         if: always()
         run: |
-          node -e "require('fs').rmSync(require('path').join(process.env.SUDO_CODE_CONFIG_HOME, 'sudocode.json'), { force: true })"
+          node -e "const dir = process.env.SUDO_CODE_CONFIG_HOME; if (dir) require('fs').rmSync(require('path').join(dir, 'sudocode.json'), { force: true })"
