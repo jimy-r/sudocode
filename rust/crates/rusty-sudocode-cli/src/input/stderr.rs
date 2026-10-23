@@ -50,9 +50,11 @@ impl StderrOutput {
             .spawn(move || {
                 let mut utf8 = Utf8Stream::default();
                 loop {
+                    let mut progressed = false;
                     // One pending notice per blocked peer delivery, never the
                     // peer message body. Keep each drain finite.
                     for notice in pending.try_iter().take(16) {
+                        progressed = true;
                         if printer.print(notice).is_err() {
                             return;
                         }
@@ -62,6 +64,7 @@ impl StderrOutput {
                         .unwrap_or_else(std::sync::PoisonError::into_inner)
                         .drain();
                     if let Some(bytes) = bytes {
+                        progressed = true;
                         let text = utf8.push(&bytes);
                         if !text.is_empty() && printer.print(text).is_err() {
                             break;
@@ -70,10 +73,17 @@ impl StderrOutput {
                     if stopping.load(Ordering::Acquire) {
                         break;
                     }
-                    std::thread::park_timeout(Duration::from_millis(80));
+                    if !progressed {
+                        std::thread::park_timeout(Duration::from_millis(80));
+                    }
                 }
             })
             .ok()?;
+        #[cfg(windows)]
+        redirect
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .wake_on_data(worker.thread().clone());
         let printer = BackgroundPrinter {
             notices,
             wake: worker.thread().clone(),

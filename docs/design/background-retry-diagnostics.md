@@ -61,6 +61,9 @@ turns and external terminal programs inherit the original stderr target.
 Rearming waits for an in-flight stderr writer before taking the capture mutex;
 the forwarder can still drain that writer's old pipe. Suspension does not wait
 for stderr, since changing fd/handle 2 cannot retarget an already-blocked write.
+The forwarder parks only when idle. Windows' existing pipe reader unparks it
+when a chunk arrives, so bounded batches do not impose a sleep between pending
+chunks. The iocraft owner retains its existing tick; neither path adds a reader.
 
 The classic path pins [rustyline 19.0.0](https://github.com/kkawakam/rustyline/releases/tag/v19.0.0),
 which includes [the upstream buffered-input fix](https://github.com/kkawakam/rustyline/pull/977).

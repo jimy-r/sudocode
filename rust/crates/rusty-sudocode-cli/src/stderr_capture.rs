@@ -96,6 +96,7 @@ mod platform {
     use std::io::{self, Read};
     use std::os::windows::io::{AsRawHandle, IntoRawHandle};
     use std::sync::mpsc::{self, Receiver};
+    use std::sync::{Arc, OnceLock};
     use std::thread::JoinHandle;
 
     use filedescriptor::{FileDescriptor, Pipe, StdioDescriptor};
@@ -108,6 +109,7 @@ mod platform {
         writer: Option<FileDescriptor>,
         captured: Option<Receiver<Vec<u8>>>,
         reader: Option<JoinHandle<()>>,
+        wake: Arc<OnceLock<std::thread::Thread>>,
     }
 
     impl StderrRedirect {
@@ -117,6 +119,8 @@ mod platform {
             let original = FileDescriptor::dup(&io::stderr()).ok()?;
             let Pipe { mut read, write } = Pipe::new().ok()?;
             let (tx, rx) = mpsc::sync_channel(CAPTURE_CHUNKS);
+            let wake = Arc::new(OnceLock::<std::thread::Thread>::new());
+            let notify = Arc::clone(&wake);
             let reader = std::thread::Builder::new()
                 .name("repl-stderr".into())
                 .spawn(move || {
@@ -127,6 +131,9 @@ mod platform {
                             Ok(n) => {
                                 if tx.send(buf[..n].to_vec()).is_err() {
                                     break;
+                                }
+                                if let Some(worker) = notify.get() {
+                                    worker.unpark();
                                 }
                             }
                             Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
@@ -146,7 +153,15 @@ mod platform {
                 writer: Some(write),
                 captured: Some(rx),
                 reader: Some(reader),
+                wake,
             })
+        }
+
+        /// Classic output waits on its forwarding thread; iocraft retains its
+        /// existing UI tick. Both drain the same bounded capture queue.
+        #[inline]
+        pub fn wake_on_data(&self, worker: std::thread::Thread) {
+            let _ = self.wake.set(worker);
         }
 
         #[inline]
