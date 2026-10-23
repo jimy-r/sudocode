@@ -148,17 +148,46 @@ fn early_hook_exit_preserves_its_decision_with_unread_tool_input() {
             "danger-full-access",
             "--allowedTools",
             "write_file",
-            &prompt,
         ]);
         session.resize(50, 160).unwrap();
+        session.expect("❯").unwrap();
+        let marker = common::turn_status_marker(&session);
+        session
+            .send(&format!("\x1b[200~{prompt}\x1b[201~"))
+            .unwrap();
+        common::expect_screen_settled(
+            &session,
+            |screen| common::input_line_of(screen).contains("TOOL_BATCH_FILE:"),
+            env.timeout(),
+            "hook fixture prompt pasted",
+        );
+        session.send("\r").unwrap();
         session
             .expect(&format!(r"\[hook {progress} PreToolUse\]"))
-            .unwrap();
+            .unwrap_or_else(|error| {
+                let markers: Vec<_> = env
+                    .captured_message_bodies()
+                    .iter()
+                    .filter_map(|body| {
+                        body.find("TOOL_BATCH_FILE:")
+                            .map(|offset| body[offset..].chars().take(500).collect::<String>())
+                    })
+                    .collect();
+                panic!("{error}; captured batch markers: {markers:?}");
+            });
+        common::expect_turn_complete_after(
+            &session,
+            &marker,
+            env.timeout(),
+            "hook fixture completed",
+        );
+        common::expect_input_line_cleared(&session, env.timeout(), "ready to exit");
+        session.send("/exit\r").unwrap();
         let exit = session.expect_eof().unwrap();
         let screen = session.render(|screen| screen.contents());
         assert!(!screen.contains("failed to start"), "{screen}");
+        assert_eq!(exit, 0, "{screen}");
         if code == 0 {
-            assert_eq!(exit, 0, "{screen}");
             assert_eq!(fs::read_to_string(destination).unwrap(), content);
         } else {
             assert!(
