@@ -94,6 +94,7 @@ mod platform {
 #[cfg(windows)]
 mod platform {
     use std::io::{self, Read};
+    use std::os::windows::io::{AsRawHandle, IntoRawHandle};
     use std::sync::mpsc::{self, Receiver};
     use std::thread::JoinHandle;
 
@@ -111,6 +112,9 @@ mod platform {
 
     impl StderrRedirect {
         pub fn activate() -> Option<Self> {
+            // Standard streams can share a Win32 handle (for example 2>&1).
+            // Own a duplicate, never the handle still installed on stdout.
+            let original = FileDescriptor::dup(&io::stderr()).ok()?;
             let Pipe { mut read, write } = Pipe::new().ok()?;
             let (tx, rx) = mpsc::sync_channel(CAPTURE_CHUNKS);
             let reader = std::thread::Builder::new()
@@ -131,15 +135,12 @@ mod platform {
                     }
                 })
                 .ok()?;
-            let original = match FileDescriptor::redirect_stdio(&write, StdioDescriptor::Stderr) {
-                Ok(original) => original,
-                Err(_) => {
-                    drop(write);
-                    drop(rx);
-                    let _ = reader.join();
-                    return None;
-                }
-            };
+            if redirect(&write).is_err() {
+                drop(write);
+                drop(rx);
+                let _ = reader.join();
+                return None;
+            }
             Some(Self {
                 original,
                 writer: Some(write),
@@ -171,11 +172,17 @@ mod platform {
 
     #[inline]
     fn redirect(source: &FileDescriptor) -> io::Result<()> {
-        // The returned descriptor owns the displaced process handle. Dropping
-        // it closes that copy; the newly installed duplicate remains live.
-        FileDescriptor::redirect_stdio(source, StdioDescriptor::Stderr)
-            .map(drop)
-            .map_err(io::Error::other)
+        let previous = FileDescriptor::redirect_stdio(source, StdioDescriptor::Stderr)
+            .map_err(io::Error::other)?;
+        // The API transfers the displaced handle, which may still be installed
+        // on another standard stream. Relinquish that borrowed global handle;
+        // only unshared displaced handles belong to this redirect operation.
+        if previous.as_raw_handle() == io::stdout().as_raw_handle()
+            || previous.as_raw_handle() == io::stdin().as_raw_handle()
+        {
+            let _ = previous.into_raw_handle();
+        }
+        Ok(())
     }
 
     impl Drop for StderrRedirect {

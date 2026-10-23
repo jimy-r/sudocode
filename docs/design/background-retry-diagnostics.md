@@ -55,7 +55,9 @@ Unix keeps its nonblocking-pipe implementation. Windows now captures the real
 Win32 stderr handle through the already-locked `filedescriptor` dependency;
 one pipe reader feeds a bounded queue, and the UI tick drains without waiting
 for IO. No workspace `unsafe` exception or engine/renderer channel is added.
-Terminal handoff restores the original stderr target and resume reinstalls
+Windows retains a separate restore handle, preserving stdout/stdin handles
+when standard streams share a target. Terminal handoff restores the original
+stderr target and resume reinstalls
 capture. Teardown closes its queue and pipe without waiting for a library's
 retained stderr clone. Headless/ACP output ownership is unchanged.
 
