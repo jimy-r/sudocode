@@ -98,6 +98,10 @@ impl StderrOutput {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if active {
+            // Finish any write to the uncaptured terminal before readline
+            // paints its prompt. Suspend stays unlocked so an in-flight pipe
+            // writer can still be drained by the forwarding worker.
+            let _stderr = std::io::stderr().lock();
             redirect.resume()
         } else {
             redirect.suspend()
