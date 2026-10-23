@@ -3,6 +3,14 @@
 `scode` speaks the **Agent Communication Protocol (ACP)** natively, in two
 transports that share a single handler chain.
 
+## TypeScript client and MCP bridge
+
+The [shared TypeScript package](../sdk/typescript/README.md) provides the ACP
+connection, direct A2A helpers, a standalone stdio MCP bridge and an optional
+Codex callback adapter. It can be installed independently of Hydra and uses
+the full scode executable. The package guide owns installation, config,
+source/checksum receipts and existing-thread handoff limits.
+
 ## Transports
 
 ```bash
@@ -246,7 +254,7 @@ hook withholds a reply while the node already holds the message. Their model
 endpoint refuses every inference request and must record zero calls. This is
 not a cross-host idle callback or production deployment acceptance.
 
-### Per-session system prompt (`_meta.sudocode.*`)
+### Closing a peer session
 
 When the last session for an agent closes, the server stops and joins that
 agent's real receiver worker before replying to `session/close`. Closing one
@@ -255,6 +263,8 @@ waits for a retiring worker rather than treating its stop signal as completed
 cleanup. The join includes the worker's lock-release attempts; a failed remote
 unlock can still require backend TTL recovery. This changes no lease, cursor,
 delivery acknowledgement or retry policy.
+
+### Per-session system prompt (`_meta.sudocode.*`)
 
 `session/new` and `session/load` accept two optional, orthogonal keys under
 the request's `_meta.sudocode` object. Both are plain strings, passed to the

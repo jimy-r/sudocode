@@ -238,7 +238,7 @@ impl<C: ApiClient, T: ToolExecutor> ConversationRuntime<C, T> {
     ///
     /// The call is admitted through the session's `background_tasks`, the
     /// fence a turn's tools take: a paused session refuses it, and a pause
-    /// waits for its worker to finish. It runs under a fresh `direct-` id and
+    /// waits for its worker to finish. It runs under a fresh `external-a2a-` command id and
     /// with no assistant message, because no model asked for it; nothing is
     /// written to the session. Returns the tool's output and whether it
     /// failed. A call cancelled after it was admitted is an error even when a
