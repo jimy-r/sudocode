@@ -9,10 +9,16 @@
 //!
 //! That failure is invisible in the easy configuration. With no journal bound,
 //! or with the task protocol off, `prepare_terminal` short-circuits to
-//! `Ok(None)` and an unscoped caller works fine. Only an ACP session with task
-//! completions negotiated reaches the branch — `set_task_protocol(true)` is
-//! called from `engine-acp` alone — which is why a REPL/PTY test cannot catch
-//! this and why the test below binds the journal explicitly.
+//! `Ok(None)` and an unscoped caller works fine.
+//!
+//! The protocol can only be switched on from an ACP session, which is why a
+//! REPL/PTY test cannot reach this branch. The derivation is about the WRITER,
+//! not the call sites: `set_task_protocol` is also called from
+//! `engine-core/subagent_completion/control.rs` (in `install_journal` and in
+//! the `CompletionAction::Configure` branch), but both only propagate
+//! `delivery.tasks` — and the sole constructor of `Configure`, the only thing
+//! that assigns that field, is `engine-acp/session_driver.rs`. So the test
+//! below binds the journal and enables the protocol explicitly.
 
 use std::path::Path;
 
