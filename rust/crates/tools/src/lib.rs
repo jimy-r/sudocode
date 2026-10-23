@@ -3776,7 +3776,10 @@ fn git_stdout(args: &[&str]) -> Option<String> {
     if !output.status.success() {
         return None;
     }
-    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let stdout = process_text::decode_process_output(&output.stdout)
+        .text
+        .trim()
+        .to_string();
     (!stdout.is_empty()).then_some(stdout)
 }
 
@@ -3801,20 +3804,10 @@ fn branch_divergence_output(
         "branch divergence detected before workspace tests: `{branch}` {relation} `{main_ref}`. Missing commits: {missing_summary}. Merge or rebase `{main_ref}` before re-running `{command}`."
     );
 
-    BashCommandOutput {
-        exit_code: None,
-        stdout: String::new(),
-        stderr: stderr.clone(),
-        raw_output_path: None,
-        interrupted: false,
-        is_image: None,
-        background_task_id: None,
-        backgrounded_by_user: None,
-        assistant_auto_backgrounded: None,
-        dangerously_disable_sandbox: None,
-        return_code_interpretation: Some("preflight_blocked:branch_divergence".to_string()),
-        no_output_expected: Some(false),
-        structured_content: Some(vec![serde_json::to_value(
+    BashCommandOutput::blocked(
+        "branch_divergence",
+        stderr.clone(),
+        Some(vec![serde_json::to_value(
             LaneEvent::new(
                 LaneEventName::BranchStaleAgainstMain,
                 LaneEventStatus::Blocked,
@@ -3833,8 +3826,7 @@ fn branch_divergence_output(
             })),
         )
         .expect("lane event should serialize")]),
-        sandbox_status: None,
-    }
+    )
 }
 
 #[allow(clippy::needless_pass_by_value)]
@@ -4299,7 +4291,8 @@ fn run_powershell(
 ) -> Result<String, String> {
     to_pretty_json(
         execute_powershell_in_session(&input, abort_signal, tasks)
-            .map_err(|error| error.to_string())?,
+            .map_err(|error| error.to_string())?
+            .model_output(),
     )
 }
 
@@ -7779,10 +7772,12 @@ fn current_git_branch() -> Option<String> {
         command.current_dir(root);
     }
     let output = command.output().ok()?;
-    output
-        .status
-        .success()
-        .then(|| String::from_utf8_lossy(&output.stdout).trim().to_string())
+    output.status.success().then(|| {
+        process_text::decode_process_output(&output.stdout)
+            .text
+            .trim()
+            .to_string()
+    })
 }
 
 fn append_agent_output(path: &str, suffix: &str, fs: &dyn FsBackend) -> Result<(), String> {
@@ -9687,7 +9682,7 @@ fn execute_shell_command(
 
     let timeout_ms = timeout.unwrap_or(runtime::DEFAULT_TOOL_SUBPROCESS_TIMEOUT_MS);
     let result = run_in_process_group(&mut process, timeout_ms, abort_signal)?;
-    Ok(shell_run_to_bash_output(result, timeout_ms))
+    Ok(shell_run_to_bash_output(result, timeout_ms).with_powershell_parse_error())
 }
 
 /// Outcome of polling a `GroupChild` to completion / abort / timeout.
@@ -9753,48 +9748,27 @@ fn run_in_process_group(
 }
 
 fn shell_run_to_bash_output(result: ShellRunResult, timeout_ms: u64) -> runtime::BashCommandOutput {
-    let stdout_text = String::from_utf8_lossy(&result.stdout).into_owned();
-    let stderr_text = String::from_utf8_lossy(&result.stderr).into_owned();
-
-    match result.outcome {
+    let ShellRunResult {
+        outcome,
+        stdout,
+        stderr,
+    } = result;
+    match outcome {
         ShellOutcome::Completed(status) => {
-            runtime::BashCommandOutput::completed(status, stdout_text, stderr_text)
+            runtime::BashCommandOutput::from_process(status, &stdout, &stderr)
         }
-        ShellOutcome::Interrupted => runtime::BashCommandOutput {
-            exit_code: None,
-            stdout: stdout_text,
-            stderr: append_status_line(&stderr_text, "Command interrupted by user"),
-            raw_output_path: None,
-            interrupted: true,
-            is_image: None,
-            background_task_id: None,
-            backgrounded_by_user: None,
-            assistant_auto_backgrounded: None,
-            dangerously_disable_sandbox: None,
-            return_code_interpretation: Some(String::from("interrupted")),
-            no_output_expected: Some(false),
-            structured_content: None,
-            sandbox_status: None,
-        },
-        ShellOutcome::TimedOut => runtime::BashCommandOutput {
-            exit_code: None,
-            stdout: stdout_text,
-            stderr: append_status_line(
-                &stderr_text,
-                &format!("Command exceeded timeout of {timeout_ms} ms"),
-            ),
-            raw_output_path: None,
-            interrupted: true,
-            is_image: None,
-            background_task_id: None,
-            backgrounded_by_user: None,
-            assistant_auto_backgrounded: None,
-            dangerously_disable_sandbox: None,
-            return_code_interpretation: Some(String::from("timeout")),
-            no_output_expected: Some(false),
-            structured_content: None,
-            sandbox_status: None,
-        },
+        ShellOutcome::Interrupted => runtime::BashCommandOutput::stopped(
+            runtime::ShellStatus::Interrupted,
+            &stdout,
+            &stderr,
+            "Command interrupted by user",
+        ),
+        ShellOutcome::TimedOut => runtime::BashCommandOutput::stopped(
+            runtime::ShellStatus::Timeout,
+            &stdout,
+            &stderr,
+            &format!("Command exceeded timeout of {timeout_ms} ms"),
+        ),
     }
 }
 
@@ -9856,14 +9830,6 @@ fn drain_budget_for(timeout_ms: u64) -> Duration {
     const MAX_DRAIN_MS: u64 = 10_000;
     let derived = timeout_ms / 4;
     Duration::from_millis(derived.clamp(MIN_DRAIN_MS, MAX_DRAIN_MS))
-}
-
-fn append_status_line(stderr: &str, status_line: &str) -> String {
-    if stderr.trim().is_empty() {
-        status_line.to_string()
-    } else {
-        format!("{}\n{status_line}", stderr.trim_end())
-    }
 }
 
 #[cfg(test)]

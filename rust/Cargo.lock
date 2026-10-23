@@ -893,6 +893,7 @@ version = "0.2.35"
 dependencies = [
  "api",
  "plugins",
+ "process-text",
  "runtime",
  "serde_json",
 ]
@@ -1597,6 +1598,7 @@ dependencies = [
  "mock-anthropic-service",
  "nexus-vfs-client",
  "plugins",
+ "process-text",
  "reqwest 0.12.28",
  "runtime",
  "serde",
@@ -3546,6 +3548,7 @@ dependencies = [
 name = "plugins"
 version = "0.2.35"
 dependencies = [
+ "process-text",
  "serde",
  "serde_json",
 ]
@@ -3654,6 +3657,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "985e7ec9bb745e6ce6535b544d84d6cd6f7ad8bd711c398938ae983b91a766d9"
 dependencies = [
  "unicode-ident",
+]
+
+[[package]]
+name = "process-text"
+version = "0.2.35"
+dependencies = [
+ "stdin-peek",
 ]
 
 [[package]]
@@ -4435,6 +4445,7 @@ dependencies = [
  "nexus-vfs-client",
  "nix 0.29.0",
  "plugins",
+ "process-text",
  "rcgen",
  "regex",
  "reqwest 0.12.28",
@@ -4612,6 +4623,7 @@ dependencies = [
  "nexus-vfs-client",
  "nix 0.29.0",
  "plugins",
+ "process-text",
  "pty-expect",
  "pulldown-cmark",
  "rcgen",
@@ -5750,6 +5762,7 @@ dependencies = [
  "futures",
  "kernel",
  "plugins",
+ "process-text",
  "regex",
  "reqwest 0.12.28",
  "runtime",
