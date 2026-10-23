@@ -126,7 +126,10 @@ impl<'a, T: ToolExecutor> ToolScheduler<'a, T> {
         }
         self.calls.push(Invocation {
             parallel: self.executor.is_concurrency_safe(&name, &input),
-            origin: parent.history.as_ref().map(|identity| identity.id.clone()),
+            origin: parent
+                .as_ref()
+                .and_then(|message| message.history.as_ref())
+                .map(|identity| identity.id.clone()),
             id,
             name,
             input,

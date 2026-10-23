@@ -2185,7 +2185,7 @@ impl NexusVfsFsBackend {
     /// can, and it is not this runtime's to follow.
     fn admit_entry(
         &self,
-        path: &str,
+        _path: &str,
         entry_type: i32,
         link_target: Option<&str>,
     ) -> io::Result<()> {
