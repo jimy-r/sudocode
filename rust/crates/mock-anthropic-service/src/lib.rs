@@ -2134,7 +2134,7 @@ fn build_stream_body(request: &MessageRequest, scenario: Scenario) -> String {
         // A co-host agent answers a peer message by calling `send` back. The
         // reply's recipient is fixed here because nothing outside the daemon
         // chooses it: the agent runs in-process and this scenario is its mind.
-        Scenario::CohostReply => match latest_tool_result(request) {
+        Scenario::CohostReply => match current_turn_tool_result(request) {
             Some((tool_output, _)) => final_text_sse(&format!("cohost replied: {tool_output}")),
             None => tool_use_sse(
                 "toolu_cohost_reply",
@@ -2933,7 +2933,7 @@ fn build_message_response(request: &MessageRequest, scenario: Scenario) -> Messa
                 ),
             }
         }
-        Scenario::CohostReply => match latest_tool_result(request) {
+        Scenario::CohostReply => match current_turn_tool_result(request) {
             Some((tool_output, _)) => text_message_response(
                 "msg_cohost_reply_final",
                 &format!("cohost replied: {tool_output}"),
