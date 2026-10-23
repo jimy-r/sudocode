@@ -2356,7 +2356,8 @@ fn stall_cause_mid_batch(consumer_accepts: bool) {
         "exactly one stall, recorded as {expected:?}: {recorded:?}"
     );
     assert_eq!(
-        recorded[0].offset, p_gate,
+        recorded[0].offset,
+        Some(p_gate),
         "the stall is recorded at the batch's offset"
     );
     // Both messages were in the stalled batch: otherwise m1 alone would have
