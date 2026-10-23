@@ -1245,7 +1245,8 @@ impl HeldLease {
     /// The flag records a renewal that failed; the age check covers one that has
     /// not answered at all. While a renewal is in flight the worker cannot clear
     /// the flag, so belief must also lapse on its own once the last successful
-    /// renewal was requested longer ago than the grace allows.
+    /// renewal was requested longer ago than the grace allows, and then it
+    /// stays lapsed.
     fn is_valid(&self) -> bool {
         if !self.valid.load(std::sync::atomic::Ordering::Acquire) {
             return false;
@@ -1260,7 +1261,11 @@ impl HeldLease {
         if within_grace(since_ms) {
             return true;
         }
+        // Lapsing is final, like a failed renewal: a success that lands later
+        // must not restore belief the holder has already acted on losing.
         let _ = self.loss.set(LeaseLoss::Lapsed { since_ms });
+        self.valid
+            .store(false, std::sync::atomic::Ordering::Release);
         false
     }
 
