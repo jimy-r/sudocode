@@ -17,6 +17,17 @@ try {
   const modules = path.join(install, 'node_modules');
   assert.deepEqual(fs.readdirSync(modules).filter(name => !name.startsWith('.')), ['@sudocode'],
     'offline package has no runtime dependency installation');
+  // Compile a real installed-package consumer with legacy Node resolution too.
+  const consumer = path.join(install, 'consumer.ts');
+  fs.writeFileSync(consumer, `import { connectScode } from '@sudocode/acp/scodeAcp';
+import { sendScodeMessage } from '@sudocode/acp/scodeA2a';
+import { runScodeMcp } from '@sudocode/acp/mcp';
+import { forwardScodeToCodex } from '@sudocode/acp/codexCallback';
+void [connectScode, sendScodeMessage, runScodeMcp, forwardScodeToCodex];
+`);
+  run(process.execPath, [path.join(root, 'node_modules/typescript/bin/tsc'),
+    '--noEmit', '--strict', '--skipLibCheck', '--module', 'commonjs', '--moduleResolution', 'node',
+    '--target', 'ES2022', '--lib', 'ES2022', '--typeRoots', path.join(root, 'node_modules/@types'), consumer]);
   const entry = path.join(modules, '@sudocode/acp/dist/server.cjs');
   const verified = JSON.parse(run(process.execPath, [entry, '--verify']));
   assert.equal(verified.verified, true);
