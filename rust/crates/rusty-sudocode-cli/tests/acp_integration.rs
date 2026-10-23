@@ -3655,19 +3655,31 @@ async fn collect_until_finished(
     seen: &[Value],
     want: usize,
 ) -> Vec<Value> {
-    let mut more = Vec::new();
+    collect_until_subagent_condition(
+        client,
+        seen,
+        |updates| finished_count(updates) >= want,
+        &format!("{want} finished sub-agents"),
+    )
+    .await
+}
+
+async fn collect_until_subagent_condition(
+    client: &mut AcpTestClient,
+    seen: &[Value],
+    ready: impl Fn(&[Value]) -> bool,
+    goal: &str,
+) -> Vec<Value> {
+    let mut updates = seen.to_vec();
     let deadline = tokio::time::Instant::now() + SUBAGENT_EVENTS_WAIT;
-    while finished_count(seen) + finished_count(&more) < want {
+    while !ready(&updates) {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         let Ok(msg) = timeout(remaining, client.recv_inner()).await else {
-            panic!(
-                "only {} of {want} sub-agents finished within {SUBAGENT_EVENTS_WAIT:?}; after the prompt saw: {more:#?}",
-                finished_count(seen) + finished_count(&more)
-            );
+            panic!("did not observe {goal} within {SUBAGENT_EVENTS_WAIT:?}: {updates:#?}");
         };
-        more.push(msg);
+        updates.push(msg);
     }
-    more
+    updates.split_off(seen.len())
 }
 
 /// What one spawned agent looked like on the wire.
@@ -4089,11 +4101,16 @@ async fn acp_subagent_events_background_parallel() {
     let mut client = spawn_stdio_client_danger(&workspace);
     initialize_with_subagent_events(&mut client).await;
     let session_id = scenario_session_new(&mut client, &workspace.root).await;
-    let (during, _) = prompt_scenario(&mut client, &session_id, "subagent_events_background").await;
+    let release = workspace.root.join("release-background-children");
+    let scenario = format!(
+        "subagent_events_background SUBAGENT_RELEASE:{}",
+        json!(release.to_str().expect("fixture release path"))
+    );
+    let (during, _) = prompt_scenario(&mut client, &session_id, &scenario).await;
     assert_eq!(
         finished_count(&during),
         0,
-        "slow background children cannot have finished inside the turn"
+        "unreleased background children cannot have finished inside the turn"
     );
     for id in ["toolu_events_bg_1", "toolu_events_bg_2"] {
         let result = tool_result_named(&during, id);
@@ -4103,7 +4120,26 @@ async fn acp_subagent_events_background_parallel() {
             true
         );
     }
-    let after = collect_until_finished(&mut client, &during, 2).await;
+    // Observe real child streams before either can finish. Fixed response
+    // delays only made overlap probable and flaked under workspace build load.
+    // A serial executor cannot satisfy this barrier and still fails the test.
+    let before_release = collect_until_subagent_condition(
+        &mut client,
+        &during,
+        |updates| {
+            assert_eq!(finished_count(updates), 0, "child finished before release");
+            let active: std::collections::BTreeSet<_> = updates
+                .iter()
+                .filter_map(|n| sudocode_meta(n)["subagent"]["agentId"].as_str())
+                .collect();
+            active.len() == 2
+        },
+        "two active child streams before release",
+    )
+    .await;
+    let seen: Vec<Value> = during.iter().chain(&before_release).cloned().collect();
+    fs::write(release, "both child streams observed").expect("release real children");
+    let after = collect_until_finished(&mut client, &seen, 2).await;
     for n in &after {
         assert_eq!(
             n["method"], "session/update",
@@ -4111,7 +4147,7 @@ async fn acp_subagent_events_background_parallel() {
         );
         assert_eq!(n["params"]["sessionId"], session_id.as_str());
     }
-    let all: Vec<Value> = during.iter().chain(&after).cloned().collect();
+    let all: Vec<Value> = seen.iter().chain(&after).cloned().collect();
     dump_subagent_events("background", &all);
 
     let traces = assert_subagent_invariants(&all);
@@ -6957,6 +6993,194 @@ async fn acp_completions_sync_and_nested_do_not_auto_publish() {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Zone-contract subprocess scope (review acceptance: "real subprocess
+// scope-denial coverage")
+// ---------------------------------------------------------------------------
+
+/// Like [`spawn_stdio_client_danger`] but injects the subprocess runner env
+/// (`NEXUS_ZONE_ID` + `NEXUS_RESOURCE_SCOPE`) after `isolate_env`'s
+/// `env_clear`, standing in for the zone metadata a moss runner manifest
+/// would plant. `danger-full-access` keeps the tool layer out of the way so
+/// a denial can only come from the zone contract.
+fn spawn_stdio_client_danger_zone_env(
+    workspace: &TestWorkspace,
+    zone_id: &str,
+    resource_scope: &str,
+) -> AcpTestClient {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_scode"));
+    cmd.current_dir(&workspace.root);
+    isolate_env(&mut cmd, workspace);
+    cmd.args([
+        "--auth",
+        "api-key",
+        "--model",
+        "sonnet",
+        "--permission-mode",
+        "danger-full-access",
+        "acp",
+    ])
+    .env("NEXUS_ZONE_ID", zone_id)
+    .env("NEXUS_RESOURCE_SCOPE", resource_scope)
+    .stdin(Stdio::piped())
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped());
+
+    let mut child = cmd.spawn().expect("spawn scode acp stdio (danger+zone)");
+    let stdin = child.stdin.take().expect("stdin should be piped");
+    let stdout = child.stdout.take().expect("stdout should be piped");
+
+    AcpTestClient {
+        transport: Transport::Stdio {
+            child,
+            stdin,
+            stdout: BufReader::new(stdout),
+        },
+        next_id: 1,
+        last_available_commands: None,
+        raw_lines: Vec::new(),
+    }
+}
+
+/// The host-injected runner env must shape the CLI's file authorization
+/// (review finding 1): a real subprocess with a scoped zone writes inside
+/// its scope and is refused outside it, while the same operation in a
+/// genuinely env-less subprocess succeeds — the standalone-local exception
+/// is limited to that absence, and the refusal is attributable to the zone
+/// layer (the `ZoneAuthError::OutOfScope` message), not the tool layer.
+///
+/// The scope prefix is computed over the CANONICALIZED workspace root: the
+/// child canonicalizes the session cwd (`canonical_session_cwd`) before
+/// booting its kernel, and `path_is_within` is a plain string prefix match —
+/// an un-canonicalized `/tmp`-style path would diverge on macOS
+/// (`/private/tmp`) and 8.3-short-name Windows temp dirs.
+///
+/// Mock scenarios are fixed to write `generated/output.txt` /
+/// `generated/denied.txt`, so in-scope vs out-of-scope is chosen by the
+/// prefix the scope grants: `…/generated` includes the writes; `…/allowed`
+/// excludes them.
+#[tokio::test]
+async fn zone_scope_env_shapes_cli_subprocess_file_authorization() {
+    let server = MockAnthropicService::spawn()
+        .await
+        .expect("mock service should start");
+
+    let scope_json_for = |granted_prefix: &str| {
+        serde_json::json!({
+            "schema_version": 1,
+            "zone_id": "zone-scope-e2e",
+            "rules": [
+                {"capability": "zone.data.read", "resource_prefixes": [granted_prefix]},
+                {"capability": "zone.data.write", "resource_prefixes": [granted_prefix]}
+            ]
+        })
+        .to_string()
+    };
+
+    // Group 1 — in scope: the write under the granted prefix succeeds.
+    {
+        let workspace = TestWorkspace::new("zone-in-scope");
+        workspace.create();
+        workspace.write_sudocode_json(&server.base_url());
+        let canonical = fs::canonicalize(&workspace.root).expect("canonicalize root");
+        let ws_vfs = runtime::vfs_path_for_host_path(&canonical).expect("workspace VFS prefix");
+        let scope = scope_json_for(&format!("{ws_vfs}/generated"));
+
+        let mut client = spawn_stdio_client_danger_zone_env(&workspace, "zone-scope-e2e", &scope);
+        scenario_initialize(&mut client).await;
+        let session = scenario_session_new(&mut client, &workspace.root).await;
+        let (text, tools) = run_scenario_collect_text(
+            &mut client,
+            &session,
+            "write_file_allowed",
+            Duration::from_secs(30),
+            "zone in-scope write",
+        )
+        .await;
+        assert!(
+            text.contains("write_file succeeded"),
+            "in-scope write must succeed: text {text:?} tools {tools:?}"
+        );
+        assert!(
+            workspace.root.join("generated/output.txt").is_file(),
+            "in-scope write must land on disk"
+        );
+        client.shutdown().await;
+        workspace.cleanup();
+    }
+
+    // Group 2 — out of scope: the identical write shape is refused, nothing
+    // lands, and the refusal reason is the zone layer's OutOfScope.
+    {
+        let workspace = TestWorkspace::new("zone-out-of-scope");
+        workspace.create();
+        workspace.write_sudocode_json(&server.base_url());
+        let canonical = fs::canonicalize(&workspace.root).expect("canonicalize root");
+        let ws_vfs = runtime::vfs_path_for_host_path(&canonical).expect("workspace VFS prefix");
+        let scope = scope_json_for(&format!("{ws_vfs}/allowed"));
+
+        let mut client = spawn_stdio_client_danger_zone_env(&workspace, "zone-scope-e2e", &scope);
+        scenario_initialize(&mut client).await;
+        let session = scenario_session_new(&mut client, &workspace.root).await;
+        let (text, tools) = run_scenario_collect_text(
+            &mut client,
+            &session,
+            "write_file_denied",
+            Duration::from_secs(30),
+            "zone out-of-scope write",
+        )
+        .await;
+        assert!(
+            text.contains("write_file denied as expected"),
+            "out-of-scope write must be denied: text {text:?} tools {tools:?}"
+        );
+        assert!(
+            !workspace.root.join("generated/denied.txt").exists(),
+            "out-of-scope write must not land on disk"
+        );
+        let tool_text = tools
+            .iter()
+            .map(|tool| tool.to_string())
+            .collect::<String>();
+        assert!(
+            format!("{text}{tool_text}").contains("is outside runtime scope"),
+            "the refusal must be the zone layer's OutOfScope, not the tool \
+             layer's: text {text:?} tools {tool_text:?}"
+        );
+        client.shutdown().await;
+        workspace.cleanup();
+    }
+
+    // Group 3 — control, genuinely env-less: the same write the zone refused
+    // succeeds, proving the refusal came from the env-shaped authorization
+    // and not the tool layer or the mock. The mock's closing text is fixed
+    // ("denied as expected") regardless of the real outcome, so only the
+    // file on disk is the evidence here.
+    {
+        let workspace = TestWorkspace::new("zone-env-absent");
+        workspace.create();
+        workspace.write_sudocode_json(&server.base_url());
+
+        let mut client = spawn_stdio_client_danger(&workspace);
+        scenario_initialize(&mut client).await;
+        let session = scenario_session_new(&mut client, &workspace.root).await;
+        let _ = run_scenario_collect_text(
+            &mut client,
+            &session,
+            "write_file_denied",
+            Duration::from_secs(30),
+            "env-less control write",
+        )
+        .await;
+        assert!(
+            workspace.root.join("generated/denied.txt").is_file(),
+            "env-less control write must land on disk"
+        );
+        client.shutdown().await;
+        workspace.cleanup();
+    }
+}
+
 async fn initialize_task_completions(client: &mut AcpTestClient) {
     let (_, response) = client.send_request("initialize", json!({"protocolVersion":1,"clientCapabilities":{"_meta":{"sudocode":{"taskCompletions":{"version":1},"subagentCompletions":{"version":1}}}}})).await;
     assert_eq!(
@@ -7461,29 +7685,34 @@ async fn acp_task_completions_interrupted_shell_and_encoded_budget() {
     client.shutdown().await;
     let mut client = spawn_stdio_client_danger(&workspace);
     initialize_task_completions(&mut client).await;
-    let (_, replay) = client
-        .send_request(
-            "_sudocode/task/replay",
-            json!({"sessionId":sid,"cwd":workspace.root,"storageRef":storage}),
-        )
-        .await;
-    assert_eq!(replay["result"]["executionUnconfirmed"], 1, "{replay}");
-    let (_, suppressed) = client.send_request("_sudocode/task/suppress", json!({"sessionId":sid,"cwd":workspace.root,"storageRef":storage,"originTraceId":"root:1"})).await;
-    assert_eq!(
-        suppressed["result"]["disposition"], "suppressed",
-        "{suppressed}"
-    );
-    let (_, replay) = client
-        .send_request(
-            "_sudocode/task/replay",
-            json!({"sessionId":sid,"cwd":workspace.root,"storageRef":storage}),
-        )
-        .await;
-    assert_eq!(replay["result"]["unresolved"], 0, "{replay}");
-    assert_eq!(
-        replay["result"]["executionUnconfirmed"], 1,
-        "suppression is not termination: {replay}"
-    );
+    // No deliverable completion keeps a cold route alive here. Repeated
+    // controls must cross its engine/writer teardown, without a test sleep or
+    // retry masking a transient same-process session_writer_busy.
+    for _ in 0..32 {
+        let (_, replay) = client
+            .send_request(
+                "_sudocode/task/replay",
+                json!({"sessionId":sid,"cwd":workspace.root,"storageRef":storage}),
+            )
+            .await;
+        assert_eq!(replay["result"]["executionUnconfirmed"], 1, "{replay}");
+        let (_, suppressed) = client.send_request("_sudocode/task/suppress", json!({"sessionId":sid,"cwd":workspace.root,"storageRef":storage,"originTraceId":"root:1"})).await;
+        assert_eq!(
+            suppressed["result"]["disposition"], "suppressed",
+            "{suppressed}"
+        );
+        let (_, replay) = client
+            .send_request(
+                "_sudocode/task/replay",
+                json!({"sessionId":sid,"cwd":workspace.root,"storageRef":storage}),
+            )
+            .await;
+        assert_eq!(replay["result"]["unresolved"], 0, "{replay}");
+        assert_eq!(
+            replay["result"]["executionUnconfirmed"], 1,
+            "suppression is not termination: {replay}"
+        );
+    }
     fs::write(workspace.root.join("release-unknown"), "go").unwrap();
     timeout(Duration::from_secs(5), async {
         while !workspace.root.join("unknown-exited").exists() {
@@ -8142,6 +8371,678 @@ $stamp = '{{0}}:{{1}}' -f $PID, (Get-Process -Id $PID).StartTime.ToUniversalTime
         "replay must not restart model or process work"
     );
     client.send_raw(&json!({"jsonrpc":"2.0","id":completion["id"],"result":{"completionId":completion["params"]["completionId"],"disposition":"stored"}})).await;
+    client.shutdown().await;
+    workspace.cleanup();
+}
+
+/// Pin the agent name a session started in `dir` answers to.
+fn pin_agent_name(dir: &Path, agent: &str) {
+    let settings = dir.join(".nexus").join("sudocode");
+    fs::create_dir_all(&settings).expect("create project settings");
+    fs::write(
+        settings.join("settings.json"),
+        json!({ "agentName": agent }).to_string(),
+    )
+    .expect("write project settings");
+}
+
+/// A non-hosted ACP process on a machine with no node receives its peers over
+/// the same-machine pair root, one receiver per agent it serves.
+///
+/// Two sessions in two workspaces are two agents. Each peer message reaches
+/// the session of the agent it was sent to, never the other one, and names its
+/// real sender. Each conversation's read position moves only once the turn the
+/// message started has finished.
+#[tokio::test]
+async fn acp_stdio_receives_peer_messages_on_the_pair_root() {
+    const FIRST: &str = "acp-pair-first";
+    const SECOND: &str = "acp-pair-second";
+    const PEER: &str = "acp-pair-peer";
+    let server = MockAnthropicService::spawn()
+        .await
+        .expect("mock service should start");
+    let workspace = TestWorkspace::new("stdio-pair-receive");
+    workspace.create();
+    workspace.write_sudocode_json(&server.base_url());
+    let second_dir = workspace.root.join("second");
+    fs::create_dir_all(&second_dir).expect("create the second workspace");
+    pin_agent_name(&workspace.root, FIRST);
+    pin_agent_name(&second_dir, SECOND);
+
+    let mut client = spawn_stdio_client(&workspace);
+    scenario_initialize(&mut client).await;
+    let mut sessions = Vec::new();
+    for (dir, agent) in [(&workspace.root, FIRST), (&second_dir, SECOND)] {
+        let (_, created) = client
+            .send_request(
+                "session/new",
+                json!({"cwd": dir.to_string_lossy(), "mcpServers": []}),
+            )
+            .await;
+        let peer = &created["result"]["_meta"]["sudocode"]["peer"];
+        assert_eq!(
+            peer["agent"], agent,
+            "session/new reports its agent: {created}"
+        );
+        assert_eq!(
+            peer["namespace"], "disk",
+            "with no node record the peers are on the pair root: {created}"
+        );
+        let id = created["result"]["sessionId"]
+            .as_str()
+            .unwrap_or_else(|| panic!("session/new returned no sessionId: {created}"))
+            .to_string();
+        sessions.push((agent, id));
+    }
+
+    let pair_root = runtime::mailbox::local_pair_root_in(&workspace.config_home);
+    let peer = runtime::mailbox::Mailbox::workspace_local(&pair_root, PEER.to_string());
+    for (agent, _) in &sessions {
+        peer.send(runtime::agent_mailbox::MailboxEnvelope {
+            from: PEER.to_string(),
+            to: (*agent).to_string(),
+            body: format!("for {agent} PARITY_SCENARIO:single_turn_text"),
+            summary: None,
+            timestamp: 0,
+            color: None,
+            kind: runtime::agent_mailbox::kinds::MESSAGE.to_string(),
+            request_id: None,
+        })
+        .expect("the peer writes on the pair root");
+    }
+
+    let mut delivered: Vec<Value> = Vec::new();
+    while delivered.len() < sessions.len() {
+        let (_, update) = client
+            .recv_until(Duration::from_secs(30), |msg| {
+                msg["method"] == "session/update"
+                    && msg["params"]["update"]["sessionUpdate"] == "user_message_chunk"
+                    && msg["params"]["_meta"]["sudocode"]["a2a"]["from"] == PEER
+            })
+            .await
+            .unwrap_or_else(|seen| {
+                panic!("a peer message never reached the client; saw {seen:#?}")
+            });
+        delivered.push(update);
+    }
+    for (agent, id) in &sessions {
+        let update = delivered
+            .iter()
+            .find(|update| update["params"]["sessionId"] == id.as_str())
+            .unwrap_or_else(|| {
+                panic!("nothing was delivered to {agent}'s session: {delivered:#?}")
+            });
+        let text = update["params"]["update"]["content"]["text"]
+            .as_str()
+            .unwrap_or_default();
+        assert!(
+            text.contains(&format!("for {agent} ")),
+            "{agent}'s session got another agent's message: {text}"
+        );
+    }
+
+    for (agent, _) in &sessions {
+        let inbox = runtime::mailbox::Mailbox::workspace_local(&pair_root, (*agent).to_string());
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            let position = inbox
+                .read_position(PEER)
+                .expect("read the agent's position")
+                .unwrap_or(0);
+            if position > 0 {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "{agent} never recorded the message after its turn finished"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+
+    client.shutdown().await;
+    workspace.cleanup();
+}
+
+// ---------------------------------------------------------------------------
+// Direct A2A requests (`_sudocode/a2a/*`)
+// ---------------------------------------------------------------------------
+
+/// Open a session in `dir` and return its id.
+async fn open_direct_session(client: &mut AcpTestClient, dir: &Path) -> String {
+    let (_, created) = client
+        .send_request(
+            "session/new",
+            json!({"cwd": dir.to_string_lossy(), "mcpServers": []}),
+        )
+        .await;
+    created["result"]["sessionId"]
+        .as_str()
+        .unwrap_or_else(|| panic!("session/new returned no sessionId: {created}"))
+        .to_string()
+}
+
+async fn set_session_mode(client: &mut AcpTestClient, session_id: &str, mode: &str) {
+    let (_, resp) = client
+        .send_request(
+            "session/setPermissionMode",
+            json!({ "sessionId": session_id, "permissionMode": mode }),
+        )
+        .await;
+    assert!(
+        resp.get("error").is_none(),
+        "session/setPermissionMode {mode} should succeed: {resp}"
+    );
+}
+
+/// A definite refusal is invalid params: nothing ran, so it may be resent.
+fn assert_refused(resp: &Value, case: &str) {
+    assert_eq!(
+        resp["error"]["code"], -32602,
+        "{case} must be refused before anything runs: {resp}"
+    );
+}
+
+/// What `sender` has written to its conversation with `peer` on the pair root,
+/// read straight from the transcript so reading it changes nothing.
+fn conversation_log(pair_root: &Path, peer: &str, sender: &str) -> String {
+    let path = runtime::mailbox::Mailbox::workspace_local(pair_root, peer.to_string())
+        .transcript_path(sender);
+    fs::read_to_string(path).unwrap_or_default()
+}
+
+/// `_sudocode/a2a/send` runs the session's own `send` tool for the client: the
+/// message reaches the peer on the pair root from the session's agent, the
+/// model is never asked, and the model's history never sees it.
+#[tokio::test]
+async fn direct_a2a_send_reaches_the_peer_without_a_model_turn() {
+    const AGENT: &str = "direct-a2a-sender";
+    const PEER: &str = "direct-a2a-peer";
+    const MARKER: &str = "DIRECT_A2A_MARKER_7c1f";
+    let server = MockAnthropicService::spawn()
+        .await
+        .expect("mock service should start");
+    let workspace = TestWorkspace::new("direct-a2a-send");
+    workspace.create();
+    workspace.write_sudocode_json(&server.base_url());
+    pin_agent_name(&workspace.root, AGENT);
+    let pair_root = runtime::mailbox::local_pair_root_in(&workspace.config_home);
+
+    let mut client = spawn_stdio_client(&workspace);
+    let (_, init) = client
+        .send_request("initialize", json!({ "protocolVersion": 1 }))
+        .await;
+    assert_eq!(
+        init["result"]["_meta"]["sudocode"]["directA2a"]["version"], 1,
+        "initialize advertises the direct A2A requests: {init}"
+    );
+    let sid = open_direct_session(&mut client, &workspace.root).await;
+    set_session_mode(&mut client, &sid, "workspace-write").await;
+
+    let before = server.captured_requests().await.len();
+    let (_, sent) = client
+        .send_request(
+            "_sudocode/a2a/send",
+            json!({
+                "sessionId": sid,
+                "to": PEER,
+                "message": format!("{MARKER} hello"),
+                "summary": "direct probe"
+            }),
+        )
+        .await;
+    assert_eq!(
+        sent["result"]["isError"], false,
+        "the send tool ran: {sent}"
+    );
+    assert!(
+        sent["result"]["content"]
+            .as_str()
+            .is_some_and(|content| !content.is_empty()),
+        "the response carries the tool's own result: {sent}"
+    );
+    let log = conversation_log(&pair_root, PEER, AGENT);
+    assert!(
+        log.contains(MARKER) && log.contains(AGENT),
+        "the peer's conversation holds the message from {AGENT}: {log}"
+    );
+
+    let (_, listed) = client
+        .send_request("_sudocode/a2a/agent_list", json!({ "sessionId": sid }))
+        .await;
+    assert_eq!(
+        listed["result"]["isError"], false,
+        "agent_list ran: {listed}"
+    );
+    let rows: Value =
+        serde_json::from_str(listed["result"]["content"].as_str().unwrap_or_default())
+            .unwrap_or_else(|e| panic!("agent_list returns the tool's JSON ({e}): {listed}"));
+    assert!(
+        rows.get("agents").is_some() && rows.get("count").is_some(),
+        "agent_list returns the tool's own rows: {rows}"
+    );
+    assert_eq!(
+        server.captured_requests().await.len(),
+        before,
+        "a direct call never asks the model"
+    );
+
+    // The next real turn's request carries no trace of the direct send.
+    let (_, prompted) = client
+        .send_request(
+            "session/prompt",
+            json!({
+                "sessionId": sid,
+                "prompt": [{ "type": "text", "text": format!("{SCENARIO_PREFIX}single_turn_text") }]
+            }),
+        )
+        .await;
+    assert!(
+        prompted.get("error").is_none(),
+        "the prompt ran: {prompted}"
+    );
+    let requests = server.captured_requests().await;
+    let last = requests.last().expect("the prompt reached the model");
+    assert!(
+        !last.raw_body.contains(MARKER),
+        "a direct send must not enter the model's history"
+    );
+
+    client.shutdown().await;
+    workspace.cleanup();
+}
+
+/// Every refusal is definite and leaves the peer untouched: an unknown
+/// session, a `sender` or structured message, a mode that forbids sending,
+/// paused tools, a session busy with a turn, and a denied permission prompt.
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn direct_a2a_refusals_send_nothing() {
+    const AGENT: &str = "direct-a2a-refuser";
+    const PEER: &str = "direct-a2a-untouched";
+    const MARKER: &str = "DIRECT_A2A_REFUSED_3e9a";
+    let server = MockAnthropicService::spawn()
+        .await
+        .expect("mock service should start");
+    let workspace = TestWorkspace::new("direct-a2a-refusals");
+    workspace.create();
+    workspace.write_sudocode_json(&server.base_url());
+    pin_agent_name(&workspace.root, AGENT);
+    let pair_root = runtime::mailbox::local_pair_root_in(&workspace.config_home);
+
+    let mut client = spawn_stdio_client(&workspace);
+    scenario_initialize(&mut client).await;
+    let sid = open_direct_session(&mut client, &workspace.root).await;
+    let send = |session: &str, extra: Value| {
+        let mut params =
+            json!({ "sessionId": session, "to": PEER, "message": MARKER, "summary": "probe" });
+        if let (Some(params), Some(extra)) = (params.as_object_mut(), extra.as_object()) {
+            params.extend(extra.clone());
+        }
+        params
+    };
+
+    for (case, params) in [
+        ("an unknown session", send("no-such-session", json!({}))),
+        (
+            "a sender override",
+            send(&sid, json!({ "sender": "someone-else" })),
+        ),
+        (
+            "a structured message",
+            send(&sid, json!({ "message": { "type": "shutdown_request" } })),
+        ),
+        (
+            "a message without a summary",
+            json!({ "sessionId": sid, "to": PEER, "message": MARKER }),
+        ),
+    ] {
+        let (_, resp) = client.send_request("_sudocode/a2a/send", params).await;
+        assert_refused(&resp, case);
+    }
+
+    // The session starts read-only: the tool runs and the policy refuses it.
+    let (_, resp) = client
+        .send_request("_sudocode/a2a/send", send(&sid, json!({})))
+        .await;
+    assert_eq!(
+        resp["result"]["isError"], true,
+        "read-only mode refuses the send: {resp}"
+    );
+    assert!(
+        resp["result"]["content"]
+            .as_str()
+            .is_some_and(|text| text.contains("read-only")),
+        "the refusal is the permission policy's: {resp}"
+    );
+
+    let (_, paused) = client
+        .send_request("_sudocode/session/pause_tools", json!({ "sessionId": sid }))
+        .await;
+    let epoch = paused["result"]["pauseEpoch"].clone();
+    let (_, resp) = client
+        .send_request("_sudocode/a2a/send", send(&sid, json!({})))
+        .await;
+    assert_refused(&resp, "paused tools");
+    let (_, resumed) = client
+        .send_request(
+            "_sudocode/session/resume_tools",
+            json!({ "sessionId": sid, "pauseEpoch": epoch }),
+        )
+        .await;
+    assert!(resumed.get("error").is_none(), "resume_tools: {resumed}");
+
+    let (prompt_id, permission_id) = park_session_on_permission_prompt(&mut client, &sid).await;
+    let (_, resp) = client
+        .send_request("_sudocode/a2a/send", send(&sid, json!({})))
+        .await;
+    assert_refused(&resp, "a session busy with a turn");
+    allow_permission(&mut client, &permission_id).await;
+    client
+        .recv_until(Duration::from_secs(60), |m| is_response_to(m, prompt_id))
+        .await
+        .unwrap_or_else(|seen| panic!("the parked turn never finished; saw {seen:#?}"));
+
+    set_session_mode(&mut client, &sid, "prompt").await;
+    let id = client
+        .send_request_no_wait("_sudocode/a2a/send", send(&sid, json!({})))
+        .await;
+    let (_, permission) = client
+        .recv_until(Duration::from_secs(30), |m| {
+            is_server_request(m, "session/request_permission")
+        })
+        .await
+        .unwrap_or_else(|seen| panic!("the direct send never asked; saw {seen:#?}"));
+    client
+        .send_raw(&json!({
+            "jsonrpc": "2.0",
+            "id": permission["id"],
+            "result": { "outcome": { "outcome": "selected", "optionId": "reject_once" } }
+        }))
+        .await;
+    let (_, resp) = client
+        .recv_until(Duration::from_secs(30), |m| is_response_to(m, id))
+        .await
+        .unwrap_or_else(|seen| panic!("the denied send never answered; saw {seen:#?}"));
+    assert_eq!(
+        resp["result"]["isError"], true,
+        "a denied permission prompt refuses the send: {resp}"
+    );
+    assert!(
+        resp["result"]["content"]
+            .as_str()
+            .is_some_and(|text| text.contains("reject_once")),
+        "the refusal is the client's denial: {resp}"
+    );
+
+    assert!(
+        !conversation_log(&pair_root, PEER, AGENT).contains(MARKER),
+        "no refused send may reach the peer"
+    );
+    client.shutdown().await;
+    workspace.cleanup();
+}
+
+/// A direct send cancelled after its message went out is not a refusal: the
+/// response says the outcome is unknown, the peer holds the message exactly
+/// once, the model is never asked, and nothing resends it.
+#[tokio::test]
+async fn direct_a2a_cancel_after_delivery_reports_unknown() {
+    const AGENT: &str = "direct-a2a-cancelled";
+    const PEER: &str = "direct-a2a-receiver";
+    const MARKER: &str = "DIRECT_A2A_UNKNOWN_5b2d";
+    let server = MockAnthropicService::spawn()
+        .await
+        .expect("mock service should start");
+    let workspace = TestWorkspace::new("direct-a2a-unknown");
+    workspace.create();
+    workspace.write_sudocode_json(&server.base_url());
+    // Hold the call in its post-tool hook, after the send itself has run.
+    let started = workspace.root.join("direct-post.started");
+    let release = workspace.root.join("direct-post.release");
+    let hook = if cfg!(windows) {
+        r"echo started>direct-post.started& for /L %i in (1,1,60) do @if not exist direct-post.release (ping -n 2 127.0.0.1 >nul)"
+    } else {
+        r"touch direct-post.started; i=0; while [ ! -f direct-post.release ] && [ $i -lt 600 ]; do sleep 0.1; i=$((i+1)); done"
+    };
+    let settings = workspace.root.join(".nexus").join("sudocode");
+    fs::create_dir_all(&settings).expect("create project settings");
+    fs::write(
+        settings.join("settings.json"),
+        json!({ "agentName": AGENT, "hooks": { "PostToolUse": [hook] } }).to_string(),
+    )
+    .expect("write project settings");
+    let pair_root = runtime::mailbox::local_pair_root_in(&workspace.config_home);
+
+    let mut client = spawn_stdio_client(&workspace);
+    scenario_initialize(&mut client).await;
+    let sid = open_direct_session(&mut client, &workspace.root).await;
+    set_session_mode(&mut client, &sid, "workspace-write").await;
+    let before = server.captured_requests().await.len();
+
+    let id = client
+        .send_request_no_wait(
+            "_sudocode/a2a/send",
+            json!({ "sessionId": sid, "to": PEER, "message": MARKER, "summary": "probe" }),
+        )
+        .await;
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    while !started.exists() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the post-tool hook never started"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(
+        conversation_log(&pair_root, PEER, AGENT)
+            .matches(MARKER)
+            .count(),
+        1,
+        "the send ran before its post-tool hook"
+    );
+    client
+        .send_raw(&json!({
+            "jsonrpc": "2.0",
+            "method": "session/cancel",
+            "params": { "sessionId": sid }
+        }))
+        .await;
+    let answered = client
+        .recv_until(Duration::from_secs(30), |m| is_response_to(m, id))
+        .await;
+    let _ = fs::write(&release, "");
+    let (_, resp) =
+        answered.unwrap_or_else(|seen| panic!("the cancelled send never answered; saw {seen:#?}"));
+    assert_eq!(
+        resp["error"]["code"], -32603,
+        "a call cancelled after it ran is not a refusal: {resp}"
+    );
+    assert_eq!(
+        resp["error"]["data"]["outcome"], "unknown",
+        "the response says the outcome is unknown: {resp}"
+    );
+
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert_eq!(
+        conversation_log(&pair_root, PEER, AGENT)
+            .matches(MARKER)
+            .count(),
+        1,
+        "nothing resends a message whose outcome is unknown"
+    );
+    assert_eq!(
+        server.captured_requests().await.len(),
+        before,
+        "a direct call never asks the model"
+    );
+    client.shutdown().await;
+    workspace.cleanup();
+}
+
+/// A pause issued while a direct send's worker is still writing waits for that
+/// worker: direct calls take the session's operation fence as a turn's tools
+/// do. The worker is held mid-write on a full FIFO standing in for the peer's
+/// transcript, so it is genuinely in flight when the pause arrives, and control
+/// is reported only after the test lets the write finish.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn direct_a2a_pause_waits_for_an_in_flight_send() {
+    use nix::{libc, sys::stat::Mode, unistd::mkfifo};
+    use std::io::{ErrorKind, Read, Write};
+    use std::os::unix::fs::OpenOptionsExt;
+
+    const AGENT: &str = "direct-a2a-fenced";
+    const PEER: &str = "direct-a2a-held";
+    const MARKER: &str = "DIRECT_A2A_FENCED_91c4";
+    let server = MockAnthropicService::spawn()
+        .await
+        .expect("mock service should start");
+    let workspace = TestWorkspace::new("direct-a2a-fence");
+    workspace.create();
+    workspace.write_sudocode_json(&server.base_url());
+    let started = workspace.root.join("direct-pre.started");
+    let settings = workspace.root.join(".nexus").join("sudocode");
+    fs::create_dir_all(&settings).expect("create project settings");
+    fs::write(
+        settings.join("settings.json"),
+        json!({ "agentName": AGENT, "hooks": { "PreToolUse": ["touch direct-pre.started"] } })
+            .to_string(),
+    )
+    .expect("write project settings");
+    let pair_root = runtime::mailbox::local_pair_root_in(&workspace.config_home);
+
+    // The send appends to this path; as a full pipe it blocks the append.
+    let transcript = runtime::mailbox::Mailbox::workspace_local(&pair_root, PEER.to_string())
+        .transcript_path(AGENT);
+    let transcript = Path::new(&transcript);
+    fs::create_dir_all(transcript.parent().expect("transcript dir"))
+        .expect("create transcript dir");
+    mkfifo(transcript, Mode::S_IRUSR | Mode::S_IWUSR).expect("mkfifo");
+    let mut pipe = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(transcript)
+        .expect("open the fifo");
+    for chunk in [65_536, 4096, 512, 64, 8, 1] {
+        let block = vec![b'#'; chunk];
+        loop {
+            match pipe.write(&block) {
+                Ok(_) => {}
+                Err(error) if error.kind() == ErrorKind::WouldBlock => break,
+                Err(error) => panic!("fill the pipe: {error}"),
+            }
+        }
+    }
+
+    let mut client = spawn_stdio_client(&workspace);
+    scenario_initialize(&mut client).await;
+    let sid = open_direct_session(&mut client, &workspace.root).await;
+    set_session_mode(&mut client, &sid, "workspace-write").await;
+    let before = server.captured_requests().await.len();
+
+    let send_id = client
+        .send_request_no_wait(
+            "_sudocode/a2a/send",
+            json!({ "sessionId": sid, "to": PEER, "message": MARKER, "summary": "probe" }),
+        )
+        .await;
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    while !started.exists() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the pre-tool hook never ran"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    // The hook runs just before dispatch; give the worker time to reach the
+    // blocked write. Too little time can only fail this test, never pass it.
+    tokio::time::sleep(Duration::from_secs(1)).await;
+
+    let pause_id = client
+        .send_request_no_wait("_sudocode/session/pause_tools", json!({ "sessionId": sid }))
+        .await;
+    let mut seen = match client
+        .recv_until(Duration::from_secs(3), |m| is_response_to(m, pause_id))
+        .await
+    {
+        Ok((_, early)) => {
+            panic!("pause reported control while the send's worker was still writing: {early}")
+        }
+        Err(seen) => seen,
+    };
+
+    // Release the worker by draining the pipe until its line arrives.
+    let mut drained = Vec::new();
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    let line_end = |bytes: &[u8]| {
+        let text = String::from_utf8_lossy(bytes);
+        text.find(MARKER)
+            .is_some_and(|at| text[at..].contains('\n'))
+    };
+    while !line_end(&drained) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the send never finished its write"
+        );
+        let mut buf = [0u8; 65_536];
+        match pipe.read(&mut buf) {
+            Ok(n) => drained.extend_from_slice(&buf[..n]),
+            Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            Err(error) => panic!("drain the pipe: {error}"),
+        }
+    }
+
+    let (more, paused) = client
+        .recv_until(Duration::from_secs(30), |m| is_response_to(m, pause_id))
+        .await
+        .unwrap_or_else(|seen| panic!("pause never reported control; saw {seen:#?}"));
+    seen.extend(more);
+    assert_eq!(
+        paused["result"]["isQuiescent"], true,
+        "pause reports control once the worker has finished: {paused}"
+    );
+    let sent = match seen.into_iter().find(|m| is_response_to(m, send_id)) {
+        Some(sent) => sent,
+        None => {
+            client
+                .recv_until(Duration::from_secs(30), |m| is_response_to(m, send_id))
+                .await
+                .unwrap_or_else(|seen| panic!("the send never answered; saw {seen:#?}"))
+                .1
+        }
+    };
+    assert_eq!(
+        sent["error"]["data"]["outcome"], "unknown",
+        "a send the pause stopped after admission has an unknown outcome: {sent}"
+    );
+
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let mut buf = [0u8; 65_536];
+    if let Ok(n) = pipe.read(&mut buf) {
+        drained.extend_from_slice(&buf[..n]);
+    }
+    assert_eq!(
+        String::from_utf8_lossy(&drained).matches(MARKER).count(),
+        1,
+        "the message was written once and never resent"
+    );
+    assert_eq!(
+        server.captured_requests().await.len(),
+        before,
+        "a direct call never asks the model"
+    );
+    let (_, resumed) = client
+        .send_request(
+            "_sudocode/session/resume_tools",
+            json!({ "sessionId": sid, "pauseEpoch": paused["result"]["pauseEpoch"] }),
+        )
+        .await;
+    assert!(resumed.get("error").is_none(), "resume_tools: {resumed}");
     client.shutdown().await;
     workspace.cleanup();
 }

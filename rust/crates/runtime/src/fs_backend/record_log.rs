@@ -231,6 +231,8 @@ pub(super) fn open_kernel<K>(
 where
     K: KernelConvenience + KernelFsAccess + Send + Sync + 'static,
 {
+    fs.authorize_target(path, super::ResourceAccessKind::Read)?;
+    fs.authorize_target(path, super::ResourceAccessKind::Write)?;
     let path = fs.to_kernel(path)?;
     fs.authorize(&path, Permission::Read)?;
     fs.authorize(&path, Permission::Write)?;
@@ -313,6 +315,8 @@ pub(super) fn open_remote(
     path: &str,
     mode: RecordLogMode,
 ) -> io::Result<Arc<dyn RecordLog>> {
+    fs.authorize_target(path, super::ResourceAccessKind::Read)?;
+    fs.authorize_target(path, super::ResourceAccessKind::Write)?;
     let entry = match fs.client.stat(path, &fs.auth_token) {
         Ok(entry) => Some(entry),
         Err(error) if error.kind() == io::ErrorKind::NotFound => None,

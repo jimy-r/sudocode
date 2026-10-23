@@ -718,10 +718,12 @@ fn rejected_thinking_is_archived_once_and_new_signatures_survive_resume() {
             &mut cli,
             "Keep the new signed response on the next request.",
         );
+        assert_eq!(capture.bodies().len(), 5, "one continuation request");
         assert_thinking_replayed(capture.bodies().last().unwrap(), 4);
         exit(&mut cli);
         let mut cli = spawn_with_env(&env, &path, &[("SUDOCODE_INTERRUPT_QUEUE_MODE", mode)]);
         turn(&mut cli, "Keep the new signed response after restart.");
+        assert_eq!(capture.bodies().len(), 6, "one resumed request");
         assert_thinking_replayed(capture.bodies().last().unwrap(), 4);
         assert_eq!(repair_archives(&path).len(), 1);
         exit(&mut cli);
@@ -742,7 +744,15 @@ fn rejected_thinking_is_archived_once_and_new_signatures_survive_resume() {
             .iter()
             .filter(|e| e["event"] == "thinking_input_transformations")
             .collect();
-        assert!((5..=6).contains(&acks.len()));
+        assert!(
+            (5..=6).contains(&acks.len()),
+            "mode={mode}, acknowledgments={}, attributes={:?}, PTY:\n{}",
+            acks.len(),
+            acks.iter()
+                .map(|event| &event["attributes"])
+                .collect::<Vec<_>>(),
+            cli.render(|screen| screen.contents())
+        );
         let final_updates: Vec<_> = acks
             .iter()
             .filter(|e| e["attributes"]["count"] == 1)
@@ -1521,7 +1531,10 @@ fn ttl_advisor_records_wire_timing_and_decides_once_after_compact() {
     let path = fixture(&env, &capture);
     let id = Session::load_from_path(&path).unwrap().session_id;
     let directory = env.config_home().join("cache/prompt-cache").join(id);
-    let enabled = [("SUDOCODE_EXPERIMENT_CACHE_TTL_ADVISOR", "1")];
+    let enabled = [
+        ("SUDOCODE_EXPERIMENT_CACHE_TTL_ADVISOR", "1"),
+        ("SUDOCODE_INTERRUPT_QUEUE_MODE", "queue"),
+    ];
     let mut cli = spawn_with_env(&env, &path, &enabled);
     turn(&mut cli, "First observed request.");
     let rows = cache_rows(&directory);
@@ -1576,6 +1589,16 @@ fn ttl_advisor_records_wire_timing_and_decides_once_after_compact() {
     cli.send("/compact\r").unwrap();
     cli.expect("Messages removed").unwrap();
     common::expect_input_line_cleared(&cli, WAIT, "advisor compaction committed");
+    common::expect_screen(
+        &cli,
+        |screen| {
+            screen
+                .rsplit_once('─')
+                .is_some_and(|(_, footer)| footer.contains("Cache TTL: consider 1h"))
+        },
+        WAIT,
+        "boundary advice in the shared footer",
+    );
     turn(&mut cli, "Continue with the configured policy.");
     exit(&mut cli);
     let state_path = directory.join("ttl-advice.json");
@@ -1636,12 +1659,33 @@ fn ttl_advisor_is_opt_in_and_marks_retried_or_restarted_streams() {
         let mut cli = spawn_with_env(
             &env,
             &path,
-            &[(
-                "SUDOCODE_EXPERIMENT_CACHE_TTL_ADVISOR",
-                if mode == "off" { "0" } else { "1" },
-            )],
+            &[
+                (
+                    "SUDOCODE_EXPERIMENT_CACHE_TTL_ADVISOR",
+                    if mode == "off" { "0" } else { "1" },
+                ),
+                (
+                    "SUDOCODE_CACHE_DIAGNOSTICS",
+                    if mode == "restarted" { "1" } else { "0" },
+                ),
+            ],
         );
-        turn(&mut cli, "Observe a normal reply.");
+        if mode == "restarted" {
+            cli.send("Observe an invalid upstream restart.\r").unwrap();
+            common::expect_screen(
+                &cli,
+                |screen| common::screen_contains(screen, "multiple message_start"),
+                WAIT,
+                "a restarted message is a protocol failure",
+            );
+            common::expect_input_line_cleared(
+                &cli,
+                WAIT,
+                "protocol failure returned to the prompt",
+            );
+        } else {
+            turn(&mut cli, "Observe a normal reply.");
+        }
         exit(&mut cli);
         let rows = cache_rows(&directory);
         let o = &rows.last().unwrap()["observation"];
@@ -1674,7 +1718,29 @@ fn ttl_advisor_is_opt_in_and_marks_retried_or_restarted_streams() {
                     "an incomplete response must not advance the successful prefix state"
                 );
             }
-            _ => assert_eq!(o["message_starts"], 2),
+            "restarted" => {
+                assert_eq!(
+                    o["message_starts"], 1,
+                    "reject the second start before it changes usage"
+                );
+                assert_eq!(o["completed"], false);
+                assert_eq!(rows.last().unwrap()["cache_creation_input_tokens"], 5235);
+                assert_eq!(rows.last().unwrap()["cache_read_input_tokens"], 124730);
+                let diagnostics: Value = serde_json::from_str(
+                    &std::fs::read_to_string(directory.join("cache-diagnostics.json")).unwrap(),
+                )
+                .unwrap();
+                assert_eq!(
+                    diagnostics["message_id"], "abandoned-attempt",
+                    "the rejected start must not replace the accepted diagnostic identity"
+                );
+                assert_eq!(
+                    capture.bodies().len(),
+                    1,
+                    "never replay an invalid upstream restart"
+                );
+            }
+            _ => unreachable!(),
         }
     }
 }

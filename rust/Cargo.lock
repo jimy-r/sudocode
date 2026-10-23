@@ -186,7 +186,7 @@ checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
 
 [[package]]
 name = "api"
-version = "0.2.34"
+version = "0.2.35"
 dependencies = [
  "base64 0.22.1",
  "bytes",
@@ -889,7 +889,7 @@ dependencies = [
 
 [[package]]
 name = "commands"
-version = "0.2.34"
+version = "0.2.35"
 dependencies = [
  "api",
  "plugins",
@@ -899,7 +899,7 @@ dependencies = [
 
 [[package]]
 name = "compat-harness"
-version = "0.2.34"
+version = "0.2.35"
 dependencies = [
  "commands",
  "runtime",
@@ -1533,7 +1533,7 @@ checksum = "c34f04666d835ff5d62e058c3995147c06f42fe86ff053337632bca83e42702d"
 
 [[package]]
 name = "engine-acp"
-version = "0.2.34"
+version = "0.2.35"
 dependencies = [
  "a2a",
  "agent-client-protocol",
@@ -1562,7 +1562,7 @@ dependencies = [
 
 [[package]]
 name = "engine-core"
-version = "0.2.34"
+version = "0.2.35"
 dependencies = [
  "api",
  "async-trait",
@@ -1578,7 +1578,7 @@ dependencies = [
 
 [[package]]
 name = "engine-events"
-version = "0.2.34"
+version = "0.2.35"
 dependencies = [
  "runtime",
  "serde_json",
@@ -1586,7 +1586,7 @@ dependencies = [
 
 [[package]]
 name = "engine-host"
-version = "0.2.34"
+version = "0.2.35"
 dependencies = [
  "backends",
  "commands",
@@ -1630,7 +1630,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -2513,7 +2513,7 @@ checksum = "3640c1c38b8e4e43584d8df18be5fc6b0aa314ce6ebf51b53313d4306cca8e46"
 dependencies = [
  "hermit-abi",
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -2943,7 +2943,7 @@ dependencies = [
 
 [[package]]
 name = "mock-anthropic-service"
-version = "0.2.34"
+version = "0.2.35"
 dependencies = [
  "api",
  "serde_json",
@@ -3060,7 +3060,7 @@ dependencies = [
 
 [[package]]
 name = "nexus-vfs-client"
-version = "0.2.34"
+version = "0.2.35"
 dependencies = [
  "prost 0.13.5",
  "protoc-bin-vendored",
@@ -3072,7 +3072,7 @@ dependencies = [
 
 [[package]]
 name = "nexusd-cohost"
-version = "0.2.34"
+version = "0.2.35"
 dependencies = [
  "a2a",
  "anyhow",
@@ -3142,7 +3142,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -3544,7 +3544,7 @@ dependencies = [
 
 [[package]]
 name = "plugins"
-version = "0.2.34"
+version = "0.2.35"
 dependencies = [
  "serde",
  "serde_json",
@@ -3858,7 +3858,7 @@ checksum = "95067976aca6421a523e491fce939a3e65249bac4b977adee0ee9771568e8aa3"
 [[package]]
 name = "pty-expect"
 version = "0.1.4"
-source = "git+https://github.com/sudoprivacy/pty-expect?rev=78aeef007475f8ea3202c679d156ae6e2f1f8cf4#78aeef007475f8ea3202c679d156ae6e2f1f8cf4"
+source = "git+https://github.com/sudoprivacy/pty-expect?rev=958b04c0506d534e0b948994756f36057fe52c02#958b04c0506d534e0b948994756f36057fe52c02"
 dependencies = [
  "portable-pty",
  "regex",
@@ -3968,7 +3968,7 @@ dependencies = [
  "once_cell",
  "socket2 0.6.5",
  "tracing",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -4407,7 +4407,7 @@ dependencies = [
 
 [[package]]
 name = "runtime"
-version = "0.2.34"
+version = "0.2.35"
 dependencies = [
  "a2a",
  "agent-client-protocol",
@@ -4415,6 +4415,7 @@ dependencies = [
  "agent-client-protocol-tokio",
  "async-trait",
  "axum",
+ "backends",
  "base64 0.22.1",
  "chrono",
  "chrono-tz",
@@ -4434,12 +4435,14 @@ dependencies = [
  "nexus-vfs-client",
  "nix 0.29.0",
  "plugins",
+ "rcgen",
  "regex",
  "reqwest 0.12.28",
  "serde",
  "serde_json",
  "sha2 0.10.9",
  "shell-words",
+ "sudo-contracts",
  "telemetry",
  "tokio",
  "tokio-tungstenite",
@@ -4500,7 +4503,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.12.1",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -4558,7 +4561,7 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -4586,7 +4589,7 @@ checksum = "cf54715a573b99ac80df0bc206da022bcd442c974952c7b9720069370852e21f"
 
 [[package]]
 name = "rusty-sudocode-cli"
-version = "0.2.34"
+version = "0.2.35"
 dependencies = [
  "arboard",
  "async-trait",
@@ -4611,6 +4614,7 @@ dependencies = [
  "plugins",
  "pty-expect",
  "pulldown-cmark",
+ "rcgen",
  "reqwest 0.12.28",
  "runtime",
  "rustyline",
@@ -4924,7 +4928,7 @@ dependencies = [
 
 [[package]]
 name = "service-host"
-version = "0.2.34"
+version = "0.2.35"
 dependencies = [
  "axum",
  "base64 0.22.1",
@@ -5173,7 +5177,7 @@ checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
 
 [[package]]
 name = "stdin-peek"
-version = "0.2.34"
+version = "0.2.35"
 dependencies = [
  "windows-sys 0.61.2",
 ]
@@ -5236,6 +5240,15 @@ name = "subtle"
 version = "2.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
+
+[[package]]
+name = "sudo-contracts"
+version = "0.2.0-rc.1"
+source = "git+https://github.com/sudoprivacy/sudostack?rev=8323b0f6ac50270594dd76120919c20cc57318dd#8323b0f6ac50270594dd76120919c20cc57318dd"
+dependencies = [
+ "serde",
+ "serde_json",
+]
 
 [[package]]
 name = "symlink"
@@ -5332,7 +5345,7 @@ dependencies = [
 
 [[package]]
 name = "telemetry"
-version = "0.2.34"
+version = "0.2.35"
 dependencies = [
  "chrono",
  "dirs",
@@ -5351,7 +5364,7 @@ dependencies = [
  "getrandom 0.4.3",
  "once_cell",
  "rustix 1.1.4",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -5727,7 +5740,7 @@ dependencies = [
 
 [[package]]
 name = "tools"
-version = "0.2.34"
+version = "0.2.35"
 dependencies = [
  "api",
  "async-trait",
@@ -6269,7 +6282,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.48.0",
 ]
 
 [[package]]

@@ -614,15 +614,17 @@ coverage starts fresh and is tracked here as the single source.</p>
   (3) bash streaming output → (4) MCP progress notifications.
 </div>
 
+<p><strong>CCB validation:</strong> <code>src/screens/REPL.tsx</code> derives query activity from <code>QueryGuard</code> separately from <code>showSpinner</code>, and distinguishes approval/input waiting from busy and idle. Codex's <code>BottomPane::set_task_running</code> likewise keeps task state independent of status visibility. Scode uses its existing ordered <code>EngineEvent::State</code> stream as the foreground authority. Its activity cue stays visible through streamed output, with input waiting owned by the question/approval panel; temporary legacy spinner suspension cannot change the engine lifecycle.</p>
+
 <table>
   <thead><tr><th>Feature</th><th>Hacker Priority</th><th>Status</th><th>Test</th><th>Notes</th></tr></thead>
   <tbody>
     <tr><td>Inline terminal refresh (unified render loop)</td><td data-priority="must-have">must-have</td><td data-status="covered"><strong>Covered</strong></td><td><code>repl_ui.rs ReplApp</code></td><td>Async REPL uses <strong>iocraft</strong> <code>render_loop()</code> — Rust equivalent of CC's Ink. Bottom chrome (spinner + separator + TextInput prompt + separator + footer) is a single iocraft component tree. <code>UseOutput::println()</code> routes turn output above the fixed chrome. Spinner ticks via <code>use_future</code> at 80ms. Keyboard input via <code>use_terminal_events</code> replaces rustyline in the async path. PR #382 removed MultiProgress; PR #383 added iocraft.</td></tr>
-    <tr><td>Spinner status line — elapsed timer</td><td data-priority="must-have">must-have</td><td data-status="covered"><strong>Covered</strong></td><td><code>render.rs:207-212</code></td><td>Spinner prints <code>({elapsed:.1}s)</code> on every frame. Timer starts at turn start via <code>Instant::now()</code>. Pauses when <code>pause_flag</code> is set (during content output). Verified in code — same semantics as CC's <code>formatDuration</code>.</td></tr>
+    <tr><td>Foreground lifecycle and elapsed timer</td><td data-priority="must-have">must-have</td><td data-status="covered"><strong>Covered</strong></td><td><code>pty_foreground_activity</code></td><td><code>render/activity.rs ActivityState</code> projects <code>Running / AwaitingInput / Idle</code> from the engine event bridge. Status and footer share one lifecycle snapshot. Thinking/Reasoning and running-tool content share the existing status row, with one amber brand animation. Questions and approvals stop activity and own the existing input panel; idle restores the result/footer. Shared inline/one-shot formatters preserve elapsed time, model, tokens and ETA.</td></tr>
     <tr><td>Spinner status line — token counter (↓ N tokens)</td><td data-priority="must-have">must-have</td><td data-status="covered"><strong>Covered</strong></td><td><code>pty_spinner_token_counter::status_line_shows_token_count_after_turn</code> · <code>live_spinner_shows_token_counter_during_streaming</code></td><td>Spinner shows <code>↓ N tokens</code> (bytes/4 approximation) after 1s of streaming. Shared <code>AtomicU32</code> counter incremented on each <code>TextDelta</code> in <code>api_client.rs</code>, read by spinner thread in <code>render.rs</code>.</td></tr>
-    <tr><td>Spinner status line — thinking status</td><td data-priority="must-have">must-have</td><td data-status="covered"><strong>Covered</strong></td><td><code>render.rs:149-153,200-201</code></td><td>Spinner switches to <code>◐◓◑◒</code> frames + <code>🧠 Reasoning...</code> label when <code>thinking_flag</code> is set. Wired via <code>api_client.rs</code> <code>set_spinner_thinking()</code>. Distinct from CC's shimmer but serves same purpose — visually distinct thinking phase.</td></tr>
+    <tr><td>Spinner status line — reasoning status</td><td data-priority="must-have">must-have</td><td data-status="covered"><strong>Covered</strong></td><td><code>pty_render_boundaries</code> · <code>pty_chrome_styles</code></td><td>Actual thinking deltas select <code>Reasoning...</code>; other model work uses <code>Thinking...</code>. A fixed four-cell animation approximates the Sudoprivacy mark and uses the existing <code>ColorTheme.logo</code> role. Tools prioritize available progress; quiet tools show their canonical name or active count. Time and tokens share the same row. Streamed prose does not hide foreground activity. Asynchronous output suspension does not reset reasoning or retry phase. All colors use <code>ColorTheme</code>.</td></tr>
     <tr><td>Spinner status line — token budget / ETA</td><td data-priority="must-have">must-have</td><td data-status="covered"><strong>Covered</strong></td><td><code>render.rs Spinner</code></td><td>When <code>max_output_tokens</code> is set (from <code>max_tokens_for_model</code>), spinner shows <code>↓ 1.2k / 16k (8%) ~3m</code>. Rate-based ETA: <code>output_tokens / elapsed</code>. Falls back to plain <code>↓ N tokens</code> when budget unknown.</td></tr>
-    <tr><td>Spinner status line — stall detection (yellow spinner)</td><td data-priority="must-have">must-have</td><td data-status="covered"><strong>Covered</strong></td><td><code>render.rs Spinner</code></td><td>Spinner tracks <code>last_bytes_change</code> timestamp; switches to <code>DarkYellow</code> when no new response bytes for 3s (excludes thinking phase). Same semantic as CC's <code>useStalledAnimation</code>.</td></tr>
+    <tr><td>Spinner status line — stall detection (yellow status text)</td><td data-priority="must-have">must-have</td><td data-status="covered"><strong>Covered</strong></td><td><code>render.rs Spinner</code></td><td>Shared <code>SpinnerProgress</code> records response, tool progress and phase activity; after response bytes arrive, status text uses <code>ColorTheme.warning</code> when no progress occurs for 3s (reasoning is exempt). The brand animation stays amber. Same semantic as CC's <code>useStalledAnimation</code>.</td></tr>
     <tr><td>Bash tool streaming output (onProgress)</td><td data-priority="must-have">must-have</td><td data-status="covered"><strong>Covered</strong></td><td><code>pty_bash_streaming::bash_streaming_shows_progress_for_slow_commands</code></td><td><code>execute_bash_streaming</code> in <code>bash.rs</code> pipes stdout/stderr via <code>tokio::io::BufReader</code>, reads line-by-line, calls <code>BashProgressCallback</code> every ~1s. <code>CliToolExecutor</code> installs a callback that pauses the spinner and prints the last 3 lines in dim style. Thread-local callback avoids changing <code>ToolExecutor</code> trait.</td></tr>
     <tr><td>MCP tool progress notifications</td><td data-priority="must-have">must-have</td><td data-status="covered"><strong>Covered</strong></td><td><code>mcp_server_manager.rs emit_mcp_progress</code></td><td>All three transports (stdio, SSE, HTTP) now detect <code>notifications/progress</code> during <code>tools/call</code> and route them via thread-local <code>McpProgressCallback</code>. Stdio reads raw JSON to distinguish notifications (no <code>id</code>) from responses. CLI shows progress with percentage and message in dim style.</td></tr>
     <tr><td>Per-turn token usage display (post-turn)</td><td data-priority="must-have">must-have</td><td data-status="covered"><strong>Covered</strong></td><td><code>format.rs:1567-1600</code></td><td><code>format_turn_status_line_with_branch()</code> prints <code>[model] turn N · Nk tokens · $X.XX · Ns · branch</code> after every turn. Uses <code>UsageTracker::current_turn_usage()</code> with model-specific pricing via <code>pricing_for_model()</code>.</td></tr>
@@ -1890,6 +1892,17 @@ fallback. This does not add another palette or change amber activity accents.
 Real CLI regressions cover dark/light/no-color chrome, resize and neutral
 drafts, and explicit foreground/full resets inside a real question overlay.</p>
 
+<p>Question options and task focus share a neutral selection surface from
+<code>ColorTheme</code>. Amber identifies the selected marker and question
+heading; ordinary choice text keeps the default terminal foreground. Selected
+text uses a paired foreground/background, with muted hints at normal intensity.
+Dark/light selection text and accents retain at least 4.5:1 contrast against
+their surface. Limited-color terminals retain textual focus without a fill;
+<code>NO_COLOR</code> remains plain. Real PTY checks move focus between options
+and verify that the next input draft has no inherited selection background.
+Single-option questions advertise Enter confirmation without an inactive digit
+shortcut. This changes presentation, not slot allocation or input ownership.</p>
+
 <h4>Architecture context</h4>
 
 <table>
@@ -2106,6 +2119,55 @@ colors. Amber remains the identity/activity accent, not a neutral-number
 highlight. Acceptance: the existing <code>pty_chrome_styles</code> real REPL
 style checks in dark/light themes and after resize.</p>
 
+<p><strong>Shared live-slot row budget.</strong> PendingSlot, StatusSlot,
+TodoSlot, InputSlot and FooterSlot use one layout allocation while the terminal
+owner alone manages history, resize recovery and drawing. InputSlot has
+priority; other slots fold into explicit summaries and expand when space
+returns. The same structured document and iocraft primitive measure and paint
+each slot, with only current-frame measurements retained. Long drafts use the
+same bounded editor; long question/plan bodies page independently with
+PgUp/PgDn and Ctrl+Home/End. Choices remain visible; undersized controls disable
+confirmation and hidden editing, retaining cancellation. This layout does not
+change slot order, force bottom docking, replay history or replace the framework
+resize fix. Acceptance: <code>pty_chrome_budget</code>,
+<code>pty_plan_review</code>, the existing Markdown/continuation and background
+task PTYs, and <code>pty_chrome_resize</code>'s real terminal budget workflow.
+Full and folded Todo projections share the count-span formatter above;
+broader UI semantic colors and the streaming-preview position remain
+separate design discussions.</p>
+
+<p><strong>Resize input ownership.</strong> The terminal event pump stops at a
+Resize boundary and dispatches the bounded batch with the last painted frame's
+callbacks. Unix can deliver keyboard bytes before its Resize notification,
+so this barrier alone is insufficient. The terminal also records each input's
+observed dimensions and presented-frame identity; TextInput and the parent's
+confirmation/paste handlers share <code>use_input_frame()</code> admission.
+A same-size redraw cannot authorize an older observation. Geometry-crossing
+events wait for a newly presented frame and require the same input owner to
+have remained continuously enabled; ordinary visible-to-visible resizing
+must not lose typing/paste/confirmation. Parent controls declare the layout's
+reviewability with <code>set_enabled</code>, while TextInput declares focus.
+Hidden-to-visible and visible-to-hidden input remains rejected. Rapid reflow
+does not wait for an obsolete intermediate size to reappear. Cancellation remains
+available. The layout is still the sole content-visibility authority; the
+terminal owns presentation/geometry, not a second application layout registry.
+This adds one OS size query per key/paste event, without cursor queries or
+raw-event reordering; performance must be measured rather than assumed free.
+Real PTY acceptance covers immediate shrink-then-type/paste/confirm and
+hidden-input-then-grow, preserving draft bytes and the middle cursor. Framework
+CI covers Linux/macOS and both Windows ConPTY backends, including Linux-only
+identity-checked pending-readiness probes; a fixture pass does not replace
+the original failing full CLI tests.</p>
+
+<p><strong>Event-time draft navigation.</strong> TextInput owns one working
+value/cursor for a key batch. Logical-line Up/Down jumps, prompt history and
+queued-human recall apply through its edit policy before the next key, not
+through a parent render snapshot or deferred cursor request. The parent retains
+submission and panel actions; real newlines retain vertical navigation and
+peer messages remain queued. Acceptance: <code>pty_input_batch</code>'s
+single-burst Up/Home/right/edit and Down/left/edit workflow, existing history,
+queue recall and paste PTYs, and the real terminal shared-budget workflow.</p>
+
 <p><strong>External terminal ownership (#584).</strong> CCB validation:
 <code>src/commands/memory/memory.tsx</code> and
 <code>src/utils/promptEditor.ts</code> (CCB <code>236d99ed</code>) confirm a
@@ -2124,6 +2186,46 @@ and keyboard input.</p>
   <li>Terminal control goes through <code>crossterm</code> uniformly; raw ANSI escape codes stay out of the codepath.</li>
   <li><strong>No <code>ratatui</code> dependency.</strong> Even behind a feature flag — its presence in <code>Cargo.lock</code> is itself the slippery slope toward the alternate-screen path the rule above forbids.</li>
 </ol>
+
+<h4>Codex CLI UX review · 2026-10-20</h4>
+
+<p><strong>CCB validation.</strong> At <code>236d99ed</code>, read
+<code>src/components/permissions/ExitPlanModePermissionRequest/ExitPlanModePermissionRequest.tsx</code>
+and <code>src/components/ScrollKeybindingHandler.tsx</code>. CCB separates a
+scrollable plan body from sticky decisions in its fullscreen presentation;
+its inline path renders the body with the dialog. The reusable contract is
+independent reading and decision ownership. Scode keeps its inline terminal
+contract and native history; fullscreen scrolling is outside this comparison.</p>
+
+<p><strong>Codex reference.</strong> Local <code>openai/codex</code> main was
+fast-forwarded to <code>e18a20d6eb6f5ede32a69fb56e3fe276d5e9d914</code>.
+Read <code>tui/src/chatwidget/streaming.rs</code>,
+<code>chatwidget/plan_implementation.rs</code>, <code>transcript_view.rs</code>,
+<code>transcript_view/{input,follow_control,search,layout,disclosure}.rs</code>,
+<code>history_cell/markdown_render_cache.rs</code> and
+<code>bottom_pane/{mod,view_stack,chat_composer}.rs</code> under <code>codex-rs/</code>.
+Codex commits proposed plans to conversation history and separately presents
+implementation choices. Its reading anchors survive reflow, search scans
+bounded chunks, and retained layouts have both entry and byte limits.</p>
+
+<table>
+  <thead><tr><th>Priority</th><th>Next user workflow</th><th>Current gap and implementation direction</th><th>Performance acceptance</th></tr></thead>
+  <tbody>
+    <tr><td>Next</td><td>Keep an unfinished composer draft when a question takes focus</td><td>Codex keeps composer state under its bottom-pane views. Scode clears input_value when ShowQuestion and ClearQuestion run. Reproduce a question arriving during a Unicode draft/paste, then separate composer state from temporary answer state, including cursor ownership.</td><td>Reuse the same draft and paste store; no duplicate editor loop. Preserve bytes and cursor through answer, cancellation, pager handoff and resize.</td></tr>
+    <tr><td>Next</td><td>Search prior prompts while preserving an unfinished draft</td><td>Codex documents Ctrl-R preview and cancellation restoring the original draft. Scode help advertises Ctrl-R, but the async input dispatcher and iocraft TextInput do not expose a reverse-search path. Confirm through a PTY before implementing one owner over the existing prompt history.</td><td>No history parsing or allocation on ordinary typing; bounded matches, exact draft/paste restoration on cancel, unchanged input latency and idle writes.</td></tr>
+    <tr><td>Next</td><td>Inspect complete historical tool output and diffs</td><td>Current cards truncate results and retain full source in the session. Add on-demand inspection through existing terminal pager ownership and persisted tool identities. Compare against Codex disclosure without retaining a second conversation viewport.</td><td>Load details only on request; release them on close. Measure large outputs, pager exit, cancellation and RSS growth.</td></tr>
+    <tr><td>Later</td><td>Find text in the current conversation, including collapsed tool results</td><td>Current /search targets workspace files. Use an unambiguous conversation action over existing session records; Codex's bounded incremental search is a useful reference. Keep file search semantics.</td><td>Bound bytes scanned per input turn, support cancellation and large sessions, keep stable result identities and avoid a permanent duplicate text index.</td></tr>
+    <tr><td>Later</td><td>Edit a proposed plan in an external editor and review the changed source</td><td>CCB exposes an editor action. Reuse scode's existing editor handoff and the engine's saved-plan comparison; a changed file requires fresh review. Verify CLI and ACP retain the same approval semantics.</td><td>No polling while idle; restore terminal, draft and cancellation after editor failure. Measure reopen latency on long documents.</td></tr>
+  </tbody>
+</table>
+
+<p>Native links (#957), foreground activity (#996), and shared live-slot
+allocation (#900) are present in the current baseline; extend their owners.
+For every renderer candidate, use the unchanged release performance policy,
+A/A calibration and paired A/B runs. Standard workloads guard typing, CPU,
+RSS, idle writes, resize, paste and cancellation; add long-review functional
+coverage separately. A missing measurement remains unverified. This source
+review does not claim a fresh Codex-versus-scode performance comparison.</p>
 
 <h4>Module layout after Phase 0</h4>
 
@@ -2377,8 +2479,56 @@ execution against that artifact.</li>
 <li>Expose unambiguous Agent and runtime destinations through the existing
 <code>agent_list</code> and <code>send</code> tools.</li>
 </ol>
+<h3 id="contract-zone-p1a">Contract-zone P1a — runtime zone context</h3>
+
+<p id="contract-zone-p1a-sources">External ticket anchor: SW-20260915-002 §8.11 (P1a).
+The zone context is the runtime's answer to "what may this process touch":
+every file operation through a kernel backend passes a ResourceRef
+authorization before any syscall, and the authority behind that check has
+exactly three trusted sources.</p>
+
+<ul>
+<li><strong>Planted descriptor</strong> (<code>for_agent_descriptor</code>):
+the ManagedAgentService plants the agent's descriptor; its zone id passes the
+owner validator, and its delegation reference and resource scope ride every
+authorization. This is the co-hosted agent's backend, and the subject its
+ReBAC evaluation carries is the agent, not its owner.</li>
+<li><strong>Host environment</strong> (<code>host_zone_once</code>): the
+subprocess runner injects zone metadata through the environment; the
+in-process kernel treats its injector — this process's parent — as the trust
+position, enforces the injected scope, and keeps a partial or invalid
+injection fail-closed rather than widening it into root.</li>
+<li><strong>Standalone-local</strong> (<code>for_standalone_session</code>):
+a CLI session acts for itself on a host the user booted; agent-identity
+context (not system), trusted-local zone defaulting to the legacy root
+namespace.</li>
+</ul>
+
+<p id="contract-zone-p1a-fail-closed">Everything else fails closed. The raw
+<code>KernelFsBackend::new</code> seam and the <code>from_arc</code> /
+<code>over_nexus</code> remote constructors refuse every operation before any
+RPC leaves the process — env or descriptor metadata is not a credential the
+VFS server can verify. The remote paths that perform IO are the mTLS ones,
+where the transport itself is the server-verified authorization. Status:
+landed on the contract-zone line with the fail-closed authorization suite
+restored; the dependency rides nexus-vfs <code>feat/contract-zone</code>
+until its v0.8.16 tag.</p>
 
 <h3 id="agent-runtime-tasks">Implementation and acceptance tasks</h3>
+
+<p><strong>Standalone startup while the node is offline.</strong>
+With an existing readable node record and credential, constructing the session's
+peer client does not perform a network probe. Ordinary startup and resume keep
+the node namespace while the receiver retries and A2A operations report their
+actual errors. Receiver-seat retries print an unchanged error once, reset that
+diagnostic after a successful receiver-seat check, and retain the existing retry
+interval. PTY acceptance requires usable input after a completed offline turn
+and covers both renderers, restored history and a
+failed real send without a disk inbox. Record parsing, missing credential files
+and identity mismatches still fail startup; representing those conditions as
+A2A unavailable, and explicit
+disk-to-node handoff, remain follow-up work. This does not provision a service
+or change cohost ownership.</p>
 
 <table>
 <thead><tr><th>Task</th><th>Implementation evidence</th><th>Next acceptance</th></tr></thead>

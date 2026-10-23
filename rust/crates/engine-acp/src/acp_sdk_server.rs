@@ -34,7 +34,7 @@ use agent_client_protocol_schema::{
     UnstructuredCommandInput, Usage,
 };
 use engine_core::engine_events::CompletionAction;
-use engine_core::{AuthMode, EngineDelegate, EngineEvent};
+use engine_core::{AuthMode, DirectToolError, EngineDelegate, EngineEvent};
 use engine_host::config::AllowedToolSet;
 use engine_host::{SessionEngine, SessionLifecycle};
 use runtime::config::{
@@ -279,6 +279,52 @@ pub(crate) struct ResumeToolsRequest {
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, JsonRpcResponse)]
 pub(crate) struct ResumeToolsResponse {}
+
+// ---------------------------------------------------------------------------
+// Custom extension: _sudocode/a2a/* (direct A2A requests)
+// ---------------------------------------------------------------------------
+
+// Served from the catch-all dispatch rather than as typed handlers: every typed
+// handler nests the server's type one level deeper, and the chain is already at
+// the depth the compiler lays out by default in every crate that runs it.
+const DIRECT_SEND_METHOD: &str = "_sudocode/a2a/send";
+const DIRECT_AGENT_LIST_METHOD: &str = "_sudocode/a2a/agent_list";
+
+/// Run the session's own `send` tool for the client, without a model turn.
+/// Plain text only, and no `sender`: the session's agent is the sender. The
+/// `send` tool requires a summary with a text message, so a request without
+/// one is refused here rather than admitted to fail.
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct DirectSendRequest {
+    session_id: String,
+    to: String,
+    message: String,
+    summary: String,
+    /// ACP lets any request carry `_meta`; it is accepted and ignored.
+    #[serde(rename = "_meta", default)]
+    _meta: Option<serde::de::IgnoredAny>,
+}
+
+/// Run the session's own `agent_list` tool for the client.
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct DirectAgentListRequest {
+    session_id: String,
+    #[serde(default)]
+    active_only: Option<bool>,
+    #[serde(rename = "_meta", default)]
+    _meta: Option<serde::de::IgnoredAny>,
+}
+
+/// The tool's own result, verbatim. `isError` reports a failed call; it does
+/// not prove that nothing was sent.
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DirectA2aResponse {
+    content: String,
+    is_error: bool,
+}
 
 /// `_meta.sudocode` key a client sets in `clientCapabilities` (and scode
 /// echoes in the `initialize` result) to opt into sub-agent events.
@@ -641,22 +687,8 @@ async fn drive_prompt(
                     Some(EngineEvent::ContextCommitted(context)) => committed_context = Some(context),
                     Some(EngineEvent::State(state)) => registry.report_state(state, None),
                     Some(EngineEvent::PermissionRequest { id, request }) => {
-                        let request = build_acp_permission_request(sid.clone(), &request);
-                        let driver = Arc::clone(&driver);
                         let abort = registry.abort_signal(&sid).expect("registered session abort signal");
-                        let cx_reply = cx_perm.clone();
-                        replies.push(async move {
-                            let answer = tokio::select! {
-                                biased;
-                                () = abort.cancelled() => None,
-                                answer = cx_reply.send_request(request).block_task() => Some(answer),
-                            };
-                            let decision = match answer {
-                                Some(Ok(response)) => map_permission_response(response),
-                                _ => PermissionPromptDecision::Deny { reason: "ACP permission request cancelled or failed".into() },
-                            };
-                            let _ = driver.send(engine_core::EngineCommand::PermissionAnswer { id, decision });
-                        }.boxed());
+                        replies.push(answer_permission(&sid, id, &request, &driver, abort, cx_perm.clone()));
                     }
                     Some(EngineEvent::QuestionRequest { id, request: question_req }) => {
                     let payload = AcpAskUserQuestionRequestPayload {
@@ -788,30 +820,46 @@ async fn drive_prompt(
 /// Normalize peer text into the same driver used by `session/prompt`.
 /// The durable conversation cursor advances after the turn returns. The bound
 /// controller receives streaming output, approval requests and questions.
+///
+/// One receiver per agent this process serves, not one per process: sessions
+/// in different workspaces are different agents, and each hears only its own
+/// peers. A message goes to a session of the agent it was sent to, never to a
+/// session that merely happens to share the process.
 fn ensure_a2a_receiver(
     registry: &SharedSessionRegistry,
     cx: &ConnectionTo<Client>,
     config: &SdkAcpConfig,
     session_id: &str,
 ) {
+    let Some(agent) = registry.agent_of(session_id) else {
+        return;
+    };
+    // The mailbox the session's tools send through: the hosted agent's, else
+    // the peer namespace the session build attached this agent to.
     let mailbox = match &registry.hosted_factory {
         Some(factory) => factory.mailbox(),
-        None => engine_host::nexus_a2a::session()
+        None => engine_host::peer::attach(&agent)
             .ok()
-            .flatten()
-            .map(|session| session.mailbox()),
+            .map(|peer| peer.mailbox()),
     };
     let Some(mailbox) = mailbox else {
         return;
     };
-    if registry.peer_receiver_started.swap(true, Ordering::SeqCst) {
-        return;
+    let stop = HookAbortSignal::new();
+    {
+        let mut receivers = registry.lock_peer_receivers();
+        if receivers
+            .get(&agent)
+            .is_some_and(|running| !running.is_aborted())
+        {
+            return;
+        }
+        receivers.insert(agent.clone(), stop.clone());
     }
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<(
         runtime::agent_mailbox::MailboxEnvelope,
         std::sync::mpsc::SyncSender<bool>,
     )>();
-    let stop = registry.peer_receiver_stop.clone();
     let callback_stop = stop.clone();
     let receiver = runtime::mailbox::spawn_inbox_poller(
         Arc::clone(&mailbox),
@@ -839,7 +887,7 @@ fn ensure_a2a_receiver(
     let registry = Arc::clone(registry);
     let cx = cx.clone();
     let config = config.clone();
-    let session_id = session_id.to_string();
+    let mut bound = session_id.to_string();
     tokio::spawn(async move {
         loop {
             let inbound = tokio::select! {
@@ -849,6 +897,14 @@ fn ensure_a2a_receiver(
             let Some((message, ack)) = inbound else {
                 break;
             };
+            // The session this agent's messages go to: the one bound so far
+            // while it lives, else another session of the same agent.
+            let Some(session_id) = registry.session_of_agent(&agent, &bound) else {
+                let _ = ack.send(false);
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                continue;
+            };
+            bound.clone_from(&session_id);
             if registry
                 .engine(&session_id)
                 .is_some_and(|engine| engine.tool_control().1)
@@ -957,6 +1013,8 @@ fn initialize_meta(subagent_events: Option<u64>) -> Map<String, serde_json::Valu
     sudocode_ns.insert("systemPromptOverride".to_string(), json!(true));
     sudocode_ns.insert("systemPromptAppend".to_string(), json!(true));
     sudocode_ns.insert("toolPause".to_string(), json!({ "version": 1 }));
+    // `_sudocode/a2a/send` and `_sudocode/a2a/agent_list`.
+    sudocode_ns.insert("directA2a".to_string(), json!({ "version": 1 }));
     // `session/new` accepts `_meta.sudocode.forkFrom` (see
     // `fork_source_from_meta`): a client that forks a conversation into a
     // new directory gates on this instead of probing.
@@ -993,6 +1051,10 @@ fn session_response_meta(
                 "workspace".into(),
                 json!({ "fileRoot": file_root, "shellRoot": shell_root }),
             );
+        }
+        // A hosted agent's mailbox is injected by its daemon, not attached.
+        if let (None, Some(agent)) = (&registry.hosted_factory, registry.agent_of(session_id)) {
+            sudocode.insert("peer".into(), json!(engine_host::peer::status(&agent)));
         }
     }
     (!sudocode.is_empty())
@@ -1369,11 +1431,12 @@ pub fn new_session_registry() -> SharedSessionRegistry {
 #[derive(Default)]
 pub struct SessionRegistry {
     sessions: Mutex<HashMap<String, SessionEntry>>,
-    completion_routes: Mutex<HashMap<String, std::sync::Weak<Delivery>>>,
+    completion_routes: Mutex<HashMap<String, CompletionRoute>>,
     cwd_lease: Arc<WorkspaceCwdLease>,
     hosted_factory: Option<Arc<dyn HostedSessionFactory>>,
-    peer_receiver_started: AtomicBool,
-    peer_receiver_stop: HookAbortSignal,
+    /// The peer receiver running for each agent this process serves, by the
+    /// signal that stops it.
+    peer_receivers: Mutex<HashMap<String, HookAbortSignal>>,
 }
 
 /// The host chooses where a session lives; the ACP handlers and turn driver are
@@ -1397,6 +1460,10 @@ struct SessionEntry {
     /// The single-session engine this ACP session wraps — `Arc` so a turn in
     /// flight keeps it alive across a concurrent `session/close`.
     engine: Arc<SessionEngine>,
+    /// The agent this session answers as, read once at registration: the
+    /// engine's own lock is held for a whole turn, so asking it later from
+    /// under the registry lock would stall every session behind one turn.
+    agent: String,
     driver: Arc<crate::session_driver::SessionDriver>,
     /// A clone of the engine's abort signal, held here so `session/cancel` fires
     /// without taking any session lock.
@@ -1420,7 +1487,64 @@ impl Drop for HostedTurnState {
 /// same session proceed.
 pub type SessionLaneGuard = tokio::sync::OwnedMutexGuard<()>;
 
+struct CompletionRoute {
+    driver: std::sync::Weak<Delivery>,
+    retirement: engine_core::CompletionRetirement,
+}
+
+struct CompletionRouteSlot<'a> {
+    routes: std::sync::MutexGuard<'a, HashMap<String, CompletionRoute>>,
+    driver: Option<Arc<Delivery>>,
+}
+
+impl CompletionRoute {
+    fn new(driver: &Arc<Delivery>) -> Self {
+        Self {
+            driver: Arc::downgrade(driver),
+            retirement: driver.completion_retirement(),
+        }
+    }
+
+    fn retained(&self) -> bool {
+        self.driver.strong_count() > 0 || !self.retirement.wait(std::time::Duration::ZERO)
+    }
+}
+
 impl SessionRegistry {
+    fn completion_route_slot(&self, session_id: &str) -> Result<CompletionRouteSlot<'_>, AcpError> {
+        loop {
+            let mut routes = self
+                .completion_routes
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            routes.retain(|_, route| route.retained());
+            let Some(route) = routes.get(session_id) else {
+                return Ok(CompletionRouteSlot {
+                    routes,
+                    driver: None,
+                });
+            };
+            if let Some(driver) = route.driver.upgrade() {
+                return Ok(CompletionRouteSlot {
+                    routes,
+                    driver: Some(driver),
+                });
+            }
+            // Weak::upgrade can fail before the detached engine drops its
+            // journal/native writer. Await that exact lifetime outside the
+            // registry lock, so other sessions can still be admitted.
+            let retirement = route.retirement.clone();
+            drop(routes);
+            if !retirement.wait(std::time::Duration::from_secs(30)) {
+                return Err(AcpError::internal(
+                    "completion engine teardown is not finished",
+                ));
+            }
+            // Another caller may have installed the successor while we waited.
+            // Recheck under the same lock rather than replace its ownership.
+        }
+    }
+
     pub fn with_hosted_factory(factory: Arc<dyn HostedSessionFactory>) -> Self {
         Self {
             hosted_factory: Some(factory),
@@ -1434,22 +1558,16 @@ impl SessionRegistry {
         cwd: &std::path::Path,
         create: bool,
     ) -> Result<Arc<Delivery>, AcpError> {
-        let mut routes = self
-            .completion_routes
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        routes.retain(|_, route| route.strong_count() > 0);
-        if let Some(route) = routes
-            .get(&session.session_id)
-            .and_then(std::sync::Weak::upgrade)
-        {
+        let CompletionRouteSlot { mut routes, driver } =
+            self.completion_route_slot(&session.session_id)?;
+        if let Some(route) = driver {
             route
                 .attach_session(session, cwd)
                 .map_err(AcpError::internal)?;
             return Ok(route);
         }
         let route = Delivery::open(session, cwd, create).map_err(AcpError::internal)?;
-        routes.insert(session.session_id.clone(), Arc::downgrade(&route));
+        routes.insert(session.session_id.clone(), CompletionRoute::new(&route));
         Ok(route)
     }
 
@@ -1458,13 +1576,11 @@ impl SessionRegistry {
         session: &runtime::Session,
         cwd: &std::path::Path,
     ) -> Result<(), AcpError> {
-        if let Some(route) = self
-            .completion_routes
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get(&session.session_id)
-            .and_then(std::sync::Weak::upgrade)
-        {
+        let CompletionRouteSlot {
+            routes: _routes,
+            driver,
+        } = self.completion_route_slot(&session.session_id)?;
+        if let Some(route) = driver {
             route
                 .attach_session(session, cwd)
                 .map_err(AcpError::internal)?;
@@ -1477,12 +1593,8 @@ impl SessionRegistry {
         session_id: &str,
         cwd: &std::path::Path,
     ) -> Result<Arc<Delivery>, AcpError> {
-        let mut routes = self
-            .completion_routes
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        routes.retain(|_, route| route.strong_count() > 0);
-        if let Some(route) = routes.get(session_id).and_then(std::sync::Weak::upgrade) {
+        let CompletionRouteSlot { mut routes, driver } = self.completion_route_slot(session_id)?;
+        if let Some(route) = driver {
             route
                 .control(CompletionAction::CheckBinding {
                     session_id: session_id.into(),
@@ -1492,7 +1604,7 @@ impl SessionRegistry {
             return Ok(route);
         }
         let route = Delivery::stored(session_id, cwd).map_err(AcpError::invalid_params)?;
-        routes.insert(session_id.into(), Arc::downgrade(&route));
+        routes.insert(session_id.into(), CompletionRoute::new(&route));
         Ok(route)
     }
 
@@ -1541,7 +1653,7 @@ impl SessionRegistry {
     }
 
     pub fn cancel_all(&self) {
-        self.peer_receiver_stop.abort();
+        self.stop_peer_receivers();
         for entry in self.lock_sessions().values() {
             let _ = entry.driver.send(engine_core::EngineCommand::Cancel);
             entry.abort.abort();
@@ -1549,7 +1661,7 @@ impl SessionRegistry {
     }
 
     pub fn close_all(&self) {
-        self.peer_receiver_stop.abort();
+        self.stop_peer_receivers();
         let entries: Vec<_> = self
             .lock_sessions()
             .drain()
@@ -1577,6 +1689,57 @@ impl SessionRegistry {
         self.sessions
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn lock_peer_receivers(&self) -> std::sync::MutexGuard<'_, HashMap<String, HookAbortSignal>> {
+        self.peer_receivers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn stop_peer_receivers(&self) {
+        for (_, stop) in self.lock_peer_receivers().drain() {
+            stop.abort();
+        }
+    }
+
+    /// Stop `agent`'s receiver once no session of that agent is left, so its
+    /// receiver seat passes to another instance instead of being held by a
+    /// process that has nowhere to deliver.
+    fn stop_unused_peer_receiver(&self, agent: &str) {
+        let in_use = self
+            .lock_sessions()
+            .values()
+            .any(|entry| entry.agent == agent);
+        if !in_use {
+            if let Some(stop) = self.lock_peer_receivers().remove(agent) {
+                stop.abort();
+            }
+        }
+    }
+
+    /// The agent `session_id` answers as.
+    fn agent_of(&self, session_id: &str) -> Option<String> {
+        self.lock_sessions()
+            .get(session_id)
+            .map(|entry| entry.agent.clone())
+    }
+
+    /// The session `agent`'s peer messages go to: `preferred` while it is still
+    /// a session of that agent, else the longest-running other one.
+    fn session_of_agent(&self, agent: &str, preferred: &str) -> Option<String> {
+        let sessions = self.lock_sessions();
+        if sessions
+            .get(preferred)
+            .is_some_and(|entry| entry.agent == agent)
+        {
+            return Some(preferred.to_string());
+        }
+        sessions
+            .iter()
+            .filter(|(_, entry)| entry.agent == agent)
+            .min_by_key(|(_, entry)| entry.started_at)
+            .map(|(id, _)| id.clone())
     }
 
     /// Register (or re-register) a session's engine after `session/new` /
@@ -1611,6 +1774,7 @@ impl SessionRegistry {
             )
         };
         let abort = engine.abort_signal();
+        let agent = engine.agent_name();
         let driver = crate::session_driver::SessionDriver::start(
             Arc::clone(&engine),
             subagents.as_ref(),
@@ -1622,6 +1786,7 @@ impl SessionRegistry {
             session_id,
             SessionEntry {
                 engine,
+                agent,
                 driver,
                 abort,
                 lane,
@@ -1680,9 +1845,9 @@ impl SessionRegistry {
         std::time::Instant,
         Arc<crate::session_driver::SessionDriver>,
     )> {
-        self.lock_sessions()
-            .remove(session_id)
-            .map(|e| (e.engine, e.started_at, e.driver))
+        let taken = self.lock_sessions().remove(session_id)?;
+        self.stop_unused_peer_receiver(&taken.agent);
+        Some((taken.engine, taken.started_at, taken.driver))
     }
 
     /// All live sessions as `(id, cwd)` — the `session/list` response.
@@ -1719,6 +1884,17 @@ impl SessionRegistry {
             .get(session_id)
             .map(|e| Arc::clone(&e.lane))?;
         Some(lane.lock_owned().await)
+    }
+
+    /// The session's lane if nothing holds it now. `None` for unknown sessions
+    /// and for sessions busy with a turn or another request.
+    #[must_use]
+    pub fn try_enter_lane(&self, session_id: &str) -> Option<SessionLaneGuard> {
+        let lane = self
+            .lock_sessions()
+            .get(session_id)
+            .map(|e| Arc::clone(&e.lane))?;
+        lane.try_lock_owned().ok()
     }
 
     /// The process-wide working-directory lease.
@@ -1870,6 +2046,144 @@ struct AcpAskUserQuestionAnswerPayload {
 #[serde(rename_all = "camelCase")]
 struct AcpAskUserQuestionResponsePayload {
     answers: Vec<AcpAskUserQuestionAnswerPayload>,
+}
+
+/// Ask the client to decide one engine permission request, then hand the
+/// decision back to the engine. Cancelling the session denies it.
+fn answer_permission(
+    session_id: &str,
+    id: engine_core::RequestId,
+    request: &PermissionRequest,
+    driver: &Arc<crate::session_driver::SessionDriver>,
+    abort: HookAbortSignal,
+    cx: ConnectionTo<Client>,
+) -> futures::future::BoxFuture<'static, ()> {
+    let request = build_acp_permission_request(session_id.to_string(), request);
+    let driver = Arc::clone(driver);
+    async move {
+        let answer = tokio::select! {
+            biased;
+            () = abort.cancelled() => None,
+            answer = cx.send_request(request).block_task() => Some(answer),
+        };
+        let decision = match answer {
+            Some(Ok(response)) => map_permission_response(response),
+            _ => PermissionPromptDecision::Deny {
+                reason: "ACP permission request cancelled or failed".into(),
+            },
+        };
+        let _ = driver.send(engine_core::EngineCommand::PermissionAnswer { id, decision });
+    }
+    .boxed()
+}
+
+/// The session, tool and tool input a direct A2A request asks for.
+fn direct_a2a_call(
+    message: agent_client_protocol::UntypedMessage,
+) -> Result<(String, &'static str, serde_json::Value), DirectToolError> {
+    let (method, params) = message.into_parts();
+    let invalid = |error: serde_json::Error| DirectToolError::Refused(error.to_string());
+    if method == DIRECT_SEND_METHOD {
+        let request: DirectSendRequest = serde_json::from_value(params).map_err(invalid)?;
+        let input = json!({
+            "to": request.to,
+            "message": request.message,
+            "summary": request.summary,
+        });
+        Ok((request.session_id, "send", input))
+    } else {
+        let request: DirectAgentListRequest = serde_json::from_value(params).map_err(invalid)?;
+        let input = request.active_only.map_or_else(
+            || json!({}),
+            |active_only| json!({ "active_only": active_only }),
+        );
+        Ok((request.session_id, "agent_list", input))
+    }
+}
+
+/// A direct A2A failure on the wire. A refusal is invalid params: nothing ran,
+/// so the client may correct the request and send it again. Anything after
+/// admission is an internal error whose `data.outcome` is `"unknown"`: the
+/// message may have been sent, so the client must not resend it blindly.
+fn direct_a2a_error(error: &DirectToolError) -> Error {
+    match error {
+        DirectToolError::Refused(reason) => {
+            acp_error_to_sdk(&AcpError::invalid_params(reason.clone()))
+        }
+        DirectToolError::Unknown(detail) => {
+            let mut error =
+                Error::internal_error().data(json!({ "outcome": "unknown", "detail": detail }));
+            error.message = "The call may have run; its outcome is unknown".into();
+            error
+        }
+    }
+}
+
+/// Run one of the session's own A2A tools for the client, outside any turn,
+/// through the hooks and permission policy a model's call passes.
+///
+/// A direct call never waits behind a turn: a busy session is a definite
+/// refusal before anything runs, so the caller never has to guess whether a
+/// queued send went out after it stopped waiting.
+async fn drive_direct_tool(
+    registry: SharedSessionRegistry,
+    session_id: String,
+    name: &'static str,
+    input: serde_json::Value,
+    cx: ConnectionTo<Client>,
+) -> Result<DirectA2aResponse, DirectToolError> {
+    let refuse = |reason: &str| DirectToolError::Refused(reason.to_string());
+    let admitted = registry
+        .engine(&session_id)
+        .ok_or_else(|| DirectToolError::Refused(format!("unknown sessionId: {session_id}")))?;
+    let (admitted_epoch, is_paused) = admitted.tool_control();
+    if is_paused {
+        return Err(refuse("Tool execution is paused by the user"));
+    }
+    let Some(_lane) = registry.try_enter_lane(&session_id) else {
+        return Err(refuse("The session is busy; nothing was sent"));
+    };
+    let unchanged = registry.engine(&session_id).is_some_and(|engine| {
+        let (epoch, is_paused) = engine.tool_control();
+        !is_paused && epoch == admitted_epoch && Arc::ptr_eq(&engine, &admitted)
+    });
+    if !unchanged {
+        return Err(refuse(
+            "Session control changed while the request was admitted",
+        ));
+    }
+    let (Some(driver), Some(abort)) = (
+        registry.driver(&session_id),
+        registry.abort_signal(&session_id),
+    ) else {
+        return Err(refuse("Unknown session"));
+    };
+    let (_listener, mut events) = driver.listen(cx.clone());
+    let reply = driver.direct_tool(name, input.to_string());
+    tokio::pin!(reply);
+    let mut replies =
+        futures::stream::FuturesUnordered::<futures::future::BoxFuture<'static, ()>>::new();
+    let value = loop {
+        tokio::select! {
+            biased;
+            _ = replies.next(), if !replies.is_empty() => {}
+            value = &mut reply => break value,
+            event = events.recv() => match event {
+                Some(EngineEvent::PermissionRequest { id, request }) => replies.push(
+                    answer_permission(&session_id, id, &request, &driver, abort.clone(), cx.clone()),
+                ),
+                Some(_) => {}
+                None => break Err(DirectToolError::Unknown(
+                    "the engine session closed before replying".into(),
+                )),
+            },
+        }
+    };
+    let value = value?;
+    if let Some(reason) = value.get("refused").and_then(serde_json::Value::as_str) {
+        return Err(refuse(reason));
+    }
+    serde_json::from_value(value).map_err(|e| DirectToolError::Unknown(e.to_string()))
 }
 
 /// Build an ACP `RequestPermissionRequest` from a runtime `PermissionRequest`.
@@ -2882,19 +3196,50 @@ pub(crate) async fn run_acp_on_transport(
             },
             on_receive_request!(),
         )
-        // --- catch-all for unhandled methods ---
+        // --- catch-all: direct A2A requests, then unhandled methods ---
         .on_receive_dispatch(
-            async move |dispatch: Dispatch, cx: ConnectionTo<Client>| match dispatch {
-                message @ (Dispatch::Request(_, _) | Dispatch::Notification(_)) => {
-                    message.respond_with_error(Error::method_not_found(), cx)?;
-                    Ok(Handled::Yes)
-                }
-                Dispatch::Response(result, router) => {
-                    // A cancelled turn drops its wire waiter. The SDK's default
-                    // router treats a late reply to that waiter as a connection
-                    // error; consume it without closing unrelated live turns.
-                    let _ = router.respond_with_result(result);
-                    Ok(Handled::Yes)
+            {
+                let registry = Arc::clone(&registry);
+                async move |dispatch: Dispatch, cx: ConnectionTo<Client>| match dispatch {
+                    Dispatch::Request(message, responder)
+                        if matches!(
+                            message.method(),
+                            DIRECT_SEND_METHOD | DIRECT_AGENT_LIST_METHOD
+                        ) =>
+                    {
+                        let registry = Arc::clone(&registry);
+                        let connection = cx.clone();
+                        cx.spawn(async move {
+                            let result = match direct_a2a_call(message) {
+                                Ok((session_id, name, input)) => {
+                                    drive_direct_tool(registry, session_id, name, input, connection)
+                                        .await
+                                }
+                                Err(error) => Err(error),
+                            };
+                            responder.respond_with_result(
+                                result
+                                    .and_then(|response| {
+                                        serde_json::to_value(response)
+                                            .map_err(|e| DirectToolError::Unknown(e.to_string()))
+                                    })
+                                    .map_err(|error| direct_a2a_error(&error)),
+                            )?;
+                            Ok(())
+                        })?;
+                        Ok(Handled::Yes)
+                    }
+                    message @ (Dispatch::Request(_, _) | Dispatch::Notification(_)) => {
+                        message.respond_with_error(Error::method_not_found(), cx)?;
+                        Ok(Handled::Yes)
+                    }
+                    Dispatch::Response(result, router) => {
+                        // A cancelled turn drops its wire waiter. The SDK's default
+                        // router treats a late reply to that waiter as a connection
+                        // error; consume it without closing unrelated live turns.
+                        let _ = router.respond_with_result(result);
+                        Ok(Handled::Yes)
+                    }
                 }
             },
             on_receive_dispatch!(),

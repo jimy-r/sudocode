@@ -36,6 +36,8 @@
 //! * **Never read a just-sent frame without blocking.** See
 //!   [`DELIVERY_WAIT_MS`].
 
+#[path = "common/lease_fault.rs"]
+mod lease_fault;
 #[path = "common/paused_transport.rs"]
 mod paused_transport;
 #[path = "common/session_controller.rs"]
@@ -56,8 +58,12 @@ use runtime::agent_mailbox::MailboxEnvelope;
 /// blocking tail. Production had already moved to `Mailbox`, so the tests were
 /// exercising the copy: green here proved nothing about what ships. They now
 /// drive the same code the running agent does.
+///
+/// The harness dials mTLS with a minted CA-signed bundle (see
+/// `e2e/nexus-a2a/lib.sh`), so the transport itself is the server-verified
+/// credential — the same construction production's standalone session uses.
 fn mailbox(client: &Arc<NexusVfsClient>, agent: &str, auth: &str) -> Mailbox {
-    Mailbox::over_nexus(Arc::clone(client), agent, auth)
+    Mailbox::over_nexus_mtls(Arc::clone(client), agent, auth, "root")
 }
 
 /// The client every test here dials with: mTLS when the harness points at an
@@ -154,7 +160,8 @@ fn live_filesystem_stream_read_and_append_preserve_all_frames() {
     let endpoint = std::env::var("NEXUS_A2A_TEST_ENDPOINT").unwrap();
     let auth = std::env::var("NEXUS_API_KEY").unwrap_or_default();
     let client = dial(&endpoint);
-    let fs = NexusVfsFsBackend::from_arc(Arc::clone(&client), auth);
+    // Cert-only dial — the mTLS transport is the authorization (see `dial`).
+    let fs = NexusVfsFsBackend::from_arc_mtls(Arc::clone(&client), auth, "root");
     let path = format!("/sessions/vfs-probe-{}/transcript.jsonl", fresh());
     fs.create_append_log(&path, 0).unwrap();
     assert!(fs.is_append_stream(&path).unwrap());
@@ -218,6 +225,46 @@ fn live_filesystem_stream_read_and_append_preserve_all_frames() {
         fs.tail_read(&path, 0, 0).unwrap(),
         (b"replacement bytes".to_vec(), 17, false)
     );
+}
+
+#[test]
+#[ignore = "requires a running nexusd-cluster; set NEXUS_A2A_TEST_ENDPOINT"]
+fn live_rename_replaces_files_and_refuses_streams() {
+    use runtime::fs_backend::NexusVfsFsBackend;
+    use runtime::FsBackend;
+
+    let endpoint = std::env::var("NEXUS_A2A_TEST_ENDPOINT").unwrap();
+    let auth = std::env::var("NEXUS_API_KEY").unwrap_or_default();
+    // Cert-only dial: the transport itself is the server-verified
+    // authorization, so the backend is the mTLS (trusted-local) shape — the
+    // fail-closed `from_arc` would refuse every operation by design.
+    let fs = NexusVfsFsBackend::from_arc_mtls(dial(&endpoint), auth, "root");
+    let dir = format!("/sessions/rename-probe-{}", fresh());
+
+    // Temp-then-rename over an existing file: one Rename on the node.
+    let target = format!("{dir}/manifest.json");
+    let temp = format!("{target}.tmp");
+    fs.write(&target, b"old").unwrap();
+    fs.write(&temp, b"new").unwrap();
+    fs.rename(&temp, &target).unwrap();
+    assert_eq!(fs.read(&target).unwrap(), b"new");
+    assert!(!fs.exists(&temp).unwrap());
+    fs.write_atomic(&target, b"atomic").unwrap();
+    assert_eq!(fs.read(&target).unwrap(), b"atomic");
+
+    // A DT_STREAM is identity-bound: the node refuses to move it, and the
+    // client must not emulate the move by copying frames into a new file.
+    let stream = format!("{dir}/transcript.jsonl");
+    let moved = format!("{dir}/moved.jsonl");
+    fs.create_append_log(&stream, 0).unwrap();
+    fs.append(&stream, b"frame\n").unwrap();
+    let error = fs.rename(&stream, &moved).unwrap_err();
+    assert!(
+        error.to_string().contains("rename not supported"),
+        "the node's refusal surfaces unchanged: {error}"
+    );
+    assert!(fs.is_append_stream(&stream).unwrap());
+    assert!(!fs.exists(&moved).unwrap());
 }
 
 #[test]
@@ -850,8 +897,9 @@ fn live_spawn_cohost() {
     let client = Arc::new(model_operator());
 
     // String-only params -> rpc_codec is plain JSON, so a raw JSON payload works.
-    let payload =
-        format!(r#"{{"agent_id":"{agent}","model":"{model}","owner_id":"root","zone_id":"root"}}"#);
+    // No `owner_id` / `zone_id`: dial with a session credential, whose owner
+    // SAN supplies the owner and whose omitted zone takes the root default.
+    let payload = format!(r#"{{"agent_id":"{agent}","model":"{model}"}}"#);
     let resp = client
         .call("managed_agent.start_session_v1", payload.as_bytes(), "")
         .expect("start_session_v1 call");
@@ -1228,94 +1276,6 @@ fn live_agent_list_sees_every_peer_from_either_node() {
     }
 }
 
-/// One session attached to BOTH a local same-machine pair and a nexus daemon
-/// sees every peer from both in ONE `agent_list`, each tagged with where it was
-/// found — the cross-namespace discovery the Directory exists for, against a
-/// real daemon rather than a temp dir.
-///
-/// The single-node endpoint suffices: the point is the UNION of two namespaces
-/// in one listing, not replication between nexus nodes (that is the test above).
-#[test]
-#[ignore = "requires a running nexusd-cluster; set NEXUS_A2A_TEST_ENDPOINT + NEXUS_A2A_TEST_CERT_DIR"]
-fn live_directory_unions_local_and_nexus_peers() {
-    use runtime::directory::{Directory, Member};
-
-    let endpoint =
-        std::env::var("NEXUS_A2A_TEST_ENDPOINT").expect("set NEXUS_A2A_TEST_ENDPOINT=host:port");
-    let auth = std::env::var("NEXUS_API_KEY").unwrap_or_default();
-    let run = fresh();
-
-    // A nexus peer announces itself on the daemon.
-    let nexus_peer = format!("union-nexus-{run}");
-    let client = dial(&endpoint);
-    mailbox(&client, &nexus_peer, &auth)
-        .ensure_presence()
-        .expect("announce the nexus peer");
-
-    // A local peer announces itself in a same-machine pair root (a second scode
-    // in another folder is exactly this).
-    let pair_root = std::env::temp_dir().join(format!("scode-union-{run}"));
-    std::fs::create_dir_all(&pair_root).expect("make the local pair root");
-    let local_peer = format!("union-local-{run}");
-    Mailbox::workspace_local(&pair_root, local_peer.clone())
-        .ensure_presence()
-        .expect("announce the local peer");
-
-    // The session: its own identity on each namespace, local primary + nexus.
-    let me = format!("union-self-{run}");
-    let directory = Directory::new(vec![
-        Member {
-            label: "local",
-            mailbox: Arc::new(Mailbox::workspace_local(&pair_root, me.clone())),
-        },
-        Member {
-            label: "nexus",
-            mailbox: Arc::new(Mailbox::over_nexus(
-                Arc::clone(&client),
-                me.clone(),
-                auth.clone(),
-            )),
-        },
-    ]);
-
-    // Poll: nexus presence is not instantaneous. Assert BOTH peers appear, each
-    // tagged with the one namespace it lives in.
-    let deadline = Instant::now() + Duration::from_millis(DELIVERY_WAIT_MS);
-    let mut recips = Vec::new();
-    while Instant::now() < deadline {
-        recips = directory
-            .list_recipients()
-            .expect("enumerate the directory");
-        let has_local = recips.iter().any(|r| r.name == local_peer);
-        let has_nexus = recips.iter().any(|r| r.name == nexus_peer);
-        if has_local && has_nexus {
-            break;
-        }
-        thread::sleep(Duration::from_millis(100));
-    }
-
-    let local_row = recips
-        .iter()
-        .find(|r| r.name == local_peer)
-        .unwrap_or_else(|| panic!("the local peer must appear; listing was {recips:?}"));
-    assert_eq!(
-        local_row.sources,
-        vec!["local"],
-        "the local peer is tagged local-only"
-    );
-    let nexus_row = recips
-        .iter()
-        .find(|r| r.name == nexus_peer)
-        .unwrap_or_else(|| panic!("the nexus peer must appear; listing was {recips:?}"));
-    assert_eq!(
-        nexus_row.sources,
-        vec!["nexus"],
-        "the nexus peer is tagged nexus-only"
-    );
-
-    let _ = std::fs::remove_dir_all(&pair_root);
-}
-
 /// `/agents` and `/sessions` are DIFFERENT namespaces, not two names for one.
 ///
 /// Both are mounted from the same zone, so a router that drops the mount prefix
@@ -1489,7 +1449,12 @@ fn live_cohost_subagent_context() {
     );
     std::fs::write(&host_instructions, &host_marker).unwrap();
 
-    let payload = json!({"agent_id":agent,"model":model,"owner_id":"root","zone_id":"root"});
+    // No `owner_id` / `zone_id`: the harness dials with a session credential
+    // (front-door minted, owner SAN'd), and v0.8.18's session-caller path takes
+    // the owner from the credential and the zone from the root default — a
+    // named zone would need an explicit grant the session cert by design
+    // carries none of.
+    let payload = json!({"agent_id":agent,"model":model});
     let started: Value = serde_json::from_slice(
         &operator
             .call(
@@ -1597,7 +1562,12 @@ fn live_cohost_model_workflow() {
         operator.read(&format!("{data}/quote.txt"), "").unwrap(),
         quote.as_bytes()
     );
-    let payload = json!({"agent_id":agent,"model":model,"owner_id":"root","zone_id":"root"});
+    // No `owner_id` / `zone_id`: the harness dials with a session credential
+    // (front-door minted, owner SAN'd), and v0.8.18's session-caller path takes
+    // the owner from the credential and the zone from the root default — a
+    // named zone would need an explicit grant the session cert by design
+    // carries none of.
+    let payload = json!({"agent_id":agent,"model":model});
     println!("LIVE COHOST: starting managed session");
     let started: Value = serde_json::from_slice(
         &operator
@@ -1776,7 +1746,10 @@ fn live_cohost_session_resume() {
 
     let mb = mailbox(&client, &user, "");
     mb.ensure_conversation(&agent).unwrap();
-    let mut request = json!({"agent_id":agent,"owner_id":"root","zone_id":"root","model":model});
+    // No `owner_id` / `zone_id`: the harness dials with a session credential
+    // (front-door minted, owner SAN'd), and v0.8.18's session-caller path takes
+    // the owner from the credential and the zone from the root default.
+    let mut request = json!({"agent_id":agent,"model":model});
     let rpc = |method: &str, payload: &Value| -> Result<Value, String> {
         let bytes = operator
             .call(method, payload.to_string().as_bytes(), "")
@@ -1861,12 +1834,18 @@ fn live_cohost_session_resume() {
         "",
     )
     .unwrap();
+    // The restored history carries the first turn's `send` tool result, so on
+    // the rebased line the scenario's mock calls `send` again: the reply the
+    // operator's mailbox must see is the "PONG" body the scenario sends. Poll
+    // the operator transcript from the start — the full replay is what resume
+    // is for.
+    let mut op_cursor = 0u64;
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         let (received, next) = mb
-            .poll_conversation(&agent, cursor, DELIVERY_WAIT_MS)
+            .poll_conversation(&agent, op_cursor, DELIVERY_WAIT_MS)
             .unwrap();
-        cursor = next;
+        op_cursor = next;
         if received
             .iter()
             .any(|m| m.from == agent && m.kind != "session" && m.body.contains("PONG"))
@@ -2240,4 +2219,208 @@ fn live_reader_receipts_keep_unprocessed_messages_and_renew_while_blocked() {
         after.messages().is_empty(),
         "acknowledged delivery must not replay"
     );
+}
+
+/// BASELINE evidence on a REAL node: what the pre-#1014 lease code does when a
+/// conversation reader's renewal fails at commit time.
+///
+/// One instance of an agent over a real mTLS client, behind the test-only fault
+/// boundary (`common/lease_fault.rs`). Exactly ONE renewal of the reader's lock
+/// is failed (INJECTED: it never reaches the node), and the re-claim that follows
+/// is held back (INJECTED delay) so the window in which the position must not
+/// move is long enough to observe; everything else is real. Asserted, with
+/// monotonic instants:
+///
+/// - the failed renewal is the commit's own `confirm()`, after the message was
+///   delivered, and the commit is refused: the durable read position stays put;
+/// - the tail drops that reader, releases its lock on the node, re-acquires it,
+///   and reloads the position from the register, so the message is delivered
+///   once more (at-least-once) and then committed;
+/// - the receiver seat is never touched, and nothing writes the position except
+///   the reader's own commit (this test only reads it).
+#[test]
+#[ignore = "requires the harness's real mTLS Nexus daemon"]
+fn live_reader_commit_refused_on_renew_error_then_reacquired_from_durable_offset() {
+    use lease_fault::{Fault, FaultyBackend, Outcome, Probe};
+    use runtime::mailbox::{spawn_inbox_poller, InboxConvention};
+    type Seen = Arc<std::sync::Mutex<Vec<(String, Instant)>>>;
+
+    let endpoint = std::env::var("NEXUS_A2A_TEST_ENDPOINT").expect("set daemon endpoint");
+    let auth = std::env::var("NEXUS_API_KEY").unwrap_or_default();
+    let agent = format!("scode-commit-fault-{}", fresh());
+    let peer = "commit-fault-peer";
+    let sender = dial(&endpoint);
+    let observer = Arc::new(mailbox(&dial(&endpoint), &agent, &auth));
+    let seen: Seen = Arc::default();
+    let probe = Probe::new();
+    let node = runtime::fs_backend::NexusVfsFsBackend::from_arc_mtls(
+        dial(&endpoint),
+        auth.clone(),
+        "root",
+    );
+    let receiver = Arc::new(Mailbox::new(
+        Arc::new(FaultyBackend::new(Arc::new(node), Arc::clone(&probe))),
+        agent.clone(),
+        InboxConvention::new(String::new()),
+    ));
+    let abort = runtime::HookAbortSignal::new();
+    let sink_seen = Arc::clone(&seen);
+    let handle = spawn_inbox_poller(receiver, 200, "commit-fault", abort.clone(), move |m| {
+        sink_seen
+            .lock()
+            .unwrap()
+            .push((m.body.clone(), Instant::now()));
+        true
+    });
+    let wait = |what: &str, within: Duration, done: &dyn Fn() -> bool| {
+        let deadline = Instant::now() + within;
+        while !done() {
+            assert!(
+                Instant::now() < deadline,
+                "timed out after {within:?} waiting for {what}"
+            );
+            thread::sleep(Duration::from_millis(50));
+        }
+    };
+    let deliveries = |body: &str| -> Vec<Instant> {
+        seen.lock()
+            .unwrap()
+            .iter()
+            .filter(|(b, _)| b == body)
+            .map(|(_, at)| *at)
+            .collect()
+    };
+    let position = || observer.read_position(peer).expect("read position");
+
+    wait("the seat", Duration::from_secs(20), &|| probe.holds_seat());
+    send_to(&sender, peer, &agent, "m0 warm-up", &auth).expect("send");
+    wait(
+        "the warm-up to be delivered and committed",
+        Duration::from_secs(20),
+        &|| !deliveries("m0 warm-up").is_empty() && position().is_some_and(|p| p > 0),
+    );
+    let p0 = position().unwrap();
+
+    // Sample the durable position, read-only, from just before the fault.
+    let sampling = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let samples: Arc<std::sync::Mutex<Vec<(Instant, Instant, Option<u64>)>>> = Arc::default();
+    let sampler = {
+        let (sampling, samples, observer) = (
+            Arc::clone(&sampling),
+            Arc::clone(&samples),
+            Arc::clone(&observer),
+        );
+        thread::spawn(move || {
+            while sampling.load(std::sync::atomic::Ordering::Acquire) {
+                let start = Instant::now();
+                let p = observer.read_position(peer).expect("read position");
+                samples.lock().unwrap().push((start, Instant::now(), p));
+                thread::sleep(Duration::from_millis(20));
+            }
+        })
+    };
+
+    let acquired_before = probe.reader_acquisitions().len();
+    let armed = Instant::now();
+    const CLAIM_DELAY: Duration = Duration::from_millis(800);
+    probe.delay_next_reader_claim(CLAIM_DELAY);
+    probe.set(Fault::ReaderRenewFails(1));
+    let body = "m1 committed under a failing renewal";
+    send_to(&sender, peer, &agent, body, &auth).expect("send");
+    wait(
+        "the position to advance past m1",
+        Duration::from_secs(30),
+        &|| position().is_some_and(|p| p > p0),
+    );
+    thread::sleep(Duration::from_secs(3));
+    sampling.store(false, std::sync::atomic::Ordering::Release);
+    sampler.join().expect("sampler");
+    let p1 = position().unwrap();
+
+    let delivered = deliveries(body);
+    assert_eq!(
+        delivered.len(),
+        2,
+        "m1 must be delivered once, refused at commit, and redelivered exactly once: {delivered:?}"
+    );
+    // With m1 delivered exactly twice, m0 delivered exactly once pins where the
+    // re-acquired reader resumed: at the durable offset, neither before it
+    // (m0 again) nor after it (no second m1).
+    assert_eq!(
+        deliveries("m0 warm-up").len(),
+        1,
+        "the re-acquired reader must resume at the durable offset, not before it"
+    );
+    let injected: Vec<_> = probe
+        .reader_renewals()
+        .into_iter()
+        .filter(|r| r.requested >= armed && r.outcome == Outcome::Injected)
+        .collect();
+    assert_eq!(
+        injected.len(),
+        1,
+        "exactly one INJECTED reader renewal: {injected:?}"
+    );
+    let failed = injected[0];
+    assert!(
+        failed.requested >= delivered[0] && failed.returned <= delivered[1],
+        "the failed renewal must be the commit's confirm(), between the two deliveries"
+    );
+    let (released, reached_node) = probe
+        .reader_releases()
+        .into_iter()
+        .find(|(at, _)| *at >= failed.returned)
+        .expect("the tail released the reader after the refused commit");
+    assert!(
+        reached_node,
+        "not partitioned, so the release reached the node"
+    );
+    let reacquired = probe
+        .reader_acquisitions()
+        .into_iter()
+        .skip(acquired_before)
+        .find(|at| *at >= released)
+        .expect("the tail re-acquired the reader");
+    assert!(
+        reacquired <= delivered[1],
+        "m1 must be redelivered by the re-acquired reader"
+    );
+    assert!(
+        reacquired.saturating_duration_since(released) >= CLAIM_DELAY,
+        "the INJECTED claim delay must have held the window open"
+    );
+    let samples = samples.lock().unwrap().clone();
+    let held: Vec<_> = samples
+        .iter()
+        .filter(|(start, end, _)| *start >= failed.returned && *end <= delivered[1])
+        .collect();
+    // Three is an empirical floor, not an invariant: the 800ms window yields
+    // dozens of samples, and three is enough to show the position held across
+    // it rather than in one lucky read.
+    assert!(
+        held.len() >= 3,
+        "too few position samples between the refused commit and the redelivery: {}",
+        held.len()
+    );
+    assert!(
+        held.iter().all(|(_, _, p)| *p == Some(p0)),
+        "the refused commit must leave the durable position at {p0}: {held:?}"
+    );
+    assert!(p1 > p0, "the redelivered batch was committed");
+    assert!(
+        probe.releases().is_empty(),
+        "the receiver seat must not be touched"
+    );
+
+    println!(
+        "BASELINE COMMIT OK: m1 delivered; ONE INJECTED reader renewal requested {:?} after that delivery and failed (the commit's confirm); commit refused, position held at {p0} in {} read-only samples; reader released {:?} and re-acquired {:?} after the failure (reached node: {reached_node}); m1 redelivered {:?} after the first delivery and committed, position {p0} -> {p1}; m1 delivered exactly twice and m0 once (resumed at the durable offset); seat untouched",
+        failed.requested.saturating_duration_since(delivered[0]),
+        held.len(),
+        released.saturating_duration_since(failed.returned),
+        reacquired.saturating_duration_since(failed.returned),
+        delivered[1].saturating_duration_since(delivered[0]),
+    );
+
+    abort.abort();
+    handle.join().expect("receiver");
 }

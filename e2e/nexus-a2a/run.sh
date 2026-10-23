@@ -161,10 +161,6 @@ NEXUS_A2A_TEST_ENDPOINT="$ENDPOINT" NEXUS_A2A_TEST_CERT_DIR="$CLIENT_BUNDLE" \
   cargo test --manifest-path "$RUST_DIR/Cargo.toml" -q -p runtime --test shared_runtime_history \
     live_runtime_history_restores_both_branches_after_daemon_restart -- --ignored --nocapture
 
-# One session on BOTH a local same-machine pair and this nexus daemon sees every
-# peer from both in ONE listing, each tagged with where it was found. The union
-# the Directory exists for, proven against a real daemon rather than a temp dir -
-# so a regression that silently drops a namespace from `agent_list` fails here.
 # /agents and /sessions are mounted from one zone; a router that drops the mount
 # prefix aliases them, and `readdir /agents` then returns session ids. The daemon
 # version comes from the nexus-vfs lock, so pin the invariant here: a bump or
@@ -173,10 +169,11 @@ echo "== [deterministic] /agents and /sessions are distinct namespaces =="
 NEXUS_A2A_TEST_ENDPOINT="$ENDPOINT" NEXUS_A2A_TEST_CERT_DIR="$CLIENT_BUNDLE" \
   "${CARGO_TEST[@]}" live_agents_and_sessions_are_not_the_same_namespace -- --ignored --nocapture
 
-echo "== [deterministic] agent_list unions local + nexus peers =="
+# Rename is the node's own Rename: a file is replaced in one step, and a stream
+# is refused rather than copied into a new regular file behind the caller's back.
+echo "== [deterministic] rename is native: files replace, streams refuse =="
 NEXUS_A2A_TEST_ENDPOINT="$ENDPOINT" NEXUS_A2A_TEST_CERT_DIR="$CLIENT_BUNDLE" \
-  "${CARGO_TEST[@]}" live_directory_unions_local_and_nexus_peers -- --ignored --nocapture
-
+  "${CARGO_TEST[@]}" live_rename_replaces_files_and_refuses_streams -- --ignored --nocapture
 # The seam the round-trip above leaves out. That one drives `Mailbox` directly,
 # so it proves the transport while saying nothing about whether the tool reaches
 # it, nor whether a receiver surfaces what arrives - and a `send` that wrote a
@@ -194,6 +191,14 @@ NEXUS_A2A_TEST_ENDPOINT="$ENDPOINT" \
 echo "== [deterministic] a silent connection errors, then recovers =="
 NEXUS_A2A_TEST_ENDPOINT="$ENDPOINT" NEXUS_A2A_TEST_CERT_DIR="$CLIENT_BUNDLE" \
   "${CARGO_TEST[@]}" live_a_silent_transport_errors_and_then_recovers -- --ignored --nocapture
+
+# The baseline lease path against the node's real lease table: one renewal of a
+# conversation reader's lock is failed by a test-only wrapper (INJECTED, it never
+# reaches the node). The commit must be refused, the durable read position left
+# alone, and the reader re-acquired so the batch is redelivered and committed.
+echo "== [deterministic] a failed reader renewal refuses the commit; the reader re-acquires =="
+NEXUS_A2A_TEST_ENDPOINT="$ENDPOINT" NEXUS_A2A_TEST_CERT_DIR="$CLIENT_BUNDLE" \
+  "${CARGO_TEST[@]}" live_reader_commit_refused_on_renew_error_then_reacquired_from_durable_offset -- --ignored --nocapture
 
 # A daemon that is alive and SILENT - the failure a unit test cannot construct.
 #
@@ -234,9 +239,20 @@ if [ -n "${SUDOROUTER_API_KEY:-}" ] && [ -n "${SCODE_BIN:-}" ]; then
     NEXUS_A2A_TEST_SPAWN="$R" NEXUS_A2A_TEST_MODEL="$MODEL" \
     "${CARGO_TEST[@]}" live_spawn_cohost -- --ignored --nocapture
   sleep 8
-  NEXUS_A2A_ENDPOINT="$ENDPOINT" NEXUS_A2A_CREDENTIAL="$SELF_BUNDLE" \
+  # scode attaches the way a machine does: a node record in its home and a
+  # session named for the credential minted for it. The config home stays the
+  # real one, so the proxy credentials still resolve.
+  SELF_HOME="$AUTHON_DATA_DIR/self-home"
+  SELF_WS="$AUTHON_DATA_DIR/self-workspace"
+  mkdir -p "$SELF_HOME/.nexus/run" "$SELF_HOME/agents/$SELF" "$SELF_WS/.nexus/sudocode"
+  cp "$SELF_BUNDLE"/* "$SELF_HOME/agents/$SELF/"
+  printf '{"version":1,"endpoint":"%s","agents_dir":"%s","role":"founder","zone":"%s"}\n' \
+    "${ENDPOINT#*://}" "$SELF_HOME/agents" "$AUTHON_ZONE" > "$SELF_HOME/.nexus/run/node.json"
+  printf '{"agentName":"%s"}\n' "$SELF" > "$SELF_WS/.nexus/sudocode/settings.json"
+  ( cd "$SELF_WS" && SUDO_CODE_CONFIG_HOME="${SUDO_CODE_CONFIG_HOME:-$HOME/.nexus/sudocode}" \
+    HOME="$SELF_HOME" USERPROFILE="$SELF_HOME" \
     "$SCODE_BIN" --auth proxy --model "$MODEL" --permission-mode danger-full-access \
-    --print "Call send once: to=$R message='reply with exactly one word: PONG' summary='ping'. Then stop."
+    --print "Call send once: to=$R message='reply with exactly one word: PONG' summary='ping'. Then stop." )
   echo "   polling ${SELF}'s inbox for the co-host reply..."
   got=
   for i in $(seq 1 30); do

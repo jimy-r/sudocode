@@ -856,14 +856,12 @@ fn compaction_can_release_an_older_image_exchange_when_recent_tail_exceeds_targe
     let env = budget_env("large-image-tail", &provider);
     let mut session = Session::new().with_workspace_root(env.workspace_root());
     session.model = Some("claude-sonnet-4-6".into());
-    session
-        .messages
-        .push(ConversationMessage::user_text(format!(
-            "Previous summary: PROJECT_ALPHA {}",
-            "s".repeat(8_000)
-        )));
+    let mut messages = vec![ConversationMessage::user_text(format!(
+        "Previous summary: PROJECT_ALPHA {}",
+        "s".repeat(8_000)
+    ))];
     for (id, path) in [("older-image", "older.png"), ("latest-image", "latest.png")] {
-        session.messages.push(ConversationMessage::assistant(vec![
+        messages.push(ConversationMessage::assistant(vec![
             ContentBlock::ToolUse {
                 id: id.into(),
                 name: "read_file".into(),
@@ -881,8 +879,9 @@ fn compaction_can_release_an_older_image_exchange_when_recent_tail_exceeds_targe
             data: "AAAA".repeat(375_000),
             mime_type: "image/png".into(),
         });
-        session.messages.push(result);
+        messages.push(result);
     }
+    let session = session.with_messages(messages);
     let before = estimate_session_tokens(&session);
     let path = env.workspace_root().join("history.jsonl");
     session.save_to_path(&path).unwrap();
@@ -893,11 +892,11 @@ fn compaction_can_release_an_older_image_exchange_when_recent_tail_exceeds_targe
     let report = restored.last_compaction_report.as_ref().unwrap();
     assert_eq!(report.outcome, runtime::CompactionOutcome::TargetMet);
     assert!(estimate_session_tokens(&restored) <= before / 2);
-    assert_eq!(restored.messages.len(), 3);
-    assert!(restored.messages[1].blocks.iter().any(|block| {
+    assert_eq!(restored.messages().len(), 3);
+    assert!(restored.messages()[1].blocks.iter().any(|block| {
         matches!(block, ContentBlock::ToolUse { id, .. } if id == "latest-image")
     }));
-    assert!(restored.messages[2]
+    assert!(restored.messages()[2]
         .blocks
         .iter()
         .any(|block| matches!(block, ContentBlock::Image { .. })));
@@ -927,10 +926,10 @@ fn latest_large_image_keeps_enough_summary_budget_on_truncated_retry() {
         let env = budget_env(mode, &provider);
         let mut session = Session::new().with_workspace_root(env.workspace_root());
         session.model = Some("claude-sonnet-4-6".into());
-        session.messages.push(ConversationMessage::user_text(
+        let mut messages = vec![ConversationMessage::user_text(
             "Certificate task: ".to_owned() + &"u".repeat(8_800),
-        ));
-        session.messages.push(ConversationMessage::assistant(vec![
+        )];
+        messages.push(ConversationMessage::assistant(vec![
             ContentBlock::ToolUse {
                 id: "earlier-command".into(),
                 name: "bash".into(),
@@ -938,13 +937,13 @@ fn latest_large_image_keeps_enough_summary_budget_on_truncated_retry() {
                 thought_signature: None,
             },
         ]));
-        session.messages.push(ConversationMessage::tool_result(
+        messages.push(ConversationMessage::tool_result(
             "earlier-command",
             "bash",
             "p".repeat(15_800),
             false,
         ));
-        session.messages.push(ConversationMessage::assistant(vec![
+        messages.push(ConversationMessage::assistant(vec![
             ContentBlock::ToolUse {
                 id: "unread-image".into(),
                 name: "read_file".into(),
@@ -962,7 +961,8 @@ fn latest_large_image_keeps_enough_summary_budget_on_truncated_retry() {
             data: "AAAA".repeat(1_382_360),
             mime_type: "image/png".into(),
         });
-        session.messages.push(image);
+        messages.push(image);
+        let session = session.with_messages(messages);
         let before = estimate_session_tokens(&session);
         let path = env.workspace_root().join("history.jsonl");
         session.save_to_path(&path).unwrap();
@@ -976,7 +976,7 @@ fn latest_large_image_keeps_enough_summary_budget_on_truncated_retry() {
         );
         assert!(estimate_session_tokens(&restored) <= before / 2);
         assert!(restored
-            .messages
+            .messages()
             .iter()
             .any(|message| message.blocks.iter().any(|block| {
                 matches!(block, ContentBlock::Image { data, .. } if data.len() == 5_529_440)

@@ -87,11 +87,11 @@ pub mod cache_advisor;
 pub mod cache_metrics;
 pub mod cache_report;
 mod engine_client;
-pub use attachment::EngineAttachment;
+pub use attachment::{CompletionRetirement, EngineAttachment};
 mod session;
 pub mod subagent_completion;
 pub use engine_client::EngineApiClient;
-pub use session::{EngineDelegate, EngineHandle, EngineSession};
+pub use session::{DirectToolError, EngineDelegate, EngineHandle, EngineSession};
 
 // Re-export the seam data types so a renderer / engine gets the WHOLE seam from
 // `engine_core` alone (`use engine_core::{EngineEvent, EngineCommand,
@@ -101,6 +101,7 @@ pub use engine_events;
 pub use engine_events::{
     EngineCommand, EngineEvent, EngineState, PromptContext, RequestId, TurnComplete,
 };
+pub use runtime::tips::{Tip, TipPriority};
 // Cost fields accepted by the session tracer exposed through EngineApiClient.
 pub use telemetry::{UsageCost, UsageTokens};
 

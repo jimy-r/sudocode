@@ -177,7 +177,7 @@ impl<C: ApiClient, T: ToolExecutor> ConversationRuntime<C, T> {
                             parent.model = Some(self.running_model().to_string());
                             if let Err(failure) = self.checkpoint_assistant(&mut assistant_index, parent.clone()) { error = Some(failure); break; }
                             parent.history.clone_from(&self.session.messages[assistant_index.expect("checkpointed assistant")].history);
-                            if let Err(failure) = scheduler.enqueue(id.clone(), name.clone(), input.clone(), parent) {
+                            if let Err(failure) = scheduler.enqueue(id.clone(), name.clone(), input.clone(), Some(parent)) {
                                 error = Some(failure); break;
                             }
                         }
@@ -230,6 +230,75 @@ impl<C: ApiClient, T: ToolExecutor> ConversationRuntime<C, T> {
             error,
             cancelled,
         }
+    }
+
+    /// Run one tool by name outside any model turn, through the gates a
+    /// model's call passes: pre-hook, the permission policy (prompting through
+    /// `prompter`), this session's own executor, post-hook.
+    ///
+    /// The call is admitted through the session's `background_tasks`, the
+    /// fence a turn's tools take: a paused session refuses it, and a pause
+    /// waits for its worker to finish. It runs under a fresh `direct-` id and
+    /// with no assistant message, because no model asked for it; nothing is
+    /// written to the session. Returns the tool's output and whether it
+    /// failed. A call cancelled after it was admitted is an error even when a
+    /// partial result exists: the tool may have run, so no result is reported
+    /// as if it were final.
+    #[allow(clippy::await_holding_lock)]
+    pub async fn run_tool_call(
+        &mut self,
+        name: &str,
+        input: &str,
+        mut prompter: Option<&mut dyn PermissionPrompter>,
+        background_tasks: Option<crate::background_tasks::BackgroundTasks>,
+    ) -> Result<(String, bool), RuntimeError> {
+        const CANCELLED: &str = "the call was cancelled after it was admitted and may have run";
+        let abort = self.hook_abort_signal.for_current_turn();
+        self.tool_executor_mut().set_abort_signal(abort.clone());
+        let no_observer: Option<&mut dyn RuntimeObserver> = None;
+        let mut context = self.dispatch_context(&no_observer, &prompter);
+        context.background_tasks = background_tasks;
+        let executor = Arc::clone(&self.tool_executor);
+        let executor = executor
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut scheduler = tool_execution::ToolScheduler::new(
+            &*executor,
+            self.hook_runner.clone(),
+            self.permission_policy.clone(),
+            abort.clone(),
+            self.hook_progress_reporter.clone(),
+        );
+        scheduler.initialize_context(context);
+        let call_id = format!("direct-{}", uuid::Uuid::new_v4());
+        scheduler.enqueue(call_id, name.into(), input.into(), None)?;
+        let completed = loop {
+            tokio::select! {
+                biased;
+                () = abort.cancelled() => {
+                    scheduler.cancel();
+                    return Err(RuntimeError::new(CANCELLED));
+                }
+                update = scheduler.next(&mut prompter) => {
+                    if let tool_execution::ToolUpdate::Completed { message, .. } = update {
+                        break message;
+                    }
+                }
+            }
+        };
+        if abort.is_aborted() {
+            return Err(RuntimeError::new(CANCELLED));
+        }
+        completed
+            .blocks
+            .into_iter()
+            .find_map(|block| match block {
+                ContentBlock::ToolResult {
+                    output, is_error, ..
+                } => Some((output, is_error)),
+                _ => None,
+            })
+            .ok_or_else(|| RuntimeError::new("the tool call produced no result"))
     }
 }
 

@@ -12,6 +12,7 @@
     clippy::unnecessary_wraps,
     clippy::unused_self
 )]
+mod background_completion;
 mod bash_mode;
 mod cancel;
 mod cli;
@@ -2334,32 +2335,45 @@ fn run_repl_loop(mut cli: LiveCli) -> Result<(), Box<dyn std::error::Error>> {
     SYNC_REPL_EDITOR.with(|cell| *cell.borrow_mut() = Some(Rc::clone(&editor)));
     println!("{}", cli.startup_banner());
 
-    // The A2A receiver lives on the coordinator loop, and that loop exists only
-    // in the async REPL. Reaching the SYNC one with an endpoint configured
-    // means the session dialled the broker and provisioned its inbox, and then
-    // nothing ever polls it — peer messages cannot arrive. An inbox nobody
-    // reads looks exactly like an inbox nobody has written to, so this says
-    // which one it is.
-    //
-    // `SUDOCODE_INTERRUPT_QUEUE_MODE` is about input queueing and has no
-    // business deciding whether A2A works. Until the sync REPL can carry a
-    // receiver the coupling stands, but it should at least be visible rather
-    // than silent. Switching modes automatically is the wrong fix: the sync
-    // REPL is the one that reprints `❯` after each turn, which is what the PTY
-    // harness matches on.
-    //
-    // Both `off` and the EMPTY string land here — see `QueueMode::from_str`.
-    let a2a_configured = std::env::var("NEXUS_A2A_ENDPOINT")
-        .map(|v| !v.trim().is_empty())
-        .unwrap_or(false);
-    if a2a_configured {
-        eprintln!(
-            "warning: NEXUS_A2A_ENDPOINT is set, but this REPL mode cannot RECEIVE A2A \
-             messages (sending still works). Unset SUDOCODE_INTERRUPT_QUEUE_MODE, or set it \
-             to `queue`, for the REPL that carries the receiver."
-        );
-    }
-
+    // The session's one receiver, on the same peer namespace its `send` tool
+    // writes through, as in the async REPL. Peer messages run as turns at the
+    // prompt boundary: rustyline cannot be interrupted from another thread, so
+    // a message that arrives while the prompt waits is announced at once and
+    // runs when the user next presses Enter. Its read position does not move
+    // until its turn has run.
+    let (peer_tx, pending_peer_turns) = mpsc::channel::<PendingPeerTurn>();
+    let peer_abort = runtime::HookAbortSignal::new();
+    // Counted before it is queued, so the count is never zero while a message
+    // is: Enter on an empty prompt must not be a no-op with one waiting.
+    let waiting_turns = editor.borrow().waiting_turns();
+    let queued = Arc::clone(&waiting_turns);
+    let deliver = peer_turn_sink(
+        peer_tx,
+        move |message, receipt| {
+            queued.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+            (message, receipt)
+        },
+        peer_abort.clone(),
+    );
+    // The notice is written straight to the terminal rather than through
+    // rustyline's external printer. On Unix that printer makes rustyline
+    // `select()` on the raw tty before every key while its own read buffer
+    // already holds the rest of a fast burst of input, so typed or pasted text
+    // stalls after its first character.
+    let peer_receiver = engine_host::peer::attach(&cli.lifecycle.agent_name())?.spawn_receiver(
+        peer_abort.clone(),
+        move |message| {
+            let mut out = io::stdout().lock();
+            let _ = write!(
+                out,
+                "\r\nMessage from {} is waiting; it runs before the next prompt (press Enter)\r\n",
+                message.from
+            );
+            let _ = out.flush();
+            drop(out);
+            deliver(message)
+        },
+    );
     // Render existing messages and seed editor history from user prompts.
     // Same code path for new sessions (messages empty → no-op) and resumed
     // sessions (messages present → render + populate history).
@@ -2405,6 +2419,7 @@ fn run_repl_loop(mut cli: LiveCli) -> Result<(), Box<dyn std::error::Error>> {
     let session_start = Instant::now();
 
     loop {
+        run_pending_peer_turns(&mut cli, &pending_peer_turns, &waiting_turns);
         editor
             .borrow_mut()
             .set_completions(cli.repl_completion_candidates().unwrap_or_default());
@@ -2424,6 +2439,11 @@ fn run_repl_loop(mut cli: LiveCli) -> Result<(), Box<dyn std::error::Error>> {
                     .into_values()
                     .map(|(data, mime_type)| runtime::ContentBlock::Image { data, mime_type })
                     .collect();
+                // An empty line only comes back while peer messages wait: the
+                // user handing the prompt back so they run, at the loop's top.
+                if trimmed.is_empty() && cli.pending_images.borrow().is_empty() {
+                    continue;
+                }
                 if matches!(trimmed.as_str(), "/exit" | "/quit") {
                     cli.persist_session()?;
                     break;
@@ -2482,6 +2502,12 @@ fn run_repl_loop(mut cli: LiveCli) -> Result<(), Box<dyn std::error::Error>> {
             }
         }
     }
+
+    // Dropping the queue refuses whatever is still waiting, which unblocks the
+    // receiver so it can be joined; those messages stay unread.
+    peer_abort.abort();
+    drop(pending_peer_turns);
+    let _ = peer_receiver.join();
 
     // Release the shared editor from the thread-local before this thread's frame
     // unwinds.
@@ -2691,6 +2717,18 @@ enum CoordinatorEvent {
         prompt: String,
         display: String,
     },
+    /// A background shell or monitor the model started has ended.
+    ///
+    /// Separate from [`Self::SubagentCompleted`] because the two want opposite
+    /// idle behaviour: a sub-agent result wakes a turn (the model delegated the
+    /// work and is waiting for it), while a background task must NOT seize an
+    /// idle prompt — the human may be mid-thought or exiting. It is queued and
+    /// delivered with the next turn, which still keeps the tool description's
+    /// promise that the model hears about it without polling.
+    BackgroundTaskCompleted {
+        prompt: String,
+        display: String,
+    },
     TurnComplete,
 }
 
@@ -2705,19 +2743,52 @@ enum CoordinatorEvent {
 ///
 /// Refuse delivery when the coordinator drops the receipt or shuts down. In
 /// particular, closing the engine must not acknowledge an interrupted turn.
-fn peer_turn_sink(
-    tx: mpsc::Sender<CoordinatorEvent>,
+///
+/// `wrap` packs the message and its receipt into whatever the REPL's loop
+/// receives, so both REPLs share this one acknowledgement rule.
+fn peer_turn_sink<E: Send + 'static>(
+    tx: mpsc::Sender<E>,
+    wrap: impl Fn(runtime::agent_mailbox::MailboxEnvelope, mpsc::Sender<()>) -> E + Send + Sync,
     stop: runtime::HookAbortSignal,
 ) -> impl Fn(&runtime::agent_mailbox::MailboxEnvelope) -> bool + Send + Sync {
     move |msg| {
         let (ack_tx, ack_rx) = mpsc::channel();
-        if tx
-            .send(CoordinatorEvent::PeerMessage(msg.clone(), ack_tx))
-            .is_err()
-        {
+        if tx.send(wrap(msg.clone(), ack_tx)).is_err() {
             return false;
         }
         ack_rx.recv().is_ok() && !stop.is_aborted()
+    }
+}
+
+/// A peer message waiting for the synchronous REPL, with its receipt.
+type PendingPeerTurn = (runtime::agent_mailbox::MailboxEnvelope, mpsc::Sender<()>);
+
+/// Run every peer message that has arrived as its own turn, acknowledging each
+/// only once its turn has finished. A turn that fails leaves its message
+/// unread, to be delivered again. `waiting` counts the messages queued and not
+/// yet taken here.
+fn run_pending_peer_turns(
+    cli: &mut LiveCli,
+    pending: &mpsc::Receiver<PendingPeerTurn>,
+    waiting: &std::sync::atomic::AtomicUsize,
+) {
+    while let Ok((message, receipt)) = pending.try_recv() {
+        waiting.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+        let prompt = tools::compose_next_turn_from_envelopes(&[message]);
+        println!(
+            "{}",
+            cli::received::render_prompt(
+                &prompt,
+                render::query_terminal_width(),
+                &render::TerminalRenderer::new(),
+            )
+        );
+        match cli.run_turn_interactive(&prompt) {
+            Ok(()) => {
+                let _ = receipt.send(());
+            }
+            Err(e) => eprintln!("{}{e}{}", ansi_fg(theme().error), RESET),
+        }
     }
 }
 
@@ -3380,8 +3451,8 @@ fn run_repl_iocraft_dispatch(
     };
     let permission_label = cli.lifecycle.current_permission_mode().as_str().to_string();
     // On resume, seed the status line with the session's running totals so the
-    // ChromeSlot shows the same B2 line you saw before exit — not the first-run
-    // Tips. `None` for a fresh session (no turns yet) leaves Tips in place.
+    // ChromeSlot shows the previous result. Fresh-session guidance belongs
+    // to the shared footer, leaving the upper status area empty until needed.
     let resume_status = cli.resume_status_line();
 
     // iocraft owns stdin (raw mode) and delivers Ctrl-C / ESC as key events;
@@ -3419,6 +3490,7 @@ fn run_repl_iocraft_dispatch(
     if let Some(status) = resume_status {
         repl_ui_cmd.set_turn_result(&status);
     }
+    repl_ui_cmd.set_cache_tip(cli.cache_ttl_tip());
     let pending_question_answer: PendingQuestionAnswer = Arc::new(Mutex::new(None));
 
     // Route LiveCli output through iocraft's OutputSender so it goes
@@ -3438,15 +3510,36 @@ fn run_repl_iocraft_dispatch(
     let engine_events = std::mem::replace(&mut cli.engine_handle.events, turn_rx);
     let completion_tx = coord_tx.clone();
     let task_ui = repl_ui_cmd.clone();
+    let activity = repl_spinner.clone();
     thread::Builder::new()
         .name("repl-engine-events".into())
         .spawn(move || {
+            // Upstream dedupes sub-agent completions in the engine now
+            // (`SubagentCompletionReady`); background tasks have no such
+            // pre-deduped event, so that state stays here.
+            let mut background = background_completion::Completions::default();
             while let Ok(event) = engine_events.recv() {
                 // Background work keeps publishing while the parent is idle.
                 // Its UI uses the same seam as every other engine consumer.
                 match &event {
+                    EngineEvent::State(state) => activity.observe_engine_state(*state),
                     EngineEvent::BackgroundTask(event) => {
                         task_ui.background_task(event.clone());
+                        // The panel is for the human; the model is a second
+                        // consumer. A background shell or monitor the model
+                        // started must report when it ends, or "end your turn,
+                        // you will be notified" is a promise nothing keeps.
+                        if let Some(finished) = background.observe(event) {
+                            if completion_tx
+                                .send(CoordinatorEvent::BackgroundTaskCompleted {
+                                    prompt: finished.prompt,
+                                    display: finished.display,
+                                })
+                                .is_err()
+                            {
+                                return;
+                            }
+                        }
                         continue;
                     }
                     EngineEvent::BackgroundTaskError { message, .. } => {
@@ -3480,6 +3573,7 @@ fn run_repl_iocraft_dispatch(
                     return;
                 }
             }
+            activity.observe_engine_state(engine_events::EngineState::Idle);
         })
         .expect("spawn REPL engine event bridge");
     let cli_shared = Arc::new(Mutex::new(cli));
@@ -3498,40 +3592,24 @@ fn run_repl_iocraft_dispatch(
         })
         .expect("spawn input bridge");
 
-    // Both transports share the coordinator's delivery and shutdown boundary.
-    let mailbox_abort = runtime::HookAbortSignal::new();
-    let mut mailbox_pollers = Vec::new();
-    if let Ok(Some(a2a_session)) = engine_host::nexus_a2a::session() {
-        mailbox_pollers.push(engine_host::nexus_a2a::spawn_poller(
-            a2a_session,
-            mailbox_abort.clone(),
-            peer_turn_sink(coord_tx.clone(), mailbox_abort.clone()),
-        ));
-    }
-
-    // Local same-machine mailbox poller: picks up messages that a peer scode
-    // (or a sub-agent) writes to this process's inbox via the `send` tool.
-    // Rooted at the shared per-machine pair root and keyed by the name the LIVE
-    // SESSION answers to, so two scode processes started in different folders
-    // can converse. Complements the nexus A2A poller above — together they
-    // close the receive loop for both local and cross-machine messaging.
+    // The session's one receiver, on the same peer namespace its `send` tool
+    // writes through, sharing the coordinator's delivery and shutdown boundary.
     //
-    // The name comes from the session rather than being re-derived here: the
-    // session already resolved it (config `agentName`, else derived from its
-    // workspace) and signs outbound messages with it, and a second derivation
-    // from the process directory is how a peer's reply arrives at an inbox
-    // nothing is polling.
-    {
-        let self_name = session_agent_name;
-        let root = runtime::mailbox::local_pair_root();
-        mailbox_pollers.push(runtime::mailbox::spawn_local_poller(
-            root,
-            self_name,
+    // Keyed by the name the LIVE SESSION answers to rather than re-derived
+    // here: the session already resolved it (config `agentName`, else derived
+    // from its workspace) and signs outbound messages with it, and a second
+    // derivation from the process directory is how a peer's reply arrives at
+    // an inbox nothing is polling. `attach` reuses the node dial the session
+    // build already made, so it cannot newly fail here.
+    let mailbox_abort = runtime::HookAbortSignal::new();
+    let mailbox_receiver = engine_host::peer::attach(&session_agent_name)?.spawn_receiver(
+        mailbox_abort.clone(),
+        peer_turn_sink(
+            coord_tx.clone(),
+            CoordinatorEvent::PeerMessage,
             mailbox_abort.clone(),
-            peer_turn_sink(coord_tx.clone(), mailbox_abort.clone()),
-        ));
-    }
-
+        ),
+    );
     // Coordinator loop on the current thread. All events arrive through
     // `coord_rx` — no timeout-based polling needed.
     let mut turn_active = false;
@@ -3607,10 +3685,15 @@ fn run_repl_iocraft_dispatch(
                 continue;
             }
             event @ (CoordinatorEvent::PeerMessage(..)
-            | CoordinatorEvent::SubagentCompleted { .. }) => {
+            | CoordinatorEvent::SubagentCompleted { .. }
+            | CoordinatorEvent::BackgroundTaskCompleted { .. }) => {
                 // Peer messages and sub-agent results share human input's
                 // scheduling: run while idle, otherwise queue until the turn
                 // boundary. Keep their origin distinct in the UI and history.
+                // A background task's news must never seize an idle prompt:
+                // the human may be typing or exiting, and a turn started under
+                // their `/exit` leaves the session unable to shut down.
+                let mut wake_on_idle = true;
                 let (prompt, display, kind, ack) = match event {
                     CoordinatorEvent::PeerMessage(msg, ack) => {
                         let prompt = tools::compose_next_turn_from_envelopes(&[msg]);
@@ -3624,9 +3707,13 @@ fn run_repl_iocraft_dispatch(
                     CoordinatorEvent::SubagentCompleted { prompt, display } => {
                         (prompt, display, input_queue::QueuedKind::Subagent, None)
                     }
+                    CoordinatorEvent::BackgroundTaskCompleted { prompt, display } => {
+                        wake_on_idle = false;
+                        (prompt, display, input_queue::QueuedKind::Subagent, None)
+                    }
                     _ => unreachable!(),
                 };
-                if !turn_active {
+                if !turn_active && wake_on_idle {
                     match kind {
                         input_queue::QueuedKind::Subagent => repl_output.println(&display),
                         _ => echo_peer_to_scrollback(&repl_output, &display),
@@ -3697,6 +3784,22 @@ fn run_repl_iocraft_dispatch(
                     let _ = commands.send(EngineCommand::BackgroundTask {
                         action: engine_events::BackgroundTaskAction::Stop { id },
                     });
+                }
+                repl_ui::InputEvent::InspectDocument(document) => {
+                    // The turn owns LiveCli while awaiting its answer. Pager
+                    // inspection needs only terminal ownership, never that lock
+                    // or an engine command. Resume the same question and draft.
+                    match repl_output.suspend() {
+                        Ok(mut suspension) => {
+                            print_with_pager(&document);
+                            if let Err(error) = suspension.finish() {
+                                repl_output.println(&format!("Could not restore review: {error}"));
+                            }
+                        }
+                        Err(error) => {
+                            repl_output.println(&format!("Could not open review: {error}"));
+                        }
+                    }
                 }
                 repl_ui::InputEvent::Submit { text, display } => {
                     // `!<cmd>` bash mode: run it here, no model turn. The
@@ -3860,6 +3963,10 @@ fn run_repl_iocraft_dispatch(
                         Ok(Some(command)) => {
                             let mut cli_lock = cli_shared.lock().expect("LiveCli mutex poisoned");
                             let refresh_context = matches!(command, SlashCommand::Compact);
+                            let prior_context = (
+                                cli_lock.lifecycle.session_handle().id,
+                                cli_lock.lifecycle.current_model(),
+                            );
                             match cli_lock.handle_repl_command(command) {
                                 Ok(true) => {
                                     if let Err(e) = cli_lock.persist_session() {
@@ -3882,6 +3989,16 @@ fn run_repl_iocraft_dispatch(
                                     repl_ui_cmd.set_turn_result(&status);
                                 }
                             }
+                            if refresh_context
+                                || prior_context
+                                    != (
+                                        cli_lock.lifecycle.session_handle().id,
+                                        cli_lock.lifecycle.current_model(),
+                                    )
+                            {
+                                repl_ui_cmd.begin_turn();
+                            }
+                            repl_ui_cmd.set_cache_tip(cli_lock.cache_ttl_tip());
                             true
                         }
                         Ok(None) => false,
@@ -3939,7 +4056,24 @@ fn run_repl_iocraft_dispatch(
                 }
                 repl_ui::InputEvent::QuestionAnswer(text) => {
                     if let Some(handler) = pending_slash_selection.take() {
+                        let prior = {
+                            let cli = cli_shared.lock().expect("LiveCli mutex poisoned");
+                            (
+                                cli.lifecycle.session_handle().id,
+                                cli.lifecycle.current_model(),
+                            )
+                        };
                         pending_slash_selection = (handler.0)(&text, &cli_shared, &repl_output);
+                        let cli = cli_shared.lock().expect("LiveCli mutex poisoned");
+                        if prior
+                            != (
+                                cli.lifecycle.session_handle().id,
+                                cli.lifecycle.current_model(),
+                            )
+                        {
+                            repl_ui_cmd.begin_turn();
+                        }
+                        repl_ui_cmd.set_cache_tip(cli.cache_ttl_tip());
                     } else if !consume_pending_question_answer(&pending_question_answer, text) {
                         repl_output.println(&format!(
                             "{DIM}(no question is waiting for an answer){RESET}"
@@ -3955,9 +4089,7 @@ fn run_repl_iocraft_dispatch(
     mailbox_abort.abort();
     drop(coord_rx);
     coord.lock().unwrap().clear();
-    for poller in mailbox_pollers {
-        let _ = poller.join();
-    }
+    let _ = mailbox_receiver.join();
 
     // Persist the session before shutting down the REPL — the UI thread may
     // still be alive and the shared CLI mutex must remain accessible.
@@ -4025,7 +4157,7 @@ fn spawn_iocraft_turn(
     next: input_queue::NextTurn<mpsc::Sender<()>>,
     output: repl_ui::OutputSender,
     ui: repl_ui::UiCommandSender,
-    spinner: repl_ui::SpinnerState,
+    spinner: render::activity::ActivityState,
     pending_question_answer: PendingQuestionAnswer,
     done_tx: mpsc::Sender<CoordinatorEvent>,
 ) -> thread::JoinHandle<()> {
@@ -4557,7 +4689,7 @@ impl LiveCli {
     /// live REPL shows after a turn, but rebuilt from the persisted session so
     /// the running totals (cost, tokens, wall time) continue seamlessly. Returns
     /// `None` for a session with no recorded turns (nothing to summarize —
-    /// StatusSlot falls back to Tips, as for a brand-new session).
+    /// StatusSlot stays empty, as for a brand-new session).
     fn resume_status_line(&self) -> Option<render::StyledLine> {
         let catalog = self.lifecycle.model_catalog();
         let _scope = catalog
@@ -4673,7 +4805,9 @@ impl LiveCli {
                     // queued until ToolStarted acquires a slot. The
                     // finished card is committed to scrollback by the renderer
                     // on the ordered output channel, not from here.
-                    if let Some(ui) = ui {
+                    if let Some(ui) =
+                        ui.filter(|_| tools::canonicalize_tool_name(name) != "set_tip")
+                    {
                         ui.tool_queued(id, name, input);
                     }
                     // Parity: `--output-format json` emits the tool input as the
@@ -4688,7 +4822,9 @@ impl LiveCli {
                     }));
                 }
                 EngineEvent::ToolStarted { id, name, input } => {
-                    if let Some(ui) = ui {
+                    if let Some(ui) =
+                        ui.filter(|_| tools::canonicalize_tool_name(name) != "set_tip")
+                    {
                         ui.tool_started(id, name, input);
                     }
                 }
@@ -4708,6 +4844,11 @@ impl LiveCli {
                     // Canonicalize first: this name is whatever the model
                     // spelled, so matching it raw would leave the panel stale.
                     if let Some(ui) = ui {
+                        if !*is_error && tools::canonicalize_tool_name(name) == "set_tip" {
+                            if let Some(tip) = tools::tip_from_tool_result(output) {
+                                ui.set_tip(tip);
+                            }
+                        }
                         if !*is_error && tools::canonicalize_tool_name(name).as_str() == "TodoWrite"
                         {
                             // From the result itself — the list is in the
@@ -4861,7 +5002,7 @@ impl LiveCli {
         let token_budget = crate::render::parse_token_budget(input);
         let model = self.lifecycle.current_model();
         let mut spinner = SpinnerHandle::new(
-            "🦀 Thinking...",
+            render::activity::THINKING_LABEL,
             Some(model.as_str()),
             TerminalRenderer::new().color_theme(),
             token_budget,
@@ -4927,10 +5068,15 @@ impl LiveCli {
         Ok(())
     }
 
-    /// Print the end-of-turn status line. Usage/turns come from a lifecycle
-    /// snapshot (the engine's live `UsageTracker`), context-window from the
-    /// response model (falling back to the active model). Routes to the iocraft
-    /// `OutputSender` when present, else the plain `out_println`.
+    /// Read the engine's frozen recommendation without copying pricing logic.
+    fn cache_ttl_tip(&self) -> Option<engine_core::Tip> {
+        engine_core::cache_advisor::session_tip(
+            &self.lifecycle.session_handle().id,
+            &self.lifecycle.current_model(),
+        )
+    }
+
+    /// Show lifecycle usage in the dynamic status slot, or plain output.
     fn print_turn_status_line(
         &self,
         model: &str,
@@ -4976,6 +5122,9 @@ impl LiveCli {
         } else {
             turn_status_line(&status)
         };
+        if let Some(ui) = ui {
+            ui.set_cache_tip(self.cache_ttl_tip());
+        }
         match (ui, output) {
             // Show in the ChromeSlot only (visible until the next turn). The
             // status line is deliberately NOT echoed to scrollback: the
@@ -4991,24 +5140,25 @@ impl LiveCli {
     }
 
     /// Run a turn using the iocraft REPL path. Output is routed through
-    /// `OutputSender` and the spinner is managed via the shared
-    /// `SpinnerState` atomics instead of indicatif.
+    /// `OutputSender`; the foreground activity projection owns the status
+    /// instead of indicatif.
     fn run_turn_iocraft(
         &mut self,
         input: &str,
         output: &repl_ui::OutputSender,
         ui: &repl_ui::UiCommandSender,
-        spinner_state: &repl_ui::SpinnerState,
+        spinner_state: &render::activity::ActivityState,
         pending_question_answer: PendingQuestionAnswer,
     ) -> Result<bool, Box<dyn std::error::Error>> {
+        ui.begin_turn();
         let turn_start = Instant::now();
         let token_budget = crate::render::parse_token_budget(input);
         let model = self.lifecycle.current_model();
 
-        // Activate the shared spinner state for the iocraft render loop, then
-        // bridge it into the SpinnerRef the renderer drives (bytes + thinking).
-        spinner_state.start_turn("\u{1f980} Thinking...", Some(model.as_str()), token_budget);
-        let spinner_ref = render::SpinnerRef::from_spinner_state(spinner_state);
+        // Prepare display metadata before submission. Engine events own the
+        // lifecycle; SpinnerRef updates only response progress and phase.
+        spinner_state.prepare_turn(model.as_str(), token_budget);
+        let spinner_ref = render::SpinnerRef::from_activity_state(spinner_state);
 
         let mut question_prompter =
             IocraftQuestionPrompter::new(ui.clone(), pending_question_answer);
@@ -5025,7 +5175,6 @@ impl LiveCli {
             &mut question_prompter,
             None,
         )?;
-        spinner_state.stop_turn();
 
         // Explicit cancellation finishes this input. The mailbox sink decides
         // whether the receiver is still running and can acknowledge delivery.
@@ -5498,6 +5647,17 @@ impl LiveCli {
         let latest = usage.current_turn_usage();
         let session = self.lifecycle.session_snapshot();
         let handle = self.lifecycle.session_handle();
+        let mut context = status_context(Some(&handle.path)).expect("status context should load");
+        let mut peer = engine_host::peer::status(&self.lifecycle.agent_name());
+        // The synchronous REPL runs a received message only once the user
+        // hands the prompt back; say so rather than imply it runs on arrival.
+        if matches!(
+            input_queue::QueueMode::from_env(),
+            input_queue::QueueMode::Off
+        ) {
+            peer.delivery = "next_prompt";
+        }
+        context.peer = Some(peer);
         let report = format_status_report(
             &self.lifecycle.current_model(),
             StatusUsage {
@@ -5508,7 +5668,7 @@ impl LiveCli {
                 estimated_tokens: self.lifecycle.estimated_tokens(),
             },
             self.lifecycle.current_permission_mode().as_str(),
-            &status_context(Some(&handle.path)).expect("status context should load"),
+            &context,
             None, // #148: REPL /status doesn't carry flag provenance
             &self.lifecycle.current_billing_account().describe(),
         );
