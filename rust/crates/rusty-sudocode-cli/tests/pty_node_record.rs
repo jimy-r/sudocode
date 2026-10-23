@@ -160,6 +160,15 @@ fn an_offline_node_does_not_block_startup_or_resume() {
             .expect("ordinary turn completes without Nexus");
         wait_for_saved_reply(&env, reply);
         common::expect_input_line_cleared(&fresh, Duration::from_secs(30), "offline turn done");
+        // Startup/model input must be usable before the receiver finishes IO.
+        // Keep this live process open until its actual background failure is
+        // logged; Windows can complete the fast mock turn before connect fails.
+        wait_for_receiver_diagnostic(&log);
+        common::expect_input_line_cleared(
+            &fresh,
+            Duration::from_secs(30),
+            "offline diagnostic shown",
+        );
         fresh.send("/exit\r").expect("exit fresh session");
         assert_eq!(fresh.expect_eof().expect("fresh session exits"), 0);
 
@@ -181,23 +190,35 @@ fn an_offline_node_does_not_block_startup_or_resume() {
         common::expect_input_line_cleared(&resumed, Duration::from_secs(30), "offline resume");
         resumed.send("/exit\r").expect("exit resumed session");
         assert_eq!(resumed.expect_eof().expect("resumed session exits"), 0);
-        let records: Vec<serde_json::Value> = std::fs::read_to_string(&log)
-            .expect("offline connection error retained in the local log")
-            .lines()
-            .map(|line| serde_json::from_str(line).unwrap())
-            .collect();
-        assert!(
-            records.iter().any(|record| {
-                let props = &record["attributes"];
-                props["subject"] == SESSION_AGENT
-                    && props["scope"] == "receiver seat"
-                    && props["error"]
-                        .as_str()
-                        .is_some_and(|error| error.contains("claim the receiver seat"))
-            }),
-            "offline receiver lost its original diagnostic: {records:?}"
-        );
         assert_no_disk_namespace(&env);
+    }
+}
+
+/// This is an observation phase after the original startup/turn readiness
+/// assertions, not an increased budget for those assertions. A node operation
+/// has its own transport deadline; do not exit the child before observing it.
+fn wait_for_receiver_diagnostic(log: &Path) {
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        let records: Vec<serde_json::Value> = std::fs::read_to_string(log)
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .filter(|record| record["attributes"]["namespace"] == "background_retry")
+            .collect();
+        if records.iter().any(|record| {
+            let props = &record["attributes"];
+            props["subject"] == SESSION_AGENT
+                && props["scope"] == "receiver seat"
+                && props["error"]
+                    .as_str()
+                    .is_some_and(|error| error.contains("claim the receiver seat"))
+        }) {
+            return;
+        }
+        assert!(Instant::now() < deadline,
+            "no receiver-seat diagnostic while the original CLI stayed alive; background records: {records:?}");
+        std::thread::sleep(Duration::from_millis(50));
     }
 }
 

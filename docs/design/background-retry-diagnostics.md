@@ -63,5 +63,9 @@ suppressed repeat. No production interval is shortened for this test.
 The offline CLI PTY workflow additionally checks that the original node error
 is retained in the diagnostic log while a real model turn, input and original
 session resume remain usable. The existing receiver/cursor/completion tests
-remain applicable. Exact-head CI and platform results are reported in the PR;
+remain applicable. After the original startup and completed-turn readiness
+assertions, the PTY keeps that process alive until its actual background IO
+failure appears in the log; a fast Windows mock turn can otherwise exit before
+the connection attempt reports a result. The original input/turn deadlines are
+unchanged. Exact-head CI and platform results are reported in the PR;
 source preparation alone does not constitute runtime rollout or acceptance.
