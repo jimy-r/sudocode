@@ -219,7 +219,7 @@ fn expect_receiver_diagnostic(session: &mut pty_expect::PtySession) {
         );
         if screen.contains("Last RX error") {
             assert!(
-                screen.contains("connect"),
+                common::screen_contains(&screen.to_ascii_lowercase(), "connect"),
                 "missing transport cause: {screen}"
             );
             return;
