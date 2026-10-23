@@ -114,7 +114,7 @@ print(json.dumps({'hookSpecificOutput': {'updatedInput': p}}))
         let (_, reply) = client
             .send_request(
                 "_sudocode/a2a/send",
-                json!({"sessionId": sid, "to": PEER, "message": case}),
+                json!({"sessionId": sid, "to": PEER, "message": case, "summary": "hook fence"}),
             )
             .await;
         assert_eq!(reply["result"]["isError"], !allowed, "{case}: {reply}");
@@ -227,7 +227,7 @@ async fn direct_a2a_obeys_the_sessions_tool_allowlist() {
     let (_, refused) = client
         .send_request(
             "_sudocode/a2a/send",
-            json!({"sessionId": sid, "to": "untouched", "message": "ALLOWLIST_REFUSED"}),
+            json!({"sessionId": sid, "to": "untouched", "message": "ALLOWLIST_REFUSED", "summary": "allowlist fence"}),
         )
         .await;
     assert_eq!(refused["result"]["isError"], true, "{refused}");
@@ -353,7 +353,7 @@ async fn live_direct_a2a_pause_waits_for_the_cancelled_node_worker() {
     let (_, sent) = client
         .send_request(
             "_sudocode/a2a/send",
-            json!({"sessionId": sid, "to": node.observer.self_id(), "message": warmup}),
+            json!({"sessionId": sid, "to": node.observer.self_id(), "message": warmup, "summary": "warm up the direct node transport"}),
         )
         .await;
     assert_eq!(sent["result"]["isError"], false, "{sent}");
@@ -364,7 +364,7 @@ async fn live_direct_a2a_pause_waits_for_the_cancelled_node_worker() {
     let request = client
         .send_request_no_wait(
             "_sudocode/a2a/send",
-            json!({"sessionId": sid, "to": node.observer.self_id(), "message": marker}),
+            json!({"sessionId": sid, "to": node.observer.self_id(), "message": marker, "summary": "hold the direct node worker"}),
         )
         .await;
     let (_, permission) = client
@@ -423,7 +423,7 @@ async fn live_direct_a2a_pause_waits_for_the_cancelled_node_worker() {
     let (_, refused) = client
         .send_request(
             "_sudocode/a2a/send",
-            json!({"sessionId": sid, "to": node.observer.self_id(), "message": marker}),
+            json!({"sessionId": sid, "to": node.observer.self_id(), "message": marker, "summary": "refuse a paused direct send"}),
         )
         .await;
     assert_direct_not_submitted(&refused, "paused");
@@ -472,7 +472,7 @@ if os.environ['HOOK_TOOL_NAME'] == 'send':
     let request = client
         .send_request_no_wait(
             "_sudocode/a2a/send",
-            json!({"sessionId": sid, "to": node.observer.self_id(), "message": marker}),
+            json!({"sessionId": sid, "to": node.observer.self_id(), "message": marker, "summary": "hold the reply after the real append"}),
         )
         .await;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
