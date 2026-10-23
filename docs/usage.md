@@ -170,8 +170,8 @@ The REPL accepts prose and slash commands. Tab completion expands slash
 command names, model aliases, permission modes, and recent session IDs.
 
 The live status follows the foreground engine lifecycle. A four-cell amber
-animation approximates the Sudoprivacy logo in one row, with a stable hexagonal
-outline and moving inner facets. Model work shows `Thinking...` or `Reasoning...`.
+animation approximates the rotating Sudoprivacy logo in one row, using twelve
+precomputed frames. Model work shows `Thinking...` or `Reasoning...`.
 The activity label uses the theme's info/warning color; model, elapsed time and
 tokens use its muted color so they remain secondary to the activity.
 Foreground tools use the same row and show available progress first. Quiet
