@@ -86,6 +86,11 @@ retries its existing node connection, and A2A tools report node IO errors;
 they do not redirect messages to a disk inbox. An uncertain send result must
 not be retried automatically.
 
+While claiming the receiver seat, an unchanged connection error is printed
+once; a different error or a new outage after a successful receiver-seat check
+is reported again. Connection retries continue without repeatedly scrolling the
+input area.
+
 This does not start Nexus or mint an agent credential. A missing record still
 selects the same-machine disk namespace. Record parsing, missing credential
 files and credential identity mismatches still stop startup; a lazy client is

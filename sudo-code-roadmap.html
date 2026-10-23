@@ -2490,7 +2490,10 @@ until its v0.8.16 tag.</p>
 With an existing readable node record and credential, constructing the session's
 peer client does not perform a network probe. Ordinary startup and resume keep
 the node namespace while the receiver retries and A2A operations report their
-actual errors. PTY acceptance covers both renderers, restored history and a
+actual errors. Receiver-seat retries print an unchanged error once, reset that
+diagnostic after a successful receiver-seat check, and retain the existing retry
+interval. PTY acceptance requires usable input after a completed offline turn
+and covers both renderers, restored history and a
 failed real send without a disk inbox. Record parsing, missing credential files
 and identity mismatches still fail startup; representing those conditions as
 A2A unavailable, and explicit
