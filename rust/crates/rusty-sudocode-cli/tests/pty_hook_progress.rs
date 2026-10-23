@@ -120,6 +120,55 @@ fn pre_tool_use_hook_progress_reaches_the_terminal() {
     );
 }
 
+#[test]
+fn early_hook_exit_preserves_its_decision_with_unread_tool_input() {
+    let content = "fixture line\n".repeat(100_000);
+    for (code, progress) in [(0, "done"), (1, "FAILED"), (2, "DENIED")] {
+        let env = TestEnv::new_mock("hook-unread-input");
+        #[cfg(windows)]
+        let command = format!("echo hook-observed & exit /b {code}");
+        #[cfg(not(windows))]
+        let command = format!("printf hook-observed; exit {code}");
+        write_pre_tool_use_hook(&env, &command);
+        let destination = env.workspace_root().join("hook-output.txt");
+        let calls = serde_json::json!([{
+            "id": "write-fixture", "name": "write_file",
+            "input": {"path": destination, "content": content}
+        }]);
+        // Keep the large tool input in the provider response. Passing it through
+        // terminal input or argv would test unrelated platform size limits.
+        let batch = env.workspace_root().join("calls.json");
+        fs::write(&batch, calls.to_string()).unwrap();
+        let prompt = format!(
+            "PARITY_SCENARIO:tool_concurrency TOOL_BATCH_FILE:{}",
+            serde_json::to_string(&batch).unwrap()
+        );
+        let mut session = env.spawn(&[
+            "--permission-mode",
+            "danger-full-access",
+            "--allowedTools",
+            "write_file",
+            &prompt,
+        ]);
+        session.resize(50, 160).unwrap();
+        session
+            .expect(&format!(r"\[hook {progress} PreToolUse\]"))
+            .unwrap();
+        let exit = session.expect_eof().unwrap();
+        let screen = session.render(|screen| screen.contents());
+        assert!(!screen.contains("failed to start"), "{screen}");
+        if code == 0 {
+            assert_eq!(exit, 0, "{screen}");
+            assert_eq!(fs::read_to_string(destination).unwrap(), content);
+        } else {
+            assert!(
+                !destination.exists(),
+                "a refused hook allowed the write: {screen}"
+            );
+        }
+    }
+}
+
 /// With no hook configured, none of that output appears.
 ///
 /// The guard for the other direction: an assertion on `[hook` alone would pass
