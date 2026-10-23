@@ -76,11 +76,14 @@ fn delayed_stream_migration_preserves_a_newer_continuation() {
     kernel
         .create_stream(path.to_str().unwrap(), 1 << 20)
         .unwrap();
-    let fs: Arc<dyn FsBackend> = Arc::new(KernelFsBackend::for_agent(
+    let fs: Arc<dyn FsBackend> = Arc::new(KernelFsBackend::for_agent_descriptor(
         kernel,
-        "test-owner",
-        "root",
-        "agent-a",
+        &kernel::core::agents::registry::AgentDescriptor {
+            name: "agent-a".into(),
+            owner_id: "test-owner".into(),
+            zone_id: "root".into(),
+            ..Default::default()
+        },
         "/workspace",
     ));
     let mut legacy = Session::new();

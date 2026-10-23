@@ -26,11 +26,9 @@ pub fn seed_managed_session(
     super::provision_stream_transcript(kernel, &transcript);
     let session = session
         .with_persistence_path(transcript)
-        .with_fs_backend(Arc::new(KernelFsBackend::for_agent(
+        .with_fs_backend(Arc::new(KernelFsBackend::for_agent_descriptor(
             Arc::clone(kernel),
-            &desc.owner_id,
-            &desc.zone_id,
-            &desc.name,
+            desc,
             workspace,
         )));
     session.initialize_persistence().unwrap();
