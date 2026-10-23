@@ -111,7 +111,7 @@ fn a_refused_batch_records_a_consumer_refused_stall_with_the_stuck_offset() {
         "the re-read must be recorded, not silent"
     );
     assert!(
-        stalls.iter().all(|e| e.offset == 0),
+        stalls.iter().all(|e| e.offset == Some(0)),
         "every stall sits at the offset that did not advance: {:?}",
         stalls.iter().map(|e| e.offset).collect::<Vec<_>>()
     );
@@ -125,9 +125,10 @@ fn a_refused_batch_records_a_consumer_refused_stall_with_the_stuck_offset() {
         "the stall is attributable to the reader that holds the lease"
     );
     assert!(
-        stalls
-            .iter()
-            .all(|e| e.tail.is_some_and(|tail| tail > e.offset)),
+        stalls.iter().all(|e| e
+            .tail
+            .zip(e.offset)
+            .is_some_and(|(tail, offset)| tail > offset)),
         "tail is known and past the stuck offset, so the pending bytes are: {:?}",
         stalls
             .iter()
@@ -225,7 +226,7 @@ fn a_peer_appending_during_a_refusal_moves_tail_but_not_offset() {
         "the appended message must show up as a larger tail: {tail_before} -> {tail_after}"
     );
     assert!(
-        stalls.iter().all(|e| e.offset == 0),
+        stalls.iter().all(|e| e.offset == Some(0)),
         "the cursor never advanced, because nothing was ever accepted: {:?}",
         stalls.iter().map(|e| e.offset).collect::<Vec<_>>()
     );

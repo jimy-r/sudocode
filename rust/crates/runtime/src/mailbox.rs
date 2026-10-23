@@ -872,6 +872,8 @@ pub struct ReaderRegister {
     /// is free. Deliberately NOT the agent name: two instances of the SAME
     /// agent are exactly what this has to tell apart.
     #[serde(default)]
+    /// The claim that failed to advance, empty when no reader was held (see
+    /// [`DeliveryStall::ClaimFailed`]).
     pub holder: String,
     /// Legacy diagnostic deadline; the backend lock controls ownership.
     #[serde(default)]
@@ -1515,9 +1517,15 @@ pub enum DeliveryStall {
 pub struct DeliveryEvent {
     pub peer: String,
     pub holder: String,
-    /// The offset that did NOT advance. With `peer`, this identifies the exact
-    /// frames that will be handed over again.
-    pub offset: u64,
+    /// The offset that did NOT advance, or `None` when no reader was held and
+    /// there is no offset to report.
+    ///
+    /// `Option` for the same reason as `tail`: offset **0** is a real and common
+    /// value — the start of a conversation, which the integration tests assert
+    /// on — so a zero standing for "unknown" would be indistinguishable from a
+    /// genuine stall at the first frame. [`DeliveryStall::ClaimFailed`] happens
+    /// before a reader exists, so it has no offset rather than an invented one.
+    pub offset: Option<u64>,
     /// End of the transcript as of the poll that observed this stall, or `None`
     /// when no poll succeeded and nothing beyond the cursor is known.
     ///
@@ -1565,7 +1573,7 @@ impl DeliveryLog {
         &self,
         peer: &str,
         holder: &str,
-        offset: u64,
+        offset: Option<u64>,
         tail: Option<u64>,
         stall: DeliveryStall,
         repeats: u32,
@@ -1606,7 +1614,7 @@ fn global_delivery_log() -> &'static DeliveryLog {
 fn record_delivery_stall(
     peer: &str,
     holder: &str,
-    offset: u64,
+    offset: Option<u64>,
     tail: Option<u64>,
     stall: DeliveryStall,
     repeats: u32,
@@ -1644,7 +1652,7 @@ fn spawn_conversation_tail(
                     }
                     Err(e) => {
                         eprintln!("[{label}] claiming reader for {peer}: {e}");
-                        record_delivery_stall(&peer, "", 0, None, DeliveryStall::ClaimFailed, 0);
+                        record_delivery_stall(&peer, "", None, None, DeliveryStall::ClaimFailed, 0);
                         sleep_unless_aborted(&abort, block_ms.max(1));
                         continue;
                     }
@@ -1660,7 +1668,7 @@ fn spawn_conversation_tail(
                                 record_delivery_stall(
                                     &peer,
                                     reader.cursor.holder(),
-                                    reader.offset,
+                                    Some(reader.offset),
                                     None,
                                     DeliveryStall::PollFailed,
                                     0,
@@ -1691,7 +1699,7 @@ fn spawn_conversation_tail(
                                 record_delivery_stall(
                                     &peer,
                                     reader.cursor.holder(),
-                                    reader.offset,
+                                    Some(reader.offset),
                                     Some(next),
                                     DeliveryStall::CommitRefused,
                                     0,
@@ -1716,7 +1724,7 @@ fn spawn_conversation_tail(
                             record_delivery_stall(
                                 &peer,
                                 reader.cursor.holder(),
-                                reader.offset,
+                                Some(reader.offset),
                                 Some(next),
                                 stall,
                                 stall_repeats,
