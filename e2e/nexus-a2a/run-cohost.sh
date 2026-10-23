@@ -305,9 +305,7 @@ NEXUS_A2A_TEST_ENDPOINT="$ENDPOINT" NEXUS_A2A_TEST_CERT_DIR="$CLIENT_BUNDLE" \
   "${CARGO_TEST[@]}" live_a_silent_transport_errors_and_then_recovers -- --ignored --nocapture
 
 echo "== 11. independent concurrent contexts in one durable SID =="
-kill "$AUTHON_DAEMON_PID" 2>/dev/null || true
-wait "$AUTHON_DAEMON_PID" 2>/dev/null || true
-AUTHON_DAEMON_PID=
+authon_stop
 # Enable the experiment only for its stage; earlier recovery stays on defaults.
 SUDOCODE_EXPERIMENT_SHARED_SESSION_HISTORY=1 authon_boot
 authon_wait_log "Zone '$AUTHON_ZONE' registered" 45

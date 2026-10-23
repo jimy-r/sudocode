@@ -28,6 +28,9 @@ fn same_process_turn_repairs_orphan_before_model_request() {
     let workspace = tempfile::tempdir().expect("workspace");
     let config_home = tempfile::tempdir().expect("config home");
     std::env::set_var("SUDO_CODE_CONFIG_HOME", config_home.path());
+    // Node discovery must use this fixture's home, not the developer's node.
+    std::env::set_var("HOME", config_home.path());
+    std::env::set_var("USERPROFILE", config_home.path());
     let config = serde_json::json!({
         "auth_modes": { "api-key": { "anthropic": {
             "baseUrl": mock.base_url(), "apiKey": "test-key"

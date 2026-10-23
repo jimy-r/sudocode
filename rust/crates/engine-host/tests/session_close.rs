@@ -7,6 +7,9 @@ fn closed_engine_releases_native_writer_and_fences_retained_snapshots() {
     let workspace = tempfile::tempdir().unwrap();
     let config = tempfile::tempdir().unwrap();
     std::env::set_var("SUDO_CODE_CONFIG_HOME", config.path());
+    // Node discovery must use this fixture's home, not the developer's node.
+    std::env::set_var("HOME", config.path());
+    std::env::set_var("USERPROFILE", config.path());
     std::fs::write(
         config.path().join("sudocode.json"),
         serde_json::json!({

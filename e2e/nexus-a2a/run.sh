@@ -142,9 +142,7 @@ if [ "$(uname -s)" = Linux ]; then
 fi
 
 echo "== [deterministic] restart the owned daemon and retain WAL history/cursors =="
-kill -KILL "$AUTHON_DAEMON_PID"
-wait "$AUTHON_DAEMON_PID" 2>/dev/null || true
-AUTHON_DAEMON_PID=
+authon_stop KILL
 authon_boot
 authon_wait_log "Zone '$AUTHON_ZONE' registered" 45
 wait_for_writable_leader
