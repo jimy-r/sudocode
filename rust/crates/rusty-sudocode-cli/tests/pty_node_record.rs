@@ -135,10 +135,13 @@ fn an_offline_node_does_not_block_startup_or_resume() {
         node_home::write_untrusted_credential(&agents, SESSION_AGENT);
         let home = home_with_record(&env, &record("127.0.0.1:1", &agents));
         let home = home.to_string_lossy();
+        let log = env.workspace_root().join("receiver-diagnostics.jsonl");
+        let log_text = log.to_string_lossy();
         let vars = [
             ("HOME", home.as_ref()),
             ("USERPROFILE", home.as_ref()),
             ("SUDOCODE_INTERRUPT_QUEUE_MODE", mode),
+            ("SCODE_LOG_PATH", log_text.as_ref()),
         ];
         let prompt = env.prompt("Reply with exactly OFFLINE_NODE_REPLY.", "single_turn_text");
         let reply = if env.is_mock() {
@@ -178,6 +181,22 @@ fn an_offline_node_does_not_block_startup_or_resume() {
         common::expect_input_line_cleared(&resumed, Duration::from_secs(30), "offline resume");
         resumed.send("/exit\r").expect("exit resumed session");
         assert_eq!(resumed.expect_eof().expect("resumed session exits"), 0);
+        let records: Vec<serde_json::Value> = std::fs::read_to_string(&log)
+            .expect("offline connection error retained in the local log")
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert!(
+            records.iter().any(|record| {
+                let props = &record["attributes"];
+                props["subject"] == SESSION_AGENT
+                    && props["scope"] == "receiver seat"
+                    && props["error"]
+                        .as_str()
+                        .is_some_and(|error| error.contains("claim the receiver seat"))
+            }),
+            "offline receiver lost its original diagnostic: {records:?}"
+        );
         assert_no_disk_namespace(&env);
     }
 }
