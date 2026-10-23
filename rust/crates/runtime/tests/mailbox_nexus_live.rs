@@ -2383,8 +2383,11 @@ fn live_receiver_seat_trusts_only_fresh_renewals() {
     );
     let took = standby.acquisitions()[standby_grants];
     let took_after = took.saturating_duration_since(last_real.requested);
+    // The node keeps lock expiry in whole seconds (expires_at = now_secs + ttl,
+    // alive while expires_at > now_secs), so a lease can lapse up to a second
+    // before 30s after the renewal it received.
     assert!(
-        took_after + Duration::from_millis(500) >= TTL,
+        took_after + Duration::from_millis(1_100) >= TTL,
         "{standby_label} took the seat {took_after:?} after {holder_label}'s last real renewal, before the node's TTL"
     );
     let cut_attempts: Vec<Renewal> = holder
