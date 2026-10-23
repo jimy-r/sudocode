@@ -1669,7 +1669,20 @@ fn spawn_conversation_tail(
                                 continue;
                             }
                         };
-                    if msgs.iter().all(|m| reader.is_valid() && sink(m)) {
+                    let mut lease_lost = false;
+                    if msgs.iter().all(|m| {
+                        // Record which step failed as it happens. Asking
+                        // `is_valid()` again afterwards would be a second
+                        // question with a window between: a sink that refused
+                        // under a held lease, followed by the lease lapsing
+                        // before the check, would be filed as `LeaseLost` when
+                        // the consumer was the actual cause.
+                        if !reader.is_valid() {
+                            lease_lost = true;
+                            return false;
+                        }
+                        sink(m)
+                    }) {
                         retry_delay_ms = DELIVERY_RETRY_INITIAL_MS;
                         stall_repeats = 0;
                         if next > reader.offset {
@@ -1693,15 +1706,12 @@ fn spawn_conversation_tail(
                         // and it used to leave no trace whatsoever.
                         if !msgs.is_empty() {
                             stall_repeats = stall_repeats.saturating_add(1);
-                            // Which of the two made `all()` false. The lease is
-                            // checked first because `all()` short-circuits: once
-                            // it lapses the remaining sinks are never called, so
-                            // "the consumer refused" would be a claim about a
-                            // handover that never happened.
-                            let stall = if reader.is_valid() {
-                                DeliveryStall::ConsumerRefused
-                            } else {
+                            // Which step actually failed, captured above rather
+                            // than re-derived here.
+                            let stall = if lease_lost {
                                 DeliveryStall::LeaseLost
+                            } else {
+                                DeliveryStall::ConsumerRefused
                             };
                             record_delivery_stall(
                                 &peer,
