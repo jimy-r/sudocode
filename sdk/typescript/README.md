@@ -154,11 +154,11 @@ After `npm test` and `npm run pack:runtime`, provide these environment values:
   its verified hash and source receipt.
 - `NEXUSD_BIN`, `NEXUSD_SHA256`, `NEXUSD_TEST_TAG`: absolute matching daemon,
   its verified hash and pinned release tag.
-- `npm_execpath`, `npm_node_execpath`: the npm CLI JavaScript and Node paths
-  (npm supplies these to scripts).
+- Optional `SCODE_TEST_PYTHON`: Python 3 executable (defaults to `python` on
+  Windows and `python3` elsewhere).
 - Optional `SCODE_NATIVE_TEST_ROOT`: a private evidence directory.
 
-Run `python3 test/nativeFixture.py` (`python` on Windows). The fixture keeps
+Run `npm run test:native`. npm supplies its own Node/npm paths. The fixture keeps
 protocol/log/receipt evidence and always stops its own daemon. It installs the
 archive offline, creates then reloads the sender's original SID through the
 actual MCP bridge, verifies an actual mTLS Node append and native actor audit,
