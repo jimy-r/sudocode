@@ -62,12 +62,27 @@ impl Drop for NoInference {
 }
 
 fn python_hook(script: &str) -> String {
-    let interpreter = python::resolve_python();
     #[cfg(windows)]
-    let interpreter = format!("\"{interpreter}\"");
+    let interpreter = "%SCODE_DIRECT_FIXTURE_PYTHON%".to_string();
     #[cfg(not(windows))]
-    let interpreter = shell_words::quote(&interpreter).into_owned();
+    let interpreter = shell_words::quote(&python::resolve_python()).into_owned();
     format!("{interpreter} {script}")
+}
+
+fn python_hook_env() -> Vec<(&'static str, String)> {
+    #[cfg(windows)]
+    {
+        // The hook runs through cmd /C. Expand the quoted executable there,
+        // after Rust's argv encoding, rather than passing literal quotes that
+        // become backslash-quoted executable names. This also keeps paths
+        // containing spaces usable without changing production hook handling.
+        vec![(
+            "SCODE_DIRECT_FIXTURE_PYTHON",
+            format!("\"{}\"", python::resolve_python()),
+        )]
+    }
+    #[cfg(not(windows))]
+    Vec::new()
 }
 
 #[tokio::test]
@@ -102,7 +117,12 @@ print(json.dumps({'hookSpecificOutput': {'updatedInput': p}}))
     )
     .unwrap();
     let root = runtime::mailbox::local_pair_root_in(&workspace.config_home);
-    let mut client = spawn_stdio_client(&workspace);
+    let hook_env = python_hook_env();
+    let env: Vec<_> = hook_env
+        .iter()
+        .map(|(key, value)| (*key, value.as_str()))
+        .collect();
+    let mut client = spawn_stdio_client_with_args_and_env(&workspace, &[], &env);
     scenario_initialize(&mut client).await;
     let sid = open_direct_session(&mut client, &workspace.root).await;
     set_session_mode(&mut client, &sid, "workspace-write").await;
@@ -295,7 +315,8 @@ impl LiveNode {
             &self.actor,
             Path::new(&self.bundle),
         );
-        let env = home.env();
+        let mut env = home.env().to_vec();
+        env.extend(python_hook_env());
         let env: Vec<_> = env
             .iter()
             .map(|(key, value)| (*key, value.as_str()))
