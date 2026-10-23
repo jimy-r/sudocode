@@ -209,25 +209,22 @@ pub(super) struct ProgressValues<'a> {
 
 /// One formatter for inline and one-shot model/time/token/budget/ETA display.
 #[inline]
-pub(super) fn progress_line(
-    frame_index: usize,
-    label: &str,
-    values: ProgressValues<'_>,
-    width: usize,
-    metric: text_layout::ColumnMetric,
-    warning: bool,
-) -> String {
+fn progress_details(values: ProgressValues<'_>) -> String {
     let ProgressValues {
         model,
         elapsed,
         bytes,
         token_budget,
     } = values;
+    // Keep time-derived metadata stable between seconds while the logo keeps
+    // animating. Token changes still refresh immediately; turn statistics use
+    // the original precise duration outside this presentation formatter.
+    let elapsed = elapsed.floor();
     let mut details = String::new();
     if let Some(model) = model {
         let _ = write!(details, " [{model}]");
     }
-    let _ = write!(details, " ({elapsed:.1}s)");
+    let _ = write!(details, " ({elapsed:.0}s)");
     if bytes > 0 && elapsed >= 1.0 {
         let tokens = bytes / 4;
         if let Some(budget) = token_budget {
@@ -253,6 +250,20 @@ pub(super) fn progress_line(
             let _ = write!(details, " ↓ {tokens} tokens");
         }
     }
+    details
+}
+
+/// Lay out the activity row using the shared metadata and semantic colors.
+#[inline]
+pub(super) fn progress_line(
+    frame_index: usize,
+    label: &str,
+    values: ProgressValues<'_>,
+    width: usize,
+    metric: text_layout::ColumnMetric,
+    warning: bool,
+) -> String {
+    let details = progress_details(values);
     let logo = brand_spinner::frame(frame_index);
     let reserved = metric.width(logo) + 1 + metric.width(&details);
     let label = text_layout::single_line(label);
@@ -279,5 +290,54 @@ fn compact_tokens(tokens: u32) -> String {
         format!("{:.1}k", f64::from(tokens) / 1_000.0)
     } else {
         tokens.to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{progress_details, ProgressValues};
+
+    #[test]
+    fn elapsed_and_eta_are_stable_between_whole_seconds() {
+        let values = ProgressValues {
+            model: Some("test-model"),
+            elapsed: 6.1,
+            bytes: 12_000,
+            token_budget: Some(6_000),
+        };
+        let details = progress_details(values);
+        assert!(details.contains("(6s)"));
+        assert!(details.contains("~6s"));
+        assert_eq!(
+            details,
+            progress_details(ProgressValues {
+                elapsed: 6.9,
+                ..values
+            })
+        );
+        assert_ne!(
+            details,
+            progress_details(ProgressValues {
+                elapsed: 7.0,
+                ..values
+            })
+        );
+    }
+
+    #[test]
+    fn token_progress_stays_live_between_clock_updates() {
+        let values = ProgressValues {
+            model: None,
+            elapsed: 6.1,
+            bytes: 40,
+            token_budget: None,
+        };
+        assert!(progress_details(values).contains("↓ 10 tokens"));
+        assert!(progress_details(ProgressValues {
+            elapsed: 6.2,
+            bytes: 44,
+            ..values
+        })
+        .contains("↓ 11 tokens"));
     }
 }
