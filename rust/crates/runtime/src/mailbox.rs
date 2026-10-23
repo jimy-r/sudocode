@@ -1483,7 +1483,20 @@ pub enum DeliveryStall {
     /// batch is re-read from the same offset. This is the DESIGNED
     /// at-least-once boundary, not a fault — it is recorded so that a repeat
     /// can be attributed instead of guessed at.
+    ///
+    /// Recorded only when the lease was still valid, so this really is the
+    /// consumer's refusal. The batch test is
+    /// `msgs.iter().all(|m| reader.is_valid() && sink(m))`, which also goes
+    /// false when the lease lapses mid-batch; attributing that to the consumer
+    /// would blame the wrong cause for exactly the repeats this record exists
+    /// to explain — and the "not a fault" note above would then be asserted
+    /// about a fault. That case is [`DeliveryStall::LeaseLost`].
     ConsumerRefused,
+    /// The lease went invalid part-way through the batch, so the handover was
+    /// abandoned and the batch is re-read. Distinct from
+    /// [`DeliveryStall::ConsumerRefused`] because this one IS a fault, and
+    /// because a repeat caused by it has a different remedy.
+    LeaseLost,
     /// The batch was accepted but `commit` refused to store the new offset, so
     /// the accepted work will be handed over again.
     CommitRefused,
@@ -1680,12 +1693,22 @@ fn spawn_conversation_tail(
                         // and it used to leave no trace whatsoever.
                         if !msgs.is_empty() {
                             stall_repeats = stall_repeats.saturating_add(1);
+                            // Which of the two made `all()` false. The lease is
+                            // checked first because `all()` short-circuits: once
+                            // it lapses the remaining sinks are never called, so
+                            // "the consumer refused" would be a claim about a
+                            // handover that never happened.
+                            let stall = if reader.is_valid() {
+                                DeliveryStall::ConsumerRefused
+                            } else {
+                                DeliveryStall::LeaseLost
+                            };
                             record_delivery_stall(
                                 &peer,
                                 reader.cursor.holder(),
                                 reader.offset,
                                 Some(next),
-                                DeliveryStall::ConsumerRefused,
+                                stall,
                                 stall_repeats,
                             );
                         }

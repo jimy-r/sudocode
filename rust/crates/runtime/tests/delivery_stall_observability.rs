@@ -134,6 +134,23 @@ fn a_refused_batch_records_a_consumer_refused_stall_with_the_stuck_offset() {
             .map(|e| (e.offset, e.tail))
             .collect::<Vec<_>>()
     );
+    // Attribution, not just detection. The batch test is
+    // `all(|m| reader.is_valid() && sink(m))`, so a lapsed lease ALSO makes it
+    // false; recording that as the consumer's refusal would blame the wrong
+    // cause for the very repeats this record explains. Here the lease is held
+    // throughout — this backend's `renew()` cannot fail — so every stall must
+    // be attributed to the consumer and none to the lease.
+    assert!(
+        !delivery_events()
+            .iter()
+            .any(|e| e.peer == "peer-sender" && e.stall == DeliveryStall::LeaseLost),
+        "a held lease must never be reported as lost: {:?}",
+        delivery_events()
+            .iter()
+            .filter(|e| e.peer == "peer-sender")
+            .map(|e| e.stall)
+            .collect::<Vec<_>>()
+    );
 }
 
 #[test]
