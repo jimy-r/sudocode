@@ -8120,6 +8120,14 @@ async fn set_session_mode(client: &mut AcpTestClient, session_id: &str, mode: &s
     );
 }
 
+/// A definite refusal is invalid params: nothing ran, so it may be resent.
+fn assert_refused(resp: &Value, case: &str) {
+    assert_eq!(
+        resp["error"]["code"], -32602,
+        "{case} must be refused before anything runs: {resp}"
+    );
+}
+
 /// What `sender` has written to its conversation with `peer` on the pair root,
 /// read straight from the transcript so reading it changes nothing.
 fn conversation_log(pair_root: &Path, peer: &str, sender: &str) -> String {
@@ -8168,12 +8176,11 @@ fn assert_direct_host_audit<'a>(
     audit
 }
 
-fn assert_direct_not_submitted(reply: &Value, reason: &str) {
-    assert_eq!(reply["error"]["code"], -32070, "{reply}");
+fn assert_direct_not_submitted(reply: &Value, case: &str) {
+    assert_refused(reply, case);
     let phase = &reply["error"]["data"]["sudocode"]["directA2a"];
     assert_eq!(phase["version"], 1);
     assert_eq!(phase["outcome"], "not_submitted");
-    assert_eq!(phase["reason"], reason);
 }
 
 #[tokio::test]
@@ -8307,7 +8314,8 @@ async fn direct_a2a_refusals_send_nothing() {
     scenario_initialize(&mut client).await;
     let sid = open_direct_session(&mut client, &workspace.root).await;
     let send = |session: &str, extra: Value| {
-        let mut params = json!({ "sessionId": session, "to": PEER, "message": MARKER });
+        let mut params =
+            json!({ "sessionId": session, "to": PEER, "message": MARKER, "summary": "probe" });
         if let (Some(params), Some(extra)) = (params.as_object_mut(), extra.as_object()) {
             params.extend(extra.clone());
         }
@@ -8328,6 +8336,11 @@ async fn direct_a2a_refusals_send_nothing() {
         (
             "a structured message",
             send(&sid, json!({ "message": { "type": "shutdown_request" } })),
+            "invalid_params",
+        ),
+        (
+            "a message without a summary",
+            json!({ "sessionId": sid, "to": PEER, "message": MARKER }),
             "invalid_params",
         ),
     ] {
@@ -8421,6 +8434,103 @@ async fn direct_a2a_refusals_send_nothing() {
     assert!(
         !conversation_log(&pair_root, PEER, AGENT).contains(MARKER),
         "no refused send may reach the peer"
+    );
+    client.shutdown().await;
+    workspace.cleanup();
+}
+
+/// A direct send cancelled after its message went out is not a refusal: the
+/// response says the outcome is unknown, the peer holds the message exactly
+/// once, the model is never asked, and nothing resends it.
+#[tokio::test]
+async fn direct_a2a_cancel_after_delivery_reports_unknown() {
+    const AGENT: &str = "direct-a2a-cancelled";
+    const PEER: &str = "direct-a2a-receiver";
+    const MARKER: &str = "DIRECT_A2A_UNKNOWN_5b2d";
+    let server = MockAnthropicService::spawn()
+        .await
+        .expect("mock service should start");
+    let workspace = TestWorkspace::new("direct-a2a-unknown");
+    workspace.create();
+    workspace.write_sudocode_json(&server.base_url());
+    // Hold the call in its post-tool hook, after the send itself has run.
+    let started = workspace.root.join("direct-post.started");
+    let release = workspace.root.join("direct-post.release");
+    let hook = if cfg!(windows) {
+        r"echo started>direct-post.started& for /L %i in (1,1,60) do @if not exist direct-post.release (ping -n 2 127.0.0.1 >nul)"
+    } else {
+        r"touch direct-post.started; i=0; while [ ! -f direct-post.release ] && [ $i -lt 600 ]; do sleep 0.1; i=$((i+1)); done"
+    };
+    let settings = workspace.root.join(".nexus").join("sudocode");
+    fs::create_dir_all(&settings).expect("create project settings");
+    fs::write(
+        settings.join("settings.json"),
+        json!({ "agentName": AGENT, "hooks": { "PostToolUse": [hook] } }).to_string(),
+    )
+    .expect("write project settings");
+    let pair_root = runtime::mailbox::local_pair_root_in(&workspace.config_home);
+
+    let mut client = spawn_stdio_client(&workspace);
+    scenario_initialize(&mut client).await;
+    let sid = open_direct_session(&mut client, &workspace.root).await;
+    set_session_mode(&mut client, &sid, "workspace-write").await;
+    let before = server.captured_requests().await.len();
+
+    let id = client
+        .send_request_no_wait(
+            "_sudocode/a2a/send",
+            json!({ "sessionId": sid, "to": PEER, "message": MARKER, "summary": "probe" }),
+        )
+        .await;
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    while !started.exists() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the post-tool hook never started"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(
+        conversation_log(&pair_root, PEER, AGENT)
+            .matches(MARKER)
+            .count(),
+        1,
+        "the send ran before its post-tool hook"
+    );
+    client
+        .send_raw(&json!({
+            "jsonrpc": "2.0",
+            "method": "session/cancel",
+            "params": { "sessionId": sid }
+        }))
+        .await;
+    let answered = client
+        .recv_until(Duration::from_secs(30), |m| is_response_to(m, id))
+        .await;
+    let _ = fs::write(&release, "");
+    let (_, resp) =
+        answered.unwrap_or_else(|seen| panic!("the cancelled send never answered; saw {seen:#?}"));
+    assert_eq!(
+        resp["error"]["code"], -32603,
+        "a call cancelled after it ran is not a refusal: {resp}"
+    );
+    assert_eq!(
+        resp["error"]["data"]["outcome"], "unknown",
+        "the response says the outcome is unknown: {resp}"
+    );
+
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert_eq!(
+        conversation_log(&pair_root, PEER, AGENT)
+            .matches(MARKER)
+            .count(),
+        1,
+        "nothing resends a message whose outcome is unknown"
+    );
+    assert_eq!(
+        server.captured_requests().await.len(),
+        before,
+        "a direct call never asks the model"
     );
     client.shutdown().await;
     workspace.cleanup();

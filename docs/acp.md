@@ -153,8 +153,8 @@ Hosts check `initialize.result._meta.sudocode.directA2a.version == 1`. Two
 session requests run the session's own A2A tools for the client, without a
 model turn:
 
-- `_sudocode/a2a/send` with `{ "sessionId", "to", "message", "summary"? }`
-  runs the `send` tool. `message` is plain text. The session's agent is the
+- `_sudocode/a2a/send` with `{ "sessionId", "to", "message", "summary" }`
+  runs the `send` tool. `message` and `summary` are plain text. The session's agent is the
   sender: a `sender` field, a structured message or any other unknown field is
   refused as invalid params.
 - `_sudocode/a2a/agent_list` with `{ "sessionId", "activeOnly"? }` runs the
@@ -172,12 +172,14 @@ reports a failed call; it does not prove that nothing was delivered, so do not
 retry it blindly.
 
 `directA2a.errorOutcomes == 1` adds a typed refusal contract. Only an error with
-code `-32070` and `error.data.sudocode.directA2a` containing
-`{ "version": 1, "outcome": "not_submitted", "reason": "..." }` attests that
-the host rejected the request before tool submission. Reasons are
-`invalid_params`, `unknown_session`, `busy`, `paused` and `session_changed`.
-After admission, driver or response failures use `-32071` with `outcome:
-"unknown"` and `reason: "after_admission"`. Generic JSON-RPC errors, opaque
+code `-32602` and `error.data.sudocode.directA2a` containing
+`{ "version": 1, "outcome": "not_submitted" }` attests that the host rejected
+the request before tool execution. This includes an unknown session, invalid
+params, paused tools, a busy session and a session control change. After
+admission, driver or response failures use `-32603` with top-level
+`error.data.outcome: "unknown"` and matching versioned phase metadata. A
+cancelled call never returns a partial tool result as if final. Generic
+JSON-RPC errors without the advertised contract, opaque
 `isError` results, timeout and disconnect do not prove that no append occurred.
 Keep the original request for reconciliation; do not retry or fall back to a
 prompt automatically.
@@ -202,7 +204,7 @@ identity evidence. Hosts retaining an audit must save the native result and
 its call ID themselves, without putting a fabricated model tool call into the
 transcript. `hostAudit:1` is specifically metadata on a returned tool result,
 including an opaque `isError` result. A driver exception, cancellation without
-a result, or transport loss may have no audit receipt; `-32071` still means
+a result, or transport loss may have no audit receipt; `-32603` still means
 Unknown and does not promise command/actor correlation. There is no all-command
 provenance claim. Inspect the real node envelope to reconcile an uncertain
 append.
@@ -223,7 +225,7 @@ result: ASCII("sudocode.direct-a2a.result.v1") || NUL
         || one byte (isError ? 1 : 0) || frame(content)
 ```
 
-Input fields use native tool names: `to`, `message`, optional `summary`, or
+Input fields use native tool names: `to`, `message`, `summary`, or
 optional `active_only`. Omitted and false are distinct. No audit field or RPC
 `sessionId` participates in those hashes; native session/actor remain separate
 audit fields. The public schemas bound the field count and types. A hook's

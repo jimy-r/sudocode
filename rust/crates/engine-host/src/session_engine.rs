@@ -1164,13 +1164,12 @@ impl engine_core::EngineDelegate for SessionEngine {
         name: &str,
         input: &str,
         prompter: &mut dyn runtime::PermissionPrompter,
-    ) -> Result<runtime::external_a2a::ExternalToolResult, String> {
+    ) -> Result<runtime::external_a2a::ExternalToolResult, engine_core::DirectToolError> {
         let mut session = self.lock_session();
         let _scope = runtime::WorkspaceRootScope::enter(&session.cwd);
-        let runtime = session
-            .runtime
-            .runtime_mut()
-            .ok_or("the session runtime is not available")?;
+        let runtime = session.runtime.runtime_mut().ok_or_else(|| {
+            engine_core::DirectToolError::Refused("the session runtime is not available".into())
+        })?;
         self.rt()
             .block_on(runtime.run_tool_call(
                 name,
@@ -1178,7 +1177,7 @@ impl engine_core::EngineDelegate for SessionEngine {
                 Some(prompter),
                 self.background_tasks.clone(),
             ))
-            .map_err(|error| error.to_string())
+            .map_err(|error| engine_core::DirectToolError::Unknown(error.to_string()))
     }
 
     fn abort_signal(&self) -> runtime::HookAbortSignal {

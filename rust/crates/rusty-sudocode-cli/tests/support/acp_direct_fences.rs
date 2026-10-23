@@ -395,9 +395,11 @@ async fn live_direct_a2a_pause_waits_for_the_cancelled_node_worker() {
         })
         .await
         .unwrap();
-    assert!(
-        cancelled["result"]["isError"] == true || cancelled.get("error").is_some(),
-        "cancellation is opaque, never a no-append claim: {cancelled}"
+    assert_eq!(cancelled["error"]["code"], -32603, "{cancelled}");
+    assert_eq!(cancelled["error"]["data"]["outcome"], "unknown");
+    assert_eq!(
+        cancelled["error"]["data"]["sudocode"]["directA2a"]["outcome"], "unknown",
+        "cancellation must never return a partial result as if final: {cancelled}"
     );
     assert!(
         !seen.iter().any(|message| is_response_to(message, pause)),
