@@ -236,10 +236,15 @@ where
     let path = fs.to_kernel(path)?;
     fs.authorize(&path, Permission::Read)?;
     fs.authorize(&path, Permission::Write)?;
-    let entry = fs.kernel.sys_stat(&path, &fs.ctx.zone_id);
+    let target = fs
+        .kernel
+        .inspect_io_target(&path, Permission::Write, &fs.ctx)
+        .map_err(kernel_err)?;
+    fs.authorize(&target.path, Permission::Read)?;
+    let path = target.path;
     existing_stream(
-        entry.is_some(),
-        entry.is_some_and(|entry| entry.entry_type == DT_STREAM),
+        target.entry_type.is_some(),
+        target.entry_type == Some(DT_STREAM),
         mode,
     )?;
     if mode == RecordLogMode::CreateNew {
@@ -317,18 +322,22 @@ pub(super) fn open_remote(
 ) -> io::Result<Arc<dyn RecordLog>> {
     fs.authorize_target(path, super::ResourceAccessKind::Read)?;
     fs.authorize_target(path, super::ResourceAccessKind::Write)?;
-    let entry = match fs.client.stat(path, &fs.auth_token) {
-        Ok(entry) => Some(entry),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => None,
-        Err(error) => return Err(error),
-    };
+    let read_target = fs.inspect_target(path, super::ResourceAccessKind::Read)?;
+    let target = fs.inspect_target(path, super::ResourceAccessKind::Write)?;
+    if target.path != read_target.path || target.entry_type != read_target.entry_type {
+        return Err(io::Error::new(
+            io::ErrorKind::WouldBlock,
+            "session record log target changed during admission",
+        ));
+    }
+    let path = target.path;
     existing_stream(
-        entry.is_some(),
-        entry.is_some_and(|entry| entry.entry_type == i32::from(DT_STREAM)),
+        target.entry_type.is_some(),
+        target.entry_type == Some(i32::from(DT_STREAM)),
         mode,
     )?;
     if mode == RecordLogMode::CreateNew
-        && !fs.client.ensure_stream(path, "wal", 0, &fs.auth_token)?
+        && !fs.client.ensure_stream(&path, "wal", 0, &fs.auth_token)?
     {
         return Err(io::Error::new(
             io::ErrorKind::AlreadyExists,
@@ -337,10 +346,10 @@ pub(super) fn open_remote(
     }
     let write_client = Arc::clone(&fs.client);
     let write_token = fs.auth_token.clone();
-    let write_path = path.to_owned();
+    let write_path = path.clone();
     let read_client = Arc::clone(&fs.client);
     let read_token = fs.auth_token.clone();
-    let read_path = path.to_owned();
+    let read_path = path;
     Ok(Arc::new(WalRecordLog {
         append_frame: Box::new(move |data| {
             write_client

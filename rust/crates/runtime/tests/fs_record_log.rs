@@ -230,6 +230,29 @@ fn live_record_log_commits_large_frames_from_independent_clients() {
     fs.create_dir_all(&root).unwrap();
     let path = format!("{root}/events");
     let log = fs.record_log(&path, RecordLogMode::CreateNew).unwrap();
+    let alias = format!("{root}-alias");
+    fs.link(&alias, &root).unwrap();
+    let alias_path = format!("{alias}/events");
+    let alias_log = fs
+        .record_log(&alias_path, RecordLogMode::Existing)
+        .expect("a directory link opens the same committed record log");
+    assert_eq!(
+        fs.record_log(&alias_path, RecordLogMode::CreateNew)
+            .err()
+            .unwrap()
+            .kind(),
+        std::io::ErrorKind::AlreadyExists,
+    );
+    let second_path = format!("{alias}/second");
+    let second = fs
+        .record_log(&second_path, RecordLogMode::CreateNew)
+        .unwrap();
+    let marker = json!({"through_directory_link": true});
+    second.append(&encode(&marker)).unwrap();
+    let canonical = fs
+        .record_log(&format!("{root}/second"), RecordLogMode::Existing)
+        .unwrap();
+    assert_eq!(read_wal_records(&*canonical, 1).0, vec![marker]);
     assert_eq!(
         fs.record_log(&path, RecordLogMode::CreateNew)
             .err()
@@ -241,6 +264,16 @@ fn live_record_log_commits_large_frames_from_independent_clients() {
     fs.write(&regular, b"preserve regular file").unwrap();
     assert!(fs.record_log(&regular, RecordLogMode::Existing).is_err());
     assert!(fs.record_log(&regular, RecordLogMode::CreateNew).is_err());
+    assert_eq!(fs.read(&regular).unwrap(), b"preserve regular file");
+    let regular_alias = format!("{root}/regular-alias");
+    fs.link(&regular_alias, &regular).unwrap();
+    assert_eq!(
+        fs.record_log(&regular_alias, RecordLogMode::Existing)
+            .err()
+            .unwrap()
+            .kind(),
+        std::io::ErrorKind::InvalidData,
+    );
     assert_eq!(fs.read(&regular).unwrap(), b"preserve regular file");
     let writers: Vec<_> =
         (0..4)
@@ -272,6 +305,7 @@ fn live_record_log_commits_large_frames_from_independent_clients() {
         "each committed frame has its own cursor"
     );
     let (records, cursor) = read_wal_records(&*log, 32);
+    assert_eq!(read_wal_records(&*alias_log, 32), (records.clone(), cursor));
     let mut seen = BTreeSet::new();
     for record in &records {
         assert_eq!(record["payload"], "λ\nx".repeat(32_768));
