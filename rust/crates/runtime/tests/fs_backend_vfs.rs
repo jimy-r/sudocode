@@ -23,6 +23,7 @@ use kernel::core::agents::registry::AgentDescriptor;
 use kernel::kernel::{Kernel, KernelError, OperationContext};
 use kernel::meta_store::DT_LINK;
 use kernel::{Permission, PermissionProvider};
+use runtime::fs_backend::RecordLogMode;
 use runtime::zone_context::{
     ContextSource, HostZoneContext, ResourceAccessKind, RuntimeResourceAuthorizer,
     ENV_NEXUS_DELEGATION_REF, ENV_NEXUS_RESOURCE_SCOPE,
@@ -385,8 +386,6 @@ fn write_then_read_round_trips_through_the_vfs() {
 
 #[test]
 fn record_log_requires_wal_and_preserves_regular_files() {
-    use runtime::fs_backend::RecordLogMode;
-
     let kernel = kernel_with_root_backend();
     let fs = vfs_backend(&kernel);
     let path = "/ws/atomic-records";
