@@ -706,19 +706,35 @@ keys under the update's own `_meta.sudocode` tell them apart:
 
 ## Durable direct sub-agent completions (extension v1)
 
-The on-disk journal uses version 2 from its first supported release. Transcript
-mutations and journal registration, replay and ACKs share one native storage
-writer. A competing ACP process receives `session_writer_busy` without changing
-either file. Replay may retire an interrupted turn only after the previous
-process has released ownership. A cold replay reused by `session/load` shares
-that writer rather than acquiring a competing one. Backends with only expiring,
-unfenced leases cannot advertise this extension.
+One SID can have several concurrent runtime contexts. Transcript appends retain
+stable message identities and parent references; each runtime continues its own
+context. See the [shared-session storage contract](design/agent-context-storage-matrix.html#shared-session-context).
 
-Version 1 journals came only from unreleased development builds. They remain
-unchanged and return `legacy_writer_unconfirmed`: acquiring a new lock cannot
-prove that a non-locking old executable has stopped. Automatic conversion or
-deletion is not supported. Protocol negotiation remains extension version 1;
-it is independent of the journal format.
+The v3 completion layout stores the SID binding and deletion tombstone in
+`transcript.completions.json`, and each context's journal in
+`transcript.completions/<context-id>.json`. A short native OS lock serializes
+commits. A separate OS owner lock holds each live context; a new runtime opens
+another context while that owner is alive. Cold recovery resumes a journal at
+the nearest matching ancestor after its owner exits. Neutral checkpoints retain
+that ancestry, so cold recovery preserves completion receipts and context
+revisions. Tool sources are keyed by
+the originating assistant message identity and provider call ID.
+
+```mermaid
+flowchart LR
+    SID[SID transcript] --> Binding[SID binding and tombstone]
+    SID --> A[Context A journal]
+    SID --> B[Context B journal]
+    A --> OA[Runtime A owner lock]
+    B --> OB[Runtime B owner lock]
+```
+
+Opening v2 storage preserves its durable facts before publishing the v3 binding
+under the commit lock. An older writer encountering this binding reports a
+protocol mismatch. Unversioned v1 journals return `legacy_writer_unconfirmed`
+with their original bytes preserved. Protocol negotiation remains extension v1,
+independent of the storage version. Backends advertise the extension when they
+provide this ownership and commit contract.
 
 A controller opts in on each connection with
 `initialize._meta.sudocode.subagentCompletions: {"version":1}`. The server
@@ -780,7 +796,8 @@ that parent's unproven completions.
 
 An opted-in prompt's committed response and `session/load` expose
 `_meta.sudocode.contextRef = {sessionId,revision,digest,lastTraceId}`. The digest
-covers recoverable transcript bytes. Live load validates exact cwd and rebinds
+covers the recoverable context projection. Appends by another context preserve
+that projection. Live load validates exact cwd and rebinds
 without replacing the engine; cold load opens the exact stored session. A
 controller sending an automatic input supplies `_meta.sudocode.expectedContext`.
 The agent checks it inside that session's prompt lane before any model work;
@@ -795,7 +812,7 @@ Controllers negotiate `initialize._meta.sudocode.taskCompletions: {"version":1}`
 When both completion extensions are offered, the server selects task completions
 only. This uses the same journal, sender and receipt reduction as sub-agent v1;
 sub-agent IDs, frozen messages, order and receipt hashes remain unchanged.
-Only native storage with session writer exclusion advertises the extension.
+Storage ownership follows the [completion storage contract above](#durable-direct-sub-agent-completions-extension-v1).
 
 `_sudocode/task/completed` is a JSON-RPC request. Sub-agent payloads replace
 `agentId` with `kind: "subagent"` and `taskId`. Terminal payloads are:
@@ -843,28 +860,22 @@ creates a journal. Use that exact reference with subsequent operations:
   Native session deletion additionally removes its transcript and offloaded
   tool results after committing the same tombstone.
 
-Transcript saves, compaction, journal writes, ACKs and deletion share one native
-writer lifetime and serialized write operations. A second process gets
-`session_writer_busy`; a cold delivery reused by `session/load` shares its writer.
-Deleting a result never removes the independent lock file. Deleted sessions
-cannot reopen. A temporary storage error retains the bounded exit snapshot for
+Transcript saves, compaction, journal writes, ACKs and deletion use the
+[same commit and context ownership contract](#durable-direct-sub-agent-completions-extension-v1).
+Purge checks other native transcript writers and completion context owners. It
+reports `session_writer_busy` while another writer is alive, including CLI
+instances that have no completion extension. Native writer presence is an OS
+lock; a crashed writer's free locator does not assert liveness. The committed
+SID tombstone fences subsequent transcript and journal writes. Context lock
+files retain stable paths for exclusion.
+A temporary storage error retains the bounded exit snapshot for
 retry; a process loss before that snapshot was saved becomes
 `execution_unconfirmed`, even if its child later exits. Uncertain process creation
 or cancellation also cannot be presented as terminal evidence. Never rerun such
 a command automatically. Recovery covers reconnects and process restart, not
 power-loss durability.
 
-The first supported on-disk journal format is v2, introduced together with
-shared writer ownership in the sub-agent completion change. Both stages use
-that same format and writer. The earlier, non-locking v1 format existed only in
-development/test builds; it is rejected with `legacy_writer_unconfirmed` and
-its original bytes are preserved. Automatic conversion/deletion is not an
-upgrade path, and no production v1 migration workflow is required.
-
-Stage-one v2 sub-agent records can be replayed and acknowledged by the task
-extension without changing their source, frozen payload, publication ordinal,
-ACK or context. Rolling back remains supported for sub-agent-only records.
-Once terminal sources exist, the stage-one binary rejects completion replay
-and transcript mutations with `completion_journal_unsupported`; read-only
-transcript loading without completion negotiation does not grant write access.
-Both journal and transcript bytes remain intact.
+The task extension retains each migrated sub-agent source, frozen payload,
+publication ordinal, ACK and context. Protocol capability negotiation controls
+which completion payloads the controller can handle; the storage binding
+controls writer compatibility.

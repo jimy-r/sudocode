@@ -91,28 +91,75 @@ echo "== waiting for a writable single-voter leader =="
 # reachable lands in this loop and used to read as "daemon never became
 # writable": a panic on a missing `NEXUS_A2A_TEST_CERT_DIR`, and a build that
 # never produced the test binary at all (`failed to find tool "cl.exe"`).
-ready=
-probe=
-for i in $(seq 1 30); do
-  if probe=$(NEXUS_A2A_TEST_ENDPOINT="$ENDPOINT" NEXUS_A2A_TEST_CERT_DIR="$CLIENT_BUNDLE" \
-      "${CARGO_TEST[@]}" live_inbox_roundtrip -- --ignored 2>&1) \
-      && printf '%s' "$probe" | grep -q "1 passed"; then
-    echo "   writable on attempt $i"
-    ready=1
-    break
+wait_for_writable_leader() {
+  local ready= probe= i
+  for i in $(seq 1 30); do
+    if probe=$(NEXUS_A2A_TEST_ENDPOINT="$ENDPOINT" NEXUS_A2A_TEST_CERT_DIR="$CLIENT_BUNDLE" \
+        "${CARGO_TEST[@]}" live_inbox_roundtrip -- --ignored 2>&1) \
+        && printf '%s' "$probe" | grep -q "1 passed"; then
+      echo "   writable on attempt $i"
+      ready=1
+      break
+    fi
+    sleep 4
+  done
+  if [ -z "$ready" ]; then
+    echo "!! daemon never became writable - the last probe said:" >&2
+    printf '%s\n' "$probe" >&2
+    daemon_logs
+    exit 1
   fi
-  sleep 4
-done
-if [ -z "$ready" ]; then
-  echo "!! daemon never became writable - the last probe said:" >&2
-  printf '%s\n' "$probe" >&2
-  daemon_logs
-  exit 1
-fi
+}
+wait_for_writable_leader
 
 echo "== [deterministic] standalone A2A client round-trip =="
 NEXUS_A2A_TEST_ENDPOINT="$ENDPOINT" NEXUS_A2A_TEST_CERT_DIR="$CLIENT_BUNDLE" \
   "${CARGO_TEST[@]}" live_inbox_roundtrip -- --ignored --nocapture
+
+echo "== [deterministic] independent clients commit complete durable WAL records =="
+RECORD_TEST=(cargo test --manifest-path "$RUST_DIR/Cargo.toml" -q -p runtime --test fs_record_log)
+RECORD_RECEIPT="$AUTHON_DATA_DIR/record-log.json"
+NEXUS_A2A_TEST_ENDPOINT="$ENDPOINT" NEXUS_A2A_TEST_CERT_DIR="$CLIENT_BUNDLE" \
+  NEXUS_RECORD_LOG_RECEIPT="$(native_path "$RECORD_RECEIPT")" \
+  "${RECORD_TEST[@]}" live_record_log_commits_large_frames_from_independent_clients -- --ignored --nocapture
+
+echo "== [deterministic] completed context forks while a sibling tool is live =="
+echo "== [deterministic] runtime resume excludes a sibling's native tool turn =="
+cargo test --manifest-path "$RUST_DIR/Cargo.toml" -q -p runtime --test shared_runtime_history -- --nocapture
+HISTORY_TEST=(cargo test --manifest-path "$RUST_DIR/Cargo.toml" -q -p runtime --test shared_history_records)
+HISTORY_RECEIPT="$AUTHON_DATA_DIR/shared-history.json"
+NEXUS_A2A_TEST_ENDPOINT="$ENDPOINT" NEXUS_A2A_TEST_CERT_DIR="$CLIENT_BUNDLE" \
+  NEXUS_HISTORY_RECEIPT="$(native_path "$HISTORY_RECEIPT")" \
+  "${HISTORY_TEST[@]}" live_shared_history_preserves_contexts_while_sibling_tool_runs -- --ignored --nocapture
+
+RUNTIME_HISTORY_RECEIPT="$AUTHON_DATA_DIR/runtime-history.json"
+NEXUS_A2A_TEST_ENDPOINT="$ENDPOINT" NEXUS_A2A_TEST_CERT_DIR="$CLIENT_BUNDLE" \
+  NEXUS_RUNTIME_HISTORY_RECEIPT="$(native_path "$RUNTIME_HISTORY_RECEIPT")" \
+  cargo test --manifest-path "$RUST_DIR/Cargo.toml" -q -p runtime --test shared_runtime_history \
+    live_runtime_resume_preserves_completed_fork_and_native_tool_result -- --ignored --nocapture
+
+if [ "$(uname -s)" = Linux ]; then
+  echo "== [deterministic] native failed flush requires a durable read barrier =="
+  "${HISTORY_TEST[@]}" flush::native_history_resynchronizes_after_failed_flush -- --ignored --exact --nocapture
+fi
+
+echo "== [deterministic] restart the owned daemon and retain WAL history/cursors =="
+authon_stop KILL
+authon_boot
+authon_wait_log "Zone '$AUTHON_ZONE' registered" 45
+wait_for_writable_leader
+NEXUS_A2A_TEST_ENDPOINT="$ENDPOINT" NEXUS_A2A_TEST_CERT_DIR="$CLIENT_BUNDLE" \
+  NEXUS_RECORD_LOG_RECEIPT="$(native_path "$RECORD_RECEIPT")" \
+  "${RECORD_TEST[@]}" live_record_log_recovers_after_daemon_restart -- --ignored --nocapture
+
+NEXUS_A2A_TEST_ENDPOINT="$ENDPOINT" NEXUS_A2A_TEST_CERT_DIR="$CLIENT_BUNDLE" \
+  NEXUS_HISTORY_RECEIPT="$(native_path "$HISTORY_RECEIPT")" \
+  "${HISTORY_TEST[@]}" live_shared_history_restores_both_contexts_after_restart -- --ignored --nocapture
+
+NEXUS_A2A_TEST_ENDPOINT="$ENDPOINT" NEXUS_A2A_TEST_CERT_DIR="$CLIENT_BUNDLE" \
+  NEXUS_RUNTIME_HISTORY_RECEIPT="$(native_path "$RUNTIME_HISTORY_RECEIPT")" \
+  cargo test --manifest-path "$RUST_DIR/Cargo.toml" -q -p runtime --test shared_runtime_history \
+    live_runtime_history_restores_both_branches_after_daemon_restart -- --ignored --nocapture
 
 # /agents and /sessions are mounted from one zone; a router that drops the mount
 # prefix aliases them, and `readdir /agents` then returns session ids. The daemon

@@ -249,7 +249,9 @@ impl EngineSession {
                         .build()
                         .expect("engine-session tokio runtime")
                 });
-                runtime.block_on(drive(delegate, cmd_rx, EventSink::new(evt_tx, completions)));
+                let route = Arc::new(evt_tx);
+                runtime.block_on(drive(delegate, cmd_rx, EventSink::new(&route, completions)));
+                drop(route);
                 let _ = stopped_tx.send(());
             })
             .expect("spawn engine-session thread");
@@ -880,8 +882,16 @@ impl RuntimeObserver for ObserverAdapter {
         });
     }
 
-    fn on_tool_result(&mut self, tool_use_id: &str, tool_name: &str, output: &str, is_error: bool) {
+    fn on_tool_result(
+        &mut self,
+        assistant_message_id: Option<&str>,
+        tool_use_id: &str,
+        tool_name: &str,
+        output: &str,
+        is_error: bool,
+    ) {
         let _ = self.tx.send(EngineEvent::ToolResult {
+            assistant_message_id: assistant_message_id.map(str::to_owned),
             id: tool_use_id.into(),
             name: tool_name.into(),
             output: output.into(),
