@@ -86,6 +86,7 @@ impl NodeBinding {
         }
     }
 
+    #[inline]
     fn snapshot(&self) -> (Option<String>, Option<String>) {
         let state = self
             .state
@@ -224,6 +225,7 @@ pub fn node(agent: &str) -> Option<Arc<Node>> {
 }
 
 impl Node {
+    #[inline]
     #[must_use]
     pub fn mailbox(&self) -> Arc<Mailbox> {
         Arc::clone(&self.mailbox)

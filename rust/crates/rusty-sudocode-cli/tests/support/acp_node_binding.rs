@@ -1,11 +1,9 @@
 //! Consumer acceptance through the existing real ACP stdio harness.
 //! This exercises unavailable node bindings, not successful node enrollment.
 
-#[path = "node_home.rs"]
-mod node_home;
-
 use super::{
-    pin_agent_name, set_session_mode, spawn_stdio_client, AcpTestClient, TestWorkspace, Transport,
+    node_home, pin_agent_name, set_session_mode, spawn_stdio_client, AcpTestClient, TestWorkspace,
+    Transport,
 };
 use mock_anthropic_service::MockAnthropicService;
 use serde_json::{json, Value};
