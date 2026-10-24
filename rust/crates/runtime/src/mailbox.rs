@@ -1773,6 +1773,25 @@ pub struct DeliveryEvent {
     /// reader; a doc comment only helps the ones who read it.
     pub tail: Option<u64>,
     pub stall: DeliveryStall,
+    /// Why the lease stopped being trusted, when that is what stopped this
+    /// delivery.
+    ///
+    /// - [`DeliveryStall::LeaseLost`]: always `Some`. The lease records its
+    ///   loss before it reads invalid, so a `LeaseLost` with `None` here is a
+    ///   bug, not a missing measurement.
+    /// - [`DeliveryStall::CommitRefused`]: `Some` when the commit was refused
+    ///   because the lease was lost — the renewal ahead of the write returned
+    ///   an error, answered "not held", or answered too late — and `None` when
+    ///   the lease held and the register write itself failed. One window is not
+    ///   told apart: a write failure coinciding with the worker losing the lease
+    ///   in the instant after the commit's own renewal succeeded would show the
+    ///   worker's loss. That takes two independent failures inside one commit.
+    /// - Every other stall: `None` **by construction**, not by observation. A
+    ///   consumer refusal is classified at the moment it happens, and the lease
+    ///   may lapse a moment later; attaching that later loss would give the
+    ///   refusal a cause it did not have — the misattribution `stall` exists to
+    ///   prevent.
+    pub loss: Option<LeaseLoss>,
     /// Consecutive stalls at the current `offset` within one reader claim.
     ///
     /// Reset when a batch is accepted, and started afresh when the reader is
@@ -1798,15 +1817,7 @@ struct DeliveryLog {
 impl DeliveryLog {
     /// Infallible and side-effect-free with respect to delivery: recording must
     /// never influence whether a batch is acknowledged.
-    fn record(
-        &self,
-        peer: &str,
-        holder: &str,
-        offset: Option<u64>,
-        tail: Option<u64>,
-        stall: DeliveryStall,
-        repeats: u32,
-    ) {
+    fn record(&self, event: DeliveryEvent) {
         let mut events = self
             .events
             .lock()
@@ -1814,15 +1825,7 @@ impl DeliveryLog {
         if events.len() == DELIVERY_EVENT_CAP {
             events.pop_front();
         }
-        events.push_back(DeliveryEvent {
-            peer: peer.to_string(),
-            holder: holder.to_string(),
-            offset,
-            tail,
-            stall,
-            repeats,
-            at_ms: now_ms(),
-        });
+        events.push_back(event);
     }
 
     fn events(&self) -> Vec<DeliveryEvent> {
@@ -1846,9 +1849,19 @@ fn record_delivery_stall(
     offset: Option<u64>,
     tail: Option<u64>,
     stall: DeliveryStall,
+    loss: Option<LeaseLoss>,
     repeats: u32,
 ) {
-    global_delivery_log().record(peer, holder, offset, tail, stall, repeats);
+    global_delivery_log().record(DeliveryEvent {
+        peer: peer.to_string(),
+        holder: holder.to_string(),
+        offset,
+        tail,
+        stall,
+        loss,
+        repeats,
+        at_ms: now_ms(),
+    });
 }
 
 /// Delivery stalls observed by this process, oldest first.
@@ -1881,7 +1894,15 @@ fn spawn_conversation_tail(
                     }
                     Err(e) => {
                         eprintln!("[{label}] claiming reader for {peer}: {e}");
-                        record_delivery_stall(&peer, "", None, None, DeliveryStall::ClaimFailed, 0);
+                        record_delivery_stall(
+                            &peer,
+                            "",
+                            None,
+                            None,
+                            DeliveryStall::ClaimFailed,
+                            None,
+                            0,
+                        );
                         sleep_unless_aborted(&abort, block_ms.max(1));
                         continue;
                     }
@@ -1900,6 +1921,7 @@ fn spawn_conversation_tail(
                                     Some(reader.offset),
                                     None,
                                     DeliveryStall::PollFailed,
+                                    None,
                                     0,
                                 );
                                 sleep_unless_aborted(&abort, block_ms.max(1));
@@ -1931,6 +1953,7 @@ fn spawn_conversation_tail(
                                     Some(reader.offset),
                                     Some(next),
                                     DeliveryStall::CommitRefused,
+                                    reader.lease.loss(),
                                     0,
                                 );
                                 break;
@@ -1944,11 +1967,12 @@ fn spawn_conversation_tail(
                         if !msgs.is_empty() {
                             stall_repeats = stall_repeats.saturating_add(1);
                             // Which step actually failed, captured above rather
-                            // than re-derived here.
-                            let stall = if lease_lost {
-                                DeliveryStall::LeaseLost
+                            // than re-derived here. Only a lost lease carries
+                            // the lease's loss; see `DeliveryEvent::loss`.
+                            let (stall, loss) = if lease_lost {
+                                (DeliveryStall::LeaseLost, reader.lease.loss())
                             } else {
-                                DeliveryStall::ConsumerRefused
+                                (DeliveryStall::ConsumerRefused, None)
                             };
                             record_delivery_stall(
                                 &peer,
@@ -1956,6 +1980,7 @@ fn spawn_conversation_tail(
                                 Some(reader.offset),
                                 Some(next),
                                 stall,
+                                loss,
                                 stall_repeats,
                             );
                         }

@@ -2458,7 +2458,9 @@ fn live_refusal_under_a_held_lease_is_recorded_as_consumer_refused() {
 
 fn stall_cause_mid_batch(consumer_accepts: bool) {
     use lease_fault::{Fault, FaultyBackend, Outcome, Probe};
-    use runtime::mailbox::{delivery_events, spawn_inbox_poller, DeliveryStall, InboxConvention};
+    use runtime::mailbox::{
+        delivery_events, spawn_inbox_poller, DeliveryStall, InboxConvention, LeaseLoss, LeaseSite,
+    };
     use std::sync::atomic::{AtomicBool, Ordering};
     type Seen = Arc<std::sync::Mutex<Vec<(String, Instant)>>>;
     type At = Arc<std::sync::Mutex<Option<Instant>>>;
@@ -2613,6 +2615,29 @@ fn stall_cause_mid_batch(consumer_accepts: bool) {
         Some(p_gate + 2),
         "the stalled batch held m1 and m2: {recorded:?}"
     );
+    // Why, not only which. A lease lost mid-batch carries the loss the lease
+    // recorded: the injected failure of the worker's renewal, an I/O error of
+    // kind `Other`. A refusal carries none, although by the time it is recorded
+    // this scenario has made the lease lost too: attaching that loss would give
+    // the refusal a cause it did not have.
+    if consumer_accepts {
+        assert!(
+            matches!(
+                recorded[0].loss,
+                Some(LeaseLoss::RenewFailed {
+                    site: LeaseSite::Worker,
+                    kind: std::io::ErrorKind::Other,
+                    ..
+                })
+            ),
+            "a lease lost mid-batch records the worker's failed renewal: {recorded:?}"
+        );
+    } else {
+        assert_eq!(
+            recorded[0].loss, None,
+            "a refusal carries no lease loss, even once the lease is lost: {recorded:?}"
+        );
+    }
 
     let armed = armed_at
         .lock()
