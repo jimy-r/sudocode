@@ -3730,13 +3730,9 @@ fn run_repl_iocraft_dispatch(
             event @ (CoordinatorEvent::PeerMessage(..)
             | CoordinatorEvent::SubagentCompleted { .. }
             | CoordinatorEvent::BackgroundTaskCompleted { .. }) => {
-                // Peer messages and sub-agent results share human input's
-                // scheduling: steer active work or explicitly queue the next
+                // Peer messages, sub-agent results and background completions
+                // share human input's scheduling: steer active work or queue the next
                 // turn. Keep their origin distinct in the UI and history.
-                // A background task's news must never seize an idle prompt:
-                // the human may be typing or exiting, and a turn started under
-                // their `/exit` leaves the session unable to shut down.
-                let mut wake_on_idle = true;
                 let mut delivery = engine_events::InputDelivery::Steer;
                 let (prompt, display, kind, ack) = match event {
                     CoordinatorEvent::PeerMessage(msg, ack) => {
@@ -3753,12 +3749,11 @@ fn run_repl_iocraft_dispatch(
                         (prompt, display, input_queue::QueuedKind::Subagent, None)
                     }
                     CoordinatorEvent::BackgroundTaskCompleted { prompt, display } => {
-                        wake_on_idle = false;
                         (prompt, display, input_queue::QueuedKind::Background, None)
                     }
                     _ => unreachable!(),
                 };
-                if coord.lock().unwrap().can_start() && wake_on_idle {
+                if coord.lock().unwrap().can_start() {
                     if coord.lock().unwrap().has_idle_queue() {
                         stage_turn_input(
                             &coord,
