@@ -7924,6 +7924,7 @@ async fn acp_completions_keep_live_contexts_independent_during_replay_and_load()
         read_transcript().starts_with(&continued_transcript),
         "a further restart must retain both contexts and append history"
     );
+    drop(history);
     competitor.shutdown().await;
 
     // Unreleased, non-locking v1 records require explicit offline handling.
