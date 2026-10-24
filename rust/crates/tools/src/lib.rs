@@ -9659,6 +9659,9 @@ fn resolve_powershell_shell(
 fn powershell_command(shell: &Path, command: &str) -> std::process::Command {
     let mut process = std::process::Command::new(shell);
     process.args(["-NoProfile", "-NonInteractive", "-Command", command]);
+    // Output is read by the model and drawn in a card, never by a terminal:
+    // PowerShell 7 would otherwise colour its errors with escape codes.
+    process.env("NO_COLOR", "1");
     if let Ok(root) = current_workspace_root() {
         process.current_dir(root);
     }
@@ -9697,7 +9700,49 @@ fn execute_shell_command(
 
     let timeout_ms = timeout.unwrap_or(runtime::DEFAULT_TOOL_SUBPROCESS_TIMEOUT_MS);
     let result = run_in_process_group(&mut process, timeout_ms, abort_signal)?;
-    Ok(shell_run_to_bash_output(result, timeout_ms).with_powershell_parse_error())
+    let output = shell_run_to_bash_output(result, timeout_ms).with_powershell_parse_error();
+    Ok(explain_silent_powershell_failure(shell, command, output))
+}
+
+/// The script [`explain_silent_powershell_failure`] runs: parse the command
+/// held in [`POWERSHELL_PARSE_INPUT_ENV`] and report each error on stderr.
+const POWERSHELL_PARSE_CHECK: &str = "$errors = $null; $null = [System.Management.Automation.Language.Parser]::ParseInput($env:SCODE_POWERSHELL_PARSE_INPUT, [ref]$null, [ref]$errors); foreach ($e in $errors) { [Console]::Error.WriteLine(('ParserError: line {0}, column {1}: {2}' -f $e.Extent.StartLineNumber, $e.Extent.StartColumnNumber, $e.Message)) }";
+const POWERSHELL_PARSE_INPUT_ENV: &str = "SCODE_POWERSHELL_PARSE_INPUT";
+
+/// PowerShell 7 exits 1 without a word when a `-Command` script cannot be
+/// parsed; Windows PowerShell writes the parser's error. A silent exit 1 is
+/// put to PowerShell's own parser, and what it reports becomes the result's
+/// stderr, so the model and the user see why nothing ran.
+fn explain_silent_powershell_failure(
+    shell: &Path,
+    command: &str,
+    mut output: runtime::BashCommandOutput,
+) -> runtime::BashCommandOutput {
+    let silent_exit_1 = output.return_code_interpretation == Some(runtime::ShellStatus::Exit(1))
+        && output.stdout.trim().is_empty()
+        && output.stderr.trim().is_empty();
+    if !silent_exit_1 {
+        return output;
+    }
+    let Ok(check) = std::process::Command::new(shell)
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            POWERSHELL_PARSE_CHECK,
+        ])
+        .env(POWERSHELL_PARSE_INPUT_ENV, command)
+        .stdin(std::process::Stdio::null())
+        .output()
+    else {
+        return output;
+    };
+    let report = process_text::decode_process_output(&check.stderr).text;
+    if report.trim().is_empty() {
+        return output;
+    }
+    output.stderr = report;
+    output.with_powershell_parse_error()
 }
 
 /// Outcome of polling a `GroupChild` to completion / abort / timeout.

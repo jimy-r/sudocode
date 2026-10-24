@@ -340,7 +340,8 @@ impl BashCommandOutput {
     /// PowerShell reports a script it could not parse as an ordinary failure,
     /// although nothing in it ran. The error names its category in a token no
     /// locale translates: `CategoryInfo : ParserError` in Windows PowerShell,
-    /// a leading `ParserError:` in PowerShell 7.
+    /// a leading `ParserError:` in PowerShell 7's error view and in the
+    /// parser's own report.
     #[must_use]
     pub fn with_powershell_parse_error(mut self) -> Self {
         let parse_error = matches!(self.return_code_interpretation, Some(ShellStatus::Exit(_)))
@@ -1361,7 +1362,7 @@ fn prepare_sandbox_dirs(cwd: &std::path::Path) {
 mod tests {
     use super::{
         execute_bash, execute_bash_with_abort, execute_bash_with_progress, BashCommandInput,
-        BashProgressCallback,
+        BashProgressCallback, ShellStatus,
     };
     use crate::hooks::HookAbortSignal;
     use crate::sandbox::FilesystemIsolationMode;
