@@ -1339,17 +1339,44 @@ impl OwnedReader {
         self.lease.is_valid()
     }
 
-    fn commit(&mut self, offset: u64) -> Result<(), String> {
-        if !self
-            .lease
-            .confirm()
-            .map_err(|e| format!("renew reader: {e}"))?
-        {
-            return Err("reader ownership lost; delivery remains unacknowledged".into());
+    fn commit(&mut self, offset: u64) -> Result<(), CommitRefusal> {
+        let confirmed = self.lease.confirm();
+        if !matches!(confirmed, Ok(true)) {
+            // Read the loss now: it is what refused this commit. The lease
+            // records it before it refuses, and only the first one is kept.
+            let message = match confirmed {
+                Err(e) => format!("renew reader: {e}"),
+                Ok(_) => "reader ownership lost; delivery remains unacknowledged".into(),
+            };
+            return Err(CommitRefusal {
+                loss: self.lease.loss(),
+                message,
+            });
         }
-        self.cursor.commit(offset, now_ms() + READER_LEASE_MS)?;
+        // The lease held. A write that fails now is the register's failure,
+        // even if the lease is lost while it is in flight.
+        self.cursor
+            .commit(offset, now_ms() + READER_LEASE_MS)
+            .map_err(|message| CommitRefusal {
+                loss: None,
+                message,
+            })?;
         self.offset = offset;
         Ok(())
+    }
+}
+
+/// Why a reader commit did not happen. `loss` is the lease's loss when the
+/// renewal ahead of the write refused it, and `None` when the lease held and
+/// the register write failed.
+struct CommitRefusal {
+    loss: Option<LeaseLoss>,
+    message: String,
+}
+
+impl std::fmt::Display for CommitRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
     }
 }
 /// A pending delivery. Only acknowledge after the consumer durably records its
@@ -1366,7 +1393,9 @@ impl UnreadBatch {
         &self.messages
     }
     pub fn acknowledge(mut self) -> Result<(), String> {
-        self.reader.commit(self.next)
+        self.reader
+            .commit(self.next)
+            .map_err(|refusal| refusal.message)
     }
 }
 
@@ -1790,11 +1819,11 @@ pub struct DeliveryEvent {
     ///   bug, not a missing measurement.
     /// - [`DeliveryStall::CommitRefused`]: `Some` when the commit was refused
     ///   because the lease was lost — the renewal ahead of the write returned
-    ///   an error, answered "not held", or answered too late — and `None` when
-    ///   the lease held and the register write itself failed. One window is not
-    ///   told apart: a write failure coinciding with the worker losing the lease
-    ///   in the instant after the commit's own renewal succeeded would show the
-    ///   worker's loss. That takes two independent failures inside one commit.
+    ///   an error, answered "not held" or answered too late, or the lease was
+    ///   already lost — captured the moment the renewal refused it. `None` when
+    ///   the lease held and the register write itself failed, even if the
+    ///   lease is lost while that write is in flight: the write is what
+    ///   refused the commit.
     /// - Every other stall: `None` **by construction**, not by observation. A
     ///   consumer refusal is classified at the moment it happens, and the lease
     ///   may lapse a moment later; attaching that later loss would give the
@@ -1962,7 +1991,7 @@ fn spawn_conversation_tail(
                                     Some(reader.offset),
                                     Some(next),
                                     DeliveryStall::CommitRefused,
-                                    reader.lease.loss(),
+                                    e.loss,
                                     0,
                                 );
                                 break;
