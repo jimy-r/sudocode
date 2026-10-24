@@ -159,7 +159,8 @@ main pushes and manual workflow runs, using `SUDOROUTER_CI_API_KEY`.
 
 Hosts check `initialize.result._meta.sudocode.directA2a.version == 1`. Two
 session requests run the session's own A2A tools for the client, without a
-model turn:
+model turn. `directA2a.errorOutcomes == 1` means every failure carries a typed
+outcome, described below.
 
 - `_sudocode/a2a/send` with `{ "sessionId", "to", "message", "summary" }`
   runs the `send` tool. `message` and `summary` are plain text. The session's agent is the
@@ -174,23 +175,97 @@ permission mode (a prompt arrives as `session/request_permission`, and a denial
 comes back as `isError: true`) and `--allowedTools`. Nothing is written to the
 conversation, so the model never sees the call.
 
-A direct request never waits. It fails in one of two ways:
+A direct request never waits: if the session is in a turn or another request,
+or its tools are paused, it is refused before anything runs. `isError: true`
+reports a failed call; it does not prove that nothing was delivered, so do not
+retry it blindly.
 
-- **Refused (`-32602` invalid params):** nothing ran, so the client may
-  correct the request and send it again. This covers an unknown session,
-  invalid params, paused tools, and a session busy with a turn or another
-  request.
-- **Outcome unknown (`-32603`, `error.data.outcome == "unknown"`):** the call
-  was admitted and then failed, was cancelled (`session/cancel`,
-  `pause_tools`) or lost its reply. The message may have been sent, so do not
-  resend it blindly.
+`directA2a.errorOutcomes == 1` adds a typed refusal contract. Only an error with
+code `-32602` and `error.data.sudocode.directA2a` containing
+`{ "version": 1, "outcome": "not_submitted" }` attests that the host rejected
+the request before tool execution. This includes an unknown session, invalid
+params, paused tools, a busy session and a session control change. The reason
+is carried in `error.data.detail`. After
+admission, driver or response failures use `-32603` with top-level
+`error.data.outcome: "unknown"` and matching versioned phase metadata. A
+cancelled call never returns a partial tool result as if final. Generic
+JSON-RPC errors without the advertised contract, opaque
+`isError` results, timeout and disconnect do not prove that no append occurred.
+Keep the original request for reconciliation; do not retry or fall back to a
+prompt automatically.
 
-`isError: true` is the tool's own failure; it does not prove that nothing was
-delivered either.
+`directA2a.hostAudit == 1` adds
+`result._meta.sudocode.directA2a.audit`: version, unique `commandId`, native
+`sessionId`, actual executor mailbox `actor` and `namespaceRoot`, tool,
+`requestedInputSha256`, optional `effectiveInputSha256` and `resultSha256`.
+The first hash binds the requested fields before hooks; the effective hash is
+present only after the real executor has validated the rewritten invocation.
+The result hash binds content and `isError` before adding metadata. The host checks the
+effective call after hooks against its actual mailbox and unique command ID;
+hooks cannot insert a sender override or structured control message, change
+tools or dispatch a shadowing MCP tool. A plain text rewrite still uses the
+ordinary scheduler, hooks, policy and real executor.
 
-A direct call takes the same operation fence as a turn's tools: paused tools
-refuse it, and `pause_tools` reports control only after its worker has
-finished.
+Audit metadata is returned on this connection, separate from model history; it
+is not a durable journal or a delivery receipt. An empty namespace root denotes
+the daemon's logical namespace, not proof of a healthy connection or verified
+remote identity. The receiving node's authenticated envelope is the independent
+identity evidence. Hosts retaining an audit must save the native result and
+its call ID themselves, without putting a fabricated model tool call into the
+transcript. `hostAudit:1` is specifically metadata on a returned tool result,
+including an opaque `isError` result. A driver exception, cancellation without
+a result, or transport loss may have no audit receipt; `-32603` still means
+Unknown and does not promise command/actor correlation. There is no all-command
+provenance claim. Inspect the real node envelope to reconcile an uncertain
+append.
+
+Hash encoding is independent of JSON property order and has no Unicode
+normalization. `frame(x)` means an unsigned 64-bit big-endian byte length,
+followed by UTF-8 bytes. Digests are SHA-256, lowercase hexadecimal:
+
+```text
+input:  ASCII("sudocode.direct-a2a.input.v1") || NUL || frame(tool)
+        || u64be(number of fields)
+        || for each ASCII field name in sorted order:
+             frame(name) || type || value
+        string: type=1, value=frame(text)
+        false:  type=2, no value bytes
+        true:   type=3, no value bytes
+result: ASCII("sudocode.direct-a2a.result.v1") || NUL
+        || one byte (isError ? 1 : 0) || frame(content)
+```
+
+Input fields use native tool names: `to`, `message`, `summary`, or
+optional `active_only`. Omitted and false are distinct. No audit field or RPC
+`sessionId` participates in those hashes; native session/actor remain separate
+audit fields. The public schemas bound the field count and types. A hook's
+effective hash does not disclose its body; the real envelope is needed to
+verify the final recipient and text.
+
+Direct calls share the session's operation registry, including the lease held
+by an actual blocking Node worker. Cancelling the scheduler does not stop that
+worker immediately. `pause_tools` acknowledges quiescence only after the worker
+has drained; a timeout keeps the fence. An accepted append can still become
+visible at the node after the caller loses its ACP reply.
+
+The normal stdio tests check typed refusals, hook rewriting, mailbox binding
+and absence from model history. `e2e/nexus-a2a/run.sh` also runs
+`acp_direct_fences::live_direct_a2a_*` against its isolated real TLS daemon:
+opaque TCP traffic is held while pause cancels a request, and a post-execution
+hook withholds a reply while the node already holds the message. Their model
+endpoint refuses every inference request and must record zero calls. This is
+not a cross-host idle callback or production deployment acceptance.
+
+### Closing a peer session
+
+When the last session for an agent closes, the server stops and joins that
+agent's real receiver worker before replying to `session/close`. Closing one
+of several sessions keeps the shared receiver running. A replacement receiver
+waits for a retiring worker rather than treating its stop signal as completed
+cleanup. The join includes the worker's lock-release attempts; a failed remote
+unlock can still require backend TTL recovery. This changes no lease, cursor,
+delivery acknowledgement or retry policy.
+
 ### Per-session system prompt (`_meta.sudocode.*`)
 
 `session/new` and `session/load` accept two optional, orthogonal keys under

@@ -1907,7 +1907,6 @@ fn live_cohost_session_resume() {
 #[test]
 #[ignore = "requires the shared-history stage of e2e/nexus-a2a/run-cohost.sh"]
 fn live_cohost_shared_sid_concurrent_contexts() {
-    use runtime::history::{HistoryGraph, HistoryRecord};
     use serde_json::{json, Value};
     let operator = Arc::new(model_operator());
     let agent = format!("shared-sid-probe-{}", fresh());
@@ -2039,16 +2038,7 @@ fn live_cohost_shared_sid_concurrent_contexts() {
         cursor = frame.next_offset;
     }
     let history = String::from_utf8(durable).unwrap();
-    let graph = HistoryGraph::decode(history.as_bytes()).expect("committed v3 history");
-    let mut tool_origins = std::collections::BTreeSet::new();
-    for line in history.lines() {
-        let record: HistoryRecord = serde_json::from_str(line).unwrap();
-        if let Some(id) = record.message_id() {
-            if let Some(origin) = graph.tool_origin(id, "call_1") {
-                tool_origins.insert(origin.to_owned());
-            }
-        }
-    }
+    let tool_origins = shared_history_tool_origins(&history);
     assert_eq!(
         tool_origins.len(),
         2,
@@ -2062,23 +2052,35 @@ fn live_cohost_shared_sid_concurrent_contexts() {
     for label in ["A", "B"] {
         let own = format!("{label}_CONTEXT_PROMPT");
         let other = format!("{}_CONTEXT_PROMPT", if label == "A" { "B" } else { "A" });
+        let is_later_resume = label == "B";
         let captured: Vec<_> = requests
             .iter()
             .filter(|entry| entry.name.ends_with(".prompt"))
             .filter_map(|entry| operator.read(&listed_path("/model", &entry.name), "").ok())
             .filter_map(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
             .filter(|request| request["body"]["messages"].to_string().contains(&own))
+            .filter(|request| {
+                is_later_resume || !request["body"]["messages"].to_string().contains(&other)
+            })
             .collect();
         assert!(
             !captured.is_empty(),
             "actual model request for {label} missing"
         );
-        assert!(
-            captured
-                .iter()
-                .all(|request| !request["body"]["messages"].to_string().contains(&other)),
-            "contexts crossed"
-        );
+        for request in captured {
+            let messages = request["body"]["messages"].to_string();
+            assert_eq!(
+                messages.contains(&other),
+                is_later_resume,
+                "a later resume inherits the source's already written input"
+            );
+            if is_later_resume {
+                assert!(
+                    !messages.contains("A_MODEL_DONE"),
+                    "the source's later reply must stay outside the frozen continuation"
+                );
+            }
+        }
     }
     let linked_agent = format!("{agent}-linked");
     let mut linked_request = request.clone();
@@ -2141,7 +2143,7 @@ fn live_cohost_shared_sid_concurrent_contexts() {
         operator.read(&linked_file, "").unwrap(),
         b"linked Agent durable effect"
     );
-    let mut complete_history = history.into_bytes();
+    let mut linked_history = history.into_bytes();
     loop {
         let frame = operator
             .stream_read_at(&path, cursor, false, 0, "")
@@ -2151,18 +2153,61 @@ fn live_cohost_shared_sid_concurrent_contexts() {
         }
         assert!(frame.next_offset > cursor);
         cursor = frame.next_offset;
-        complete_history.extend(frame.data);
+        linked_history.extend(frame.data);
     }
-    let graph = HistoryGraph::decode(&complete_history).expect("linked Agent committed history");
-    let completed = graph.completed_session(None).unwrap();
-    assert_eq!(completed.session_id, sid);
-    assert_eq!(completed.identity.as_ref().unwrap().agent_name, agent);
-    assert!(completed.messages().iter().flat_map(|message| &message.blocks).any(|block|
+    let graph = runtime::history::HistoryGraph::decode(&linked_history).unwrap();
+    let restored = graph.resume_session().unwrap();
+    assert_eq!(restored.session_id, sid);
+    assert!(restored.messages().iter().flat_map(|message| &message.blocks).any(|block|
         matches!(block, runtime::ContentBlock::Text { text } if text.contains("linked Agent durable effect"))));
+    assert_eq!(
+        restored.identity.as_ref().unwrap().agent_name,
+        agent,
+        "linked context must preserve the durable session identity"
+    );
+    assert_eq!(
+        shared_history_tool_origins(std::str::from_utf8(&linked_history).unwrap()).len(),
+        3,
+        "the linked Agent's tool result requires its own assistant origin"
+    );
     println!(
         "COHOST SHARED SID OK: {sid}, linked Agent={linked_agent}, independent PIDs={},{}",
         first["session_id"], second["session_id"]
     );
+}
+
+fn shared_history_tool_origins(history: &str) -> std::collections::BTreeSet<String> {
+    use runtime::history::{HistoryGraph, HistoryRecord};
+    let graph = HistoryGraph::decode(history.as_bytes()).unwrap();
+    let contexts: std::collections::BTreeSet<_> = history
+        .lines()
+        .map(|line| serde_json::from_str::<HistoryRecord>(line).unwrap())
+        .map(|record| record.context_id().to_owned())
+        .collect();
+    let mut origins = std::collections::BTreeSet::new();
+    for context in contexts {
+        let session = graph.context_session(&context).unwrap();
+        for message in session.messages() {
+            if !message.blocks.iter().any(|block| {
+                matches!(block, runtime::ContentBlock::ToolResult { tool_use_id, .. } if tool_use_id == "call_1")
+            }) {
+                continue;
+            }
+            let identity = message.history.as_ref().unwrap();
+            let origin = &identity.tool_origins["call_1"];
+            assert!(
+                session.messages().iter().any(|assistant| {
+                    assistant.history.as_ref().is_some_and(|identity| identity.id == *origin)
+                    && assistant.blocks.iter().any(|block| {
+                        matches!(block, runtime::ContentBlock::ToolUse { id, .. } if id == "call_1")
+                    })
+                }),
+                "a restored result must resolve to its originating assistant"
+            );
+            origins.insert(origin.clone());
+        }
+    }
+    origins
 }
 
 /// Atomic reader claims and receipt recovery through mTLS, gRPC and Raft.
@@ -2421,4 +2466,424 @@ fn live_reader_commit_refused_on_renew_error_then_reacquired_from_durable_offset
 
     abort.abort();
     handle.join().expect("receiver");
+}
+
+/// The receiver seat on a REAL node, through a test-only fault boundary
+/// (`common/lease_fault.rs`; every fault it causes is labelled INJECTED).
+///
+/// Two instances of one agent, each over its own real mTLS client. A renewal
+/// proves ownership only as of when it was requested, and each phase asserts
+/// what the node and the lease code actually did:
+///
+/// 2. One seat renewal really succeeds on the node, but its reply comes back
+///    after the bound (INJECTED delay). The holder must not count that as
+///    fresh: it lets go of the seat once the reply lands, before the node
+///    would have expired it. Whoever holds the seat next holds it on a new
+///    grant. Before that, a prompt renewal must be followed a normal interval
+///    after its request.
+/// 3. The holder is cut off from the node entirely (INJECTED partition; locks
+///    it drops are never released). It stops renewing within its bound, the
+///    standby gets the seat only once the node expires the lease by its TTL,
+///    and the cut-off instance stands by after it reconnects.
+/// 4. Slow but successful renewals: a reply 3s late keeps the seat and the next
+///    renewal is timed from the request, not the reply; a reply 19s late (just
+///    inside the bound) must not extend belief in the old proof past the bound,
+///    so a message sent in that window is delivered only on a grant taken
+///    after the reply landed.
+///
+/// Mirrors the runtime's lease timing (30s TTL, renew every 15s, 10s margin);
+/// a change there should change this.
+#[test]
+#[ignore = "requires the harness's real mTLS Nexus daemon"]
+fn live_receiver_seat_trusts_only_fresh_renewals() {
+    use lease_fault::{Fault, FaultyBackend, Outcome, Probe, Renewal};
+    use runtime::mailbox::{spawn_inbox_poller, InboxConvention};
+
+    const TTL: Duration = Duration::from_secs(30);
+    const RENEW_EVERY: Duration = Duration::from_secs(15);
+    const BOUND: Duration = Duration::from_secs(20);
+    type Seen = Arc<std::sync::Mutex<Vec<(&'static str, String, Instant)>>>;
+
+    let endpoint = std::env::var("NEXUS_A2A_TEST_ENDPOINT").expect("set daemon endpoint");
+    let auth = std::env::var("NEXUS_API_KEY").unwrap_or_default();
+    let agent = format!("scode-seat-fault-{}", fresh());
+    let peer = "seat-fault-peer";
+    let sender = dial(&endpoint);
+    let seen: Seen = Arc::default();
+
+    let start = |label: &'static str| {
+        let probe = Probe::new();
+        let node = runtime::fs_backend::NexusVfsFsBackend::from_arc_mtls(
+            dial(&endpoint),
+            auth.clone(),
+            "root",
+        );
+        let mailbox = Arc::new(Mailbox::new(
+            Arc::new(FaultyBackend::new(Arc::new(node), Arc::clone(&probe))),
+            agent.clone(),
+            InboxConvention::new(String::new()),
+        ));
+        let abort = runtime::HookAbortSignal::new();
+        let sink_seen = Arc::clone(&seen);
+        let handle = spawn_inbox_poller(mailbox, 200, label, abort.clone(), move |m| {
+            sink_seen
+                .lock()
+                .unwrap()
+                .push((label, m.body.clone(), Instant::now()));
+            true
+        });
+        (probe, abort, handle)
+    };
+    let wait = |what: &str, within: Duration, done: &dyn Fn() -> bool| {
+        let deadline = Instant::now() + within;
+        while !done() {
+            assert!(
+                Instant::now() < deadline,
+                "timed out after {within:?} waiting for {what}"
+            );
+            thread::sleep(Duration::from_millis(100));
+        }
+    };
+    let delivered = |by: &str, body: &str| {
+        seen.lock()
+            .unwrap()
+            .iter()
+            .any(|(who, b, _)| *who == by && b == body)
+    };
+    let send = |body: &str| send_to(&sender, peer, &agent, body, &auth).expect("send");
+    let real_renewal_after = |probe: &Probe, after: Instant| -> Option<Renewal> {
+        probe
+            .renewals()
+            .into_iter()
+            .find(|r| r.outcome == Outcome::Held && r.requested > after)
+    };
+    let next_real_renewal = |probe: &Probe, who: &str| -> Renewal {
+        let mark = Instant::now();
+        wait(
+            &format!("a real seat renewal by {who}"),
+            RENEW_EVERY + Duration::from_secs(10),
+            &|| real_renewal_after(probe, mark).is_some(),
+        );
+        real_renewal_after(probe, mark).unwrap()
+    };
+
+    let (a, a_stop, a_join) = start("seat-a");
+    wait("A to take the seat", Duration::from_secs(20), &|| {
+        a.holds_seat()
+    });
+    let (b, b_stop, b_join) = start("seat-b");
+    send("m0 warm-up");
+    wait("A to deliver the warm-up", Duration::from_secs(20), &|| {
+        delivered("seat-a", "m0 warm-up")
+    });
+    assert!(
+        b.acquisitions().is_empty(),
+        "a second instance must stand by"
+    );
+
+    // A prompt real renewal to time the next one from.
+    let recovered = next_real_renewal(&a, "A");
+    // 2. A success that comes back too late is not fresh: the holder lets go of
+    //    the seat it can no longer vouch for. It may claim the seat straight
+    //    back (a new grant is a new proof); what it must not do is keep acting
+    //    on the old one.
+    let a_released_before = a.releases().len();
+    a.set(Fault::SeatRenewReturnsLate(BOUND + Duration::from_secs(1)));
+    wait(
+        "A to give its seat up after the late renewal reply",
+        RENEW_EVERY + BOUND + Duration::from_secs(15),
+        &|| a.releases().len() > a_released_before,
+    );
+    let late = a
+        .renewals()
+        .into_iter()
+        .rev()
+        .find(|r| {
+            r.outcome == Outcome::Held && r.returned.saturating_duration_since(r.requested) >= BOUND
+        })
+        .expect("the INJECTED late renewal");
+    let after_recovery = a
+        .renewals()
+        .into_iter()
+        .find(|r| r.requested > recovered.requested)
+        .expect("a seat renewal after the prompt one");
+    let interval = after_recovery
+        .requested
+        .saturating_duration_since(recovered.requested);
+    assert!(
+        interval + Duration::from_secs(1) >= RENEW_EVERY,
+        "after a prompt renewal the next one must follow a normal interval later, \
+         timed from the request: it came {interval:?} later"
+    );
+    let (a_released, a_reached_node) = a.releases()[a_released_before];
+    assert!(
+        a_reached_node,
+        "A was not partitioned, so its release reached the node"
+    );
+    assert!(
+        a_released >= late.returned,
+        "A let go of the seat before its late reply landed"
+    );
+    let let_go_after = a_released.saturating_duration_since(late.requested);
+    assert!(
+        let_go_after < TTL,
+        "A held the seat {let_go_after:?} after the request its last renewal proved, past the TTL"
+    );
+    wait(
+        "the seat to be held again",
+        Duration::from_secs(10),
+        &|| a.holds_seat() || b.holds_seat(),
+    );
+    let regrant = a
+        .acquisitions()
+        .into_iter()
+        .chain(b.acquisitions())
+        .filter(|at| *at >= a_released)
+        .min()
+        .expect("a grant after A let go");
+    let (holder, standby, holder_label, standby_label) = if b.holds_seat() {
+        (&b, &a, "seat-b", "seat-a")
+    } else {
+        (&a, &b, "seat-a", "seat-b")
+    };
+    send("m2 after a late renewal");
+    wait(
+        "the seat holder to deliver m2",
+        Duration::from_secs(20),
+        &|| delivered(holder_label, "m2 after a late renewal"),
+    );
+    println!(
+        "SEAT PHASE 2 OK: the worker renewed {interval:?} after a prompt renewal (timed from its request); A's renewal returned {:?} after it was requested; A let go {let_go_after:?} after that request (TTL {TTL:?}); {holder_label} holds it on a new grant {:?} later",
+        late.returned.saturating_duration_since(late.requested),
+        regrant.saturating_duration_since(a_released)
+    );
+
+    // 3. Partitioned holder: gives up by its bound; the node hands the seat on
+    //    only at the TTL.
+    let standby_grants = standby.acquisitions().len();
+    let holder_grants = holder.acquisitions().len();
+    let last_real = next_real_renewal(holder, holder_label);
+    holder.set(Fault::Partitioned);
+    let cut = Instant::now();
+    send("m3 during a partition");
+    wait(
+        "the standby to take the seat from the partitioned holder",
+        TTL + Duration::from_secs(15),
+        &|| standby.acquisitions().len() > standby_grants,
+    );
+    let took = standby.acquisitions()[standby_grants];
+    let took_after = took.saturating_duration_since(last_real.requested);
+    // The node keeps lock expiry in whole seconds (expires_at = now_secs + ttl,
+    // alive while expires_at > now_secs), so a lease can lapse up to a second
+    // before 30s after the renewal it received.
+    assert!(
+        took_after + Duration::from_millis(1_100) >= TTL,
+        "{standby_label} took the seat {took_after:?} after {holder_label}'s last real renewal, before the node's TTL"
+    );
+    let cut_attempts: Vec<Renewal> = holder
+        .renewals()
+        .into_iter()
+        .filter(|r| r.requested >= cut)
+        .collect();
+    assert!(
+        !cut_attempts.is_empty() && cut_attempts.iter().all(|r| r.outcome == Outcome::Injected),
+        "every renewal the holder tried while cut off must have been an INJECTED failure: {cut_attempts:?}"
+    );
+    let last_try = cut_attempts
+        .last()
+        .unwrap()
+        .requested
+        .saturating_duration_since(last_real.requested);
+    assert!(
+        last_try <= BOUND + Duration::from_secs(1),
+        "{holder_label} kept renewing {last_try:?} after its last real renewal, past its bound"
+    );
+    let (gave_up, reached_node) = *holder
+        .releases()
+        .last()
+        .expect("the holder gave the seat up");
+    assert!(
+        !reached_node,
+        "partitioned, so the release never reached the node"
+    );
+    assert!(
+        gave_up < took,
+        "the cut-off holder must stop receiving before the node hands the seat on"
+    );
+    wait(
+        "the new holder to deliver what was sent during the partition",
+        Duration::from_secs(45),
+        &|| delivered(standby_label, "m3 during a partition"),
+    );
+    holder.set(Fault::None);
+    thread::sleep(Duration::from_secs(3));
+    assert_eq!(
+        holder.acquisitions().len(),
+        holder_grants,
+        "after reconnecting, {holder_label} must find the seat taken and stand by"
+    );
+    send("m4 after the partition heals");
+    wait(
+        "the new holder to deliver m4",
+        Duration::from_secs(20),
+        &|| delivered(standby_label, "m4 after the partition heals"),
+    );
+    thread::sleep(Duration::from_secs(2));
+    for body in ["m3 during a partition", "m4 after the partition heals"] {
+        assert!(
+            !delivered(holder_label, body),
+            "{body:?} was delivered by the instance that lost the seat"
+        );
+    }
+    println!(
+        "SEAT PHASE 3 OK: {holder_label}'s last renewal attempt {last_try:?} after its last real one ({} INJECTED); it stopped receiving {:?} and {standby_label} took the seat {took_after:?} after it; {holder_label} stood by after reconnecting",
+        cut_attempts.len(),
+        gave_up.saturating_duration_since(last_real.requested)
+    );
+
+    // 4. Slow but successful renewals, on whoever holds the seat now.
+    //    a) A reply 3s late is still fresh: the seat stays, and the next
+    //       renewal is timed from when the slow one was requested, not 15s
+    //       after its reply.
+    let (owner, owner_label) = (standby, standby_label);
+    let seat_releases_before = owner.releases().len();
+    let slow_mark = Instant::now();
+    owner.set(Fault::SeatRenewReturnsLate(Duration::from_secs(3)));
+    let slow_renewal = |probe: &Probe| {
+        probe.renewals().into_iter().find(|r| {
+            r.returned > slow_mark
+                && r.returned.saturating_duration_since(r.requested) >= Duration::from_secs(3)
+        })
+    };
+    wait(
+        "a 3s-late seat renewal and the renewal after it",
+        RENEW_EVERY * 2 + Duration::from_secs(10),
+        &|| {
+            slow_renewal(owner).is_some_and(|slow| {
+                owner
+                    .renewals()
+                    .iter()
+                    .any(|r| r.requested > slow.requested)
+            })
+        },
+    );
+    let slow = slow_renewal(owner).unwrap();
+    let following = owner
+        .renewals()
+        .into_iter()
+        .find(|r| r.requested > slow.requested)
+        .unwrap();
+    assert_eq!(
+        slow.outcome,
+        Outcome::Held,
+        "a 3s-late reply is still fresh"
+    );
+    let cadence = following
+        .requested
+        .saturating_duration_since(slow.requested);
+    assert!(
+        cadence < RENEW_EVERY + Duration::from_secs(1),
+        "the renewal after a slow reply must be timed from its request: it came {cadence:?} \
+         later, where 15s after the reply would be {:?}",
+        RENEW_EVERY + slow.returned.saturating_duration_since(slow.requested)
+    );
+    assert_eq!(
+        owner.releases().len(),
+        seat_releases_before,
+        "a slow but fresh renewal must not cost the seat"
+    );
+    println!(
+        "SEAT PHASE 4a OK: a seat renewal replied {:?} late and stayed fresh; the next one was requested {cadence:?} after it (from the request, not the reply); {owner_label} kept the seat",
+        slow.returned.saturating_duration_since(slow.requested)
+    );
+
+    //    b) A reply 19s late (just inside the 20s bound). Belief in the old
+    //       proof must lapse at the bound while the reply is still out, so
+    //       nothing is delivered on it; the seat is held again only on a grant
+    //       taken after the reply landed.
+    let last_proof = next_real_renewal(owner, owner_label);
+    let seat_releases_before = owner.releases().len();
+    owner.set(Fault::SeatRenewReturnsLate(Duration::from_secs(19)));
+    let stale_from = last_proof.requested + BOUND;
+    thread::sleep((stale_from + Duration::from_secs(3)).saturating_duration_since(Instant::now()));
+    let stale_body = "m5 sent while the seat's last proof is past the bound";
+    let sent_stale = Instant::now();
+    send(stale_body);
+    wait(
+        "the 19s-late renewal reply to land",
+        RENEW_EVERY + Duration::from_secs(30),
+        &|| {
+            owner.renewals().iter().any(|r| {
+                r.requested > last_proof.requested
+                    && r.returned.saturating_duration_since(r.requested) >= Duration::from_secs(19)
+            })
+        },
+    );
+    let very_late = owner
+        .renewals()
+        .into_iter()
+        .find(|r| {
+            r.requested > last_proof.requested
+                && r.returned.saturating_duration_since(r.requested) >= Duration::from_secs(19)
+        })
+        .unwrap();
+    wait("m5 to be delivered", Duration::from_secs(30), &|| {
+        delivered("seat-a", stale_body) || delivered("seat-b", stale_body)
+    });
+    let (m5_receiver, m5_at) = seen
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|(_, body, _)| body == stale_body)
+        .map(|(who, _, at)| (*who, *at))
+        .unwrap();
+    assert!(
+        m5_at >= very_late.returned,
+        "m5 was delivered by {m5_receiver} {:?} before the late reply landed, on a proof past the bound",
+        very_late.returned.saturating_duration_since(m5_at)
+    );
+    let (owner_released, owner_reached) = owner
+        .releases()
+        .get(seat_releases_before)
+        .copied()
+        .expect("the holder must give up a seat whose last proof passed the bound");
+    assert!(
+        owner_reached,
+        "not partitioned, so the release reached the node"
+    );
+    assert!(
+        owner_released >= very_late.returned,
+        "the old seat is released once its renewal returns"
+    );
+    let regrant = a
+        .acquisitions()
+        .into_iter()
+        .chain(b.acquisitions())
+        .filter(|at| *at >= owner_released)
+        .min()
+        .expect("a grant after the old seat was released");
+    let deliverer = if m5_receiver == "seat-a" { &a } else { &b };
+    assert!(
+        deliverer
+            .acquisitions()
+            .iter()
+            .any(|at| *at >= owner_released),
+        "m5 must be delivered on a grant taken after the old seat was released"
+    );
+    println!(
+        "SEAT PHASE 4b OK: a seat renewal requested {:?} after the last proof replied {:?} late; m5 was sent {:?} past the bound and not delivered on the old proof; the old seat was released {:?} after the late reply landed and {m5_receiver} delivered m5 on a new grant {:?} after that",
+        very_late
+            .requested
+            .saturating_duration_since(last_proof.requested),
+        very_late
+            .returned
+            .saturating_duration_since(very_late.requested),
+        sent_stale.saturating_duration_since(stale_from),
+        owner_released.saturating_duration_since(very_late.returned),
+        regrant.saturating_duration_since(owner_released),
+    );
+    a_stop.abort();
+    b_stop.abort();
+    a_join.join().expect("A receiver");
+    b_join.join().expect("B receiver");
 }
