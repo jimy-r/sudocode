@@ -159,7 +159,8 @@ main pushes and manual workflow runs, using `SUDOROUTER_CI_API_KEY`.
 
 Hosts check `initialize.result._meta.sudocode.directA2a.version == 1`. Two
 session requests run the session's own A2A tools for the client, without a
-model turn:
+model turn. `directA2a.errorOutcomes == 1` means every failure carries a typed
+outcome, described below.
 
 - `_sudocode/a2a/send` with `{ "sessionId", "to", "message", "summary" }`
   runs the `send` tool. `message` and `summary` are plain text. The session's agent is the
@@ -183,7 +184,8 @@ retry it blindly.
 code `-32602` and `error.data.sudocode.directA2a` containing
 `{ "version": 1, "outcome": "not_submitted" }` attests that the host rejected
 the request before tool execution. This includes an unknown session, invalid
-params, paused tools, a busy session and a session control change. After
+params, paused tools, a busy session and a session control change. The reason
+is carried in `error.data.detail`. After
 admission, driver or response failures use `-32603` with top-level
 `error.data.outcome: "unknown"` and matching versioned phase metadata. A
 cancelled call never returns a partial tool result as if final. Generic
