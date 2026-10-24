@@ -227,6 +227,13 @@ NEXUS_A2A_TEST_ENDPOINT="$ENDPOINT" NEXUS_A2A_TEST_CERT_DIR="$CLIENT_BUNDLE" \
 NEXUS_A2A_TEST_ENDPOINT="$ENDPOINT" NEXUS_A2A_TEST_CERT_DIR="$CLIENT_BUNDLE" \
   "${CARGO_TEST[@]}" live_refusal_under_a_held_lease_is_recorded_as_consumer_refused -- --ignored --nocapture
 
+# The receiver seat trusts only fresh renewals: a late reply, a partition and a
+# slow-but-successful renewal are injected by the test-only wrapper; the node's
+# TTL is what any takeover waits on.
+echo "== [deterministic] the receiver seat trusts only fresh renewals =="
+NEXUS_A2A_TEST_ENDPOINT="$ENDPOINT" NEXUS_A2A_TEST_CERT_DIR="$CLIENT_BUNDLE" \
+  "${CARGO_TEST[@]}" live_receiver_seat_trusts_only_fresh_renewals -- --ignored --nocapture
+
 # A daemon that is alive and SILENT - the failure a unit test cannot construct.
 #
 # A dropped connection reports itself; a stopped process holds the socket open
