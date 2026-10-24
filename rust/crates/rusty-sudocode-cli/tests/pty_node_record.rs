@@ -113,14 +113,14 @@ fn ordinary_task_with_unavailable_a2a(env: &TestEnv, home: &Path, label: &str, e
         ],
     );
     session.set_default_timeout(common::at_least(Duration::from_secs(30)));
-    session
-        .expect(expected)
-        .unwrap_or_else(|e| panic!("[{label}] the session must name the cause {expected:?}: {e}"));
     common::expect_input_line_cleared(&session, Duration::from_secs(30), label);
     session.send("/status\r").expect("inspect A2A status");
     session
         .expect("node (unavailable:")
         .expect("selected node namespace, not disk");
+    session
+        .expect(expected)
+        .unwrap_or_else(|e| panic!("[{label}] status must name the cause {expected:?}: {e}"));
     common::expect_input_line_cleared(&session, Duration::from_secs(30), "status done");
     let prompt = env.prompt(
         "Reply with exactly NODE_CONFIG_TASK_OK.",
@@ -167,10 +167,13 @@ fn startup_and_resume_with_credential(has_credential: bool) {
         }
         let home = home_with_record(&env, &record("127.0.0.1:1", &agents));
         let home = home.to_string_lossy();
+        let log = env.workspace_root().join("receiver-diagnostics.jsonl");
+        let log_text = log.to_string_lossy();
         let vars = [
             ("HOME", home.as_ref()),
             ("USERPROFILE", home.as_ref()),
             ("SUDOCODE_INTERRUPT_QUEUE_MODE", mode),
+            ("SCODE_LOG_PATH", log_text.as_ref()),
         ];
         let prompt = env.prompt("Reply with exactly OFFLINE_NODE_REPLY.", "single_turn_text");
         let reply = if env.is_mock() {
@@ -180,7 +183,11 @@ fn startup_and_resume_with_credential(has_credential: bool) {
         };
         let mut fresh = env.spawn_with_env(&["--permission-mode", "read-only"], &vars);
         fresh.set_default_timeout(common::at_least(Duration::from_secs(30)));
-        common::expect_input_line_cleared(&fresh, Duration::from_secs(30), "offline fresh");
+        common::expect_input_line_cleared(
+            &fresh,
+            Duration::from_secs(30),
+            &format!("offline {mode} fresh"),
+        );
         fresh
             .send(&format!("{prompt}\r"))
             .expect("send ordinary prompt");
@@ -188,7 +195,20 @@ fn startup_and_resume_with_credential(has_credential: bool) {
             .expect(reply)
             .expect("ordinary turn completes without Nexus");
         wait_for_saved_reply(&env, reply);
-        common::expect_input_line_cleared(&fresh, Duration::from_secs(30), "offline turn done");
+        common::expect_input_line_cleared(
+            &fresh,
+            Duration::from_secs(30),
+            &format!("offline {mode} turn done"),
+        );
+        // Startup/model input must be usable before the receiver finishes IO.
+        // Keep this live process open until its actual background failure is
+        // logged; Windows can complete the fast mock turn before connect fails.
+        wait_for_receiver_diagnostic(&log, has_credential);
+        common::expect_input_line_cleared(
+            &fresh,
+            Duration::from_secs(30),
+            &format!("offline {mode} diagnostic shown"),
+        );
         fresh.send("/exit\r").expect("exit fresh session");
         assert_eq!(fresh.expect_eof().expect("fresh session exits"), 0);
 
@@ -207,10 +227,46 @@ fn startup_and_resume_with_credential(has_credential: bool) {
         resumed
             .expect(reply)
             .expect("restored reply from original transcript");
-        common::expect_input_line_cleared(&resumed, Duration::from_secs(30), "offline resume");
+        common::expect_input_line_cleared(
+            &resumed,
+            Duration::from_secs(30),
+            &format!("offline {mode} resume"),
+        );
         resumed.send("/exit\r").expect("exit resumed session");
         assert_eq!(resumed.expect_eof().expect("resumed session exits"), 0);
         assert_no_disk_namespace(&env);
+    }
+}
+
+/// This is an observation phase after the original startup/turn readiness
+/// assertions, not an increased budget for those assertions. A node operation
+/// has its own transport deadline; do not exit the child before observing it.
+fn wait_for_receiver_diagnostic(log: &Path, has_credential: bool) {
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        let records: Vec<serde_json::Value> = std::fs::read_to_string(log)
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .filter(|record| record["attributes"]["namespace"] == "background_retry")
+            .collect();
+        if records.iter().any(|record| {
+            let props = &record["attributes"];
+            props["subject"] == SESSION_AGENT
+                && props["scope"] == "presence announcement"
+                && props["error"].as_str().is_some_and(|error| {
+                    if has_credential {
+                        error.contains("announce") && error.contains("connect")
+                    } else {
+                        error.contains("ask the node owner to mint")
+                    }
+                })
+        }) {
+            return;
+        }
+        assert!(Instant::now() < deadline,
+            "no presence diagnostic while the original CLI stayed alive; background records: {records:?}");
+        std::thread::sleep(Duration::from_millis(50));
     }
 }
 
@@ -232,6 +288,8 @@ fn the_original_receiver_retries_a_new_bundle_without_a_restart_or_tool_call() {
     let agents = empty_agents_dir(&env);
     let home = home_with_record(&env, &record("127.0.0.1:1", &agents));
     let home = home.to_string_lossy();
+    let log = env.workspace_root().join("receiver-diagnostics.jsonl");
+    let log_text = log.to_string_lossy();
     let mut session = env.spawn_with_env(
         &["--permission-mode", "workspace-write"],
         &[
@@ -239,20 +297,17 @@ fn the_original_receiver_retries_a_new_bundle_without_a_restart_or_tool_call() {
             ("USERPROFILE", home.as_ref()),
             ("PAGER", ""),
             ("SUDOCODE_INTERRUPT_QUEUE_MODE", "queue"),
+            ("SCODE_LOG_PATH", log_text.as_ref()),
         ],
     );
     session.set_default_timeout(common::at_least(Duration::from_secs(30)));
-    session
-        .expect("ask the node owner to mint")
-        .expect("receiver reports the missing credential");
     common::expect_input_line_cleared(&session, Duration::from_secs(30), "pending receiver");
+    wait_for_receiver_diagnostic(&log, false);
 
     // No tool call or second CLI process triggers resolution. The original
     // receiver must pick up the new files and reach the real offline transport.
     node_home::write_untrusted_credential(&agents, SESSION_AGENT);
-    session
-        .expect("connect")
-        .expect("original receiver retries and reaches actual node IO");
+    wait_for_receiver_diagnostic(&log, true);
     session.send("/status\r").expect("inspect the same binding");
     session
         .expect("node 127.0.0.1:1")

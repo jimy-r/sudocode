@@ -1483,7 +1483,14 @@ fn a_concurrent_edit_to_existing_history_prevents_checkpoint_installation() {
                 "source conflict finished",
             );
             cli.send("/exit\r").unwrap();
-            assert_eq!(cli.expect_eof().unwrap(), 0);
+            let pid = cli.process_id();
+            let code = cli.expect_eof().unwrap();
+            assert_eq!(
+                code,
+                0,
+                "source conflict exit; before_run={before_run}, child={pid:?}\nPTY:\n{}",
+                cli.render(rendered_contents)
+            );
             screen
         } else {
             provider.response_released.store(true, Ordering::Relaxed);
