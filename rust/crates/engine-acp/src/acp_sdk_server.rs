@@ -324,6 +324,8 @@ struct DirectAgentListRequest {
 struct DirectA2aResponse {
     content: String,
     is_error: bool,
+    #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
+    meta: Option<serde_json::Value>,
 }
 
 /// `_meta.sudocode` key a client sets in `clientCapabilities` (and scode
@@ -825,7 +827,7 @@ async fn drive_prompt(
 /// in different workspaces are different agents, and each hears only its own
 /// peers. A message goes to a session of the agent it was sent to, never to a
 /// session that merely happens to share the process.
-fn ensure_a2a_receiver(
+async fn ensure_a2a_receiver(
     registry: &SharedSessionRegistry,
     cx: &ConnectionTo<Client>,
     config: &SdkAcpConfig,
@@ -845,45 +847,84 @@ fn ensure_a2a_receiver(
     let Some(mailbox) = mailbox else {
         return;
     };
-    let stop = HookAbortSignal::new();
-    {
-        let mut receivers = registry.lock_peer_receivers();
-        if receivers
-            .get(&agent)
-            .is_some_and(|running| !running.is_aborted())
-        {
-            return;
-        }
-        receivers.insert(agent.clone(), stop.clone());
-    }
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<(
-        runtime::agent_mailbox::MailboxEnvelope,
-        std::sync::mpsc::SyncSender<bool>,
-    )>();
-    let callback_stop = stop.clone();
-    let receiver = runtime::mailbox::spawn_inbox_poller(
-        Arc::clone(&mailbox),
-        200,
-        "acp-peer",
-        stop.clone(),
-        move |message| {
-            if message.body.trim().is_empty() {
-                return true;
+    let (receiver, mut rx) = loop {
+        let admission = {
+            // Closing the last session and admitting its replacement use this
+            // same lock order. A stopped receiver stays registered until its
+            // real worker has dropped its locks and finished its remote
+            // unlock attempts. A failed unlock still relies on backend TTL.
+            let sessions = registry.lock_sessions();
+            if !sessions.contains_key(session_id) {
+                return;
             }
-            let (ack_tx, ack_rx) = std::sync::mpsc::sync_channel(1);
-            if tx.send((message.clone(), ack_tx)).is_err() {
-                return false;
+            let mut receivers = registry.lock_peer_receivers();
+            if let Some(previous) = receivers.get(&agent) {
+                if !previous.stop.is_aborted() {
+                    return;
+                }
+                Err(Arc::clone(previous))
+            } else {
+                let stop = HookAbortSignal::new();
+                let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<(
+                    runtime::agent_mailbox::MailboxEnvelope,
+                    std::sync::mpsc::SyncSender<bool>,
+                )>();
+                let callback_stop = stop.clone();
+                let worker = runtime::mailbox::spawn_inbox_poller(
+                    Arc::clone(&mailbox),
+                    200,
+                    "acp-peer",
+                    stop.clone(),
+                    move |message| {
+                        if message.body.trim().is_empty() {
+                            return true;
+                        }
+                        let (ack_tx, ack_rx) = std::sync::mpsc::sync_channel(1);
+                        if tx.send((message.clone(), ack_tx)).is_err() {
+                            return false;
+                        }
+                        while !callback_stop.is_aborted() {
+                            match ack_rx.recv_timeout(std::time::Duration::from_millis(200)) {
+                                Ok(handled) => return handled,
+                                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                                    return false
+                                }
+                            }
+                        }
+                        false
+                    },
+                );
+                let receiver = Arc::new(PeerReceiver {
+                    stop,
+                    worker: Mutex::new(PeerReceiverWorker::Running(worker)),
+                });
+                receivers.insert(agent.clone(), Arc::clone(&receiver));
+                Ok((receiver, rx))
             }
-            while !callback_stop.is_aborted() {
-                match ack_rx.recv_timeout(std::time::Duration::from_millis(200)) {
-                    Ok(handled) => return handled,
-                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
-                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return false,
+        };
+        match admission {
+            Ok(started) => break started,
+            Err(previous) => {
+                let joining = Arc::clone(&previous);
+                match tokio::task::spawn_blocking(move || joining.stop_and_join()).await {
+                    Ok(Ok(())) => {}
+                    error => {
+                        eprintln!("[acp-peer] previous receiver teardown failed: {error:?}");
+                        return;
+                    }
+                }
+                let mut receivers = registry.lock_peer_receivers();
+                if receivers
+                    .get(&agent)
+                    .is_some_and(|entry| Arc::ptr_eq(entry, &previous))
+                {
+                    receivers.remove(&agent);
                 }
             }
-            false
-        },
-    );
+        }
+    };
+    let stop = receiver.stop.clone();
     let registry = Arc::clone(registry);
     let cx = cx.clone();
     let config = config.clone();
@@ -935,8 +976,14 @@ fn ensure_a2a_receiver(
                 session_id.clone(),
                 vec![ContentBlock::Text(TextContent::new(text))],
             );
-            let result =
-                drive_prompt(request, Arc::clone(&registry), config.clone(), cx.clone()).await;
+            let result = tokio::select! {
+                biased;
+                () = stop.cancelled() => {
+                    let _ = ack.send(false);
+                    break;
+                }
+                result = drive_prompt(request, Arc::clone(&registry), config.clone(), cx.clone()) => result,
+            };
             if let Ok((response, text)) = &result {
                 if response.stop_reason != StopReason::Cancelled {
                     if let Some(body) = runtime::spawn_task::auto_reply_body(
@@ -969,7 +1016,10 @@ fn ensure_a2a_receiver(
             let _ = ack.send(result.is_ok() && !stop.is_aborted());
         }
         stop.abort();
-        let _ = tokio::task::spawn_blocking(move || receiver.join()).await;
+        match tokio::task::spawn_blocking(move || receiver.stop_and_join()).await {
+            Ok(Ok(())) => {}
+            error => eprintln!("[acp-peer] receiver teardown failed: {error:?}"),
+        }
     });
 }
 
@@ -1016,7 +1066,9 @@ fn initialize_meta(subagent_events: Option<u64>) -> Map<String, serde_json::Valu
     // `_sudocode/a2a/send` and `_sudocode/a2a/agent_list`.
     sudocode_ns.insert(
         "directA2a".to_string(),
-        json!({ "version": 1, "errorOutcomes": 1 }),
+        json!({
+            "version": 1, "errorOutcomes": 1, "hostAudit": 1,
+        }),
     );
     // `session/new` accepts `_meta.sudocode.forkFrom` (see
     // `fork_source_from_meta`): a client that forks a conversation into a
@@ -1437,9 +1489,40 @@ pub struct SessionRegistry {
     completion_routes: Mutex<HashMap<String, CompletionRoute>>,
     cwd_lease: Arc<WorkspaceCwdLease>,
     hosted_factory: Option<Arc<dyn HostedSessionFactory>>,
-    /// The peer receiver running for each agent this process serves, by the
-    /// signal that stops it.
-    peer_receivers: Mutex<HashMap<String, HookAbortSignal>>,
+    /// Own the worker until it has stopped; an abort signal alone does not
+    /// release its remote receiver seat.
+    peer_receivers: Mutex<HashMap<String, Arc<PeerReceiver>>>,
+}
+
+struct PeerReceiver {
+    stop: HookAbortSignal,
+    worker: Mutex<PeerReceiverWorker>,
+}
+
+enum PeerReceiverWorker {
+    Running(std::thread::JoinHandle<()>),
+    Joined(Result<(), String>),
+}
+
+impl PeerReceiver {
+    /// Called on a blocking worker, never on the async executor. Keep the
+    /// mutex until join completes so concurrent close/replacement callers
+    /// cannot mistake a taken handle for a completed retirement.
+    fn stop_and_join(&self) -> Result<(), String> {
+        self.stop.abort();
+        let mut worker = self
+            .worker
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let result = match std::mem::replace(&mut *worker, PeerReceiverWorker::Joined(Ok(()))) {
+            PeerReceiverWorker::Running(handle) => handle
+                .join()
+                .map_err(|_| "peer receiver worker panicked".to_string()),
+            PeerReceiverWorker::Joined(result) => result,
+        };
+        *worker = PeerReceiverWorker::Joined(result.clone());
+        result
+    }
 }
 
 /// The host chooses where a session lives; the ACP handlers and turn driver are
@@ -1678,6 +1761,16 @@ impl SessionRegistry {
                 eprintln!("ACP session teardown timed out");
             }
         }
+        let receivers: Vec<_> = self
+            .lock_peer_receivers()
+            .drain()
+            .map(|(_, receiver)| receiver)
+            .collect();
+        for receiver in receivers {
+            if let Err(error) = receiver.stop_and_join() {
+                eprintln!("ACP peer receiver teardown failed: {error}");
+            }
+        }
         if let Some(factory) = &self.hosted_factory {
             factory.close();
         }
@@ -1694,31 +1787,31 @@ impl SessionRegistry {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    fn lock_peer_receivers(&self) -> std::sync::MutexGuard<'_, HashMap<String, HookAbortSignal>> {
+    fn lock_peer_receivers(&self) -> std::sync::MutexGuard<'_, HashMap<String, Arc<PeerReceiver>>> {
         self.peer_receivers
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     fn stop_peer_receivers(&self) {
-        for (_, stop) in self.lock_peer_receivers().drain() {
-            stop.abort();
+        for receiver in self.lock_peer_receivers().values() {
+            receiver.stop.abort();
         }
     }
 
     /// Stop `agent`'s receiver once no session of that agent is left, so its
     /// receiver seat passes to another instance instead of being held by a
     /// process that has nowhere to deliver.
-    fn stop_unused_peer_receiver(&self, agent: &str) {
-        let in_use = self
-            .lock_sessions()
-            .values()
-            .any(|entry| entry.agent == agent);
+    fn stop_unused_peer_receiver(&self, agent: &str) -> Option<Arc<PeerReceiver>> {
+        let sessions = self.lock_sessions();
+        let in_use = sessions.values().any(|entry| entry.agent == agent);
         if !in_use {
-            if let Some(stop) = self.lock_peer_receivers().remove(agent) {
-                stop.abort();
+            if let Some(receiver) = self.lock_peer_receivers().get(agent) {
+                receiver.stop.abort();
+                return Some(Arc::clone(receiver));
             }
         }
+        None
     }
 
     /// The agent `session_id` answers as.
@@ -1847,10 +1940,11 @@ impl SessionRegistry {
         Arc<SessionEngine>,
         std::time::Instant,
         Arc<crate::session_driver::SessionDriver>,
+        Option<Arc<PeerReceiver>>,
     )> {
         let taken = self.lock_sessions().remove(session_id)?;
-        self.stop_unused_peer_receiver(&taken.agent);
-        Some((taken.engine, taken.started_at, taken.driver))
+        let receiver = self.stop_unused_peer_receiver(&taken.agent);
+        Some((taken.engine, taken.started_at, taken.driver, receiver))
     }
 
     /// All live sessions as `(id, cwd)` — the `session/list` response.
@@ -2506,7 +2600,8 @@ pub(crate) async fn run_acp_on_transport(
                                     &cx_notify,
                                     &peer_config,
                                     &session_id,
-                                );
+                                )
+                                .await;
                             }
                             Err(e) => {
                                 responder.respond_with_error(acp_error_to_sdk(&e))?;
@@ -2569,7 +2664,7 @@ pub(crate) async fn run_acp_on_transport(
                         let _lane = registry.enter_lane(&sid).await;
                         let taken = registry.take(&sid);
                         let closed = tokio::task::spawn_blocking(move || {
-                            if let Some((engine, started_at, driver)) = taken {
+                            if let Some((engine, started_at, driver, receiver)) = taken {
                                 // Session-ended telemetry, then persist + drop.
                                 if let Some(tracer) = engine.session_tracer() {
                                     let usage = engine.usage_snapshot();
@@ -2590,9 +2685,13 @@ pub(crate) async fn run_acp_on_transport(
                                     );
                                 }
                                 drop(engine);
-                                if !driver.shutdown() {
+                                let driver_stopped = driver.shutdown();
+                                let receiver_stopped =
+                                    receiver.map_or(Ok(()), |receiver| receiver.stop_and_join());
+                                if !driver_stopped {
                                     return Err(AcpError::internal("session teardown timed out"));
                                 }
+                                receiver_stopped.map_err(AcpError::internal)?;
                             }
                             Ok(())
                         })
@@ -2850,7 +2949,8 @@ pub(crate) async fn run_acp_on_transport(
                                     &cx_notify,
                                     &peer_config,
                                     &session_id,
-                                );
+                                )
+                                .await;
                             }
                             Err(e) => {
                                 responder.respond_with_error(acp_error_to_sdk(&e))?;
