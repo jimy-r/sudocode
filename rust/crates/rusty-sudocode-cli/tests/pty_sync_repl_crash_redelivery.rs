@@ -105,6 +105,7 @@ fn the_next_instance_receives_a_message_the_crashed_one_left_unrun() {
 
     // The redelivered message is live, not a stale notice: Enter runs it and the
     // position finally advances.
+    let turn_marker = common::turn_status_marker(&second);
     second
         .send("\r")
         .expect("press Enter on the second instance");
@@ -120,37 +121,28 @@ fn the_next_instance_receives_a_message_the_crashed_one_left_unrun() {
         std::thread::sleep(Duration::from_millis(100));
     }
 
-    // The position moves as the turn finishes, before the REPL is back at an
-    // idle prompt, and input typed in that window can be consumed by the turn.
-    // Ask for /status until it answers: that proves the prompt is idle (so
-    // /exit will land) and that the second instance now holds the receiver.
-    assert!(
-        status_shows(
-            &mut second,
-            "receiving; waiting messages run at the next prompt"
-        ),
-        "the second instance never reported itself as the receiver:\n{}",
-        second.render(|s| s.contents())
+    // A durable read position can advance before the input row is rearmed.
+    // Reuse the shared turn/ready gate before asking for a fresh receiver report.
+    let ready_deadline = Instant::now() + BUDGET;
+    common::expect_turn_complete_after(&second, &turn_marker, BUDGET, "redelivered peer turn");
+    common::expect_input_line_cleared(
+        &second,
+        ready_deadline.saturating_duration_since(Instant::now()),
+        "status at the rearmed prompt",
+    );
+    second.send("/status\r").expect("query the new receiver");
+    common::expect_screen_settled(
+        &second,
+        |screen| {
+            screen.contains("receiving; waiting messages run at the next prompt")
+                && common::input_line_of(screen).is_empty()
+        },
+        ready_deadline.saturating_duration_since(Instant::now()),
+        "the new receiver reports ownership and restores its input row",
     );
 
     second.send("/exit\r").expect("exit the REPL");
     assert_eq!(second.expect_eof().expect("the REPL exits"), 0);
-}
-
-/// Ask `/status` until `needle` shows, retrying in case an earlier `/status` was
-/// typed while the previous turn was still winding down.
-fn status_shows(sess: &mut pty_expect::PtySession, needle: &str) -> bool {
-    for _ in 0..8 {
-        sess.send("/status\r").expect("send /status");
-        let deadline = Instant::now() + Duration::from_secs(4);
-        while Instant::now() < deadline {
-            if sess.render(|s| s.contents()).contains(needle) {
-                return true;
-            }
-            std::thread::sleep(Duration::from_millis(100));
-        }
-    }
-    false
 }
 
 fn spawn_instance(env: &TestEnv) -> pty_expect::PtySession {
