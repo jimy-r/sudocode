@@ -10,6 +10,8 @@
 //! spawned `scode acp` cannot initialise winsock — so `acp serve` fails to bind
 //! and dies before printing its ready line. See `common/isolated_env.rs`.
 
+#[path = "support/acp_direct_fences.rs"]
+mod acp_direct_fences;
 #[path = "common/isolated_env.rs"]
 mod isolated_env;
 #[path = "support/node_home.rs"]
@@ -8537,11 +8539,35 @@ async fn set_session_mode(client: &mut AcpTestClient, session_id: &str, mode: &s
     );
 }
 
-/// A definite refusal is invalid params: nothing ran, so it may be resent.
+/// A definite refusal is invalid params typed `not_submitted`: nothing ran, so
+/// it may be resent.
 fn assert_refused(resp: &Value, case: &str) {
     assert_eq!(
         resp["error"]["code"], -32602,
         "{case} must be refused before anything runs: {resp}"
+    );
+    assert_eq!(
+        resp["error"]["data"]["sudocode"]["directA2a"],
+        json!({ "version": 1, "outcome": "not_submitted" }),
+        "{case} is typed as not submitted: {resp}"
+    );
+}
+
+/// A failure after admission is an internal error typed `unknown`: the call
+/// may have run, so it must not be resent blindly.
+fn assert_unknown(resp: &Value, case: &str) {
+    assert_eq!(
+        resp["error"]["code"], -32603,
+        "{case} is not a refusal: {resp}"
+    );
+    assert_eq!(
+        resp["error"]["data"]["outcome"], "unknown",
+        "{case} says its outcome is unknown: {resp}"
+    );
+    assert_eq!(
+        resp["error"]["data"]["sudocode"]["directA2a"],
+        json!({ "version": 1, "outcome": "unknown" }),
+        "{case} is typed as unknown: {resp}"
     );
 }
 
@@ -8556,6 +8582,50 @@ fn conversation_log(pair_root: &Path, peer: &str, sender: &str) -> String {
 /// `_sudocode/a2a/send` runs the session's own `send` tool for the client: the
 /// message reaches the peer on the pair root from the session's agent, the
 /// model is never asked, and the model's history never sees it.
+fn assert_direct_host_audit<'a>(
+    reply: &'a Value,
+    sid: &str,
+    actor: &str,
+    root: &Path,
+    tool: &str,
+) -> &'a Value {
+    use sha2::{Digest, Sha256};
+    let audit = &reply["result"]["_meta"]["sudocode"]["directA2a"]["audit"];
+    assert_eq!(audit["version"], 1, "{reply}");
+    assert_eq!(
+        audit["sessionId"], sid,
+        "the loaded native session: {reply}"
+    );
+    assert_eq!(
+        audit["actor"], actor,
+        "the executor's actual sender: {reply}"
+    );
+    assert_eq!(audit["namespaceRoot"], root.to_string_lossy().as_ref());
+    assert_eq!(audit["tool"], tool);
+    assert!(audit["commandId"]
+        .as_str()
+        .is_some_and(|id| id.starts_with("external-a2a-")));
+    let mut hash = Sha256::new();
+    let content = reply["result"]["content"].as_str().unwrap().as_bytes();
+    hash.update(b"sudocode.direct-a2a.result.v1\0");
+    hash.update([u8::from(reply["result"]["isError"].as_bool().unwrap())]);
+    hash.update((content.len() as u64).to_be_bytes());
+    hash.update(content);
+    assert_eq!(
+        audit["resultSha256"],
+        format!("{:x}", hash.finalize()),
+        "audit binds actual unchanged tool output and isError, before metadata"
+    );
+    audit
+}
+
+fn assert_direct_not_submitted(reply: &Value, case: &str) {
+    assert_refused(reply, case);
+    let phase = &reply["error"]["data"]["sudocode"]["directA2a"];
+    assert_eq!(phase["version"], 1);
+    assert_eq!(phase["outcome"], "not_submitted");
+}
+
 #[tokio::test]
 async fn direct_a2a_send_reaches_the_peer_without_a_model_turn() {
     const AGENT: &str = "direct-a2a-sender";
@@ -8575,8 +8645,17 @@ async fn direct_a2a_send_reaches_the_peer_without_a_model_turn() {
         .send_request("initialize", json!({ "protocolVersion": 1 }))
         .await;
     assert_eq!(
-        init["result"]["_meta"]["sudocode"]["directA2a"]["version"], 1,
-        "initialize advertises the direct A2A requests: {init}"
+        init["result"]["_meta"]["sudocode"]["directA2a"],
+        json!({ "version": 1, "errorOutcomes": 1, "hostAudit": 1 }),
+        "initialize advertises the direct A2A requests and their typed outcomes: {init}"
+    );
+    assert_eq!(
+        init["result"]["_meta"]["sudocode"]["directA2a"]["errorOutcomes"],
+        1
+    );
+    assert_eq!(
+        init["result"]["_meta"]["sudocode"]["directA2a"]["hostAudit"],
+        1
     );
     let sid = open_direct_session(&mut client, &workspace.root).await;
     set_session_mode(&mut client, &sid, "workspace-write").await;
@@ -8608,6 +8687,7 @@ async fn direct_a2a_send_reaches_the_peer_without_a_model_turn() {
         log.contains(MARKER) && log.contains(AGENT),
         "the peer's conversation holds the message from {AGENT}: {log}"
     );
+    let sent_audit = assert_direct_host_audit(&sent, &sid, AGENT, &pair_root, "send");
 
     let (_, listed) = client
         .send_request("_sudocode/a2a/agent_list", json!({ "sessionId": sid }))
@@ -8623,6 +8703,8 @@ async fn direct_a2a_send_reaches_the_peer_without_a_model_turn() {
         rows.get("agents").is_some() && rows.get("count").is_some(),
         "agent_list returns the tool's own rows: {rows}"
     );
+    let list_audit = assert_direct_host_audit(&listed, &sid, AGENT, &pair_root, "agent_list");
+    assert_ne!(sent_audit["commandId"], list_audit["commandId"]);
     assert_eq!(
         server.captured_requests().await.len(),
         before,
@@ -8684,23 +8766,34 @@ async fn direct_a2a_refusals_send_nothing() {
         params
     };
 
-    for (case, params) in [
-        ("an unknown session", send("no-such-session", json!({}))),
+    for (case, params, reason) in [
+        (
+            "an unknown session",
+            send("no-such-session", json!({})),
+            "unknown_session",
+        ),
         (
             "a sender override",
             send(&sid, json!({ "sender": "someone-else" })),
+            "invalid_params",
         ),
         (
             "a structured message",
             send(&sid, json!({ "message": { "type": "shutdown_request" } })),
+            "invalid_params",
         ),
         (
             "a message without a summary",
             json!({ "sessionId": sid, "to": PEER, "message": MARKER }),
+            "invalid_params",
         ),
     ] {
         let (_, resp) = client.send_request("_sudocode/a2a/send", params).await;
-        assert_refused(&resp, case);
+        assert!(
+            resp.get("error").is_some(),
+            "{case} must be refused: {resp}"
+        );
+        assert_direct_not_submitted(&resp, reason);
     }
 
     // The session starts read-only: the tool runs and the policy refuses it.
@@ -8725,7 +8818,8 @@ async fn direct_a2a_refusals_send_nothing() {
     let (_, resp) = client
         .send_request("_sudocode/a2a/send", send(&sid, json!({})))
         .await;
-    assert_refused(&resp, "paused tools");
+    assert!(resp.get("error").is_some(), "paused tools refuse: {resp}");
+    assert_direct_not_submitted(&resp, "paused");
     let (_, resumed) = client
         .send_request(
             "_sudocode/session/resume_tools",
@@ -8738,7 +8832,11 @@ async fn direct_a2a_refusals_send_nothing() {
     let (_, resp) = client
         .send_request("_sudocode/a2a/send", send(&sid, json!({})))
         .await;
-    assert_refused(&resp, "a session busy with a turn");
+    assert!(
+        resp.get("error").is_some(),
+        "a session busy with a turn refuses at once: {resp}"
+    );
+    assert_direct_not_submitted(&resp, "busy");
     allow_permission(&mut client, &permission_id).await;
     client
         .recv_until(Duration::from_secs(60), |m| is_response_to(m, prompt_id))
@@ -8856,14 +8954,7 @@ async fn direct_a2a_cancel_after_delivery_reports_unknown() {
     let _ = fs::write(&release, "");
     let (_, resp) =
         answered.unwrap_or_else(|seen| panic!("the cancelled send never answered; saw {seen:#?}"));
-    assert_eq!(
-        resp["error"]["code"], -32603,
-        "a call cancelled after it ran is not a refusal: {resp}"
-    );
-    assert_eq!(
-        resp["error"]["data"]["outcome"], "unknown",
-        "the response says the outcome is unknown: {resp}"
-    );
+    assert_unknown(&resp, "a call cancelled after it ran");
 
     tokio::time::sleep(Duration::from_secs(2)).await;
     assert_eq!(
@@ -9018,10 +9109,7 @@ async fn direct_a2a_pause_waits_for_an_in_flight_send() {
                 .1
         }
     };
-    assert_eq!(
-        sent["error"]["data"]["outcome"], "unknown",
-        "a send the pause stopped after admission has an unknown outcome: {sent}"
-    );
+    assert_unknown(&sent, "a send the pause stopped after admission");
 
     tokio::time::sleep(Duration::from_secs(2)).await;
     let mut buf = [0u8; 65_536];
@@ -9275,10 +9363,7 @@ async fn direct_a2a_through_a_node_appends_once_as_the_session() {
     let _ = fs::write(workspace.root.join("direct-node.release"), "");
     let (_, resp) =
         answered.unwrap_or_else(|seen| panic!("the cancelled send never answered; saw {seen:#?}"));
-    assert_eq!(
-        resp["error"]["data"]["outcome"], "unknown",
-        "a call cancelled after its append has an unknown outcome: {resp}"
-    );
+    assert_unknown(&resp, "a call cancelled after its append on the node");
 
     tokio::time::sleep(Duration::from_secs(2)).await;
     let (later, _) = node_conversation(&endpoint, &receiver_credential, &sender, tail, 0).await;

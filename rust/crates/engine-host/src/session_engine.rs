@@ -1205,7 +1205,7 @@ impl engine_core::EngineDelegate for SessionEngine {
         name: &str,
         input: &str,
         prompter: &mut dyn runtime::PermissionPrompter,
-    ) -> Result<(String, bool), engine_core::DirectToolError> {
+    ) -> Result<runtime::external_a2a::ExternalToolResult, engine_core::DirectToolError> {
         let mut session = self.lock_session();
         let _scope = runtime::WorkspaceRootScope::enter(&session.cwd);
         let runtime = session.runtime.runtime_mut().ok_or_else(|| {
@@ -1216,7 +1216,7 @@ impl engine_core::EngineDelegate for SessionEngine {
                 name,
                 input,
                 Some(prompter),
-                Some(self.background_tasks.clone()),
+                self.background_tasks.clone(),
             ))
             .map_err(|error| engine_core::DirectToolError::Unknown(error.to_string()))
     }

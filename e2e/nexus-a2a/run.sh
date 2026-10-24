@@ -188,6 +188,26 @@ NEXUS_A2A_TEST_ENDPOINT="$ENDPOINT" \
   cargo_in_workspace test --manifest-path "$RUST_DIR/Cargo.toml" -q -p rusty-sudocode-cli \
   --test pty_agent_duet -- --nocapture
 
+echo "== [deterministic] ACP close joins an acquired receiver before replying =="
+NEXUS_A2A_TEST_ENDPOINT="$ENDPOINT" \
+  NEXUS_A2A_TEST_RECEIVER_CREDENTIAL="$(authon_mint "acp-close-receiver")" \
+  cargo_in_workspace test --manifest-path "$RUST_DIR/Cargo.toml" -q -p rusty-sudocode-cli \
+  --test acp_a2a_receive live_session_close_releases_an_acquired_receiver_seat_before_reply \
+  -- --ignored --nocapture
+
+echo "== [deterministic] a real receiver lease handoff preserves terminal drafts =="
+NEXUS_A2A_TEST_ENDPOINT="$ENDPOINT" \
+  NEXUS_A2A_TEST_RECEIVER_CREDENTIAL="$(authon_mint "receiver-draft-probe")" \
+  cargo_in_workspace test --manifest-path "$RUST_DIR/Cargo.toml" -q -p rusty-sudocode-cli \
+  --test pty_node_record live_node_lease_loss_preserves_editable_draft \
+  -- --ignored --exact --test-threads=1 --nocapture
+
+echo "== [deterministic] direct ACP uses no model; pause and lost reply use real mTLS =="
+NEXUS_A2A_TEST_ENDPOINT="$ENDPOINT" NEXUS_A2A_TEST_CERT_DIR="$CLIENT_BUNDLE" \
+  NEXUS_A2A_TEST_DIRECT_CREDENTIAL="$(authon_mint "direct-acp-probe")" \
+  cargo_in_workspace test --manifest-path "$RUST_DIR/Cargo.toml" -q -p rusty-sudocode-cli \
+  --test acp_integration live_direct_a2a_ -- --ignored --test-threads=1 --nocapture
+
 # The path an ACP client drives with no model turn: `_sudocode/a2a/send` runs
 # the session's own `send` tool. The node must stamp the session's
 # authenticated identity on exactly one append, and a call cancelled after its
@@ -217,6 +237,13 @@ NEXUS_A2A_TEST_ENDPOINT="$ENDPOINT" NEXUS_A2A_TEST_CERT_DIR="$CLIENT_BUNDLE" \
 echo "== [deterministic] a failed reader renewal refuses the commit; the reader re-acquires =="
 NEXUS_A2A_TEST_ENDPOINT="$ENDPOINT" NEXUS_A2A_TEST_CERT_DIR="$CLIENT_BUNDLE" \
   "${CARGO_TEST[@]}" live_reader_commit_refused_on_renew_error_then_reacquired_from_durable_offset -- --ignored --nocapture
+
+# The receiver seat trusts only fresh renewals: a late reply, a partition and a
+# slow-but-successful renewal are injected by the test-only wrapper; the node's
+# TTL is what any takeover waits on.
+echo "== [deterministic] the receiver seat trusts only fresh renewals =="
+NEXUS_A2A_TEST_ENDPOINT="$ENDPOINT" NEXUS_A2A_TEST_CERT_DIR="$CLIENT_BUNDLE" \
+  "${CARGO_TEST[@]}" live_receiver_seat_trusts_only_fresh_renewals -- --ignored --nocapture
 
 # A daemon that is alive and SILENT - the failure a unit test cannot construct.
 #
