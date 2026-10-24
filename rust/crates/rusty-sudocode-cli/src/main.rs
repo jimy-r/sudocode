@@ -1644,7 +1644,7 @@ fn run_resume(
                     "kind": "restored",
                     "session_id": session.session_id,
                     "path": handle.path.display().to_string(),
-                    "message_count": session.messages.len(),
+                    "message_count": session.messages().len(),
                 })
             );
             return;
@@ -1683,6 +1683,7 @@ fn run_resume(
     }
 
     let mut session = session;
+    let mut resolved_path = resolved_path;
     for raw_command in commands {
         // Intercept spec commands that have no parse arm before calling
         // SlashCommand::parse — they return Err(SlashCommandParseError) which
@@ -1763,6 +1764,9 @@ fn run_resume(
                 message,
                 json,
             }) => {
+                if let Some(path) = next_session.persistence_path() {
+                    resolved_path = path.to_path_buf();
+                }
                 session = next_session;
                 if output_format == CliOutputFormat::Json {
                     if let Some(value) = json {
@@ -1896,23 +1900,26 @@ fn run_resume_command(
             }
             let backup_path = write_session_clear_backup(session, session_path)?;
             let previous_session_id = session.session_id.clone();
-            let cleared = new_cli_session()?;
+            let mut cleared = new_cli_session()?;
+            cleared.model = session.model.clone();
             let new_session_id = cleared.session_id.clone();
-            cleared.save_to_path(session_path)?;
+            let handle = create_managed_session_handle(&new_session_id)?;
+            let cleared = cleared.with_persistence_path(handle.path.clone());
+            cleared.save_to_path(&handle.path)?;
             Ok(ResumeCommandOutcome {
                 session: cleared,
                 message: Some(format!(
-                    "Session cleared\n  Mode             resumed session reset\n  Previous session {previous_session_id}\n  Backup           {}\n  Resume previous  scode --resume {}\n  New session      {new_session_id}\n  Session file     {}",
+                    "Session cleared\n  Mode             fresh session\n  Previous session {previous_session_id}\n  Backup           {}\n  Resume previous  scode --resume {}\n  New session      {new_session_id}\n  Session file     {}",
                     backup_path.display(),
                     backup_path.display(),
-                    session_path.display()
+                    handle.path.display()
                 )),
                 json: Some(serde_json::json!({
                     "kind": "clear",
                     "previous_session_id": previous_session_id,
                     "new_session_id": new_session_id,
                     "backup": backup_path.display().to_string(),
-                    "session_file": session_path.display().to_string(),
+                    "session_file": handle.path.display().to_string(),
                 })),
             })
         }
@@ -1930,7 +1937,7 @@ fn run_resume_command(
                 message: Some(format_status_report(
                     model,
                     StatusUsage {
-                        message_count: session.messages.len(),
+                        message_count: session.messages().len(),
                         turns: tracker.turns(),
                         latest: tracker.current_turn_usage(),
                         cumulative: usage,
@@ -1944,7 +1951,7 @@ fn run_resume_command(
                 json: Some(status_json_value(
                     session.model.as_deref(),
                     StatusUsage {
-                        message_count: session.messages.len(),
+                        message_count: session.messages().len(),
                         turns: tracker.turns(),
                         latest: tracker.current_turn_usage(),
                         cumulative: usage,
@@ -2049,7 +2056,7 @@ fn run_resume_command(
         }
         SlashCommand::Undo => {
             let already_undone = std::collections::HashSet::new();
-            match crate::cli::undo::find_last_undoable_edit(&session.messages, &already_undone) {
+            match crate::cli::undo::find_last_undoable_edit(&session.messages(), &already_undone) {
                 None => Ok(ResumeCommandOutcome {
                     session: session.clone(),
                     message: Some(
@@ -2086,7 +2093,7 @@ fn run_resume_command(
         SlashCommand::Export { path } => {
             let export_path = resolve_export_path(path.as_deref(), session)?;
             fs::write(&export_path, render_export_text(session))?;
-            let msg_count = session.messages.len();
+            let msg_count = session.messages().len();
             Ok(ResumeCommandOutcome {
                 session: session.clone(),
                 message: Some(format!(
@@ -2373,7 +2380,7 @@ fn run_repl_loop(mut cli: LiveCli) -> Result<(), Box<dyn std::error::Error>> {
     // Same code path for new sessions (messages empty → no-op) and resumed
     // sessions (messages present → render + populate history).
     let session = cli.lifecycle.session_snapshot();
-    let messages = &session.messages;
+    let messages = session.messages();
     if !messages.is_empty() {
         let term_width = crossterm::terminal::size()
             .map(|(cols, _)| cols as usize)
@@ -4214,34 +4221,6 @@ struct LiveCli {
     iocraft_output: Option<repl_ui::OutputSender>,
 }
 
-/// Outcome of [`clear_session_state`].
-struct ClearedSession {
-    /// Empty transcript to rebuild the runtime around (persistence path set).
-    fresh: Session,
-    /// Where `fresh` lives.
-    handle: SessionHandle,
-    /// Where the previous transcript lives — a managed session, so it stays
-    /// resumable (`/resume <id>`).
-    previous: SessionHandle,
-}
-
-/// REPL `/clear` core: the previous transcript stays on disk under its own
-/// id, and a fresh one with a new id and file keeps the workspace root. The
-/// caller rebuilds its runtime around `fresh` (model and permission mode
-/// live in the runtime config, so they carry over).
-fn clear_session_state(
-    cwd: &Path,
-    current_handle: &SessionHandle,
-) -> Result<ClearedSession, Box<dyn std::error::Error>> {
-    let fresh = new_cli_session_for(cwd)?;
-    let handle = create_managed_session_handle_for(cwd, &fresh.session_id)?;
-    Ok(ClearedSession {
-        fresh: fresh.with_persistence_path(handle.path.clone()),
-        handle,
-        previous: current_handle.clone(),
-    })
-}
-
 fn run_acp_server(
     model: String,
     model_flag_raw: Option<String>,
@@ -4698,14 +4677,14 @@ impl LiveCli {
     /// printed only the banner, leaving a resumed session's history invisible.
     fn render_restored_scrollback(&self) -> String {
         let session = self.lifecycle.session_snapshot();
-        if session.messages.is_empty() {
+        if session.messages().is_empty() {
             return String::new();
         }
         let term_width = crossterm::terminal::size()
             .map(|(cols, _)| cols as usize)
             .unwrap_or(80);
         let renderer = render::TerminalRenderer::new();
-        render_messages(&session.messages, term_width, &renderer)
+        render_messages(&session.messages(), term_width, &renderer)
     }
 
     /// Build the status line for a freshly resumed session: the same B2 line the
@@ -4856,6 +4835,7 @@ impl LiveCli {
                     name,
                     output,
                     is_error,
+                    ..
                 } => {
                     // A successful TodoWrite replaces the shared todo list.
                     // The iocraft REPL's TodoSlot derives live from the
@@ -5441,7 +5421,7 @@ impl LiveCli {
                     let session = self.lifecycle.session_snapshot();
                     self.out_println(format_resume_report(
                         &handle.path.display().to_string(),
-                        session.messages.len(),
+                        session.messages().len(),
                         self.lifecycle.usage_snapshot().turns(),
                     ));
                 }
@@ -5683,7 +5663,7 @@ impl LiveCli {
         let report = format_status_report(
             &self.lifecycle.current_model(),
             StatusUsage {
-                message_count: session.messages.len(),
+                message_count: session.messages().len(),
                 turns: usage.turns(),
                 latest,
                 cumulative,
@@ -6344,7 +6324,7 @@ impl LiveCli {
 
     fn handle_undo(&mut self) {
         let session = self.lifecycle.session_snapshot();
-        let messages = &session.messages;
+        let messages = session.messages();
         match crate::cli::undo::find_last_undoable_edit(messages, &self.undone_tool_use_ids) {
             None => {
                 self.out_println(
@@ -6377,7 +6357,7 @@ impl LiveCli {
         self.out_println(format!(
             "Export\n  Result           wrote transcript\n  File             {}\n  Messages         {}",
             export_path.display(),
-            session.messages.len(),
+            session.messages().len(),
         ));
         Ok(())
     }
