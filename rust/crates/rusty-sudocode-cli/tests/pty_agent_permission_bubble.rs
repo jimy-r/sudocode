@@ -176,7 +176,9 @@ print(result)
             "Read exactly OUTPUT_FILE and return the actual invoice output. Only read this report: do not run commands or create another report.",
         );
         let marker = common::turn_status_marker(&cli);
-        cli.send(&format!("The Agent call above saved its report at the outputFile path in its returned result. Call the Agent tool with this exact input object, replacing only OUTPUT_FILE with that actual outputFile path: {verification}. Report that verified output.")).unwrap();
+        // Keep JSON escaping of a Windows verbatim path out of the report
+        // verification journey while still following the returned report.
+        cli.send(&format!("The Agent call above saved its report at the outputFile path in its returned result. Express that same report as a workspace-relative path under .sudocode-agents, using forward slashes. Call the Agent tool with this exact input object, replacing only OUTPUT_FILE with that workspace-relative report path: {verification}. Report that verified output.")).unwrap();
         common::expect_screen(
             &cli,
             |s| {
@@ -267,7 +269,9 @@ print(result)
                         } else {
                             env.workspace_root().join(path)
                         };
-                        let actual = path.canonicalize().expect("report file must exist");
+                        let actual = path.canonicalize().unwrap_or_else(|error| {
+                            panic!("report file {path:?} must exist: {error}")
+                        });
                         let reports = env
                             .workspace_root()
                             .join(".sudocode-agents")
