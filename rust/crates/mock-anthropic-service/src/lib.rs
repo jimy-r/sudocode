@@ -579,6 +579,12 @@ async fn handle_connection(
             socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n").await?;
             let body = build_stream_body(&request, scenario);
             let thinking_count = calls.first().map_or(0, |call| call.stream_thinking.len());
+            let tool_offset = thinking_count
+                + usize::from(
+                    calls
+                        .first()
+                        .is_some_and(|call| call.stream_text_prelude.is_some()),
+                );
             let mut text_waited = false;
             for chunk in body.split_inclusive("\n\n") {
                 socket.write_all(chunk.as_bytes()).await?;
@@ -591,9 +597,12 @@ async fn handle_connection(
                     .as_u64()
                     .and_then(|index| usize::try_from(index).ok());
                 let call = index
-                    .and_then(|index| index.checked_sub(thinking_count))
+                    .and_then(|index| index.checked_sub(tool_offset))
                     .and_then(|index| calls.get(index));
-                let waiting_call = if event["delta"]["type"] == "text_delta" && !text_waited {
+                let waiting_call = if event["delta"]["type"] == "text_delta"
+                    && index == Some(tool_offset + calls.len())
+                    && !text_waited
+                {
                     text_waited = true;
                     calls
                         .iter()
@@ -820,6 +829,8 @@ struct ConcurrencyCall {
     stream_fail_after: bool,
     stream_pause_at: String,
     stream_thinking: Vec<(String, String)>,
+    stream_text_prelude: Option<String>,
+    // These chunks follow the tool-use blocks; introductory text uses prelude.
     stream_text_chunks: Vec<String>,
     id: String,
     name: String,
@@ -864,6 +875,7 @@ fn concurrency_calls(request: &MessageRequest) -> Vec<ConcurrencyCall> {
                     )
                 })
                 .collect(),
+            stream_text_prelude: call["stream_text_prelude"].as_str().map(str::to_owned),
             // File-backed chunks keep response markers out of the echoed prompt.
             stream_text_chunks: call["stream_text_chunks_path"].as_str().map_or_else(
                 || {
@@ -1714,7 +1726,13 @@ fn build_stream_body(request: &MessageRequest, scenario: Scenario) -> String {
                     .flat_map(|call| &call.stream_text_chunks)
                     .map(String::as_str)
                     .collect();
-                tool_uses_sse_with_blocks(&uses, 12, None, &text_chunks, &calls[0].stream_thinking)
+                tool_uses_sse_with_blocks(
+                    &uses,
+                    12,
+                    calls[0].stream_text_prelude.as_deref(),
+                    &text_chunks,
+                    &calls[0].stream_thinking,
+                )
             }
             true => final_text_sse("Concurrency batch done."),
         },

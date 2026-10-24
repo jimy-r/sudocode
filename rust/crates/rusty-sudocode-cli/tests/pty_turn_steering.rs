@@ -37,8 +37,12 @@ fn start(label: &str, hold_stream: bool) -> (TestEnv, PtySession, Release) {
     );
     session.resize(60, 120).unwrap();
     common::expect_input_line_cleared(&session, Duration::from_secs(30), "initial prompt");
+    let input = json!({
+        "command": "sh wait.sh",
+        "timeout": common::LIVE_TURN_BUDGET.as_millis() * 3,
+    });
     let prompt = if env.is_mock() {
-        let mut call = json!({"id":"steer-tool", "name":"Bash", "input":{"command":"sh wait.sh", "timeout":30000}});
+        let mut call = json!({"id":"steer-tool", "name":"Bash", "input":input});
         if hold_stream {
             call["stream_wait_for"] = json!(env.workspace_root().join("release-stream"));
         }
@@ -47,7 +51,7 @@ fn start(label: &str, hold_stream: bool) -> (TestEnv, PtySession, Release) {
             json!([call])
         )
     } else {
-        "Run sh wait.sh in the foreground exactly once. Do not create release-tool. After it completes, briefly report the actual result. Later input may be FYI; continue this original task unless it warrants a change.".into()
+        format!("Run sh wait.sh in the foreground exactly once using these literal Bash inputs: {input}. Do not create release-tool. After it completes, briefly report the actual result. Later input may be FYI; continue this original task unless it warrants a change.")
     };
     submit(&mut session, &prompt, "\r");
     common::expect_screen(
@@ -507,10 +511,8 @@ fn escape_flushes_explicitly_queued_peer_input_without_interrupting_the_task() {
     peer_input(engine_events::InputDelivery::Queue);
 }
 
-#[test]
-fn core_send_delivery_reaches_another_real_repl_without_losing_its_intent() {
+fn core_sender(env: &TestEnv) -> (String, PtySession) {
     use runtime::mailbox::local_pair_root_in;
-    let (env, mut receiver, _release) = start("core-send-delivery", true);
     let agents = local_pair_root_in(env.config_home()).join("agents");
     let target = fs::read_dir(agents)
         .unwrap()
@@ -535,34 +537,53 @@ fn core_send_delivery_reaches_another_real_repl_without_losing_its_intent() {
     );
     sender.resize(60, 120).unwrap();
     common::expect_input_line_cleared(&sender, Duration::from_secs(30), "sender prompt");
-    let body =
-        "PEER_CORE_SEND_BODY: auxiliary FYI only; continue the original task and do not reply.";
-    let calls = json!([{"id":"core-delivery", "name":"send", "input":{
-        "to":target, "message":body, "summary":"queued auxiliary information", "delivery":"queue"
-    }}]);
+    (target, sender)
+}
+
+fn expect_core_delivery(receiver: &PtySession, sender: &PtySession, label: &str) {
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        common::expect_screen(
+            receiver,
+            |view| {
+                view.lines()
+                    .any(|line| line.contains(label) && line.contains("PEER_CORE_SEND_BODY"))
+            },
+            common::LIVE_TURN_BUDGET,
+            "core send's delivery intent survives transport and receipt",
+        )
+    }));
+    if let Err(failure) = result {
+        let context = sender.render(|screen| format!("Sender PTY:\n{}", screen.contents()));
+        eprintln!("{context}");
+        std::panic::resume_unwind(failure);
+    }
+}
+
+fn core_send_delivery(delivery: engine_events::InputDelivery) {
+    let (env, mut receiver, _release) = start("core-send-delivery", true);
+    let (target, mut sender) = core_sender(&env);
+    let body = "Auxiliary calibration result: PEER_CORE_SEND_BODY = 42.";
+    let mut input = json!({"to":target, "message":body, "summary":"auxiliary information"});
+    if delivery == engine_events::InputDelivery::Queue {
+        input["delivery"] = json!("queue");
+    }
+    let calls = json!([{"id":"core-delivery", "name":"send", "input":&input}]);
     let prompt = if env.is_mock() {
         format!("PARITY_SCENARIO:tool_concurrency TOOL_BATCH:{calls}")
     } else {
-        format!("Call send exactly once to {target}, with message {body:?}, summary queued auxiliary information and delivery queue. Do not use other tools. Then briefly acknowledge completion.")
+        format!("I am testing message delivery between two disposable scode instances I started in this workspace. The recipient is my other instance, currently running a shell fixture. Please send it this factual calibration result using the send tool with this JSON input object: {input}. Any delivery field is transport metadata, separate from the summary and message. After send returns, briefly report the result.")
     };
     submit(&mut sender, &prompt, "\r");
-    common::expect_screen(
-        &receiver,
-        |view| {
-            view.lines()
-                .any(|line| line.contains("queued:") && line.contains("PEER_CORE_SEND_BODY"))
-        },
-        common::LIVE_TURN_BUDGET,
-        "core send's queue intent survives transport and receipt",
-    );
+    let label = match delivery {
+        engine_events::InputDelivery::Queue => "queued:",
+        engine_events::InputDelivery::Steer => "steering:",
+    };
+    expect_core_delivery(&receiver, &sender, label);
     finish(&mut sender);
-    receiver.send("\x1b").unwrap();
-    common::expect_screen(
-        &receiver,
-        |view| view.contains("steering:") && view.contains("PEER_CORE_SEND_BODY"),
-        common::DEFAULT_TIMEOUT,
-        "recipient human flushes the queued core-tool message",
-    );
+    if delivery == engine_events::InputDelivery::Queue {
+        receiver.send("\x1b").unwrap();
+        expect_core_delivery(&receiver, &sender, "steering:");
+    }
     fs::write(env.workspace_root().join("release-tool"), "release").unwrap();
     common::expect_screen_settled(
         &receiver,
@@ -590,6 +611,16 @@ fn core_send_delivery_reaches_another_real_repl_without_losing_its_intent() {
         assert!(context.contains("mailbox-message") && !context.contains("Interrupted"));
     }
     finish(&mut receiver);
+}
+
+#[test]
+fn core_send_delivery_reaches_another_real_repl_without_losing_its_intent() {
+    core_send_delivery(engine_events::InputDelivery::Queue);
+}
+
+#[test]
+fn core_send_default_delivery_steers_another_real_repl() {
+    core_send_delivery(engine_events::InputDelivery::Steer);
 }
 
 #[test]
