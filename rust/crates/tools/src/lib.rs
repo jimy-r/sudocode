@@ -14369,15 +14369,23 @@ printf 'pwsh:%s' "$1"
         let _ = std::fs::remove_dir_all(dir);
 
         let output: serde_json::Value = serde_json::from_str(&result).expect("json");
-        assert_eq!(output["exit_code"], 0, "{output}");
-        assert_eq!(output["interrupted"], false, "{output}");
-        assert_eq!(output["stdout"], "pwsh:Write-Output hello", "{output}");
-        assert!(output["stderr"].as_str().expect("stderr").is_empty());
+        // The model gets the compact shell result bash gets: what happened,
+        // without null or default fields.
+        assert_eq!(
+            output,
+            json!({"stdout": "pwsh:Write-Output hello", "exit_code": 0}),
+            "{output}"
+        );
 
         let background_output: serde_json::Value = serde_json::from_str(&background).expect("json");
-        assert!(background_output["backgroundTaskId"].as_str().is_some());
-        assert_eq!(background_output["backgroundedByUser"], true);
-        assert_eq!(background_output["assistantAutoBackgrounded"], false);
+        assert!(
+            background_output["backgroundTaskId"].as_str().is_some(),
+            "{background_output}"
+        );
+        assert!(
+            background_output.get("exit_code").is_none(),
+            "a background run has not exited yet: {background_output}"
+        );
     }
 
     fn powershell_test_candidate(dir: &Path, shell: &str) -> PathBuf {
