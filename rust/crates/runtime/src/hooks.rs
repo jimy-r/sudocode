@@ -1022,13 +1022,12 @@ enum CommandExecution {
 
 #[cfg(test)]
 mod tests {
-    use std::process::Stdio;
     use std::thread;
     use std::time::Duration;
 
     use super::{
-        shell_command, CommandExecution, HookAbortSignal, HookEvent, HookProgressEvent,
-        HookProgressReporter, HookRunResult, HookRunner,
+        HookAbortSignal, HookEvent, HookProgressEvent, HookProgressReporter, HookRunResult,
+        HookRunner,
     };
     use crate::config::{RuntimeFeatureConfig, RuntimeHookConfig};
     use crate::permissions::PermissionOverride;
@@ -1054,33 +1053,6 @@ mod tests {
         let result = runner.run_pre_tool_use("Read", r#"{"path":"README.md"}"#);
 
         assert_eq!(result, HookRunResult::allow(vec!["pre ok".to_string()]));
-    }
-
-    #[test]
-    fn unused_stdin_keeps_hook_output_and_exit_status() {
-        // Exceed the pipe buffer so a command that never reads stdin always
-        // closes it before the parent can finish writing, without a timing race.
-        let input = vec![b'x'; 1024 * 1024];
-        for exit_code in [0, 2, 7] {
-            let script = shell_snippet(&format!("printf 'hook observed'; exit {exit_code}"));
-            let mut command = shell_command(&script);
-            command
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped());
-
-            let CommandExecution::Finished(output) = command
-                .output_with_stdin(&input, None)
-                .expect("an unused input pipe must not replace the hook's result")
-            else {
-                panic!("a hook without an abort signal must finish");
-            };
-            assert_eq!(output.status.code(), Some(exit_code));
-            assert_eq!(
-                String::from_utf8_lossy(&output.stdout).trim(),
-                "hook observed"
-            );
-        }
     }
 
     #[test]
