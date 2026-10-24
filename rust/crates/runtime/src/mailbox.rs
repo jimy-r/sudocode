@@ -1693,7 +1693,7 @@ fn receive_while_seated(
         sleep_unless_aborted(abort, CONVERSATION_DISCOVERY_MS);
     }
     if let Some(loss) = seat.loss() {
-        eprintln!("[{label}] receiver seat lost: {loss}");
+        eprintln!("[{}] receiver seat lost: {loss}", diagnostics.component());
     }
     // Joining is what makes the receiver's handle mean "the receiver has
     // stopped". Without it the caller's join returns while N tails are still
@@ -1794,7 +1794,10 @@ fn spawn_conversation_tail(
                     diagnostics.succeeded(&scope);
                 }
                 if let Some(loss) = reader.lease.loss() {
-                    eprintln!("[{label}] reader for {peer} lost: {loss}");
+                    eprintln!(
+                        "[{}] reader for {peer} lost: {loss}",
+                        diagnostics.component()
+                    );
                 }
             }
         })
