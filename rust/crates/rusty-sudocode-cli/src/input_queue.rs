@@ -18,7 +18,9 @@ pub enum QueueMode {
 impl QueueMode {
     /// Resolve from `SUDOCODE_INTERRUPT_QUEUE_MODE`. Case-insensitive.
     /// Default is `Queue` — message queue ON, matching Claude Code parity.
-    /// Enter steers independently of this setting. Esc flushes pending input;
+    /// In the async REPL, Enter steers independently of the queue setting.
+    /// Startup `off` instead selects the legacy synchronous REPL.
+    /// Esc flushes pending input;
     /// Ctrl+C always cancels through the engine control channel.
     #[must_use]
     pub fn from_env() -> Self {

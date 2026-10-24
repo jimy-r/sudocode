@@ -2307,11 +2307,8 @@ fn run_repl(
         auth_mode,
     )?;
 
-    // Env-gated opt-in to the async REPL that accepts input during a running
-    // turn (see `input_queue` module docs and
-    // `notes/plans/conversation-interrupt-queue-sudocode.md`). When set to
-    // anything other than `off` / unset, dispatch to the async loop. Default
-    // path below stays byte-identical to today's sync behavior.
+    // The default async REPL accepts steering during a running turn.
+    // Explicit startup `off` retains the legacy synchronous receive loop.
     let mode = input_queue::QueueMode::from_env();
     if !matches!(mode, input_queue::QueueMode::Off) {
         return run_repl_iocraft_dispatch(cli, mode);

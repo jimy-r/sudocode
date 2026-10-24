@@ -54,6 +54,10 @@ human messages before history, leaving inbound peer messages queued.
 
 ## Steering, queueing and cancellation
 
+These controls apply to the default asynchronous REPL. Starting with
+`SUDOCODE_INTERRUPT_QUEUE_MODE=off` selects the legacy synchronous REPL,
+which retains turn-boundary delivery.
+
 While the model or tools are working:
 
 | Key | Behavior |

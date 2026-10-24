@@ -789,3 +789,41 @@ fn escape_flush_preserves_the_question_and_its_answer_owner() {
     }
     finish(&mut session);
 }
+
+#[test]
+fn ctrl_c_from_the_task_browser_cancels_even_with_queued_input() {
+    let (env, mut session, _release) = start("task-browser-cancel", true);
+    submit(&mut session, "RETAINED_FROM_TASK_BROWSER", "\t");
+    common::expect_screen(
+        &session,
+        |view| view.contains("queued: RETAINED_FROM_TASK_BROWSER"),
+        common::DEFAULT_TIMEOUT,
+        "input queued before task inspection",
+    );
+    submit(&mut session, "/tasks", "\r");
+    common::expect_screen(
+        &session,
+        |view| view.contains("Background tasks") && view.contains("No background tasks"),
+        common::DEFAULT_TIMEOUT,
+        "task browser owns the keyboard",
+    );
+    session.send("\x03").unwrap();
+    common::expect_screen(
+        &session,
+        |view| {
+            view.to_lowercase().contains("cancelled")
+                && view.contains("queued: RETAINED_FROM_TASK_BROWSER")
+                && !view.contains("No background tasks")
+        },
+        common::DEFAULT_TIMEOUT,
+        "Ctrl+C closes task inspection and cancels work without flushing the queue",
+    );
+    if env.is_mock() {
+        assert_eq!(
+            requests(&env).len(),
+            1,
+            "cancelled work must not restart the retained queue"
+        );
+    }
+    finish(&mut session);
+}

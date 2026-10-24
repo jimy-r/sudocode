@@ -1695,7 +1695,14 @@ fn ReplApp(mut hooks: Hooks) -> impl Into<AnyElement<'static>> {
                 if matches!(current_slot, InputSlot::TextInput) {
                     let mut browser = tasks_for_events.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                     let focus = browser.focus;
-                    if focus != TaskFocus::Input {
+                    let is_cancel = code == KeyCode::Char('c') && modifiers.contains(KeyModifiers::CONTROL);
+                    if focus != TaskFocus::Input && is_cancel {
+                        browser.close();
+                        input_value.set(String::new());
+                    }
+                    // Navigation is local; cancellation always reaches the
+                    // same handler below, including double Ctrl+C to exit.
+                    if focus != TaskFocus::Input && !is_cancel {
                         match (focus, code) {
                             (TaskFocus::Footer, KeyCode::Enter | KeyCode::Down) => browser.open(),
                             (TaskFocus::Footer, KeyCode::Esc | KeyCode::Up) => browser.close(),
@@ -1713,7 +1720,6 @@ fn ReplApp(mut hooks: Hooks) -> impl Into<AnyElement<'static>> {
                             (TaskFocus::Footer, KeyCode::Char(_)) if !modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) => {
                                 browser.close();
                             }
-                            (_, KeyCode::Char('c')) if modifiers.contains(KeyModifiers::CONTROL) => browser.close(),
                             _ => {}
                         }
                         frame.set(frame.get().wrapping_add(1));
