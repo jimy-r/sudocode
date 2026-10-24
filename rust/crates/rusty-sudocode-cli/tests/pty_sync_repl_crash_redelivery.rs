@@ -105,7 +105,7 @@ fn the_next_instance_receives_a_message_the_crashed_one_left_unrun() {
 
     // The redelivered message is live, not a stale notice: Enter runs it and the
     // position finally advances.
-    let turn_before = common::turn_status_marker(&second);
+    let turn_marker = common::turn_status_marker(&second);
     second
         .send("\r")
         .expect("press Enter on the second instance");
@@ -121,26 +121,22 @@ fn the_next_instance_receives_a_message_the_crashed_one_left_unrun() {
         std::thread::sleep(Duration::from_millis(100));
     }
 
-    // The cursor and result precede the rearmed editor. Use the shared turn
-    // identity/readiness contract before sending the next command.
-    common::expect_turn_complete_after(
-        &second,
-        &turn_before,
-        BUDGET,
-        "redelivered message finishes and rearms input",
-    );
-    submit_line(&mut second, "/status");
+    // A durable read position can advance before the input row is rearmed.
+    // Reuse the shared turn/ready gate before asking for a fresh receiver report.
+    let ready_deadline = Instant::now() + BUDGET;
+    common::expect_turn_complete_after(&second, &turn_marker, BUDGET, "redelivered peer turn");
+    submit_line(&mut second, "/status", ready_deadline);
     common::expect_screen_settled(
         &second,
         |screen| {
             common::screen_contains(screen, "receiving; waiting messages run at the next prompt")
                 && common::input_line_of(screen).is_empty()
         },
-        BUDGET,
-        "the replacement receiver reports status and returns to an empty prompt",
+        ready_deadline.saturating_duration_since(Instant::now()),
+        "the new receiver reports ownership and restores its input row",
     );
 
-    submit_line(&mut second, "/exit");
+    submit_line(&mut second, "/exit", ready_deadline);
     let exit = second.expect_eof().unwrap_or_else(|error| {
         panic!(
             "the REPL did not exit: {error:?}\nPTY:\n{}",
@@ -152,13 +148,17 @@ fn the_next_instance_receives_a_message_the_crashed_one_left_unrun() {
 
 /// Observe the command in the live editor before Enter: a status block can
 /// appear before raw input is rearmed, discarding a batched submit key.
-fn submit_line(sess: &mut pty_expect::PtySession, line: &str) {
-    common::expect_input_line_cleared(sess, BUDGET, "ready for the next command");
+fn submit_line(sess: &mut pty_expect::PtySession, line: &str, deadline: Instant) {
+    common::expect_input_line_cleared(
+        sess,
+        deadline.saturating_duration_since(Instant::now()),
+        "ready for the next command",
+    );
     sess.send(line).expect("type command");
     common::expect_screen_settled(
         sess,
         |screen| common::input_line_of(screen) == line,
-        BUDGET,
+        deadline.saturating_duration_since(Instant::now()),
         "command reached the live editor",
     );
     sess.send("\r").expect("submit the rendered command");
