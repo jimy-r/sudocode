@@ -187,6 +187,19 @@ NEXUS_A2A_TEST_ENDPOINT="$ENDPOINT" \
   cargo_in_workspace test --manifest-path "$RUST_DIR/Cargo.toml" -q -p rusty-sudocode-cli \
   --test pty_agent_duet -- --nocapture
 
+echo "== [deterministic] ACP close joins an acquired receiver before replying =="
+NEXUS_A2A_TEST_ENDPOINT="$ENDPOINT" \
+  NEXUS_A2A_TEST_RECEIVER_CREDENTIAL="$(authon_mint "acp-close-receiver")" \
+  cargo_in_workspace test --manifest-path "$RUST_DIR/Cargo.toml" -q -p rusty-sudocode-cli \
+  --test acp_a2a_receive live_session_close_releases_an_acquired_receiver_seat_before_reply \
+  -- --ignored --nocapture
+
+echo "== [deterministic] direct ACP uses no model; pause and lost reply use real mTLS =="
+NEXUS_A2A_TEST_ENDPOINT="$ENDPOINT" NEXUS_A2A_TEST_CERT_DIR="$CLIENT_BUNDLE" \
+  NEXUS_A2A_TEST_DIRECT_CREDENTIAL="$(authon_mint "direct-acp-probe")" \
+  cargo_in_workspace test --manifest-path "$RUST_DIR/Cargo.toml" -q -p rusty-sudocode-cli \
+  --test acp_integration live_direct_a2a_ -- --ignored --test-threads=1 --nocapture
+
 # The path an ACP client drives with no model turn: `_sudocode/a2a/send` runs
 # the session's own `send` tool. The node must stamp the session's
 # authenticated identity on exactly one append, and a call cancelled after its
