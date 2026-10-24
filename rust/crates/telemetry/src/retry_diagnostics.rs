@@ -5,6 +5,7 @@
 //! does not become one terminal warning per worker.
 
 use std::collections::HashMap;
+use std::io::Write;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -154,16 +155,17 @@ impl RetryDiagnostics {
                 .is_none_or(|last| now.duration_since(last) >= REMINDER_INTERVAL)
             {
                 match (self.log(), state.log_error.as_ref()) {
-                    (Ok(log), None) => eprintln!(
-                        "[{}] {} Details: {}",
-                        self.component,
-                        self.pending,
-                        log.path().display()
+                    (Ok(log), None) => self.notice(
+                        scope,
+                        format_args!("{} Details: {}", self.pending, log.path().display()),
                     ),
                     // Do not hide the original cause if its log cannot open.
-                    (Err(reason), _) | (_, Some(reason)) => eprintln!(
-                        "[{}] {} Diagnostic log unavailable ({reason}); {scope}: {error}",
-                        self.component, self.pending
+                    (Err(reason), _) | (_, Some(reason)) => self.notice(
+                        scope,
+                        format_args!(
+                            "{} Diagnostic log unavailable ({reason}); {scope}: {error}",
+                            self.pending
+                        ),
                     ),
                 }
                 state.last_notice = Some(now);
@@ -185,10 +187,30 @@ impl RetryDiagnostics {
                     .last_failure
                     .is_some_and(|last| now.duration_since(last) >= RECOVERY_QUIET_PERIOD)
             {
-                eprintln!("[{}] {}", self.component, self.recovered);
+                self.notice(scope, format_args!("{}", self.recovered));
                 state.active = false;
                 state.last_notice = None;
             }
+        }
+    }
+
+    /// The local record precedes its terminal notice. A closed pipe, terminal
+    /// handoff or unwritable stderr must not panic an observing service. Do not
+    /// retry a partial terminal write: it may already have displayed a prefix.
+    #[inline]
+    fn notice(&self, scope: &str, text: std::fmt::Arguments<'_>) {
+        if let Err(error) = writeln!(std::io::stderr().lock(), "[{}] {text}", self.component) {
+            let context = Map::from_iter([("kind".into(), format!("{:?}", error.kind()).into())]);
+            // This is the existing fallible file path, never another terminal
+            // write or a recursive retry. Retain the terminal's actual error
+            // separately from the original operation's already-saved cause.
+            let _ = self.record(
+                "background_retry_terminal_unavailable",
+                scope,
+                &error.to_string(),
+                0,
+                &context,
+            );
         }
     }
 

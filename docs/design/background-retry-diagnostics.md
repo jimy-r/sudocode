@@ -16,7 +16,13 @@ The first error, changed errors and repeat counts go to the existing rotated
 local `scode.log` / `sudoclaw.log` sink (`SCODE_LOG_PATH` still overrides it).
 These are local diagnostic events, not model messages or remote telemetry.
 An unavailable log falls back to a rate-limited terminal notice retaining the
-original cause.
+original cause. Notices use fallible stderr writes: a closed terminal or a
+descriptor handoff must not panic the observing service. The original operation
+is recorded before its notice. A failed notice gets a separate local
+`background_retry_terminal_unavailable` event with its IO error kind; it is
+never retried, since a prefix may already have been displayed. If both outputs
+are unavailable, reporting remains best effort and does not change the work's
+actual result.
 
 A scope identifies an independently failing operation. A healthy conversation
 does not clear a different conversation's failure. Recovery is reported only
@@ -60,7 +66,11 @@ hold up receiver shutdown. The sync capture is active only around readline;
 turns and external terminal programs inherit the original stderr target.
 Rearming waits for an in-flight stderr writer before taking the capture mutex;
 the forwarder can still drain that writer's old pipe. Suspension does not wait
-for stderr, since changing fd/handle 2 cannot retarget an already-blocked write.
+for stderr. A retained pipe handle keeps its target, but replacing fd 2 on
+Darwin can cancel an in-flight global stderr write with `BrokenPipe`, even
+while both pipe ends remain open. The retry reporter handles that error without
+panicking; this capture does not promise lossless writes from arbitrary
+third-party code which panics on stderr failure.
 The forwarder parks only when idle. Windows' existing pipe reader unparks it
 when a chunk arrives, so bounded batches do not impose a sleep between pending
 chunks. The iocraft owner retains its existing tick; neither path adds a reader.
@@ -125,10 +135,17 @@ Separate subprocess cases gate the actual forwarder and fill the real capture
 pipe with an 8 MiB write while holding Rust's stderr lock. One retains a library
 handle to the old pipe, so rearm must wait until the gate is released and that
 writer finishes. The other writes through global stderr: a short write may
-retry against the restored target, so early completion is allowed, but a failed
-write or suspension waiting for the gated writer is not. Both retain the same
-deadlines and release the gate before reporting assertions. Raw IO results and
-handoff stages survive a child timeout. These isolate pipe/lock ordering with
+retry against the restored target, or Darwin can report `BrokenPipe`. The
+original requirement that this global write must succeed was contradicted by
+the retained macOS CI result and an isolated OS-only descriptor probe; the
+fixture now explicitly asserts the platform's actual IO outcome. The retained
+handle case still requires successful IO and rearm waiting for the writer.
+A third case drives the actual retry reporter through the full pipe: macOS
+must record one real `BrokenPipe` notice failure, retain both original operation
+errors and their scope recoveries, and continue to observe a second operation.
+All cases retain the original deadlines and release the gate before reporting
+assertions. Raw IO results and handoff stages survive a child timeout.
+These isolate pipe/lock ordering with
 a controlled printer; they do not replace the native-editor PTY assertions.
 Exact-head CI and platform results are reported in the PR;
 source preparation alone does not constitute runtime rollout or acceptance.

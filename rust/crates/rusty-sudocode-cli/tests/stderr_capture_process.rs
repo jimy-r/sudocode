@@ -24,6 +24,13 @@ mod input {
     use std::sync::{mpsc, Arc};
     use std::time::Duration;
 
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    pub(super) enum Writer {
+        Retained,
+        Global,
+        Diagnostics,
+    }
+
     struct GatedPrinter {
         entered: Option<mpsc::Sender<()>>,
         release: mpsc::Receiver<()>,
@@ -58,8 +65,8 @@ mod input {
     }
 
     /// A retained library handle must stay on its old pipe across dup2 or
-    /// SetStdHandle. A write_all to the global stderr can instead make a short
-    /// write and retry against the restored target, notably on macOS.
+    /// SetStdHandle. A global stderr write can instead retry on its restored
+    /// target, or fail on Darwin when dup2 cancels its in-flight fd-2 write.
     #[cfg(unix)]
     #[inline]
     fn retained_stderr() -> std::fs::File {
@@ -80,7 +87,7 @@ mod input {
             .unwrap()
     }
 
-    pub(super) fn exercise_rearm(log: &Path, retain_handle: bool) {
+    pub(super) fn exercise_rearm(log: &Path, kind: Writer) {
         const BUDGET: Duration = Duration::from_secs(5);
         let (entered, printing) = mpsc::channel();
         let (release, released) = mpsc::channel();
@@ -100,7 +107,7 @@ mod input {
         output.printer().print("hold the forwarder".into()).unwrap();
         printing.recv_timeout(BUDGET).unwrap();
 
-        let mut retained = retain_handle.then(retained_stderr);
+        let mut retained = (kind == Writer::Retained).then(retained_stderr);
         let (locked, writing) = mpsc::channel();
         let (finished, written) = mpsc::channel();
         let writer_log = log.to_path_buf();
@@ -111,9 +118,29 @@ mod input {
             // Larger than the native pipe plus the Windows capture queue.
             // With the forwarder gated, this write must remain in flight.
             let bytes = vec![b'x'; 8 * 1024 * 1024];
-            let result = match retained.as_mut() {
-                Some(handle) => handle.write_all(&bytes),
-                None => stderr.write_all(&bytes),
+            let result = match kind {
+                Writer::Retained => retained.as_mut().unwrap().write_all(&bytes),
+                Writer::Global => stderr.write_all(&bytes),
+                Writer::Diagnostics => {
+                    // Force a notice through the same real pipe boundary as
+                    // the raw writer. This leaked test-only text lives only in
+                    // this child; production notices remain short constants.
+                    let pending = Box::leak("x".repeat(bytes.len()).into_boxed_str());
+                    let diagnostics = telemetry::RetryDiagnostics::new(
+                        "capture-fixture",
+                        "reader",
+                        pending,
+                        "checks recovered",
+                    );
+                    diagnostics.failed("first", "ORIGINAL_READER_TRANSPORT_ERROR");
+                    diagnostics.succeeded("first");
+                    // The original attempt and its recovery must survive even
+                    // when the terminal notice failed partway through. A
+                    // second scope proves the observer thread kept running.
+                    diagnostics.failed("second", "NEXT_READER_CHECK_CONTINUED");
+                    diagnostics.succeeded("second");
+                    Ok(())
+                }
             };
             drop(stderr);
             // Never panic/report an IO error while owning the global stderr
@@ -181,14 +208,24 @@ mod input {
         stage(log, "capture dropped");
         assert!(!expired.load(Ordering::Acquire), "printer gate expired");
         assert!(was_blocked, "write did not reach pipe backpressure");
-        if retain_handle {
+        if kind == Writer::Retained {
             assert!(rearm_waited, "rearm bypassed the in-flight stderr writer");
         }
         suspended.expect("suspend with an in-flight writer");
         released.expect("release the gated printer");
-        written
-            .expect("drain blocked writer")
-            .expect("stderr write");
+        let written = written.expect("drain blocked writer");
+        // Darwin cancels an in-flight write to fd 2 when dup2 replaces it,
+        // even while other descriptors keep both pipe ends alive. The
+        // retained-handle case still requires lossless IO. The diagnostics
+        // case separately requires the actual observer to survive this error
+        // and retain both original failures and recoveries in its local log.
+        if kind == Writer::Global && cfg!(target_os = "macos") {
+            let error = written.expect_err("Darwin must expose interrupted fd-2 IO");
+            assert_eq!(error.kind(), std::io::ErrorKind::BrokenPipe);
+            println!("DARWIN_FD2_HANDOFF_BROKEN_PIPE");
+        } else {
+            written.expect("retained write or diagnostics observer must finish");
+        }
         ready
             .expect("rearm after pipe drain")
             .expect("rearm capture");
@@ -200,24 +237,33 @@ mod input {
 async fn a_full_capture_pipe_can_drain_while_the_next_prompt_rearms() {
     run_capture_case(
         "a_full_capture_pipe_can_drain_while_the_next_prompt_rearms",
-        true,
+        input::Writer::Retained,
     )
     .await;
 }
 
 #[tokio::test]
-async fn a_global_stderr_write_can_finish_across_prompt_handoff() {
+async fn a_global_stderr_write_exposes_its_actual_handoff_outcome() {
     run_capture_case(
-        "a_global_stderr_write_can_finish_across_prompt_handoff",
-        false,
+        "a_global_stderr_write_exposes_its_actual_handoff_outcome",
+        input::Writer::Global,
     )
     .await;
 }
 
-async fn run_capture_case(test: &str, retain_handle: bool) {
+#[tokio::test]
+async fn a_retry_notice_cannot_abort_its_observer_during_terminal_handoff() {
+    run_capture_case(
+        "a_retry_notice_cannot_abort_its_observer_during_terminal_handoff",
+        input::Writer::Diagnostics,
+    )
+    .await;
+}
+
+async fn run_capture_case(test: &str, kind: input::Writer) {
     const CHILD: &str = "SCODE_CAPTURE_REARM_FIXTURE";
     if let Some(log) = std::env::var_os(CHILD) {
-        input::exercise_rearm(std::path::Path::new(&log), retain_handle);
+        input::exercise_rearm(std::path::Path::new(&log), kind);
         return;
     }
     // Informational layouts from the actual compiler/target. These do not
@@ -231,17 +277,20 @@ async fn run_capture_case(test: &str, retain_handle: bool) {
     );
     // Keep process-global stderr replacement out of the parallel test runner.
     // Kill a deadlocked child on timeout instead of hanging the workspace job.
-    let log = tempfile::NamedTempFile::new().unwrap();
+    let files = tempfile::tempdir().unwrap();
+    let log = files.path().join("handoff.log");
+    let diagnostic_log = files.path().join("diagnostics.log");
     let result = tokio::time::timeout(
         Duration::from_secs(15),
         tokio::process::Command::new(std::env::current_exe().unwrap())
             .args(["--exact", test, "--nocapture"])
-            .env(CHILD, log.path())
+            .env(CHILD, &log)
+            .env("SCODE_LOG_PATH", &diagnostic_log)
             .kill_on_drop(true)
             .output(),
     )
     .await;
-    let stages = std::fs::read_to_string(log.path()).unwrap_or_default();
+    let stages = std::fs::read_to_string(&log).unwrap_or_default();
     let result = result
         .unwrap_or_else(|_| panic!("capture handoff must not deadlock; stages:\n{stages}"))
         .unwrap();
@@ -252,4 +301,41 @@ async fn run_capture_case(test: &str, retain_handle: bool) {
         "stages:\n{stages}\n{stdout}\n{}",
         String::from_utf8_lossy(stderr)
     );
+    if kind == input::Writer::Diagnostics {
+        let original = std::fs::read_to_string(diagnostic_log).unwrap();
+        let records = original
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        for (scope, error) in [
+            ("first", "ORIGINAL_READER_TRANSPORT_ERROR"),
+            ("second", "NEXT_READER_CHECK_CONTINUED"),
+        ] {
+            for action in ["background_retry", "background_retry_scope_recovered"] {
+                assert!(
+                    records.iter().any(|record| {
+                        let attributes = &record["attributes"];
+                        attributes["action"] == action
+                            && attributes["scope"] == scope
+                            && attributes["error"] == error
+                    }),
+                    "missing {action}/{scope}: {original}"
+                );
+            }
+        }
+        if cfg!(target_os = "macos") {
+            let failed = records
+                .iter()
+                .filter(|record| {
+                    record["attributes"]["action"] == "background_retry_terminal_unavailable"
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                failed.len(),
+                1,
+                "must cover the actual failed notice: {original}"
+            );
+            assert_eq!(failed[0]["attributes"]["context"]["kind"], "BrokenPipe");
+        }
+    }
 }
