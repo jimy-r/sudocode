@@ -1957,9 +1957,9 @@ fn ReplApp(mut hooks: Hooks) -> impl Into<AnyElement<'static>> {
         .take()
     {
         system.suspend(move || {
-            let redir = stderr_redir.lock().expect("stderr redirect mutex poisoned");
+            let mut redir = stderr_redir.lock().expect("stderr redirect mutex poisoned");
             let released = redir
-                .as_ref()
+                .as_mut()
                 .map_or(Ok(()), stderr_redirect::StderrRedirect::suspend);
             let is_released = released.is_ok();
             if request.ready.send(released).is_ok() && is_released {
@@ -1967,7 +1967,7 @@ fn ReplApp(mut hooks: Hooks) -> impl Into<AnyElement<'static>> {
                 let _ = request.resume.recv();
             }
             let restored = redir
-                .as_ref()
+                .as_mut()
                 .map_or(Ok(()), stderr_redirect::StderrRedirect::resume);
             let _ = request.done.send(restored);
         });

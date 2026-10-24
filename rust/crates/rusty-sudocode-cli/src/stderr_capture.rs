@@ -48,13 +48,13 @@ mod platform {
 
         /// External programs inherit the real terminal, not the capture pipe.
         #[inline]
-        pub fn suspend(&self) -> std::io::Result<()> {
+        pub fn suspend(&mut self) -> std::io::Result<()> {
             nix::unistd::dup2(self.original_stderr.as_raw_fd(), 2)?;
             Ok(())
         }
 
         #[inline]
-        pub fn resume(&self) -> std::io::Result<()> {
+        pub fn resume(&mut self) -> std::io::Result<()> {
             nix::unistd::dup2(self.write_fd.as_raw_fd(), 2)?;
             Ok(())
         }
@@ -107,6 +107,7 @@ mod platform {
     pub struct StderrRedirect {
         original: FileDescriptor,
         writer: Option<FileDescriptor>,
+        active: bool,
         captured: Option<Receiver<Vec<u8>>>,
         reader: Option<JoinHandle<()>>,
         wake: Arc<OnceLock<std::thread::Thread>>,
@@ -142,15 +143,19 @@ mod platform {
                     }
                 })
                 .ok()?;
-            if redirect(&write).is_err() {
-                drop(write);
-                drop(rx);
-                let _ = reader.join();
-                return None;
-            }
+            let previous = match redirect(&write) {
+                Ok(previous) => previous,
+                Err(_) => {
+                    drop(write);
+                    drop(rx);
+                    let _ = reader.join();
+                    return None;
+                }
+            };
             Some(Self {
-                original,
+                original: previous.unwrap_or(original),
                 writer: Some(write),
+                active: true,
                 captured: Some(rx),
                 reader: Some(reader),
                 wake,
@@ -165,13 +170,32 @@ mod platform {
         }
 
         #[inline]
-        pub fn suspend(&self) -> io::Result<()> {
-            redirect(&self.original)
+        pub fn suspend(&mut self) -> io::Result<()> {
+            if self.active {
+                let previous = redirect(&self.original)?;
+                // Keep the actual displaced pipe handle alive. Closing it can
+                // wait for a synchronous WriteFile while the caller is still
+                // needed to release/drain that write. The old uninstalled
+                // duplicate is not an IO owner and can be dropped instead.
+                if let Some(previous) = previous {
+                    self.writer = Some(previous);
+                }
+                self.active = false;
+            }
+            Ok(())
         }
 
         #[inline]
-        pub fn resume(&self) -> io::Result<()> {
-            self.writer.as_ref().map_or(Ok(()), redirect)
+        pub fn resume(&mut self) -> io::Result<()> {
+            if !self.active {
+                if let Some(writer) = self.writer.as_ref() {
+                    if let Some(previous) = redirect(writer)? {
+                        self.original = previous;
+                    }
+                    self.active = true;
+                }
+            }
+            Ok(())
         }
 
         pub fn drain(&self) -> Option<Vec<u8>> {
@@ -186,7 +210,7 @@ mod platform {
     }
 
     #[inline]
-    fn redirect(source: &FileDescriptor) -> io::Result<()> {
+    fn redirect(source: &FileDescriptor) -> io::Result<Option<FileDescriptor>> {
         let previous = FileDescriptor::redirect_stdio(source, StdioDescriptor::Stderr)
             .map_err(io::Error::other)?;
         // The API transfers the displaced handle, which may still be installed
@@ -196,8 +220,9 @@ mod platform {
             || previous.as_raw_handle() == io::stdin().as_raw_handle()
         {
             let _ = previous.into_raw_handle();
+            return Ok(None);
         }
-        Ok(())
+        Ok(Some(previous))
     }
 
     impl Drop for StderrRedirect {
@@ -227,11 +252,11 @@ impl StderrRedirect {
         None
     }
     #[inline]
-    pub fn suspend(&self) -> std::io::Result<()> {
+    pub fn suspend(&mut self) -> std::io::Result<()> {
         Ok(())
     }
     #[inline]
-    pub fn resume(&self) -> std::io::Result<()> {
+    pub fn resume(&mut self) -> std::io::Result<()> {
         Ok(())
     }
 }

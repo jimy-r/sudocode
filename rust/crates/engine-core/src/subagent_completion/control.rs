@@ -32,14 +32,14 @@ impl CompletionState {
     #[inline]
     pub(super) fn persistence_diagnostics(&self) -> &telemetry::RetryDiagnostics {
         self.persistence_diagnostics.get_or_init(|| {
-            telemetry::RetryDiagnostics::new(
+            Box::new(telemetry::RetryDiagnostics::new(
                 "engine-completion",
                 self.binding
                     .as_ref()
                     .map_or("unbound session", |binding| binding.session_id.as_str()),
                 "Task completion persistence is pending; retrying in the background.",
                 "Task completion persistence checks recovered.",
-            )
+            ))
         })
     }
 

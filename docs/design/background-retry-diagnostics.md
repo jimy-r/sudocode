@@ -64,6 +64,10 @@ for stderr, since changing fd/handle 2 cannot retarget an already-blocked write.
 The forwarder parks only when idle. Windows' existing pipe reader unparks it
 when a chunk arrives, so bounded batches do not impose a sleep between pending
 chunks. The iocraft owner retains its existing tick; neither path adds a reader.
+The completion reporter is boxed behind its lazy cell: healthy completion
+states reserve only the cell/pointer, rather than the reporter's map and strings.
+This reduces inline layout; it does not establish the rendering workload's
+retained state count or explain its measured RSS by itself.
 
 The classic path pins [rustyline 19.0.0](https://github.com/kkawakam/rustyline/releases/tag/v19.0.0),
 which includes [the upstream buffered-input fix](https://github.com/kkawakam/rustyline/pull/977).
@@ -79,8 +83,10 @@ one pipe reader feeds a bounded queue, and the UI tick drains without waiting
 for IO. No workspace `unsafe` exception or engine/renderer channel is added.
 Windows retains a separate restore handle, preserving stdout/stdin handles
 when standard streams share a target. Terminal handoff restores the original
-stderr target and resume reinstalls
-capture. Teardown closes its queue and pipe without waiting for a library's
+stderr target and resume reinstalls capture. Suspension retains the actual
+displaced pipe handle, rather than closing a handle with a synchronous write
+still in flight. Repeated suspend/resume calls are idempotent and keep only one
+saved handle per target. Teardown closes its queue and pipe without waiting for a library's
 retained stderr clone. Headless/ACP output ownership is unchanged.
 
 ## Validation
@@ -115,10 +121,14 @@ The existing long UTF-8 diagnostic PTY case now runs in both modes on all three
 platforms and requires a clean input line afterward. The sync peer PTY preserves
 a Unicode draft and its middle cursor across the real waiting notice, then
 processes a control-key burst before its original peer-turn assertions.
-A separate subprocess regression gates the actual forwarder, fills the real
-capture pipe with an 8 MiB Rust stderr write, suspends capture, then rearms it
-while the writer is still in flight. Releasing the gate must allow both the
-writer and rearm to finish. This isolates pipe/lock ordering with a controlled
-printer; it does not replace the native-editor PTY assertions.
+Separate subprocess cases gate the actual forwarder and fill the real capture
+pipe with an 8 MiB write while holding Rust's stderr lock. One retains a library
+handle to the old pipe, so rearm must wait until the gate is released and that
+writer finishes. The other writes through global stderr: a short write may
+retry against the restored target, so early completion is allowed, but a failed
+write or suspension waiting for the gated writer is not. Both retain the same
+deadlines and release the gate before reporting assertions. Raw IO results and
+handoff stages survive a child timeout. These isolate pipe/lock ordering with
+a controlled printer; they do not replace the native-editor PTY assertions.
 Exact-head CI and platform results are reported in the PR;
 source preparation alone does not constitute runtime rollout or acceptance.

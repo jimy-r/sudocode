@@ -37,7 +37,7 @@ pub(super) struct StderrOutput {
 
 impl StderrOutput {
     pub(super) fn activate(mut printer: impl ExternalPrinter + Send + 'static) -> Option<Self> {
-        let redirect = StderrRedirect::activate()?;
+        let mut redirect = StderrRedirect::activate()?;
         // Outside readline the caller or its child owns the terminal.
         redirect.suspend().ok()?;
         let redirect = Arc::new(Mutex::new(redirect));
@@ -107,7 +107,7 @@ impl StderrOutput {
         // pipe after suspension. Keep the redirect mutex available to the
         // drain worker until that writer releases stderr.
         let _stderr = active.then(|| std::io::stderr().lock());
-        let redirect = self
+        let mut redirect = self
             .redirect
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);

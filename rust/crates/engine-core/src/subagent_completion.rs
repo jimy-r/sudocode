@@ -42,7 +42,9 @@ pub struct CompletionState {
     wake: Arc<tokio::sync::Notify>,
     delivery: Mutex<control::DeliveryState>,
     inner: Mutex<CompletionTurn>,
-    persistence_diagnostics: std::sync::OnceLock<telemetry::RetryDiagnostics>,
+    // Error-only state must not reserve the reporter's map/strings in every
+    // healthy session. Keep allocation lazy as well as initialization.
+    persistence_diagnostics: std::sync::OnceLock<Box<telemetry::RetryDiagnostics>>,
     // Fields drop in declaration order. Keep this last so retirement follows
     // the journal/storage fields, including a worker's final state owner.
     pub(crate) lifetime: crate::attachment::CompletionLifetime,
