@@ -23,6 +23,7 @@ use runtime::{
 
 fn user_text(text: &str) -> ConversationMessage {
     ConversationMessage {
+        history: None,
         role: MessageRole::User,
         blocks: vec![ContentBlock::Text {
             text: text.to_string(),
@@ -35,6 +36,7 @@ fn user_text(text: &str) -> ConversationMessage {
 
 fn assistant_text(text: &str) -> ConversationMessage {
     ConversationMessage {
+        history: None,
         role: MessageRole::Assistant,
         blocks: vec![ContentBlock::Text {
             text: text.to_string(),
@@ -47,6 +49,7 @@ fn assistant_text(text: &str) -> ConversationMessage {
 
 fn assistant_tool_use(id: &str, name: &str, input: &str) -> ConversationMessage {
     ConversationMessage {
+        history: None,
         role: MessageRole::Assistant,
         blocks: vec![ContentBlock::ToolUse {
             id: id.to_string(),

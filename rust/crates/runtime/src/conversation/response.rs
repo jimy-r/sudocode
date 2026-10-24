@@ -176,6 +176,7 @@ impl<C: ApiClient, T: ToolExecutor> ConversationRuntime<C, T> {
                             let (mut parent, ..) = build_assistant_message(prefix).expect("complete tool block supplies content");
                             parent.model = Some(self.running_model().to_string());
                             if let Err(failure) = self.checkpoint_assistant(&mut assistant_index, parent.clone()) { error = Some(failure); break; }
+                            parent.history.clone_from(&self.session.messages[assistant_index.expect("checkpointed assistant")].history);
                             if let Err(failure) = scheduler.enqueue(id.clone(), name.clone(), input.clone(), Some(parent)) {
                                 error = Some(failure); break;
                             }
