@@ -534,7 +534,7 @@ pub(crate) fn render_last_tool_debug_report(
     session: &Session,
 ) -> Result<String, Box<dyn std::error::Error>> {
     let last_tool_use = session
-        .messages
+        .messages()
         .iter()
         .rev()
         .find_map(|message| {
@@ -547,7 +547,7 @@ pub(crate) fn render_last_tool_debug_report(
         })
         .ok_or_else(|| "no prior tool call found in session".to_string())?;
 
-    let tool_result = session.messages.iter().rev().find_map(|message| {
+    let tool_result = session.messages().iter().rev().find_map(|message| {
         message.blocks.iter().rev().find_map(|block| match block {
             ContentBlock::ToolResult {
                 tool_use_id,
