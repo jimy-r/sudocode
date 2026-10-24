@@ -766,6 +766,8 @@ impl FsBackend for StdFsBackend {
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
             Err(error) => return Err(error),
         };
+        // Recovery mutates the same inode that snapshot readers lock.
+        file.lock()?;
         let length = file.metadata()?.len();
         if length == 0 {
             return Ok(());
@@ -921,9 +923,13 @@ impl FsBackend for StdFsBackend {
     fn append(&self, path: &str, data: &[u8]) -> io::Result<()> {
         use std::io::Write;
         let mut file = std::fs::OpenOptions::new()
+            // Windows requires read access to lock an append handle.
+            .read(cfg!(windows))
             .create(true)
             .append(true)
             .open(path)?;
+        // Coordinate legacy appends with native snapshots and record writers.
+        file.lock()?;
         file.write_all(data)
     }
 

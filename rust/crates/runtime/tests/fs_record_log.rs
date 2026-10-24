@@ -156,6 +156,69 @@ fn native_snapshot_waits_for_another_process_to_finish_its_commit() {
 }
 
 #[test]
+fn native_legacy_writes_wait_for_shared_snapshot_readers() {
+    if let Ok(root) = std::env::var(WORKER_DIR) {
+        let root = Path::new(&root);
+        let path = root.join("events.jsonl");
+        std::fs::write(root.join("legacy-ready"), b"ready").unwrap();
+        match std::env::var(WORKER_ID).unwrap().as_str() {
+            "append" => StdFsBackend
+                .append(&path.to_string_lossy(), b"{\"after\":true}\n")
+                .unwrap(),
+            "recover" => StdFsBackend
+                .recover_append_log(&path.to_string_lossy())
+                .unwrap(),
+            operation => panic!("unknown legacy operation: {operation}"),
+        }
+        return;
+    }
+
+    for operation in ["append", "recover"] {
+        let fixture = Fixture::new();
+        let path = fixture.0.join("events.jsonl");
+        let initial = if operation == "append" {
+            b"{\"before\":true}\n".as_slice()
+        } else {
+            b"{\"before\":true}\n{\"partial\":".as_slice()
+        };
+        std::fs::write(&path, initial).unwrap();
+        let mut snapshot = std::fs::File::open(&path).unwrap();
+        snapshot.lock_shared().unwrap();
+        let mut worker = Worker::spawn(
+            &fixture.0,
+            operation,
+            "native_legacy_writes_wait_for_shared_snapshot_readers",
+        );
+        wait_for_marker(&mut worker, &fixture.0.join("legacy-ready"));
+        let deadline = Instant::now() + Duration::from_millis(100);
+        while Instant::now() < deadline {
+            assert!(
+                worker.0.try_wait().unwrap().is_none(),
+                "legacy {operation} bypassed or failed on the snapshot lock"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+        let mut observed = Vec::new();
+        std::io::Read::read_to_end(&mut snapshot, &mut observed).unwrap();
+        assert_eq!(
+            observed, initial,
+            "snapshot bytes changed during {operation}"
+        );
+        snapshot.unlock().unwrap();
+        worker.finish();
+        assert_eq!(
+            std::fs::read(path).unwrap(),
+            if operation == "append" {
+                b"{\"before\":true}\n{\"after\":true}\n".as_slice()
+            } else {
+                b"{\"before\":true}\n".as_slice()
+            },
+            "legacy {operation} must finish after the reader releases its lock"
+        );
+    }
+}
+
+#[test]
 fn native_records_preserve_large_concurrent_process_writes() {
     if let Ok(root) = std::env::var(WORKER_DIR) {
         let id = std::env::var(WORKER_ID).unwrap();
