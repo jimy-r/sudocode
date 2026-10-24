@@ -1525,6 +1525,48 @@ fn a_concurrent_edit_to_existing_history_prevents_checkpoint_installation() {
 }
 
 #[test]
+fn a_rejected_source_refresh_exits_cleanly_and_preserves_the_changed_transcript() {
+    let provider = Provider::new("budget-revision-conflict");
+    let env = budget_env("source-refresh-identity-conflict", &provider);
+    let path = budget_fixture(&env);
+    let mut cli = env.spawn(&["--resume", path.to_str().unwrap()]);
+    common::expect_input_line_cleared(&cli, Duration::from_secs(30), "original source loaded");
+    let original = std::fs::read_to_string(&path).unwrap();
+    let sid = Session::load_from_path(&path).unwrap().session_id;
+    let changed = original.replace(&sid, "session-external-identity");
+    assert_ne!(
+        original, changed,
+        "the fixture must change the durable identity"
+    );
+    std::fs::write(&path, &changed).unwrap();
+    cli.send("/compact\r").unwrap();
+    common::expect_screen(
+        &cli,
+        |screen| screen.contains("source_changed") || screen.contains("source changed"),
+        Duration::from_secs(30),
+        "identity change must reject the source refresh",
+    );
+    common::expect_input_line_cleared(&cli, Duration::from_secs(30), "source rejection finished");
+    cli.send("/exit\r").unwrap();
+    let code = cli.expect_eof().unwrap();
+    let screen = cli.render(rendered_contents);
+    assert_eq!(
+        code, 1,
+        "persistence error must exit normally, not abort: {screen}"
+    );
+    assert!(
+        !screen.contains("threads should not terminate unexpectedly"),
+        "{screen}"
+    );
+    assert!(
+        !screen.contains("thread local panicked on drop"),
+        "{screen}"
+    );
+    assert_eq!(compaction_request_count(&provider), 0);
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), changed);
+}
+
+#[test]
 fn compaction_preserves_external_billing_for_unchanged_history() {
     let provider = Provider::new("budget-weak-then-target");
     let env = budget_env("external-maintenance-ledger", &provider);
