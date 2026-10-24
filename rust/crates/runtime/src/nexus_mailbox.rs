@@ -200,10 +200,10 @@ impl Config {
             tls: credential.tls,
         }))
     }
-    /// Dial the daemon, returning a shared client. mTLS with the credential's
-    /// material when [`Config::tls`] is set (the cert is the whole
-    /// authorization - the node derives identity from its SAN, so no token is
-    /// sent).
+    /// Construct a shared lazy client using this agent's mTLS material.
+    /// Construction does not establish node reachability or authentication;
+    /// actual IO reports those failures. The node derives the authenticated
+    /// identity from the certificate's SAN, so no request token is substituted.
     ///
     /// # Errors
     /// Returns a message if a PEM file cannot be read or the channel fails
