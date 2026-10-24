@@ -51,3 +51,20 @@ pub fn decode_process_output(bytes: &[u8]) -> DecodedText {
     }
     decoded
 }
+
+/// Decode the end of a longer output, cut at a byte offset, as
+/// [`decode_process_output`] does. The cut can fall inside a UTF-8 character;
+/// when skipping the rest of that character is what makes the first line
+/// UTF-8, it is skipped, so the line reads as written instead of starting with
+/// a replacement character or being taken for code-page text.
+#[must_use]
+pub fn decode_process_output_tail(bytes: &[u8]) -> DecodedText {
+    let first_line = bytes
+        .iter()
+        .position(|byte| *byte == b'\n')
+        .map_or(bytes.len(), |newline| newline + 1);
+    let skip = (0..=first_line.min(3))
+        .find(|&skip| std::str::from_utf8(&bytes[skip..first_line]).is_ok())
+        .unwrap_or(0);
+    decode_process_output(&bytes[skip..])
+}

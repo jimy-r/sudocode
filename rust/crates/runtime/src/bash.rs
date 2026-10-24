@@ -1112,17 +1112,12 @@ impl BackgroundShell {
                         .read_to_end(&mut bytes)
                 });
                 if read.is_ok() {
-                    // A tail cut mid-file starts mid-line, possibly mid-character:
-                    // drop that partial line rather than guess what it spelled.
-                    let whole_lines = if start > 0 {
-                        bytes
-                            .iter()
-                            .position(|byte| *byte == b'\n')
-                            .map_or(&bytes[..0], |newline| &bytes[newline + 1..])
+                    final_output = if start > 0 {
+                        process_text::decode_process_output_tail(&bytes)
                     } else {
-                        &bytes[..]
-                    };
-                    final_output = process_text::decode_process_output(whole_lines).text;
+                        process_text::decode_process_output(&bytes)
+                    }
+                    .text;
                     output_truncated = start > 0;
                     self.tasks.update(&self.id, |task| {
                         task.output.clone_from(&final_output);
