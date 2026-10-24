@@ -5,7 +5,7 @@
 //! Esc flushes the queue; cancellation is a separate engine command.
 
 pub use engine_events::InputSource as QueuedKind;
-use engine_events::{InputView, TurnInput};
+use engine_events::{EngineCommand, InputView, TurnInput};
 use std::collections::{BTreeMap, VecDeque};
 
 /// Whether the REPL queues inputs that land while a turn is running.
@@ -162,8 +162,11 @@ pub fn load_queue_mode(shared: &SharedQueueMode) -> QueueMode {
 enum Phase {
     #[default]
     Idle,
+    Preparing,
     Running,
-    Cancelling,
+    Cancelling {
+        resume_requested: bool,
+    },
     Paused,
 }
 
@@ -190,22 +193,52 @@ impl<R> TurnInputCoordinator<R> {
         matches!(self.phase, Phase::Idle)
     }
     pub fn can_steer(&self) -> bool {
+        matches!(self.phase, Phase::Preparing | Phase::Running)
+    }
+    pub fn can_deliver(&self) -> bool {
         matches!(self.phase, Phase::Running)
     }
     pub fn has_idle_queue(&self) -> bool {
         !self.is_running() && !self.queue.is_empty()
     }
     pub fn is_running(&self) -> bool {
-        matches!(self.phase, Phase::Running | Phase::Cancelling)
+        matches!(
+            self.phase,
+            Phase::Preparing | Phase::Running | Phase::Cancelling { .. }
+        )
     }
     pub fn is_paused(&self) -> bool {
-        matches!(self.phase, Phase::Cancelling | Phase::Paused)
+        matches!(
+            self.phase,
+            Phase::Cancelling {
+                resume_requested: false
+            } | Phase::Paused
+        )
     }
     pub fn start_turn(&mut self) {
-        self.phase = Phase::Running;
+        self.phase = Phase::Preparing;
+    }
+    /// Engine admission opens the inbox and resets abort before this receipt.
+    /// Controls accepted during preparation must follow that reset, never precede it.
+    pub fn turn_started(&mut self) -> Option<EngineCommand> {
+        match self.phase {
+            Phase::Preparing => {
+                self.phase = Phase::Running;
+                let inputs = self
+                    .steering
+                    .values()
+                    .map(|input| input.input.clone())
+                    .collect::<Vec<_>>();
+                (!inputs.is_empty()).then_some(EngineCommand::Steer { inputs })
+            }
+            Phase::Cancelling { .. } => Some(EngineCommand::Cancel),
+            _ => None,
+        }
     }
     pub fn cancel_turn(&mut self) {
-        self.phase = Phase::Cancelling;
+        self.phase = Phase::Cancelling {
+            resume_requested: false,
+        };
     }
     pub fn finish_turn(&mut self) {
         let paused = self.is_paused();
@@ -217,11 +250,11 @@ impl<R> TurnInputCoordinator<R> {
         };
     }
     pub fn resume(&mut self) {
-        self.phase = if self.is_running() {
-            Phase::Running
-        } else {
-            Phase::Idle
-        };
+        match &mut self.phase {
+            Phase::Cancelling { resume_requested } => *resume_requested = true,
+            Phase::Paused => self.phase = Phase::Idle,
+            _ => {}
+        }
     }
 
     fn identify(&mut self, input: &mut TurnInput) {

@@ -2716,12 +2716,7 @@ enum CoordinatorEvent {
     },
     /// A background shell or monitor the model started has ended.
     ///
-    /// Separate from [`Self::SubagentCompleted`] because the two want opposite
-    /// idle behaviour: a sub-agent result wakes a turn (the model delegated the
-    /// work and is waiting for it), while a background task must NOT seize an
-    /// idle prompt — the human may be mid-thought or exiting. It is queued and
-    /// delivered with the next turn, which still keeps the tool description's
-    /// promise that the model hears about it without polling.
+    /// Uses the same idle wake-up and active-turn intake as sub-agent results.
     BackgroundTaskCompleted {
         prompt: String,
         display: String,
@@ -2729,6 +2724,7 @@ enum CoordinatorEvent {
     InputCommitted(u64),
     InputDeferred(Vec<engine_events::TurnInput>),
     PumpQueue,
+    TurnStarted,
     TurnComplete,
 }
 
@@ -3517,6 +3513,9 @@ fn run_repl_iocraft_dispatch(
                 // Its UI uses the same seam as every other engine consumer.
                 match &event {
                     EngineEvent::State(state) => activity.observe_engine_state(*state),
+                    EngineEvent::TurnStarted { .. } => {
+                        let _ = completion_tx.send(CoordinatorEvent::TurnStarted);
+                    }
                     EngineEvent::BackgroundTask(event) => {
                         task_ui.background_task(event.clone());
                         // The panel is for the human; the model is a second
@@ -3650,6 +3649,12 @@ fn run_repl_iocraft_dispatch(
             event => event,
         };
         match event {
+            CoordinatorEvent::TurnStarted => {
+                let command = coord.lock().unwrap().turn_started();
+                if let Some(command) = command {
+                    let _ = commands.send(command);
+                }
+            }
             CoordinatorEvent::InputCommitted(id) => {
                 // This receipt means the prompt is durable, not just in a channel.
                 if let Some(receipt) = coord.lock().unwrap().committed(id) {
@@ -3826,13 +3831,7 @@ fn run_repl_iocraft_dispatch(
                     coord.lock().unwrap().resume();
                     if coord.lock().unwrap().is_running() {
                         let inputs = coord.lock().unwrap().flush();
-                        // Update the same row ids in place, preserving tool/input order.
-                        for input in &inputs {
-                            repl_ui_cmd.steering_push(input);
-                        }
-                        if !inputs.is_empty() {
-                            let _ = commands.send(EngineCommand::Steer { inputs });
-                        }
+                        deliver_steering_inputs(&coord, inputs, &commands, &repl_ui_cmd);
                     } else {
                         let _ = coord_tx.send(CoordinatorEvent::PumpQueue);
                     }
@@ -4265,20 +4264,34 @@ fn stage_turn_input(
     match delivery {
         engine_events::InputDelivery::Steer => {
             let input = coord.lock().unwrap().steer(input);
-            ui.steering_push(&input);
-            if commands
-                .send(EngineCommand::Steer {
-                    inputs: vec![input.clone()],
-                })
-                .is_err()
-            {
-                coord.lock().unwrap().defer(input.id);
-                ui.pending_input(input.view(), engine_events::InputDelivery::Queue);
-            }
+            deliver_steering_inputs(coord, vec![input], commands, ui);
         }
         engine_events::InputDelivery::Queue => {
             let view = coord.lock().unwrap().enqueue(input);
             ui.pending_input(view, engine_events::InputDelivery::Queue);
+        }
+    }
+}
+
+fn deliver_steering_inputs(
+    coord: &Arc<Mutex<input_queue::TurnInputCoordinator<mpsc::Sender<()>>>>,
+    inputs: Vec<engine_events::TurnInput>,
+    commands: &mpsc::Sender<EngineCommand>,
+    ui: &repl_ui::UiCommandSender,
+) {
+    // Keep row ids and tool/input ordering while preparation still owns delivery.
+    for input in &inputs {
+        ui.steering_push(input);
+    }
+    if inputs.is_empty() || !coord.lock().unwrap().can_deliver() {
+        return;
+    }
+    if let Err(mpsc::SendError(EngineCommand::Steer { inputs })) =
+        commands.send(EngineCommand::Steer { inputs })
+    {
+        for input in inputs {
+            coord.lock().unwrap().defer(input.id);
+            ui.pending_input(input.view(), engine_events::InputDelivery::Queue);
         }
     }
 }

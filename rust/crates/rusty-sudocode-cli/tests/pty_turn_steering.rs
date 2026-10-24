@@ -79,6 +79,172 @@ fn finish(session: &mut PtySession) {
     assert_eq!(session.expect_eof().unwrap(), 0);
 }
 
+/// Hold real prompt preparation before the runner sends `EngineCommand::Prompt`.
+#[cfg(unix)]
+fn preparing_turn(label: &str) -> (TestEnv, PtySession, fs::File, Release) {
+    use std::{cell::RefCell, os::unix::fs::OpenOptionsExt};
+    let env = TestEnv::new_mock(label);
+    let image = env.workspace_root().join("preparing.png");
+    assert!(std::process::Command::new("mkfifo")
+        .arg(&image)
+        .status()
+        .unwrap()
+        .success());
+    let mut prompt = common::terminal_host::prose_prompt(
+        &env,
+        "RenderBodySTART ORIGINAL_RESPONSE RenderBodyEND.",
+        json!({
+            "start_ready": env.workspace_root().join("provider-ready"),
+            "start_release": env.workspace_root().join("release-provider"),
+        }),
+    );
+    let marker = prompt.find("PROSE_CONTROL:").unwrap();
+    prompt.insert_str(marker, &format!("@{} ", image.display()));
+    let mut session = env.spawn_with_env(
+        &["--permission-mode", "danger-full-access"],
+        &[("SUDOCODE_INTERRUPT_QUEUE_MODE", "queue")],
+    );
+    session.resize(60, 120).unwrap();
+    common::expect_input_line_cleared(&session, common::DEFAULT_TIMEOUT, "ready");
+    submit(&mut session, &prompt, "\r");
+    let writer = RefCell::new(None);
+    common::expect_screen(
+        &session,
+        |_| {
+            if let Ok(file) = fs::OpenOptions::new()
+                .write(true)
+                .custom_flags(nix::libc::O_NONBLOCK)
+                .open(&image)
+            {
+                *writer.borrow_mut() = Some(file);
+                true
+            } else {
+                false
+            }
+        },
+        common::DEFAULT_TIMEOUT,
+        "prompt preparation reached the held image read",
+    );
+    let release = Release(env.workspace_root().to_path_buf());
+    (env, session, writer.into_inner().unwrap(), release)
+}
+
+#[cfg(unix)]
+fn release_prepared_image(mut writer: fs::File) {
+    use base64::Engine as _;
+    use std::io::Write;
+    // One RGB pixel, encoded independently of the application's image loader.
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGNg+M8AAAICAQB7CYF4AAAAAElFTkSuQmCC")
+        .unwrap();
+    writer.write_all(&bytes).unwrap();
+}
+
+#[test]
+#[cfg(unix)]
+fn cancel_during_prompt_preparation_is_not_lost_before_engine_admission() {
+    let (_env, mut session, writer, _release) = preparing_turn("preparation-cancel");
+    session.send("\x03").unwrap();
+    // Keep preparation held while the idle engine handles the control command.
+    std::thread::sleep(Duration::from_millis(100));
+    release_prepared_image(writer);
+    common::expect_screen(
+        &session,
+        |view| view.to_lowercase().contains("cancelled"),
+        Duration::from_secs(10),
+        "cancel still applies when the prepared turn reaches the engine",
+    );
+    session.send("/exit\r").unwrap();
+    assert_eq!(session.expect_eof().unwrap(), 0);
+}
+
+#[test]
+#[cfg(unix)]
+fn steering_during_prompt_preparation_reaches_the_same_active_turn() {
+    let (env, mut session, writer, _release) = preparing_turn("preparation-steer");
+    submit(
+        &mut session,
+        "EARLY_STEER: continue the original task.",
+        "\r",
+    );
+    common::expect_screen(
+        &session,
+        |view| view.contains("EARLY_STEER"),
+        common::DEFAULT_TIMEOUT,
+        "early input remains pending while preparation is held",
+    );
+    release_prepared_image(writer);
+    common::expect_screen(
+        &session,
+        |_| {
+            env.captured_message_bodies()
+                .iter()
+                .any(|body| body.contains("EARLY_STEER"))
+        },
+        Duration::from_secs(10),
+        "early steering reaches the model without waiting for the original response",
+    );
+    session.send("/exit\r").unwrap();
+    assert_eq!(session.expect_eof().unwrap(), 0);
+}
+
+#[test]
+#[cfg(unix)]
+fn cancelling_preparation_then_enter_resumes_only_after_the_cancelled_turn() {
+    let (env, mut session, writer, _release) = preparing_turn("preparation-resume");
+    session.send("\x03").unwrap();
+    std::thread::sleep(Duration::from_millis(100));
+    submit(
+        &mut session,
+        "EARLY_FOLLOWUP: continue with this input.",
+        "\r",
+    );
+    release_prepared_image(writer);
+    common::expect_screen(
+        &session,
+        |view| {
+            view.to_lowercase().contains("cancelled")
+                && env
+                    .captured_message_bodies()
+                    .iter()
+                    .any(|body| body.contains("EARLY_FOLLOWUP"))
+        },
+        Duration::from_secs(10),
+        "early follow-up starts after cancellation settles",
+    );
+    session.send("/exit\r").unwrap();
+    assert_eq!(session.expect_eof().unwrap(), 0);
+}
+
+#[test]
+#[cfg(unix)]
+fn escape_flush_during_preparation_delivers_the_whole_queue_after_admission() {
+    let (env, mut session, writer, _release) = preparing_turn("preparation-flush");
+    submit(&mut session, "EARLY_QUEUE_ONE", "\t");
+    submit(&mut session, "EARLY_QUEUE_TWO", "\t");
+    session.send("\x1b").unwrap();
+    common::expect_screen(
+        &session,
+        |view| view.contains("steering: EARLY_QUEUE_TWO"),
+        common::DEFAULT_TIMEOUT,
+        "the whole early queue is marked for delivery",
+    );
+    release_prepared_image(writer);
+    common::expect_screen(
+        &session,
+        |_| {
+            env.captured_message_bodies()
+                .iter()
+                .any(|body| body.contains("EARLY_QUEUE_ONE") && body.contains("EARLY_QUEUE_TWO"))
+        },
+        Duration::from_secs(10),
+        "the flushed batch reaches the model after preparation",
+    );
+    assert!(session.render(|screen| !screen.contents().to_lowercase().contains("cancelled")));
+    session.send("/exit\r").unwrap();
+    assert_eq!(session.expect_eof().unwrap(), 0);
+}
+
 #[test]
 fn enter_steers_without_cancelling_an_admitted_tool_or_waiting_for_response_end() {
     let (env, mut session, _release) = start("enter-steer", true);
