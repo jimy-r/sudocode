@@ -66,7 +66,7 @@ fn tool_identity_is_required_and_scoping_clears_that_gate() {
     // refusal has MOVED PAST the identity gate, which is exactly what the fix
     // buys. Asserting the error changed (rather than asserting success) keeps
     // this test honest about what a journal without a running turn can prove.
-    let scoped = tasks.for_tool(Some("toolu_identity_probe"));
+    let scoped = tasks.for_tool(Some("msg_identity_probe"), Some("toolu_identity_probe"));
     let scoped_error = runtime::launch_background_command(
         runtime::shell_command_in(&cwd, "printf 'identity\\n'"),
         ShellKind::Bash,

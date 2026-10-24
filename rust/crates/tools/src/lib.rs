@@ -1940,9 +1940,9 @@ fn execute_tool_with_enforcer(
             run_monitor(
                 monitor_input,
                 ctx.and_then(|ctx| {
-                    ctx.background_tasks
-                        .as_ref()
-                        .map(|tasks| tasks.for_tool(ctx.tool_use_id.as_deref()))
+                    ctx.background_tasks.as_ref().map(|tasks| {
+                        tasks.for_tool(ctx.assistant_message_id(), ctx.tool_use_id.as_deref())
+                    })
                 })
                 .as_ref(),
             )
