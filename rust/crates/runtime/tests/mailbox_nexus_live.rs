@@ -1680,7 +1680,7 @@ fn listed_path(parent: &str, name: &str) -> String {
     if name.starts_with('/') {
         name.to_string()
     } else {
-        format!("{parent}/{name}")
+        format!("{}/{name}", parent.trim_end_matches('/'))
     }
 }
 
@@ -1798,7 +1798,7 @@ fn live_cohost_session_resume() {
         std::fs::write(&scratch, bytes).unwrap();
         let loaded = runtime::Session::load_from_path(&scratch);
         std::fs::remove_file(&scratch).unwrap();
-        loaded.unwrap().messages
+        loaded.unwrap().into_messages()
     };
     let old_messages = messages(&old_bytes);
     assert_eq!(
@@ -1809,30 +1809,14 @@ fn live_cohost_session_resume() {
         1
     );
     request["resume_session_id"] = json!(sid);
-    assert!(
-        rpc("managed_agent.start_session_v1", &request).is_err(),
-        "active transcript resumed twice"
-    );
     rpc(
         "managed_agent.cancel_v1",
         &json!({"session_id":first["session_id"],"mode":"session"}),
     )
     .unwrap();
-    drop(controller);
-    // Cancel signals the worker. Recovery must wait for its last write and lease
-    // release rather than stealing a still-running transcript.
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-    let second = loop {
-        match rpc("managed_agent.start_session_v1", &request) {
-            Ok(started) => break started,
-            Err(error)
-                if error.contains("still running") && std::time::Instant::now() < deadline =>
-            {
-                std::thread::sleep(std::time::Duration::from_millis(100))
-            }
-            Err(error) => panic!("restore failed: {error}"),
-        }
-    };
+    // The closing frame follows engine shutdown and the final durable save.
+    controller.wait_closed();
+    let second = rpc("managed_agent.start_session_v1", &request).unwrap();
     let _controller = Controller::attach(&operator, &second, "");
     assert_ne!(second["session_id"], first["session_id"]);
     assert_eq!(second["durable_session_id"], sid);
@@ -1850,12 +1834,10 @@ fn live_cohost_session_resume() {
         "",
     )
     .unwrap();
-    // The restored history carries the first turn's `send` tool result, so on
-    // the rebased line the scenario's mock calls `send` again: the reply the
-    // operator's mailbox must see is the "PONG" body the scenario sends. Poll
-    // the operator transcript from the start — the full replay is what resume
-    // is for.
-    let mut op_cursor = 0u64;
+    // Only a new mailbox reply proves that the restored runtime processed
+    // this turn. Replaying from zero can accept the pre-restart PONG while
+    // the new runtime is still ready and has not appended any messages.
+    let mut op_cursor = cursor;
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         let (received, next) = mb
@@ -1916,6 +1898,269 @@ fn live_cohost_session_resume() {
     .unwrap();
     println!(
         "COHOST RESUME OK: durable={sid}, old_pid={}, new_pid={}",
+        first["session_id"], second["session_id"]
+    );
+}
+
+/// Two independent managed runtimes keep separate active contexts in one SID.
+/// Model-side file gates prove overlap through the real daemon's WAL backend.
+#[test]
+#[ignore = "requires the shared-history stage of e2e/nexus-a2a/run-cohost.sh"]
+fn live_cohost_shared_sid_concurrent_contexts() {
+    use runtime::history::{HistoryGraph, HistoryRecord};
+    use serde_json::{json, Value};
+    let operator = Arc::new(model_operator());
+    let agent = format!("shared-sid-probe-{}", fresh());
+    let model = std::env::var("NEXUS_A2A_TEST_MODEL").unwrap();
+    let rpc = |method: &str, params: &Value| -> Value {
+        let bytes = operator
+            .call(method, params.to_string().as_bytes(), "")
+            .unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    };
+    let mut request = json!({"agent_id":agent,"owner_id":"root","zone_id":"root","model":model});
+    let first = rpc("managed_agent.start_session_v1", &request);
+    let first_controller = Controller::attach(&operator, &first, "");
+    let sid = first["durable_session_id"].as_str().unwrap();
+    request["resume_session_id"] = json!(sid);
+    let root = std::env::temp_dir().join(format!("scode-cohost-shared-{}", fresh()));
+    std::fs::create_dir_all(&root).unwrap();
+    struct Release(Vec<std::path::PathBuf>);
+    impl Drop for Release {
+        fn drop(&mut self) {
+            for path in &self.0 {
+                let _ = std::fs::write(path, "release");
+            }
+        }
+    }
+    let prompt = |label: &str| {
+        let path = root.join(format!("{label}.json"));
+        std::fs::write(
+            &path,
+            json!({
+                "document":format!("{label}_MODEL_DONE"),
+                "start_ready":root.join(format!("{label}.ready")),
+                "start_release":root.join(format!("{label}.release")),
+                "release":root.join(format!("{label}.release")),"delay_ms":0
+            })
+            .to_string(),
+        )
+        .unwrap();
+        json!({"sessionId":sid,"prompt":[{"type":"text","text":format!(
+            "{label}_CONTEXT_PROMPT PARITY_SCENARIO:prose_preview PROSE_CONTROL:{}", json!({"path":path})
+        )}]})
+    };
+    let wait_ready = |label: &str| {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while !root.join(format!("{label}.ready")).exists() {
+            assert!(
+                Instant::now() < deadline,
+                "{label} model request did not connect"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+    };
+    let (second, second_controller) = thread::scope(|scope| {
+        let _release = Release(vec![root.join("A.release"), root.join("B.release")]);
+        let first_prompt = prompt("A");
+        let a = scope.spawn(|| first_controller.request("session/prompt", first_prompt));
+        wait_ready("A");
+        let second = rpc("managed_agent.start_session_v1", &request);
+        let second_controller = Arc::new(Controller::attach(&operator, &second, ""));
+        assert_eq!(second["durable_session_id"], sid);
+        assert_ne!(first["session_id"], second["session_id"]);
+        let second_prompt = prompt("B");
+        let controller = Arc::clone(&second_controller);
+        let b = scope.spawn(move || controller.request("session/prompt", second_prompt));
+        wait_ready("B");
+        std::fs::write(root.join("B.release"), "release").unwrap();
+        let response = b.join().unwrap();
+        assert_eq!(response["result"]["stopReason"], "end_turn", "{response}");
+        assert!(!root.join("A.release").exists());
+        std::fs::write(root.join("A.release"), "release").unwrap();
+        let response = a.join().unwrap();
+        assert_eq!(response["result"]["stopReason"], "end_turn", "{response}");
+        (second, second_controller)
+    });
+    for (controller, label) in [(&first_controller, "A"), (second_controller.as_ref(), "B")] {
+        // This launch has no repository mount. Use the Agent's durable VFS
+        // subtree rather than treating its empty procfs workspace as storage.
+        let file = format!("/agents/{agent}/memory/shared-{label}.txt");
+        let content = format!("{label} VFS durable effect");
+        let calls =
+            json!([{"id":"call_1","name":"write_file","input":{"path":file,"content":content}}]);
+        let response = controller.request(
+            "session/prompt",
+            json!({
+                "sessionId":sid,"prompt":[{"type":"text","text":format!(
+                    "PARITY_SCENARIO:tool_concurrency TOOL_BATCH:{calls}"
+                )}]
+            }),
+        );
+        assert_eq!(response["result"]["stopReason"], "end_turn", "{response}");
+        let stored = operator.read(&file, "").unwrap_or_else(|error| {
+            let mut cursor = 0;
+            let mut durable = Vec::new();
+            loop {
+                let frame = operator
+                    .stream_read_at(
+                        &format!("/sessions/{sid}/transcript.jsonl"),
+                        cursor,
+                        false,
+                        0,
+                        "",
+                    )
+                    .unwrap();
+                if frame.data.is_empty() {
+                    break;
+                }
+                cursor = frame.next_offset;
+                durable.extend(frame.data);
+            }
+            panic!(
+                "workspace effect missing: {error}; history: {}",
+                String::from_utf8_lossy(&durable)
+            )
+        });
+        assert_eq!(stored, content.as_bytes());
+    }
+    let path = format!("/sessions/{sid}/transcript.jsonl");
+    let mut durable = Vec::new();
+    let mut cursor = 0;
+    loop {
+        let frame = operator
+            .stream_read_at(&path, cursor, false, 0, "")
+            .unwrap();
+        if frame.data.is_empty() {
+            break;
+        }
+        assert!(frame.next_offset > cursor);
+        durable.extend(frame.data);
+        cursor = frame.next_offset;
+    }
+    let history = String::from_utf8(durable).unwrap();
+    let graph = HistoryGraph::decode(history.as_bytes()).expect("committed v3 history");
+    let mut tool_origins = std::collections::BTreeSet::new();
+    for line in history.lines() {
+        let record: HistoryRecord = serde_json::from_str(line).unwrap();
+        if let Some(id) = record.message_id() {
+            if let Some(origin) = graph.tool_origin(id, "call_1") {
+                tool_origins.insert(origin.to_owned());
+            }
+        }
+    }
+    assert_eq!(
+        tool_origins.len(),
+        2,
+        "reused call IDs require separate assistant origins"
+    );
+    for label in ["A", "B"] {
+        assert!(history.contains(&format!("{label}_CONTEXT_PROMPT")));
+        assert!(history.contains(&format!("{label}_MODEL_DONE")));
+    }
+    let requests = operator.readdir("/model", "").unwrap();
+    for label in ["A", "B"] {
+        let own = format!("{label}_CONTEXT_PROMPT");
+        let other = format!("{}_CONTEXT_PROMPT", if label == "A" { "B" } else { "A" });
+        let captured: Vec<_> = requests
+            .iter()
+            .filter(|entry| entry.name.ends_with(".prompt"))
+            .filter_map(|entry| operator.read(&listed_path("/model", &entry.name), "").ok())
+            .filter_map(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+            .filter(|request| request["body"]["messages"].to_string().contains(&own))
+            .collect();
+        assert!(
+            !captured.is_empty(),
+            "actual model request for {label} missing"
+        );
+        assert!(
+            captured
+                .iter()
+                .all(|request| !request["body"]["messages"].to_string().contains(&other)),
+            "contexts crossed"
+        );
+    }
+    let linked_agent = format!("{agent}-linked");
+    let mut linked_request = request.clone();
+    linked_request["agent_id"] = json!(linked_agent);
+    assert!(
+        operator
+            .call(
+                "managed_agent.start_session_v1",
+                linked_request.to_string().as_bytes(),
+                "",
+            )
+            .is_err(),
+        "another Agent must explicitly link this SID before restoring it"
+    );
+    let link_session = |name: &str, target: &str| {
+        operator.ensure_dir(&format!("/agents/{name}"), "").unwrap();
+        operator
+            .ensure_dir(&format!("/agents/{name}/sessions"), "")
+            .unwrap();
+        operator
+            .ensure_link(&format!("/agents/{name}/sessions/{sid}"), target, "")
+            .unwrap();
+    };
+    let wrong_agent = format!("{agent}-wrong-link");
+    link_session(&wrong_agent, "/sessions/another-sid");
+    let mut wrong_request = linked_request.clone();
+    wrong_request["agent_id"] = json!(wrong_agent);
+    assert!(operator
+        .call(
+            "managed_agent.start_session_v1",
+            wrong_request.to_string().as_bytes(),
+            "",
+        )
+        .is_err());
+    link_session(&linked_agent, &format!("/sessions/{sid}"));
+    let mut wrong_owner = linked_request.clone();
+    wrong_owner["owner_id"] = json!("another-owner");
+    assert!(operator
+        .call(
+            "managed_agent.start_session_v1",
+            wrong_owner.to_string().as_bytes(),
+            "",
+        )
+        .is_err());
+    let linked = rpc("managed_agent.start_session_v1", &linked_request);
+    assert_eq!(linked["durable_session_id"], sid);
+    let linked_controller = Controller::attach(&operator, &linked, "");
+    let linked_file = format!("/agents/{linked_agent}/memory/linked-sid.txt");
+    let calls = json!([{"id":"call_1","name":"write_file","input":{
+        "path":linked_file,"content":"linked Agent durable effect"
+    }}]);
+    let linked_response = linked_controller.request(
+        "session/prompt",
+        json!({"sessionId":sid,"prompt":[{"type":"text","text":format!(
+            "PARITY_SCENARIO:tool_concurrency TOOL_BATCH:{calls}"
+        )}]}),
+    );
+    assert_eq!(linked_response["result"]["stopReason"], "end_turn");
+    assert_eq!(
+        operator.read(&linked_file, "").unwrap(),
+        b"linked Agent durable effect"
+    );
+    let mut complete_history = history.into_bytes();
+    loop {
+        let frame = operator
+            .stream_read_at(&path, cursor, false, 0, "")
+            .unwrap();
+        if frame.data.is_empty() {
+            break;
+        }
+        assert!(frame.next_offset > cursor);
+        cursor = frame.next_offset;
+        complete_history.extend(frame.data);
+    }
+    let graph = HistoryGraph::decode(&complete_history).expect("linked Agent committed history");
+    let completed = graph.completed_session(None).unwrap();
+    assert_eq!(completed.session_id, sid);
+    assert_eq!(completed.identity.as_ref().unwrap().agent_name, agent);
+    assert!(completed.messages().iter().flat_map(|message| &message.blocks).any(|block|
+        matches!(block, runtime::ContentBlock::Text { text } if text.contains("linked Agent durable effect"))));
+    println!(
+        "COHOST SHARED SID OK: {sid}, linked Agent={linked_agent}, independent PIDs={},{}",
         first["session_id"], second["session_id"]
     );
 }
