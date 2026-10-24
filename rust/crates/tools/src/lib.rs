@@ -1919,9 +1919,9 @@ fn execute_tool_with_enforcer(
                 bash_input,
                 abort_signal,
                 ctx.and_then(|ctx| {
-                    ctx.background_tasks
-                        .as_ref()
-                        .map(|tasks| tasks.for_tool(ctx.tool_use_id.as_deref()))
+                    ctx.background_tasks.as_ref().map(|tasks| {
+                        tasks.for_tool(ctx.assistant_message_id(), ctx.tool_use_id.as_deref())
+                    })
                 })
                 .as_ref(),
             )
@@ -2009,9 +2009,9 @@ fn execute_tool_with_enforcer(
                 ps_input,
                 abort_signal,
                 ctx.and_then(|ctx| {
-                    ctx.background_tasks
-                        .as_ref()
-                        .map(|tasks| tasks.for_tool(ctx.tool_use_id.as_deref()))
+                    ctx.background_tasks.as_ref().map(|tasks| {
+                        tasks.for_tool(ctx.assistant_message_id(), ctx.tool_use_id.as_deref())
+                    })
                 })
                 .as_ref(),
             )
@@ -4889,7 +4889,11 @@ impl SubagentLink {
         );
         Some(Self {
             tasks: ctx.background_tasks.clone(),
-            scope: Arc::new(SubagentScope::new(manifest.agent_id.clone(), spawn_call_id)),
+            scope: Arc::new(SubagentScope::new(
+                manifest.agent_id.clone(),
+                spawn_call_id,
+                ctx.assistant_message_id().map(str::to_owned),
+            )),
             spawner,
             identity: SubagentIdentity {
                 agent_id: manifest.agent_id.clone(),
@@ -4923,6 +4927,7 @@ impl SubagentLink {
             spawner.register_completion(
                 SubagentLifecycle {
                     tool_call_id: self.scope.parent_tool_call_id().to_string(),
+                    assistant_message_id: self.scope.assistant_message_id().map(str::to_owned),
                     phase: SubagentPhase::Started,
                     seq: 0,
                     agent: self.identity.clone(),
@@ -4960,6 +4965,7 @@ impl SubagentLink {
             &self.scope,
             SubagentLifecycle {
                 tool_call_id: self.scope.parent_tool_call_id().to_string(),
+                assistant_message_id: self.scope.assistant_message_id().map(str::to_owned),
                 phase: SubagentPhase::Started,
                 seq: 0,
                 agent: self.identity.clone(),
@@ -5027,6 +5033,7 @@ impl SubagentLink {
             &self.scope,
             SubagentLifecycle {
                 tool_call_id: self.scope.parent_tool_call_id().to_string(),
+                assistant_message_id: self.scope.assistant_message_id().map(str::to_owned),
                 phase: SubagentPhase::Finished,
                 seq: 0,
                 agent: self.identity.clone(),
@@ -5093,7 +5100,14 @@ impl RuntimeObserver for SubagentForwarder {
         });
     }
 
-    fn on_tool_result(&mut self, tool_use_id: &str, tool_name: &str, output: &str, is_error: bool) {
+    fn on_tool_result(
+        &mut self,
+        _assistant_message_id: Option<&str>,
+        tool_use_id: &str,
+        tool_name: &str,
+        output: &str,
+        is_error: bool,
+    ) {
         if let Some(tasks) = &self.tasks {
             tasks.update(&self.agent_id, |task| {
                 use std::fmt::Write as _;
@@ -9160,6 +9174,7 @@ fn build_forked_messages(
     user_blocks.push(ContentBlock::Text { text: child_text });
 
     let user_message = ConversationMessage {
+        history: None,
         role: MessageRole::User,
         blocks: user_blocks,
         usage: None,
@@ -11728,6 +11743,7 @@ mod tests {
 
     #[test]
     fn core_definitions_includes_all_tools_with_defer_loading() {
+        let _guard = env_guard();
         let registry = GlobalToolRegistry::builtin();
         let core = registry.core_definitions(None, None);
         let all = registry.definitions(None);
@@ -11781,6 +11797,8 @@ mod tests {
 
     #[test]
     fn deferred_tool_listing_returns_non_core_tools() {
+        // Cron visibility shares process-global configuration with the host-gating test.
+        let _guard = env_guard();
         let registry = GlobalToolRegistry::builtin();
         let listing = registry.deferred_tool_listing();
         let names: BTreeSet<_> = listing.iter().map(|(n, _)| n.as_str()).collect();
@@ -11885,6 +11903,7 @@ mod tests {
             },
         ])];
         messages.push(ConversationMessage {
+            history: None,
             role: MessageRole::Tool,
             blocks: vec![ContentBlock::ToolResult {
                 tool_use_id: "tu_1".to_string(),
@@ -11941,6 +11960,7 @@ mod tests {
         });
         let messages = vec![
             ConversationMessage {
+                history: None,
                 role: MessageRole::Tool,
                 blocks: vec![ContentBlock::ToolResult {
                     tool_use_id: "tu_1".to_string(),
@@ -11953,6 +11973,7 @@ mod tests {
                 duration_ms: None,
             },
             ConversationMessage {
+                history: None,
                 role: MessageRole::Tool,
                 blocks: vec![ContentBlock::ToolResult {
                     tool_use_id: "tu_2".to_string(),
@@ -12887,7 +12908,7 @@ mod tests {
         );
         assert!(runtime
             .session()
-            .messages
+            .messages()
             .iter()
             .flat_map(|message| message.blocks.iter())
             .any(|block| matches!(
