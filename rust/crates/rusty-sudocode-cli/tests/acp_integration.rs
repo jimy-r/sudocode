@@ -34,7 +34,6 @@ use mock_anthropic_service::{
     SUBAGENT_CHILD_TOOL_ID,
 };
 use openai_compat_mock::OpenAiCompatMock;
-use runtime::fs_backend::{FsBackend, RecordLogMode, StdFsBackend};
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
@@ -6327,6 +6326,15 @@ fn seed_legacy_completion(workspace: &TestWorkspace, sid: &str, context: &Value)
 
 #[tokio::test]
 async fn acp_legacy_completion_upgrade_preserves_context_and_model_history() {
+    exercise_legacy_completion_upgrade(false).await;
+}
+
+#[tokio::test]
+async fn acp_legacy_completion_upgrade_into_record_history_preserves_context_and_model_history() {
+    exercise_legacy_completion_upgrade(true).await;
+}
+
+async fn exercise_legacy_completion_upgrade(is_record_history: bool) {
     let server = MockAnthropicService::spawn().await.unwrap();
     let workspace = TestWorkspace::new("legacy-completion-upgrade");
     workspace.create();
@@ -6335,7 +6343,10 @@ async fn acp_legacy_completion_upgrade_preserves_context_and_model_history() {
         spawn_stdio_client_with_args_and_env(
             &workspace,
             &["--permission-mode", "danger-full-access"],
-            &[("SUDOCODE_EXPERIMENT_SHARED_SESSION_HISTORY", "0")],
+            &[(
+                "SUDOCODE_EXPERIMENT_SHARED_SESSION_HISTORY",
+                if is_record_history { "1" } else { "0" },
+            )],
         )
     };
     let mut producer = spawn();
@@ -7758,7 +7769,7 @@ async fn acp_task_completions_interrupted_shell_and_encoded_budget() {
 }
 
 /// Concurrent ACP contexts append to the same SID while retaining separate
-/// completion ownership. A sibling never repairs another context's live tool.
+/// completion ownership. A continuation repairs only its frozen inherited tail.
 #[tokio::test]
 async fn acp_completions_keep_live_contexts_independent_during_replay_and_load() {
     let server = MockAnthropicService::spawn().await.unwrap();
@@ -7786,13 +7797,11 @@ async fn acp_completions_keep_live_contexts_independent_during_replay_and_load()
         .await
         .unwrap();
     let transcript = find_session_transcript(&workspace.root, &sid);
+    let read_transcript = || {
+        runtime::FsBackend::read_snapshot(&runtime::StdFsBackend, &transcript.to_string_lossy())
+            .unwrap()
+    };
     let journal = completion_context_path(&workspace, &sid);
-    // Join the writer's record protocol: Windows enforces its commit lock even
-    // against raw file reads, and snapshots must contain only complete records.
-    let history = StdFsBackend
-        .record_log(&transcript.to_string_lossy(), RecordLogMode::Existing)
-        .unwrap();
-    let read_transcript = || history.read(0).expect("read committed transcript").0;
     // The question can reach ACP before the provider's final usage update is
     // persisted. Wait for that durable boundary while the question keeps the
     // turn open; otherwise the owner itself can change our byte snapshot.
@@ -7898,16 +7907,16 @@ async fn acp_completions_keep_live_contexts_independent_during_replay_and_load()
     assert_eq!(continued["result"]["stopReason"], "end_turn", "{continued}");
     let continued_transcript = read_transcript();
     assert!(
-        !String::from_utf8_lossy(&continued_transcript)
+        String::from_utf8_lossy(&continued_transcript)
             .contains("Side effects may already have occurred"),
-        "a sibling must not repair another runtime's interrupted tool"
+        "the continuation must retain its inherited tool's unknown outcome"
     );
     let requests = server.captured_requests().await;
     let request = &requests.last().unwrap().raw_body;
     assert!(
-        !request.contains("Side effects may already have occurred")
-            && !request.contains(&format!("{SCENARIO_PREFIX}ask_user_question_roundtrip")),
-        "the resumed model must exclude the sibling's unfinished turn: {request}"
+        request.contains("Side effects may already have occurred")
+            && request.contains(&format!("{SCENARIO_PREFIX}ask_user_question_roundtrip")),
+        "the resumed model must inherit the written turn and its recovery result: {request}"
     );
     competitor.shutdown().await;
     assert_eq!(fs::read(&journal).unwrap(), before_journal);
@@ -7924,7 +7933,6 @@ async fn acp_completions_keep_live_contexts_independent_during_replay_and_load()
         read_transcript().starts_with(&continued_transcript),
         "a further restart must retain both contexts and append history"
     );
-    drop(history);
     competitor.shutdown().await;
 
     // Unreleased, non-locking v1 records require explicit offline handling.
