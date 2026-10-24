@@ -64,6 +64,9 @@ disconnects the print queue, then restores stderr before joining.
 The receiver only queues display text, so a blocked terminal print cannot
 hold up receiver shutdown. The sync capture is active only around readline;
 turns and external terminal programs inherit the original stderr target.
+Error exits also abort/join the receiver and clear the shared editor in normal
+stack cleanup. Its capture worker is never left for thread-local destruction
+just because a final transcript save failed.
 Rearming waits for an in-flight stderr writer before taking the capture mutex;
 the forwarder can still drain that writer's old pipe. Suspension does not wait
 for stderr. A retained pipe handle keeps its target, but replacing fd 2 on
@@ -149,3 +152,16 @@ These isolate pipe/lock ordering with
 a controlled printer; they do not replace the native-editor PTY assertions.
 Exact-head CI and platform results are reported in the PR;
 source preparation alone does not constitute runtime rollout or acceptance.
+
+The retained Windows compaction-conflict failure also exposed a source-refresh
+ownership boundary. Reloading the same live transcript must keep that context's
+existing writer, which can still be held by a snapshot or completion journal.
+Fresh source/checkpoint caches are retained; no second writer is opened. Record
+history refreshes the existing continuation, never the latest sibling's view.
+An identity/workspace/owner change or a closed/deleted writer remains an error.
+The original conflict PTY still requires a successful normal exit. A rejected
+identity refresh exercises normal error exit without a TLS teardown abort and
+checks that the changed transcript is untouched. A real record-history runtime
+case retains the original writer across refresh and a subsequent model turn
+while excluding a sibling's committed private history. These fixtures do not
+establish the cause of the original Windows TLS abort on their own.
