@@ -1,5 +1,7 @@
 //! Pure formatting and report functions extracted from `main.rs`.
 
+mod a2a;
+
 use std::fmt::Write as _;
 
 use engine_core::{AuthMode, ProviderKind};
@@ -721,6 +723,8 @@ pub(crate) enum ToolKind {
     WebSearch,
     Skill,
     ReadToolOutput,
+    Send,
+    AgentList,
 }
 
 impl ToolKind {
@@ -737,6 +741,8 @@ impl ToolKind {
             Self::WebSearch => "WebSearch",
             Self::Skill => "Skill",
             Self::ReadToolOutput => "ReadToolOutput",
+            Self::Send => "Send",
+            Self::AgentList => "AgentList",
         }
     }
 
@@ -762,6 +768,8 @@ impl ToolKind {
             "web_search" | "WebSearch" => Some(Self::WebSearch),
             "Skill" => Some(Self::Skill),
             "read_tool_output" => Some(Self::ReadToolOutput),
+            "send" | "Send" => Some(Self::Send),
+            "agent_list" | "AgentList" => Some(Self::AgentList),
             _ => None,
         }
     }
@@ -782,6 +790,14 @@ pub(crate) fn describe_tool_progress(name: &str, input: &str) -> String {
                 format!("command {}", truncate_for_summary(command.trim(), 100))
             }
         }
+        Some(ToolKind::Send) => format!(
+            "sending to {}",
+            parsed
+                .get("to")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("?")
+        ),
+        Some(ToolKind::AgentList) => "listing agents".to_string(),
         Some(ToolKind::Read) => format!("reading {}", extract_tool_path(&parsed)),
         Some(ToolKind::Write) => format!("writing {}", extract_tool_path(&parsed)),
         Some(ToolKind::Edit) => format!("editing {}", extract_tool_path(&parsed)),
@@ -865,6 +881,8 @@ pub(crate) fn tool_card_content(
 ) -> ToolCardContent {
     match ToolKind::from_name(name) {
         Some(ToolKind::Bash) => bash_card(input, output, status),
+        Some(ToolKind::Send) => a2a::send_card(input, output, status),
+        Some(ToolKind::AgentList) => a2a::agent_list_card(input, output, status),
         Some(ToolKind::Read) => read_card(input, output, status),
         Some(ToolKind::Write) => write_card(input, output, status),
         Some(ToolKind::Edit) => edit_card(input, output, status),
@@ -1034,7 +1052,16 @@ pub(crate) fn format_tool_result(name: &str, input: &str, output: &str, is_error
             None
         } else {
             let removed = ansi_fg(theme().diff_removed);
-            Some(format!("{removed}{summary}{RESET}"))
+            let target = if ToolKind::from_name(name) == Some(ToolKind::Send) {
+                in_val
+                    .get("to")
+                    .and_then(serde_json::Value::as_str)
+                    .map(|to| format!("To: {to}\n"))
+                    .unwrap_or_default()
+            } else {
+                String::new()
+            };
+            Some(format!("{target}{removed}{summary}{RESET}"))
         };
     }
     if let (Some(feedback), false) = (hook_feedback, is_error) {
