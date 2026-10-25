@@ -44,6 +44,15 @@ fn inspection_preserves_a_fresh_profile_and_absent_runtime() {
 }
 
 #[test]
+fn help_exposes_runtime_setup_without_preparing_services() {
+    let root = tempfile::tempdir().unwrap();
+    let result = command(root.path()).arg("--help").output().unwrap();
+    assert!(result.status.success());
+    assert!(String::from_utf8_lossy(&result.stdout).contains("scode setup [--mode local|shared]"));
+    assert!(!root.path().join("services").exists());
+}
+
+#[test]
 fn choosing_local_never_installs_starts_or_calls_a_model() {
     let root = tempfile::tempdir().unwrap();
     let model = std::net::TcpListener::bind("127.0.0.1:0").unwrap();

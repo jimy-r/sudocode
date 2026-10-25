@@ -4,6 +4,10 @@ Day-to-day `scode` workflows.
 
 ## Installation and updates
 
+Choose daemon-free execution or shared local services with
+[`scode setup`](shared-services.md). The runtime owner, installation behavior
+and separate collaboration-enrollment boundary are defined there.
+
 Install macOS/Linux with the [installer](../install.sh), or choose a platform
 package from [GitHub Releases](https://github.com/sudoprivacy/sudocode/releases/latest).
 Release builds check for updates in the background when an interactive terminal
