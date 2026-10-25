@@ -38,7 +38,13 @@ fn unfinished_unsupported_and_narrow_fences_keep_readable_source() {
     assert!(!unfinished.contains("source shown"));
     for (source, width) in [("pie\n\"Cats\": 2\n", 80), (source, 8)] {
         let output = render(&format!("```mermaid\n{source}```\n"), width);
-        assert!(output.contains("source shown"), "{output}");
+        assert!(
+            output
+                .split_whitespace()
+                .collect::<String>()
+                .contains("Mermaidsourceshown:"),
+            "{output}"
+        );
         assert!(output.contains(source), "{output}");
     }
     let unsafe_source = render("```mermaid\nflowchart TD\nA[\x1b[2J]\n```", 80);

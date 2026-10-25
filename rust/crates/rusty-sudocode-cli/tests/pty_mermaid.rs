@@ -31,11 +31,17 @@ fn mermaid_stream_and_replay_preserve_input_and_original_markdown() {
         common::expect_input_line_cleared(&session, Duration::from_secs(30), "initial prompt");
         let initial_status = common::turn_status_marker(&session);
         session.send(&prompt).unwrap();
-        common::expect_input_line(
+        let complete_prompt = prompt.split_whitespace().collect::<String>();
+        common::expect_screen(
             &session,
-            &prompt,
+            |screen| {
+                screen
+                    .split_whitespace()
+                    .collect::<String>()
+                    .contains(&complete_prompt)
+            },
             common::DEFAULT_TIMEOUT,
-            "complete prompt",
+            "complete prompt across wrapped input rows",
         );
         session.send("\r").unwrap();
         let screen = common::expect_screen_settled(
