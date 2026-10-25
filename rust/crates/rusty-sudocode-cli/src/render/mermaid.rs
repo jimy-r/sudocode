@@ -64,7 +64,9 @@ pub(super) fn stream_boundary(source: &str, boundary: Option<usize>) -> Option<u
             Event::End(TagEnd::CodeBlock) if fence.is_some() => {
                 let fence = fence.take().expect("Mermaid fence");
                 if boundary > block_start
-                    && (boundary < fence.end || !has_closing_fence(source, fence, content_end))
+                    && (boundary < fence.end
+                        || (boundary == fence.end && !source[..boundary].ends_with('\n'))
+                        || !has_closing_fence(source, fence, content_end))
                 {
                     return (block_start > 0).then_some(block_start);
                 }

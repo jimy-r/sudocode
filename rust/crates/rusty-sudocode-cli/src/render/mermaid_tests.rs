@@ -99,3 +99,18 @@ fn streaming_keeps_nested_mermaid_fences_with_blank_lines_together() {
     );
     assert_eq!(output.trim(), render(&format!("{prefix}{tail}"), 78).trim());
 }
+
+#[test]
+fn a_partial_closing_line_cannot_commit_a_diagram() {
+    let renderer = TerminalRenderer::new().with_color_support(ColorSupport::NoColor);
+    let mut stream = MarkdownStreamState::default();
+    let prefix = "```mermaid\nflowchart TD\nA --> B\n```";
+    assert!(stream.push(&renderer, prefix).is_none());
+    assert!(stream.push(&renderer, "junk\n").is_none());
+    let output = stream.flush(&renderer).unwrap();
+    assert!(
+        output.contains("flowchart TD") && output.contains("```junk"),
+        "{output}"
+    );
+    assert!(!output.contains("source shown"));
+}
