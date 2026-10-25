@@ -138,7 +138,7 @@ fn undersized_picker_cannot_confirm_an_unseen_selection() {
     sess.resize(6, 80).unwrap();
     common::expect_screen_settled(
         &sess,
-        |s| s.contains("Enlarge terminal to review"),
+        |s| s.contains("Enlarge terminal to review; Ctrl+C cancels"),
         common::DEFAULT_TIMEOUT,
         "size warning",
     );

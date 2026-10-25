@@ -76,9 +76,9 @@ impl FooterTips {
                     (_, cache) => cache,
                 }
             })
-            .or((!active).then_some(&ordinary))
             .filter(|tip| !active || tip.priority == TipPriority::Urgent)
             .or(control.as_ref())
+            .or((!active).then_some(&ordinary))
             .filter(|tip| tasks.focus == TaskFocus::Input || tip.priority == TipPriority::Urgent);
 
         let mut base = truncate_to_width(&format!("  ⏵⏵ {permission}"), width);

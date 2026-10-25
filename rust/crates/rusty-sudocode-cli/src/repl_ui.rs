@@ -969,6 +969,17 @@ pub enum InputEvent {
     Exit,
 }
 
+/// Share the active input controls between the footer and scrollback notices.
+#[must_use]
+#[inline]
+pub(crate) const fn running_input_controls(has_pending_input: bool) -> &'static str {
+    if has_pending_input {
+        "Enter steer · Tab queue · Esc flush · Ctrl+C cancel"
+    } else {
+        "Enter steer · Tab queue · Esc/Ctrl+C cancel"
+    }
+}
+
 /// Handle returned by `spawn_repl_ui` for the coordinator to use.
 pub struct ReplHandle {
     pub output: OutputSender,
@@ -2157,12 +2168,10 @@ fn ReplApp(mut hooks: Hooks) -> impl Into<AnyElement<'static>> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .iter()
         .any(|item| matches!(item, PendingItem::Input { .. }));
-    let controls = if pending_input && !turn_active {
-        Some("Enter send · Esc flush · ↑ edit queued")
+    let controls = if turn_active {
+        Some(running_input_controls(pending_input))
     } else if pending_input {
-        Some("Enter steer · Tab queue · Esc flush · Ctrl+C cancel")
-    } else if turn_active {
-        Some("Enter steer · Tab queue · Esc/Ctrl+C cancel")
+        Some("Enter send · Esc flush · ↑ edit queued")
     } else {
         None
     };
@@ -2365,7 +2374,7 @@ fn ReplApp(mut hooks: Hooks) -> impl Into<AnyElement<'static>> {
     let input_warning = layout.warning.clone().or_else(|| {
         ((!matches!(current_input_slot, InputSlot::TextInput) || task_panel.is_some())
             && !input_layout.fits_controls)
-            .then(|| "Enlarge terminal to review; Esc cancels".to_string())
+            .then(|| "Enlarge terminal to review; Ctrl+C cancels".to_string())
     });
     let reviewable = input_warning.is_none();
     input_frame.set_enabled(reviewable);

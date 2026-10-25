@@ -3908,7 +3908,13 @@ fn run_repl_iocraft_dispatch(
                         continue;
                     }
                     if coord.lock().unwrap().is_running() && trimmed.starts_with('/') {
-                        repl_output.println("A turn is running; use Enter to steer, Tab to queue, Esc to flush, or Ctrl+C to cancel before changing session settings.");
+                        let controls = repl_ui::running_input_controls(
+                            coord.lock().unwrap().has_pending_input(),
+                        );
+                        repl_output.println(&format!(
+                            "{}A turn is running; finish or cancel before changing session settings.\n{controls}{RESET}",
+                            theme().muted_fg(),
+                        ));
                         continue;
                     }
                     // Try slash command dispatch.

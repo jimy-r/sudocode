@@ -414,8 +414,9 @@ same editor, preserving the complete text and cursor.
 The choice controls stay visible while the document is read in native history
 or the pager. If the terminal is too small to show those controls
 safely, an enlargement warning replaces the panel; confirmation and hidden
-edits are disabled, but Esc/Ctrl-C can still cancel. Resizing does not answer a
-question, alter the saved plan, or clear conversation history.
+edits are disabled. Ctrl+C can still cancel; Esc follows the pending-message
+controls described above. Resizing does not answer a question, alter the saved
+plan, or clear conversation history.
 
 `write_plan` saves the complete Markdown document, including Context,
 Constraints, and Acceptance Criteria, before presenting it for review. The
@@ -435,14 +436,16 @@ conversation. The current input draft is retained. For UI that fits within
 the viewport, resize clears only the live UI from its retained start position,
 without clearing the preceding conversation or purging terminal scrollback.
 
-While a turn is running, messages you submit wait in the staging area.
+While a turn is running, Enter steers the current task and Tab queues a message
+for the next turn. Pending messages stay visible in the staging area until
+consumed, with `queued` and `steering` labels indicating their delivery state.
 Each queued preview uses a muted label and normal-intensity message text;
 narrow windows shorten the label and clip the preview, not the queued text.
 Press ↑ on an empty input to bring all queued human messages back for editing,
 joined in their original submit order. Their staging entries disappear;
 peer/A2A messages remain queued. The cursor starts at the end of the recalled
-text, and further arrow presses use normal cursor navigation. Submitting it
-queues the edited text again. On an empty input with no queued human message,
+text, and further arrow presses use normal cursor navigation. Enter steers with
+the edited text; Tab queues it again. On an empty input with no queued human message,
 ↑ recalls prompt history.
 
 A line starting with `!` runs the rest as a shell command instead of

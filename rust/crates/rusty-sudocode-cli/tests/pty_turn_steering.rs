@@ -71,6 +71,15 @@ fn requests(env: &TestEnv) -> Vec<Value> {
         .collect()
 }
 
+fn expect_controls(session: &PtySession, text: &str) {
+    common::expect_screen(
+        session,
+        |view| common::input_and_footer_of(view).is_some_and(|footer| footer.contains(text)),
+        common::DEFAULT_TIMEOUT,
+        text,
+    );
+}
+
 fn finish(session: &mut PtySession) {
     common::expect_screen(
         session,
@@ -319,6 +328,7 @@ fn tab_queues_for_the_next_turn_without_affecting_the_current_tool_continuation(
 #[test]
 fn escape_flushes_every_queued_input_without_cancellation() {
     let (env, mut session, _release) = start("escape-flush", true);
+    expect_controls(&session, "Enter steer · Tab queue · Esc/Ctrl+C cancel");
     submit(&mut session, "FLUSH_FIRST", "\t");
     submit(&mut session, "FLUSH_SECOND", "\t");
     common::expect_screen(
@@ -326,6 +336,10 @@ fn escape_flushes_every_queued_input_without_cancellation() {
         |view| view.contains("queued: FLUSH_SECOND"),
         common::DEFAULT_TIMEOUT,
         "both messages queued",
+    );
+    expect_controls(
+        &session,
+        "Enter steer · Tab queue · Esc flush · Ctrl+C cancel",
     );
     session.send("UNSENT_DRAFT").unwrap();
     common::expect_input_line(
@@ -347,6 +361,7 @@ fn escape_flushes_every_queued_input_without_cancellation() {
         common::DEFAULT_TIMEOUT,
         "flush preserves unsent draft",
     );
+    session.render(|screen| assert!(!screen.contents().contains("Cancelled")));
     fs::write(env.workspace_root().join("release-tool"), "release").unwrap();
     common::expect_screen(
         &session,
@@ -382,6 +397,7 @@ fn ctrl_c_cancels_with_queued_input_and_busy_management_cannot_block_it() {
         Duration::from_secs(10),
         "hard cancellation preserves unapplied input",
     );
+    expect_controls(&session, "Enter send · Esc flush · ↑ edit queued");
     if env.is_mock() {
         assert_eq!(
             env.captured_message_count(),
@@ -1034,5 +1050,7 @@ fn ctrl_c_from_the_task_browser_cancels_even_with_queued_input() {
             "cancelled work must not restart the retained queue"
         );
     }
-    finish(&mut session);
+    expect_controls(&session, "Enter send · Esc flush · ↑ edit queued");
+    submit(&mut session, "/exit", "\r");
+    assert_eq!(session.expect_eof().unwrap(), 0);
 }
