@@ -164,6 +164,8 @@ fn spawn_runtime(root: &Path) -> Result<Child> {
         .stdout(Stdio::null())
         .stderr(Stdio::null());
     hide_console(&mut command);
+    #[cfg(windows)]
+    stdin_peek::prevent_standard_handle_inheritance()?;
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;

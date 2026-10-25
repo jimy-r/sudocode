@@ -88,6 +88,48 @@ def retiring_service_lock(root):
                 fcntl.flock(lock, fcntl.LOCK_UN)
 
 
+def check_cli_setup(binary, root, rpc):
+    """A cold CLI launch must finish while its shared service stays alive."""
+    rpc.request('service.shutdown')
+    deadline = time.monotonic() + 15
+    while (root / 'run/service.json').exists():
+        if time.monotonic() > deadline:
+            raise AssertionError('Previous service owner did not retire')
+        time.sleep(0.1)
+    env = os.environ | {'SCODE_SERVICE_ROOT': str(root),
+        'SCODE_GLOBAL_CONFIG_DIR': str(root / 'setup-config'),
+        'SCODE_CHECK_UPDATES': '0'}
+
+    def setup(mode):
+        child = subprocess.Popen([str(binary), 'setup', '--mode', mode,
+            '--output-format', 'json'], env=env, stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding='utf-8')
+        try:
+            stdout, stderr = child.communicate(timeout=60)
+        except subprocess.TimeoutExpired:
+            # A daemon holding the launcher's output pipe must be retired by
+            # its native owner before draining that pipe, including on Windows.
+            if child.poll() is None:
+                child.kill()
+            rpc.request('service.shutdown')
+            stdout, stderr = child.communicate(timeout=15)
+            raise AssertionError(
+                f'{mode} setup retained launcher output: {stdout!r} {stderr!r}')
+        assert child.returncode == 0, (stdout, stderr)
+        return json.loads(stdout)
+
+    first = setup('shared')
+    assert first['service']['running'] and not first['domainJoinAccepted']
+    status = rpc.request('service.status')
+    assert status['running'] and status['instance'] == first['service']['instance']
+    assert status['nexusPid'] == first['service']['nexusPid']
+    second = setup('shared')
+    assert second['service']['instance'] == first['service']['instance']
+    assert setup('local')['service'] is None
+    assert rpc.request('service.status')['instance'] == first['service']['instance']
+    print('PASS: cold setup releases captured output and reuses the shared service; local setup preserves it', flush=True)
+
+
 def run(binary, root):
     unrelated = root / 'unrelated-identity' / 'identity.json'
     unrelated.parent.mkdir()
@@ -213,6 +255,7 @@ def run(binary, root):
         b.request('service.start')
         assert b.request('vault.get', {'namespace': namespace, 'key': 'sample'}) == secret + '-rotated'
         print('PASS: frontend closure, service restart and installation repair preserve data', flush=True)
+        check_cli_setup(binary, root, b)
     finally:
         if b:
             if session:
