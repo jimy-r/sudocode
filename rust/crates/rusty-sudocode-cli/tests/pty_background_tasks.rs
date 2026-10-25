@@ -275,6 +275,41 @@ fn failed_background_shell_exposes_unread_result_and_exit_code() {
 }
 
 #[test]
+fn task_command_enter_opens_the_list_without_also_opening_details() {
+    let (env, _release) = task_env("background-task-command-key-owner");
+    let mut session = start(
+        &env,
+        &[shell(
+            "key-owner",
+            "echo TASK_COMMAND_RESULT; exit 7",
+            "Task command keyboard ownership",
+        )],
+    );
+    screen(&session, "1 new result");
+    // The editor drains its event batch before parent hooks are polled. Ctrl+A/E
+    // give the asynchronous /ps command time to reach the UI in that batch.
+    // Its submission Enter must never also navigate the newly opened panel.
+    for cursor_pairs in [0, 64, 1024, 8192] {
+        let input = format!("/ps\r{}", "\x01\x05".repeat(cursor_pairs));
+        session.send(&input).unwrap();
+        common::expect_screen_settled(
+            &session,
+            |s| {
+                common::input_and_footer_of(s).is_some_and(|area| {
+                    area.contains("Enter details") && !area.contains("Esc task list")
+                })
+            },
+            common::DEFAULT_TIMEOUT,
+            &format!("/ps Enter opens only the list ({cursor_pairs} cursor pairs)"),
+        );
+        session.send("\x1b").unwrap();
+        expect_input_ready(&session, common::DEFAULT_TIMEOUT, "task list closed");
+    }
+    session.send("/exit\r").unwrap();
+    assert_eq!(session.expect_eof().unwrap(), 0);
+}
+
+#[test]
 fn inspecting_running_task_does_not_acknowledge_its_future_result() {
     let (env, _release) = task_env("background-result-after-peek");
     let calls = [shell(

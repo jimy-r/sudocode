@@ -1397,272 +1397,9 @@ fn ReplApp(mut hooks: Hooks) -> impl Into<AnyElement<'static>> {
     let mut input_reviewable = hooks.use_state(|| true);
     let mut measurements = hooks.use_ref_default::<Measurements>();
 
-    // Clone handles for the future (StdoutHandle is Clone).
-    let stdout_for_future = stdout.clone();
-    let spinner_for_future = spinner.clone();
-    let output_rx_for_future = Arc::clone(&output_rx);
-    let ui_rx_for_future = Arc::clone(&ui_rx);
-    let stderr_redir_for_future = Arc::clone(&stderr_redir);
-
-    // 80ms tick loop: drain output/control channels, update spinner text.
-    hooks.use_future(async move {
-        let mut todo_hide_deadline: Option<Instant> = None;
-        let mut stderr_text = Utf8Stream::default();
-        let mut task_clock_tick = Instant::now();
-        loop {
-            smol::Timer::after(Duration::from_millis(80)).await;
-            let mut is_preview_changed = false;
-
-            // Drain stderr redirect — route captured text through stdout
-            // so it appears in the iocraft scrollback instead of corrupting
-            // the canvas.
-            if let Ok(guard) = stderr_redir_for_future.lock() {
-                if let Some(ref redir) = *guard {
-                    if let Some(captured) = redir.drain() {
-                        write_iocraft_output(
-                            &stdout_for_future,
-                            &stderr_text.push(&captured),
-                            false,
-                        );
-                    }
-                }
-            }
-
-            // Drain output channel.
-            if let Ok(rx) = output_rx_for_future.lock() {
-                loop {
-                    let (text, terminated) = match rx.try_recv() {
-                        Ok(OutputMsg::AssistantUpdate { committed, preview }) => {
-                            prose_preview_for_future
-                                .lock()
-                                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                                .update(preview);
-                            is_preview_changed = true;
-                            // use_output queues history for the same presentation
-                            // as the newly rendered preview, never an empty frame.
-                            (committed, false)
-                        }
-                        Ok(OutputMsg::Line(text)) => (text, true),
-                        Ok(OutputMsg::Raw(text)) => (text, false),
-                        Ok(OutputMsg::ToolProgress(text)) => {
-                            if *tool_progress.read() != text {
-                                tool_progress.set(text);
-                            }
-                            continue;
-                        }
-                        Ok(OutputMsg::Suspend(request)) => {
-                            *terminal_handoff_for_future
-                                .lock()
-                                .expect("terminal handoff mutex poisoned") = Some(request);
-                            frame.set(frame.get().wrapping_add(1));
-                            break;
-                        }
-                        Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
-                    };
-                    write_iocraft_output(&stdout_for_future, &text, terminated);
-                }
-            }
-
-            if let Ok(rx) = ui_rx_for_future.lock() {
-                loop {
-                    match rx.try_recv() {
-                        Ok(UiCommand::OpenTasks) => {
-                            tasks_for_future.lock().unwrap_or_else(std::sync::PoisonError::into_inner).open();
-                            frame.set(frame.get().wrapping_add(1));
-                        }
-                        Ok(UiCommand::BackgroundTask(event)) => {
-                            let changed = tasks_for_future
-                                .lock()
-                                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                                .update(event);
-                            if changed {
-                                frame.set(frame.get().wrapping_add(1));
-                            }
-                        }
-                        Ok(UiCommand::BackgroundTaskError(message)) => {
-                            footer_hint
-                                .set(Some((message, Instant::now() + Duration::from_secs(3))));
-                        }
-                        Ok(UiCommand::ShowQuestion(question)) => {
-                            // A request's immutable description belongs to
-                            // history. Only its first field presents it; the
-                            // live slot owns the current field's controls.
-                            if question.index == 0 {
-                                if let Some(description) = &question.description {
-                                    let document = prompt_text::render_document(
-                                        description,
-                                        crate::render::query_terminal_width(),
-                                    );
-                                    write_iocraft_output(&stdout_for_future, &document, true);
-                                }
-                            }
-                            tasks_for_future
-                                .lock()
-                                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                                .close();
-                            let slot = if question.force_fuzzy_select
-                                || question.options.len() > DIALPAD_MAX_OPTIONS
-                            {
-                                InputSlot::FuzzySelect(FuzzySelectState::new(question))
-                            } else {
-                                let initial = question
-                                    .options
-                                    .iter()
-                                    .position(|o| o.recommended)
-                                    .unwrap_or(0);
-                                dialpad_cursor.set(initial);
-                                dialpad_input.set(String::new());
-                                InputSlot::DialPad(question)
-                            };
-                            input_slot.set(slot);
-                            input_value.set(String::new());
-                        }
-                        Ok(UiCommand::ClearQuestion) => {
-                            let is_plain_input = matches!(*input_slot.read(), InputSlot::TextInput);
-                            if !is_plain_input {
-                                input_slot.set(InputSlot::TextInput);
-                                input_value.set(String::new());
-                            }
-                        }
-                        Ok(UiCommand::SetTip(tip)) => footer_tips.write().set(tip),
-                        Ok(UiCommand::SetCacheTip(tip)) => footer_tips.write().cache(tip),
-                        Ok(UiCommand::BeginTurn) => footer_tips.write().begin_turn(),
-                        Ok(UiCommand::SetTurnResult(text)) => {
-                            turn_result.set(Some(text));
-                        }
-                        Ok(UiCommand::UpdateTodos(todos)) => {
-                            if let Ok(mut items) = todo_items_for_future.lock() {
-                                let has_incomplete = todos
-                                    .iter()
-                                    .any(|t| t.status != runtime::TodoStatus::Completed);
-                                if todos.is_empty() {
-                                    // Empty list → hide immediately
-                                    items.clear();
-                                    todo_hide_deadline = None;
-                                } else if has_incomplete {
-                                    // Has open todos → show, cancel any hide timer
-                                    *items = todos;
-                                    todo_hide_deadline = None;
-                                } else if todo_hide_deadline.is_none() {
-                                    // All terminal → start 5s hide timer
-                                    *items = todos;
-                                    todo_hide_deadline =
-                                        Some(Instant::now() + Duration::from_secs(5));
-                                } else {
-                                    *items = todos;
-                                }
-                            }
-                        }
-                        Ok(UiCommand::ToolQueued { id, name, input }) => {
-                            if let Ok(mut pending) = pending_for_future.lock() {
-                                pending.push(PendingItem::Tool(ToolCard::new(id, &name, &input)));
-                            }
-                        }
-                        Ok(UiCommand::ToolStarted { id, name, input }) => {
-                            if let Ok(mut pending) = pending_for_future.lock() {
-                                if let Some(PendingItem::Tool(card)) = pending.iter_mut().find(
-                                    |item| matches!(item, PendingItem::Tool(card) if card.id == id),
-                                ) {
-                                    if card.input != input {
-                                        card.content =
-                                            Arc::new(crate::cli::format::tool_call_start_content(
-                                                &name, &input,
-                                            ));
-                                        card.input = input;
-                                    }
-                                    card.status = crate::cli::format::ToolStatus::Running;
-                                }
-                            }
-                        }
-                        Ok(UiCommand::ToolFinished { id }) => {
-                            // Only clear the transient overlay entry. The
-                            // finished card's permanent content is written to
-                            // scrollback by the render engine on the ordered
-                            // `output` channel — never from here — so the
-                            // overlay stays a pure projection.
-                            if let Ok(mut pending) = pending_for_future.lock() {
-                                pending
-                                    .retain(|p| !matches!(p, PendingItem::Tool(c) if c.id == id));
-                            }
-                        }
-                        // Waiting for an answer has no spinner-driven redraw.
-                        // Input ownership changes must wake their own frame.
-                        Ok(UiCommand::InputUpsert { id, display, is_human, delivery }) => {
-                            if let Ok(mut pending) = pending_for_future.lock() {
-                                let row = PendingItem::Input { id, display, is_human, delivery };
-                                if let Some(existing) = pending.iter_mut().find(|item| matches!(item, PendingItem::Input { id: value, .. } if *value == id)) {
-                                    *existing = row;
-                                } else { pending.push(row); }
-                            }
-                            frame.set(frame.get().wrapping_add(1));
-                        }
-                        Ok(UiCommand::InputRemove(id)) => {
-                            if let Ok(mut pending) = pending_for_future.lock() {
-                                pending.retain(|item| !matches!(item, PendingItem::Input { id: value, .. } if *value == id));
-                            }
-                            frame.set(frame.get().wrapping_add(1));
-                        }
-                        Ok(UiCommand::PendingInputsClear) => {
-                            if let Ok(mut pending) = pending_for_future.lock() { pending.retain(|item| matches!(item, PendingItem::Tool(_))); }
-                            frame.set(frame.get().wrapping_add(1));
-                        }
-                        Err(TryRecvError::Empty) => break,
-                        Err(TryRecvError::Disconnected) => break,
-                    }
-                }
-            }
-
-            // Auto-hide the TodoSlot 5s after all todos are completed.
-            // Refresh elapsed time only in an open running detail, once a second.
-            // An invisible task entry introduces no idle rendering churn.
-            if task_clock_tick.elapsed() >= Duration::from_secs(1) {
-                task_clock_tick = Instant::now();
-                if tasks_for_future
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .shows_running_detail()
-                {
-                    frame.set(frame.get().wrapping_add(1));
-                }
-            }
-            if let Some(deadline) = todo_hide_deadline {
-                if Instant::now() >= deadline {
-                    if let Ok(mut items) = todo_items_for_future.lock() {
-                        if !items.is_empty() {
-                            items.clear();
-                            frame.set(frame.get().wrapping_add(1));
-                        }
-                    }
-                    todo_hide_deadline = None;
-                }
-            }
-
-            // Auto-dismiss footer_hint after deadline.
-            let hint_expired = footer_hint
-                .read()
-                .as_ref()
-                .is_some_and(|(_, deadline)| Instant::now() >= *deadline);
-            if hint_expired {
-                footer_hint.set(None);
-            }
-
-            // One lifecycle snapshot drives the status and footer. Animate
-            // only Running; waiting hides the row, Idle changes no UI state.
-            // Identical idle State::set calls starve keyboard delivery in iocraft.
-            let idx = frame.get();
-            let state = spinner_for_future.engine_state();
-            if state == EngineState::Running || is_preview_changed {
-                frame.set(idx.wrapping_add(1));
-            }
-            if state != EngineState::Idle && turn_result.read().is_some() {
-                turn_result.set(None);
-            }
-            if foreground_state.get() != state {
-                foreground_state.set(state);
-            }
-        }
-    });
-
+    // Drain keys against their current UI owner before applying asynchronous
+    // panel changes. Otherwise the editor's /ps submission Enter can also enter
+    // task details when OpenTasks is applied between the two event consumers.
     // Clone for the terminal event handler.
     let input_tx_for_events = input_tx.clone();
     let stdout_for_events = stdout.clone();
@@ -2068,6 +1805,272 @@ fn ReplApp(mut hooks: Hooks) -> impl Into<AnyElement<'static>> {
                 }
             }
             _ => {}
+        }
+    });
+
+    // Clone handles for the future (StdoutHandle is Clone).
+    let stdout_for_future = stdout.clone();
+    let spinner_for_future = spinner.clone();
+    let output_rx_for_future = Arc::clone(&output_rx);
+    let ui_rx_for_future = Arc::clone(&ui_rx);
+    let stderr_redir_for_future = Arc::clone(&stderr_redir);
+
+    // 80ms tick loop: drain output/control channels, update spinner text.
+    hooks.use_future(async move {
+        let mut todo_hide_deadline: Option<Instant> = None;
+        let mut stderr_text = Utf8Stream::default();
+        let mut task_clock_tick = Instant::now();
+        loop {
+            smol::Timer::after(Duration::from_millis(80)).await;
+            let mut is_preview_changed = false;
+
+            // Drain stderr redirect — route captured text through stdout
+            // so it appears in the iocraft scrollback instead of corrupting
+            // the canvas.
+            if let Ok(guard) = stderr_redir_for_future.lock() {
+                if let Some(ref redir) = *guard {
+                    if let Some(captured) = redir.drain() {
+                        write_iocraft_output(
+                            &stdout_for_future,
+                            &stderr_text.push(&captured),
+                            false,
+                        );
+                    }
+                }
+            }
+
+            // Drain output channel.
+            if let Ok(rx) = output_rx_for_future.lock() {
+                loop {
+                    let (text, terminated) = match rx.try_recv() {
+                        Ok(OutputMsg::AssistantUpdate { committed, preview }) => {
+                            prose_preview_for_future
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                .update(preview);
+                            is_preview_changed = true;
+                            // use_output queues history for the same presentation
+                            // as the newly rendered preview, never an empty frame.
+                            (committed, false)
+                        }
+                        Ok(OutputMsg::Line(text)) => (text, true),
+                        Ok(OutputMsg::Raw(text)) => (text, false),
+                        Ok(OutputMsg::ToolProgress(text)) => {
+                            if *tool_progress.read() != text {
+                                tool_progress.set(text);
+                            }
+                            continue;
+                        }
+                        Ok(OutputMsg::Suspend(request)) => {
+                            *terminal_handoff_for_future
+                                .lock()
+                                .expect("terminal handoff mutex poisoned") = Some(request);
+                            frame.set(frame.get().wrapping_add(1));
+                            break;
+                        }
+                        Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
+                    };
+                    write_iocraft_output(&stdout_for_future, &text, terminated);
+                }
+            }
+
+            if let Ok(rx) = ui_rx_for_future.lock() {
+                loop {
+                    match rx.try_recv() {
+                        Ok(UiCommand::OpenTasks) => {
+                            tasks_for_future.lock().unwrap_or_else(std::sync::PoisonError::into_inner).open();
+                            frame.set(frame.get().wrapping_add(1));
+                        }
+                        Ok(UiCommand::BackgroundTask(event)) => {
+                            let changed = tasks_for_future
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                .update(event);
+                            if changed {
+                                frame.set(frame.get().wrapping_add(1));
+                            }
+                        }
+                        Ok(UiCommand::BackgroundTaskError(message)) => {
+                            footer_hint
+                                .set(Some((message, Instant::now() + Duration::from_secs(3))));
+                        }
+                        Ok(UiCommand::ShowQuestion(question)) => {
+                            // A request's immutable description belongs to
+                            // history. Only its first field presents it; the
+                            // live slot owns the current field's controls.
+                            if question.index == 0 {
+                                if let Some(description) = &question.description {
+                                    let document = prompt_text::render_document(
+                                        description,
+                                        crate::render::query_terminal_width(),
+                                    );
+                                    write_iocraft_output(&stdout_for_future, &document, true);
+                                }
+                            }
+                            tasks_for_future
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                .close();
+                            let slot = if question.force_fuzzy_select
+                                || question.options.len() > DIALPAD_MAX_OPTIONS
+                            {
+                                InputSlot::FuzzySelect(FuzzySelectState::new(question))
+                            } else {
+                                let initial = question
+                                    .options
+                                    .iter()
+                                    .position(|o| o.recommended)
+                                    .unwrap_or(0);
+                                dialpad_cursor.set(initial);
+                                dialpad_input.set(String::new());
+                                InputSlot::DialPad(question)
+                            };
+                            input_slot.set(slot);
+                            input_value.set(String::new());
+                        }
+                        Ok(UiCommand::ClearQuestion) => {
+                            let is_plain_input = matches!(*input_slot.read(), InputSlot::TextInput);
+                            if !is_plain_input {
+                                input_slot.set(InputSlot::TextInput);
+                                input_value.set(String::new());
+                            }
+                        }
+                        Ok(UiCommand::SetTip(tip)) => footer_tips.write().set(tip),
+                        Ok(UiCommand::SetCacheTip(tip)) => footer_tips.write().cache(tip),
+                        Ok(UiCommand::BeginTurn) => footer_tips.write().begin_turn(),
+                        Ok(UiCommand::SetTurnResult(text)) => {
+                            turn_result.set(Some(text));
+                        }
+                        Ok(UiCommand::UpdateTodos(todos)) => {
+                            if let Ok(mut items) = todo_items_for_future.lock() {
+                                let has_incomplete = todos
+                                    .iter()
+                                    .any(|t| t.status != runtime::TodoStatus::Completed);
+                                if todos.is_empty() {
+                                    // Empty list → hide immediately
+                                    items.clear();
+                                    todo_hide_deadline = None;
+                                } else if has_incomplete {
+                                    // Has open todos → show, cancel any hide timer
+                                    *items = todos;
+                                    todo_hide_deadline = None;
+                                } else if todo_hide_deadline.is_none() {
+                                    // All terminal → start 5s hide timer
+                                    *items = todos;
+                                    todo_hide_deadline =
+                                        Some(Instant::now() + Duration::from_secs(5));
+                                } else {
+                                    *items = todos;
+                                }
+                            }
+                        }
+                        Ok(UiCommand::ToolQueued { id, name, input }) => {
+                            if let Ok(mut pending) = pending_for_future.lock() {
+                                pending.push(PendingItem::Tool(ToolCard::new(id, &name, &input)));
+                            }
+                        }
+                        Ok(UiCommand::ToolStarted { id, name, input }) => {
+                            if let Ok(mut pending) = pending_for_future.lock() {
+                                if let Some(PendingItem::Tool(card)) = pending.iter_mut().find(
+                                    |item| matches!(item, PendingItem::Tool(card) if card.id == id),
+                                ) {
+                                    if card.input != input {
+                                        card.content =
+                                            Arc::new(crate::cli::format::tool_call_start_content(
+                                                &name, &input,
+                                            ));
+                                        card.input = input;
+                                    }
+                                    card.status = crate::cli::format::ToolStatus::Running;
+                                }
+                            }
+                        }
+                        Ok(UiCommand::ToolFinished { id }) => {
+                            // Only clear the transient overlay entry. The
+                            // finished card's permanent content is written to
+                            // scrollback by the render engine on the ordered
+                            // `output` channel — never from here — so the
+                            // overlay stays a pure projection.
+                            if let Ok(mut pending) = pending_for_future.lock() {
+                                pending
+                                    .retain(|p| !matches!(p, PendingItem::Tool(c) if c.id == id));
+                            }
+                        }
+                        // Waiting for an answer has no spinner-driven redraw.
+                        // Input ownership changes must wake their own frame.
+                        Ok(UiCommand::InputUpsert { id, display, is_human, delivery }) => {
+                            if let Ok(mut pending) = pending_for_future.lock() {
+                                let row = PendingItem::Input { id, display, is_human, delivery };
+                                if let Some(existing) = pending.iter_mut().find(|item| matches!(item, PendingItem::Input { id: value, .. } if *value == id)) {
+                                    *existing = row;
+                                } else { pending.push(row); }
+                            }
+                            frame.set(frame.get().wrapping_add(1));
+                        }
+                        Ok(UiCommand::InputRemove(id)) => {
+                            if let Ok(mut pending) = pending_for_future.lock() {
+                                pending.retain(|item| !matches!(item, PendingItem::Input { id: value, .. } if *value == id));
+                            }
+                            frame.set(frame.get().wrapping_add(1));
+                        }
+                        Ok(UiCommand::PendingInputsClear) => {
+                            if let Ok(mut pending) = pending_for_future.lock() { pending.retain(|item| matches!(item, PendingItem::Tool(_))); }
+                            frame.set(frame.get().wrapping_add(1));
+                        }
+                        Err(TryRecvError::Empty) => break,
+                        Err(TryRecvError::Disconnected) => break,
+                    }
+                }
+            }
+
+            // Auto-hide the TodoSlot 5s after all todos are completed.
+            // Refresh elapsed time only in an open running detail, once a second.
+            // An invisible task entry introduces no idle rendering churn.
+            if task_clock_tick.elapsed() >= Duration::from_secs(1) {
+                task_clock_tick = Instant::now();
+                if tasks_for_future
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .shows_running_detail()
+                {
+                    frame.set(frame.get().wrapping_add(1));
+                }
+            }
+            if let Some(deadline) = todo_hide_deadline {
+                if Instant::now() >= deadline {
+                    if let Ok(mut items) = todo_items_for_future.lock() {
+                        if !items.is_empty() {
+                            items.clear();
+                            frame.set(frame.get().wrapping_add(1));
+                        }
+                    }
+                    todo_hide_deadline = None;
+                }
+            }
+
+            // Auto-dismiss footer_hint after deadline.
+            let hint_expired = footer_hint
+                .read()
+                .as_ref()
+                .is_some_and(|(_, deadline)| Instant::now() >= *deadline);
+            if hint_expired {
+                footer_hint.set(None);
+            }
+
+            // One lifecycle snapshot drives the status and footer. Animate
+            // only Running; waiting hides the row, Idle changes no UI state.
+            // Identical idle State::set calls starve keyboard delivery in iocraft.
+            let idx = frame.get();
+            let state = spinner_for_future.engine_state();
+            if state == EngineState::Running || is_preview_changed {
+                frame.set(idx.wrapping_add(1));
+            }
+            if state != EngineState::Idle && turn_result.read().is_some() {
+                turn_result.set(None);
+            }
+            if foreground_state.get() != state {
+                foreground_state.set(state);
+            }
         }
     });
 
