@@ -195,6 +195,14 @@ enum Cmd {
     Login,
     /// Log out from the service
     Logout,
+    /// Choose local execution or prepare Sudocode's shared local services
+    Setup {
+        #[arg(long, value_enum, conflicts_with = "check")]
+        mode: Option<super::setup::RuntimeMode>,
+        /// Inspect preferences and services without installing or starting them
+        #[arg(long)]
+        check: bool,
+    },
     /// Update scode to the latest release and restart
     Update {
         /// Pin a release tag (e.g. v0.1.27); defaults to the latest release
@@ -317,6 +325,11 @@ enum ServiceSub {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum CliAction {
+    Setup {
+        mode: Option<super::setup::RuntimeMode>,
+        check: bool,
+        output_format: CliOutputFormat,
+    },
     Service {
         is_daemon: bool,
     },
@@ -467,6 +480,7 @@ impl CliAction {
                 | CliAction::Logout
                 | CliAction::Update { .. }
                 | CliAction::Service { .. }
+                | CliAction::Setup { .. }
         )
     }
 }
@@ -727,6 +741,11 @@ fn convert_cli_to_action(cli: Cli) -> Result<CliAction, String> {
                 yes,
             }),
             Cmd::Logout => Ok(CliAction::Logout),
+            Cmd::Setup { mode, check } => Ok(CliAction::Setup {
+                mode,
+                check,
+                output_format,
+            }),
             Cmd::Service { action } => Ok(CliAction::Service {
                 is_daemon: matches!(action, ServiceSub::Daemon),
             }),

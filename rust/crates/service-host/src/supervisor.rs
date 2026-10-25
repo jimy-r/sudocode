@@ -385,6 +385,45 @@ fn control_operation(root: &Path, method: &str) -> Result<Value> {
     }
 }
 
+/// Inspect the same runtime used by frontend channels without installing or starting it.
+pub fn inspect_local_services() -> Result<Value> {
+    let root = artifacts::root()?;
+    let installed = control_operation(&root, "service.checkInstalled")?;
+    let http = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(2))
+        .no_proxy()
+        .build()?;
+    let running = read_discovery(&root).filter(|discovery| is_serving(&http, discovery));
+    Ok(
+        json!({"installation": installed, "running": running.is_some(),
+        "runningVersion": running.map(|discovery| discovery.version)}),
+    )
+}
+
+/// CLI setup uses the frontend's existing install/discovery/lifecycle owner.
+pub fn start_local_services() -> Result<Value> {
+    let root = artifacts::root()?;
+    let http = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(2))
+        .no_proxy()
+        .build()?;
+    let discovery = ensure_runtime(&root, &http)?;
+    if discovery.version != artifacts::version() {
+        return Err("The shared Nexus version differs from this CLI; use the service owner's controlled upgrade before selecting shared mode".into());
+    }
+    call(
+        &http,
+        &discovery,
+        &Request {
+            id: json!(0),
+            method: "service.status".into(),
+            params: Value::Null,
+        },
+    )?
+    .result
+    .ok_or_else(|| "missing service status".into())
+}
+
 async fn dispatch_stdio(
     root: Arc<PathBuf>,
     http: &reqwest::Client,

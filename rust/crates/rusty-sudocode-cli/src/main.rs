@@ -844,6 +844,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     startup::measure("legacy_config", auto_migrate_legacy_config);
     let is_interactive_session = matches!(&action, CliAction::Repl { .. })
         || matches!(&action, CliAction::ResumeSession { commands, output_format: CliOutputFormat::Text, .. } if commands.is_empty());
+    if matches!(&action, CliAction::Repl { .. }) {
+        cli::setup::startup_prompt()?;
+    }
     if is_interactive_session {
         cli::update::startup_prompt()?;
     }
@@ -852,6 +855,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     // If an ensure_authenticated() call is ever added below this point it
     // MUST be guarded by `if !action.is_informational()`.
     match action {
+        CliAction::Setup {
+            mode,
+            check,
+            output_format,
+        } => cli::setup::run(mode, check, output_format)?,
         CliAction::Service { is_daemon } => {
             let result = if is_daemon {
                 service_host::run_daemon()

@@ -4,6 +4,29 @@ Sudocode owns the local Nexus service used by its frontends. Each OS user has on
 supervisor in a service root. The default root is `~/.nexus-vfs`;
 `SCODE_SERVICE_ROOT` selects an absolute root for a container or an isolated test.
 
+The CLI offers runtime selection on its first interactive launch with a fresh
+configuration home. Local execution installs no service. Shared local services
+use this same supervisor and verified artifact installer as SudoWork. Existing
+configuration homes keep their current behavior until explicit setup:
+
+```sh
+scode setup --mode local
+scode setup --mode shared
+scode setup --check --output-format json
+```
+
+The preference lives in the CLI's configuration home, while service lifetime
+remains owned by the OS-user supervisor. Selecting local does not stop services
+used by another frontend. Inspection installs and starts nothing. ACP, service
+stdio, headless commands and resume do not display the onboarding picker.
+Shared mode prepares local services; cross-domain enrollment and participant
+authorization are separate, and setup reports `domainJoinAccepted:false`.
+
+CLI release discovery and explicit `scode update` already share one installer.
+An updated CLI does not silently restart the shared Nexus service: setup refuses
+a running service with a different native Nexus version. Service transitions
+continue through the lifecycle owner's explicit drain/upgrade operation.
+
 ```mermaid
 flowchart LR
     Desktop[Sudowork frontend] --> Channel[scode service stdio]
