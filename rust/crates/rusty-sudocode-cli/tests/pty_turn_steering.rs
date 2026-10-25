@@ -95,7 +95,6 @@ fn finish(session: &mut PtySession) {
 /// Hold real prompt preparation before the runner sends `EngineCommand::Prompt`.
 #[cfg(unix)]
 fn preparing_turn(label: &str) -> (TestEnv, PtySession, fs::File, Release) {
-    use std::{cell::RefCell, os::unix::fs::OpenOptionsExt};
     let env = TestEnv::new_mock(label);
     let image = env.workspace_root().join("preparing.png");
     assert!(std::process::Command::new("mkfifo")
@@ -120,14 +119,22 @@ fn preparing_turn(label: &str) -> (TestEnv, PtySession, fs::File, Release) {
     session.resize(60, 120).unwrap();
     common::expect_input_line_cleared(&session, common::DEFAULT_TIMEOUT, "ready");
     submit(&mut session, &prompt, "\r");
+    let writer = held_image_writer(&image, &session);
+    let release = Release(env.workspace_root().to_path_buf());
+    (env, session, writer, release)
+}
+
+#[cfg(unix)]
+fn held_image_writer(image: &std::path::Path, session: &PtySession) -> fs::File {
+    use std::{cell::RefCell, os::unix::fs::OpenOptionsExt};
     let writer = RefCell::new(None);
     common::expect_screen(
-        &session,
+        session,
         |_| {
             if let Ok(file) = fs::OpenOptions::new()
                 .write(true)
                 .custom_flags(nix::libc::O_NONBLOCK)
-                .open(&image)
+                .open(image)
             {
                 *writer.borrow_mut() = Some(file);
                 true
@@ -136,10 +143,9 @@ fn preparing_turn(label: &str) -> (TestEnv, PtySession, fs::File, Release) {
             }
         },
         common::DEFAULT_TIMEOUT,
-        "prompt preparation reached the held image read",
+        "input preparation reached the held image read",
     );
-    let release = Release(env.workspace_root().to_path_buf());
-    (env, session, writer.into_inner().unwrap(), release)
+    writer.into_inner().unwrap()
 }
 
 #[cfg(unix)]
@@ -169,6 +175,65 @@ fn cancel_during_prompt_preparation_is_not_lost_before_engine_admission() {
     );
     session.send("/exit\r").unwrap();
     assert_eq!(session.expect_eof().unwrap(), 0);
+}
+
+#[cfg(unix)]
+fn assert_cancel_during_steered_image_preparation(valid_image: bool) {
+    let (env, mut session, _release) = start("steered-image-cancel", false);
+    let image = env.workspace_root().join("steered-preparation.png");
+    assert!(std::process::Command::new("mkfifo")
+        .arg(&image)
+        .status()
+        .unwrap()
+        .success());
+    submit(
+        &mut session,
+        &format!("STEER_IMAGE_CANCEL @{}", image.display()),
+        "\r",
+    );
+    common::expect_screen(
+        &session,
+        |view| view.contains("steering: STEER_IMAGE_CANCEL"),
+        common::DEFAULT_TIMEOUT,
+        "image input accepted while the tool is running",
+    );
+    fs::write(env.workspace_root().join("release-tool"), "release").unwrap();
+    let writer = held_image_writer(&image, &session);
+    session.send("\x03").unwrap();
+    // The command pump can handle cancellation while the worker reads the image.
+    std::thread::sleep(Duration::from_millis(100));
+    if valid_image {
+        release_prepared_image(writer);
+    } else {
+        drop(writer); // EOF also makes image decoding fail after cancellation.
+    }
+    common::expect_screen(
+        &session,
+        |view| view.contains("Cancelled") && view.contains("queued: STEER_IMAGE_CANCEL"),
+        common::DEFAULT_TIMEOUT,
+        "cancel does not commit a prepared image or lose its input",
+    );
+    if env.is_mock() {
+        assert_eq!(
+            env.captured_message_count(),
+            1,
+            "the cancelled attachment must not reach another request"
+        );
+    }
+    session.send("/exit\r").unwrap();
+    assert_eq!(session.expect_eof().unwrap(), 0);
+}
+
+#[test]
+#[cfg(unix)]
+fn cancel_during_steered_image_preparation_preserves_uncommitted_input() {
+    assert_cancel_during_steered_image_preparation(true);
+}
+
+#[test]
+#[cfg(unix)]
+fn cancel_takes_priority_over_a_steered_image_preparation_error() {
+    assert_cancel_during_steered_image_preparation(false);
 }
 
 #[test]
@@ -484,7 +549,7 @@ fn peer_input(delivery: engine_events::InputDelivery) {
     inject_peer_input(
         &env,
         delivery,
-        "PEER_FYI: this is only auxiliary information; continue the human's original task.",
+        "PEER_FYI: this is only auxiliary information; continue the human's original task. Keep @missing-peer-image.png literal.",
     );
     let label = if delivery == engine_events::InputDelivery::Queue {
         "queued:"
@@ -521,6 +586,7 @@ fn peer_input(delivery: engine_events::InputDelivery) {
         assert_eq!(captured.len(), 2);
         let context = captured[1]["messages"].to_string();
         assert!(context.contains("mailbox-message") && context.contains("PEER_FYI"));
+        assert!(context.contains("@missing-peer-image.png"));
         assert!(context.contains("ORIGINAL_TOOL_RESULT") && !context.contains("Interrupted"));
     }
     finish(&mut session);

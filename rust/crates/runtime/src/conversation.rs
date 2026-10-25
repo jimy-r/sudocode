@@ -1895,6 +1895,21 @@ where
         summary
     }
 
+    /// Normalize incoming images consistently for initial and steering input.
+    #[inline]
+    fn prepare_input_blocks(
+        &self,
+        mut blocks: Vec<ContentBlock>,
+    ) -> Result<Vec<ContentBlock>, RuntimeError> {
+        for block in &mut blocks {
+            if let ContentBlock::Image { data, mime_type } = block {
+                *block = crate::image_input::prepare_image(data, mime_type, self.running_model())
+                    .map_err(RuntimeError::new)?;
+            }
+        }
+        Ok(blocks)
+    }
+
     async fn run_turn_with_blocks_inner(
         &mut self,
         blocks: Vec<ContentBlock>,
@@ -1922,18 +1937,7 @@ where
             }
         }
 
-        let mut prepared_blocks = Vec::with_capacity(blocks.len());
-        for block in blocks {
-            let block = match block {
-                ContentBlock::Image { data, mime_type } => {
-                    let model = self.running_model().to_string();
-                    crate::image_input::prepare_image(&data, &mime_type, &model)
-                        .map_err(RuntimeError::new)?
-                }
-                other => other,
-            };
-            prepared_blocks.push(block);
-        }
+        let prepared_blocks = self.prepare_input_blocks(blocks)?;
 
         // Start file tracking for this turn
         self.current_turn_id = Some(turn_id.clone());
@@ -2021,8 +2025,21 @@ where
                     break;
                 }
                 let view = input.view();
+                // Resolve human references through the session filesystem;
+                // peer and task notifications keep their literal text.
+                let prepared = if input.source == crate::turn_input::InputSource::Human {
+                    crate::image_input::prompt_blocks(input.text, self.session.fs_handle().as_ref())
+                        .map_err(|error| RuntimeError::new(error.to_string()))
+                        .and_then(|blocks| self.prepare_input_blocks(blocks))
+                } else {
+                    Ok(vec![ContentBlock::Text { text: input.text }])
+                };
+                // Preparation can perform I/O; cancellation still owns admission.
+                if self.hook_abort_signal.is_aborted() {
+                    break;
+                }
                 self.session
-                    .push_user_text(input.text)
+                    .push_user_blocks(prepared?)
                     .map_err(|error| RuntimeError::new(error.to_string()))?;
                 self.turn_inputs.committed(input.id);
                 if let Some(observer) = observer.as_deref_mut() {
