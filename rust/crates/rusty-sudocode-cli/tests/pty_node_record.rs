@@ -116,7 +116,7 @@ fn ordinary_task_with_unavailable_a2a(env: &TestEnv, home: &Path, label: &str, e
     common::expect_input_line_cleared(&session, Duration::from_secs(30), label);
     session.send("/status\r").expect("inspect A2A status");
     session
-        .expect("node (unavailable:")
+        .expect(r"node \(unavailable:")
         .expect("selected node namespace, not disk");
     session
         .expect(expected)
