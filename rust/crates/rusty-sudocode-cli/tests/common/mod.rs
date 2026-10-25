@@ -86,12 +86,16 @@ pub fn find_session_transcript(dir: &std::path::Path) -> Option<PathBuf> {
 /// Inert on Linux and macOS, where the variables mean nothing.
 const MSYS_ARGV_PASSTHROUGH: &str = "export MSYS_NO_PATHCONV=1 MSYS2_ARG_CONV_EXCL='*';";
 
-/// Default PTY-test timeout for `expect` operations.
-/// Windows CI runners are significantly slower to spawn PTY processes
-/// (cold cache, antivirus scanning, etc.), so use a generous timeout.
+/// Watchdog for functional PTY operations, not a performance threshold.
+/// Fresh macOS executables can spend over 16 seconds before entering `main`,
+/// including the replacement image in self-update. Performance gates measure
+/// startup and input latency separately; their thresholds remain unchanged.
+#[cfg(target_os = "macos")]
+pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
+/// Windows cold launches can also include executable scanning.
 #[cfg(windows)]
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(20);
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "macos")))]
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Live-mode timeout — real API calls can take a few seconds.
@@ -99,7 +103,7 @@ pub const LIVE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// A wait, never shorter than this platform's floor.
 ///
-/// [`DEFAULT_TIMEOUT`] exists because Windows runners are slow to spawn a PTY,
+/// [`DEFAULT_TIMEOUT`] accounts for platform-specific process startup delays,
 /// and a test that hardcodes fewer seconds silently opts out of it — the
 /// calibration is there precisely for the runner it then fails on. Of the four
 /// `pty_resume` tests, the two asking for 10s and 5s were the two that failed on
