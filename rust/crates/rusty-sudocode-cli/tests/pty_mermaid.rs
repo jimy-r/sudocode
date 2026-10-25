@@ -18,6 +18,41 @@ fn assert_diagram(screen: &str) {
     );
 }
 
+fn assert_model_wire_and_original_source(env: &TestEnv, prompt: &str) {
+    let requests = env.captured_message_bodies();
+    let request: serde_json::Value = serde_json::from_str(&requests[0]).unwrap();
+    let instructions = request["system"].to_string();
+    let received_full_prompt = request["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|message| message["role"] == "user")
+        .flat_map(|message| message["content"].as_array().into_iter().flatten())
+        .filter_map(|block| block["text"].as_str())
+        .any(|text| text.contains(prompt));
+    assert!(
+        received_full_prompt,
+        "the exact complete prompt must reach the model"
+    );
+    assert!(
+        instructions.contains("# Diagrams") && instructions.contains("fenced `mermaid` block"),
+        "diagram guidance must reach the actual model request: {instructions}"
+    );
+    let transcript = common::find_session_transcript(&env.workspace_root().join(".scode/sessions"))
+        .expect("persisted transcript");
+    let saved = runtime::Session::load_from_path(&transcript).unwrap();
+    let unchanged = saved.messages().iter().any(|message| {
+        message
+            .blocks
+            .iter()
+            .any(|block| matches!(block, runtime::ContentBlock::Text { text } if text == DOCUMENT))
+    });
+    assert!(
+        unchanged,
+        "original Mermaid Markdown must survive display unchanged"
+    );
+}
+
 #[test]
 fn mermaid_stream_and_replay_preserve_input_and_original_markdown() {
     for mode in ["off", "queue"] {
@@ -92,37 +127,7 @@ fn mermaid_stream_and_replay_preserve_input_and_original_markdown() {
         common::expect_input_line(&session, "/exit", common::DEFAULT_TIMEOUT, "exit input");
         session.send("\r").unwrap();
         assert_eq!(session.expect_eof().unwrap(), 0);
-        let requests = env.captured_message_bodies();
-        let request: serde_json::Value = serde_json::from_str(&requests[0]).unwrap();
-        let instructions = request["system"].to_string();
-        let received_full_prompt = request["messages"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .filter(|message| message["role"] == "user")
-            .flat_map(|message| message["content"].as_array().into_iter().flatten())
-            .filter_map(|block| block["text"].as_str())
-            .any(|text| text.contains(&prompt));
-        assert!(
-            received_full_prompt,
-            "the exact complete prompt must reach the model"
-        );
-        assert!(
-            instructions.contains("# Diagrams") && instructions.contains("fenced `mermaid` block"),
-            "diagram guidance must reach the actual model request: {instructions}"
-        );
-        let transcript =
-            common::find_session_transcript(&env.workspace_root().join(".scode/sessions"))
-                .expect("persisted transcript");
-        let saved = runtime::Session::load_from_path(&transcript).unwrap();
-        assert!(
-            saved.messages().iter().any(|message| {
-                message.blocks.iter().any(|block|
-            matches!(block, runtime::ContentBlock::Text { text } if text == DOCUMENT)
-        )
-            }),
-            "original Mermaid Markdown must survive display unchanged"
-        );
+        assert_model_wire_and_original_source(&env, &prompt);
 
         let mut replay = env.spawn_with_env(
             &["--resume", "latest", "--permission-mode", "read-only"],
