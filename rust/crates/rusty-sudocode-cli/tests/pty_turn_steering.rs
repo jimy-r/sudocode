@@ -405,7 +405,16 @@ fn enter_after_ctrl_c_resumes_retained_input_after_the_cancelled_worker_settles(
     );
     // Do not wait for cancellation to finish: this is the actual input race.
     session.send("\x03").unwrap();
-    submit(&mut session, "NEW_INPUT_AFTER_CANCEL", "\r");
+    // Bare state markers are valid FYIs: a live model may resume the held task.
+    // State the next action explicitly so this checks recovery to an idle prompt.
+    submit(
+        &mut session,
+        concat!(
+            "NEW_INPUT_AFTER_CANCEL: The previous command is cancelled. ",
+            "Do not run it again or use any other tools. Briefly acknowledge this message."
+        ),
+        "\r",
+    );
     common::expect_screen_settled(
         &session,
         |view| {
