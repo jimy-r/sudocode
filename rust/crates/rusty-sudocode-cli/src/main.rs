@@ -912,7 +912,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             permission_mode,
             auth_mode,
             reasoning_effort,
-        ),
+        )?,
         CliAction::ListSessions { output_format } => {
             list_sessions_cli(output_format)?;
         }
@@ -1609,7 +1609,7 @@ fn run_resume(
     permission_mode: PermissionMode,
     auth_mode: Option<AuthMode>,
     reasoning_effort: Option<String>,
-) {
+) -> Result<(), Box<dyn std::error::Error>> {
     let session_reference = session_path.display().to_string();
     let (handle, session) = match load_session_reference(&session_reference) {
         Ok(loaded) => loaded,
@@ -1647,7 +1647,7 @@ fn run_resume(
                     "message_count": session.messages().len(),
                 })
             );
-            return;
+            return Ok(());
         }
         // No commands — enter the interactive REPL with the restored session.
         let mut cli = match LiveCli::new(
@@ -1671,15 +1671,9 @@ fn run_resume(
             std::process::exit(1);
         }
         // Enter the REPL loop (it renders banner + any existing messages).
-        let mode = input_queue::QueueMode::from_env();
-        if !matches!(mode, input_queue::QueueMode::Off) {
-            if let Err(e) = run_repl_iocraft_dispatch(cli, mode) {
-                eprintln!("{}{e}{}", ansi_fg(theme().error), RESET);
-            }
-        } else if let Err(e) = run_repl_loop(cli) {
-            eprintln!("{}{e}{}", ansi_fg(theme().error), RESET);
-        }
-        return;
+        // Propagate terminal/save errors to the same top-level handler used
+        // by a new REPL, after the loop has cleaned up its receiver/editor.
+        return dispatch_repl(cli);
     }
 
     let mut session = session;
@@ -1803,6 +1797,7 @@ fn run_resume(
             }
         }
     }
+    Ok(())
 }
 
 #[derive(Debug, Clone)]
@@ -2308,11 +2303,14 @@ fn run_repl(
         auth_mode,
     )?;
 
-    // Env-gated opt-in to the async REPL that accepts input during a running
-    // turn (see `input_queue` module docs and
-    // `notes/plans/conversation-interrupt-queue-sudocode.md`). When set to
-    // anything other than `off` / unset, dispatch to the async loop. Default
-    // path below stays byte-identical to today's sync behavior.
+    dispatch_repl(cli)
+}
+
+/// New and resumed sessions share renderer selection and error propagation.
+#[inline]
+fn dispatch_repl(cli: LiveCli) -> Result<(), Box<dyn std::error::Error>> {
+    // Select the input owner once for both entry paths. Either loop's returned
+    // error reaches main's normal diagnostic and nonzero-exit handling.
     let mode = input_queue::QueueMode::from_env();
     if !matches!(mode, input_queue::QueueMode::Off) {
         return run_repl_iocraft_dispatch(cli, mode);
