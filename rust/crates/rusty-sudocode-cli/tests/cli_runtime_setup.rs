@@ -46,9 +46,16 @@ fn inspection_preserves_a_fresh_profile_and_absent_runtime() {
 #[test]
 fn help_exposes_runtime_setup_without_preparing_services() {
     let root = tempfile::tempdir().unwrap();
-    let result = command(root.path()).arg("--help").output().unwrap();
+    let result = command(root.path()).arg("help").output().unwrap();
     assert!(result.status.success());
     assert!(String::from_utf8_lossy(&result.stdout).contains("scode setup [--mode local|shared]"));
+    let setup_help = command(root.path())
+        .args(["setup", "--help"])
+        .output()
+        .unwrap();
+    assert!(setup_help.status.success());
+    assert!(String::from_utf8_lossy(&setup_help.stdout).contains("--mode"));
+    assert!(String::from_utf8_lossy(&setup_help.stdout).contains("--check"));
     assert!(!root.path().join("services").exists());
 }
 
@@ -126,7 +133,7 @@ fn interactive_setup_defaults_to_local_without_installing_services() {
         &[("SCODE_SERVICE_ROOT", &services.to_string_lossy())],
     );
     child.expect("Choose how to run scode").unwrap();
-    child.send_line("").unwrap();
+    child.send("\r").unwrap();
     child.expect("Runtime preference saved").unwrap();
     let preference: serde_json::Value = serde_json::from_slice(
         &std::fs::read(env.config_home().join("runtime-profile.json")).unwrap(),
@@ -150,7 +157,7 @@ fn first_interactive_launch_offers_setup_before_a_session_is_started() {
         ],
     );
     child.expect("Choose how to run scode").unwrap();
-    child.send_line("").unwrap();
+    child.send("\r").unwrap();
     child.expect("Runtime preference saved").unwrap();
     let preference: serde_json::Value =
         serde_json::from_slice(&std::fs::read(config.join("runtime-profile.json")).unwrap())
