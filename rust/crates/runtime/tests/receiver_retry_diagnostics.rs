@@ -84,6 +84,9 @@ fn child_receiver() {
     wait_for("both actual claim paths retried", || {
         paths.iter().all(|p| probe.register_write_attempts(p) >= 4)
     });
+    // Retain this observation before the optional real-minute run rolls the
+    // bounded ring past the early peer's failures. Assert only after cleanup.
+    let initial_events = runtime::mailbox::delivery_events();
     let failure_started = Instant::now();
     let first_failures = probe.fail_register_writes(&paths[0], false);
     wait_for("first peer delivered", || seen.lock().unwrap().len() == 1);
@@ -131,9 +134,8 @@ fn child_receiver() {
         ]
     );
     for peer in ["peer-a", "peer-b"] {
-        let events = runtime::mailbox::delivery_events();
         assert!(
-            events.iter().any(|event| {
+            initial_events.iter().any(|event| {
                 event.peer == peer
                     && event.stall == runtime::mailbox::DeliveryStall::ClaimFailed
                     && event.holder.is_empty()
@@ -141,7 +143,7 @@ fn child_receiver() {
                     && event.tail.is_none()
                     && event.loss.is_none()
             }),
-            "the same real claim failure must reach the structured consumer: {events:?}"
+            "the same real claim failure must reach the structured consumer: {initial_events:?}"
         );
     }
 }
