@@ -455,8 +455,14 @@ fn task_updates_do_not_take_keyboard_ownership_from_questions() {
         "actual question options, rather than the echoed prompt",
     );
     screen(&session, "1 terminal");
+    let before = common::turn_status_marker(&session);
     session.send("\x1b[B\r").unwrap();
-    common::expect_input_line_cleared(&session, Duration::from_secs(90), "question answered");
+    common::expect_turn_complete_after(
+        &session,
+        &before,
+        Duration::from_secs(90),
+        "selected question answer committed and parent completed",
+    );
     if env.is_mock() {
         let bodies = env.captured_message_bodies();
         assert!(
