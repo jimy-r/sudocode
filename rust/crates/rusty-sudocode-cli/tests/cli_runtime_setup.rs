@@ -17,7 +17,7 @@ fn command(root: &Path) -> Command {
     command
 }
 
-fn output_json(output: Output) -> serde_json::Value {
+fn output_json(output: &Output) -> serde_json::Value {
     assert!(
         output.status.success(),
         "{}",
@@ -30,7 +30,7 @@ fn output_json(output: Output) -> serde_json::Value {
 fn inspection_preserves_a_fresh_profile_and_absent_runtime() {
     let root = tempfile::tempdir().unwrap();
     let result = output_json(
-        command(root.path())
+        &command(root.path())
             .args(["setup", "--check", "--output-format", "json"])
             .output()
             .unwrap(),
@@ -66,7 +66,7 @@ fn choosing_local_never_installs_starts_or_calls_a_model() {
     model.set_nonblocking(true).unwrap();
     let address = format!("http://{}", model.local_addr().unwrap());
     let result = output_json(
-        command(root.path())
+        &command(root.path())
             .env("ANTHROPIC_BASE_URL", &address)
             .env("OPENAI_BASE_URL", &address)
             .args(["setup", "--mode", "local", "--output-format", "json"])
@@ -84,7 +84,7 @@ fn choosing_local_never_installs_starts_or_calls_a_model() {
         serde_json::json!({"schemaVersion": 1, "mode": "local"})
     );
     let checked = output_json(
-        command(root.path())
+        &command(root.path())
             .args(["setup", "--check", "--output-format", "json"])
             .output()
             .unwrap(),
