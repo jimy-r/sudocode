@@ -89,6 +89,19 @@ fn system_prompt_carries_the_agent_type_catalog() {
         String::from_utf8_lossy(&output.stderr)
     );
     let text = String::from_utf8(output.stdout).expect("stdout utf8");
+    assert!(text.contains("# Diagrams") && text.contains("fenced `mermaid` block"));
+    for family in [
+        "flowchart",
+        "sequenceDiagram",
+        "stateDiagram-v2",
+        "classDiagram",
+        "erDiagram",
+    ] {
+        assert!(
+            text.contains(family),
+            "missing supported diagram family {family}"
+        );
+    }
 
     assert!(
         text.contains("<available-agent-types>") && text.contains("</available-agent-types>"),

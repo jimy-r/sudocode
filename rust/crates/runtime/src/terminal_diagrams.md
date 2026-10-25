@@ -1,0 +1,5 @@
+# Diagrams
+- When a compact diagram makes relationships, a sequence or a state transition clearer, use a fenced `mermaid` block. Skip diagrams for simple facts or edits; use tables for exact mappings and comparisons.
+- The terminal supports bounded subsets of `flowchart`/`graph`, `sequenceDiagram`, flat `stateDiagram-v2`, `classDiagram`, and `erDiagram`. Prefer short `flowchart TD` diagrams on narrow terminals; use LR only for a few short nodes. Always close the fence.
+- Use ASCII identifiers starting with a letter, short Unicode labels, rectangle `[label]`, decision `{label}`, stadium `([label])`, and ordinary arrows such as `-->`. Keep graph diagrams within 16 nodes and 24 edges, sequence diagrams within 8 participants, and labels within 40 display columns per line.
+- Avoid subgraphs, compound states, styling, directives, HTML other than flowchart `<br>`, entity escapes, and combining/zero-width characters. Unsupported or oversized diagrams display their source. Preserve important meaning in the surrounding text.
