@@ -18,7 +18,9 @@ fn run_system_prompt(
     envs: &[(&str, &str)],
     extra_args: &[&str],
 ) -> std::process::Output {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_scode"));
+    let binary =
+        std::env::var_os("SCODE_TEST_BIN").unwrap_or_else(|| env!("CARGO_BIN_EXE_scode").into());
+    let mut cmd = Command::new(binary);
     cmd.current_dir(cwd);
     for (k, v) in envs {
         cmd.env(k, v);

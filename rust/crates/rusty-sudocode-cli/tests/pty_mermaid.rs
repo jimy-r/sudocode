@@ -29,6 +29,7 @@ fn mermaid_stream_and_replay_preserve_input_and_original_markdown() {
         );
         session.resize(60, 100).unwrap();
         common::expect_input_line_cleared(&session, Duration::from_secs(30), "initial prompt");
+        let initial_status = common::turn_status_marker(&session);
         session.send(&prompt).unwrap();
         common::expect_input_line(
             &session,
@@ -54,7 +55,12 @@ fn mermaid_stream_and_replay_preserve_input_and_original_markdown() {
         std::fs::write(env.workspace_root().join("prose-release"), "release").unwrap();
         common::expect_screen_settled(
             &session,
-            |s| common::input_line_of(s) == "draftkeep",
+            |s| {
+                let status = common::turn_status_identity(s);
+                !status.is_empty()
+                    && status != initial_status
+                    && common::input_line_of(s) == "draftkeep"
+            },
             common::DEFAULT_TIMEOUT,
             "draft after handoff",
         );
