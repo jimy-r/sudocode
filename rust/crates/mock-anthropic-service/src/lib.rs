@@ -579,44 +579,47 @@ async fn handle_connection(
             socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n").await?;
             let body = build_stream_body(&request, scenario);
             let thinking_count = calls.first().map_or(0, |call| call.stream_thinking.len());
-            let tool_offset = thinking_count
-                + usize::from(
-                    calls
-                        .first()
-                        .is_some_and(|call| call.stream_text_prelude.is_some()),
-                );
+            let tool_offset = thinking_count + usize::from(concurrency_prelude(&calls).is_some());
+            let postlude_index = tool_offset + calls.len();
             let mut text_waited = false;
             for chunk in body.split_inclusive("\n\n") {
                 socket.write_all(chunk.as_bytes()).await?;
                 let event = chunk
                     .lines()
                     .find_map(|line| line.strip_prefix("data: "))
-                    .and_then(|data| serde_json::from_str::<Value>(data).ok())
-                    .unwrap();
-                let index = event["index"]
-                    .as_u64()
+                    .and_then(|data| serde_json::from_str::<Value>(data).ok());
+                let index = event
+                    .as_ref()
+                    .and_then(|event| event["index"].as_u64())
                     .and_then(|index| usize::try_from(index).ok());
+                let event_type = event.as_ref().and_then(|event| event["type"].as_str());
+                let delta_type = event
+                    .as_ref()
+                    .and_then(|event| event["delta"]["type"].as_str());
                 let call = index
                     .and_then(|index| index.checked_sub(tool_offset))
                     .and_then(|index| calls.get(index));
-                let waiting_call = if event["delta"]["type"] == "text_delta"
-                    && index == Some(tool_offset + calls.len())
+                let waiting_call = if event_type == Some("content_block_delta")
+                    && delta_type == Some("text_delta")
+                    && index == Some(postlude_index)
                     && !text_waited
                 {
                     text_waited = true;
                     calls
                         .iter()
                         .find(|call| !call.stream_text_chunks.is_empty())
-                } else if event["type"] == "content_block_stop"
+                } else if event_type == Some("content_block_stop")
                     && index == Some(0)
                     && thinking_count > 0
                 {
                     calls
                         .first()
                         .filter(|call| call.stream_pause_at == "thinking")
-                } else if event["delta"]["type"] == "input_json_delta" {
+                } else if event_type == Some("content_block_delta")
+                    && delta_type == Some("input_json_delta")
+                {
                     call.filter(|call| call.stream_pause_at == "arguments")
-                } else if event["type"] == "content_block_stop" {
+                } else if event_type == Some("content_block_stop") {
                     call.filter(|call| {
                         call.stream_pause_at == "tool_stop" && call.stream_text_chunks.is_empty()
                     })
@@ -829,7 +832,7 @@ struct ConcurrencyCall {
     stream_fail_after: bool,
     stream_pause_at: String,
     stream_thinking: Vec<(String, String)>,
-    stream_text_prelude: Option<String>,
+    stream_prelude: Option<String>,
     // These chunks follow the tool-use blocks; introductory text uses prelude.
     stream_text_chunks: Vec<String>,
     id: String,
@@ -875,7 +878,11 @@ fn concurrency_calls(request: &MessageRequest) -> Vec<ConcurrencyCall> {
                     )
                 })
                 .collect(),
-            stream_text_prelude: call["stream_text_prelude"].as_str().map(str::to_owned),
+            // Normalize the earlier fixture spelling at the boundary.
+            stream_prelude: call["stream_prelude"]
+                .as_str()
+                .or_else(|| call["stream_text_prelude"].as_str())
+                .map(str::to_owned),
             // File-backed chunks keep response markers out of the echoed prompt.
             stream_text_chunks: call["stream_text_chunks_path"].as_str().map_or_else(
                 || {
@@ -898,6 +905,11 @@ fn concurrency_calls(request: &MessageRequest) -> Vec<ConcurrencyCall> {
             input: call["input"].clone(),
         })
         .collect()
+}
+
+#[inline]
+fn concurrency_prelude(calls: &[ConcurrencyCall]) -> Option<&str> {
+    calls.iter().find_map(|call| call.stream_prelude.as_deref())
 }
 
 fn concurrency_batch_complete(request: &MessageRequest) -> bool {
@@ -1729,7 +1741,7 @@ fn build_stream_body(request: &MessageRequest, scenario: Scenario) -> String {
                 tool_uses_sse_with_blocks(
                     &uses,
                     12,
-                    calls[0].stream_text_prelude.as_deref(),
+                    concurrency_prelude(&calls),
                     &text_chunks,
                     &calls[0].stream_thinking,
                 )
