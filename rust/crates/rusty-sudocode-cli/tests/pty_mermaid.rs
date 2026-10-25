@@ -21,6 +21,7 @@ fn assert_diagram(screen: &str) {
 #[test]
 fn mermaid_stream_and_replay_preserve_input_and_original_markdown() {
     for mode in ["off", "queue"] {
+        eprintln!("Mermaid native fixture mode={mode}");
         let env = TestEnv::new_mock("mermaid-stream-replay");
         let prompt = common::terminal_host::prose_prompt(&env, DOCUMENT, serde_json::json!({}));
         let mut session = env.spawn_with_env(
@@ -46,25 +47,41 @@ fn mermaid_stream_and_replay_preserve_input_and_original_markdown() {
         session.send("\r").unwrap();
         let screen = common::expect_screen_settled(
             &session,
-            |s| s.contains("DiagramDone."),
+            |s| {
+                s.contains("请求")
+                    && s.contains("Reply")
+                    && env.workspace_root().join("prose-ready").exists()
+            },
             common::DEFAULT_TIMEOUT,
             "streamed Mermaid before EOF",
         );
         assert_diagram(&screen);
-        session.send("draftkeep").unwrap();
-        common::expect_input_line(
-            &session,
-            "draftkeep",
-            common::DEFAULT_TIMEOUT,
-            "draft during stream",
-        );
+        if mode == "queue" {
+            session.send("draftkeep").unwrap();
+            common::expect_input_line(
+                &session,
+                "draftkeep",
+                common::DEFAULT_TIMEOUT,
+                "draft during stream",
+            );
+        }
         std::fs::write(env.workspace_root().join("prose-release"), "release").unwrap();
+        if mode == "off" {
+            common::expect_turn_complete_after(
+                &session,
+                &initial_status,
+                common::DEFAULT_TIMEOUT,
+                "classic turn completed",
+            );
+            session.send("draftkeep").unwrap();
+        }
         common::expect_screen_settled(
             &session,
             |s| {
                 let status = common::turn_status_identity(s);
                 !status.is_empty()
                     && status != initial_status
+                    && s.contains("DiagramDone.")
                     && common::input_line_of(s) == "draftkeep"
             },
             common::DEFAULT_TIMEOUT,
@@ -77,6 +94,18 @@ fn mermaid_stream_and_replay_preserve_input_and_original_markdown() {
         let requests = env.captured_message_bodies();
         let request: serde_json::Value = serde_json::from_str(&requests[0]).unwrap();
         let instructions = request["system"].to_string();
+        let received_full_prompt = request["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|message| message["role"] == "user")
+            .flat_map(|message| message["content"].as_array().into_iter().flatten())
+            .filter_map(|block| block["text"].as_str())
+            .any(|text| text.contains(&prompt));
+        assert!(
+            received_full_prompt,
+            "the exact complete prompt must reach the model"
+        );
         assert!(
             instructions.contains("# Diagrams") && instructions.contains("fenced `mermaid` block"),
             "diagram guidance must reach the actual model request: {instructions}"
