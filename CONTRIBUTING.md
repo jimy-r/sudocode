@@ -700,8 +700,10 @@ any commit with a `Merge-adapts: <path>` trailer (for example,
 `git commit --allow-empty -m 'Declare merge adaptation' -m 'Merge-adapts: <path>'`).
 
 The "Verify PR history" check enforces this on the PR and again on the
-merge-queue group. It requires every file the range changes to be edited
-by a non-merge commit or declared, and it rejects new conflict markers. It
+merge-queue group. For each merge commit it recomputes Git's own merge of
+the two parents; a file may differ from that result only if it conflicted
+or is declared. It also rejects new conflict markers. (nexi-lab/nexus's
+`check_merge_history.py` enforces the same rule.) It
 runs for every PR regardless of changed paths. Its implementation is
 [`check_pr_history.py`](.github/scripts/check_pr_history.py). The required
 CI checks must pass before merging, including for admins.

@@ -100,6 +100,18 @@ def main():
         git("merge", "--no-ff", "reverting", "-m", "Merge queue group")
         expect("merge queue group with the same rewrite rejected", False, "  other.txt\n", base="main", head="HEAD")
 
+        # Hiding an edit in a merge is caught even in a file the PR does edit.
+        git("switch", "-c", "hiding", "feature")
+        commit("feature-only.txt", "the PR's own file\n")
+        git("switch", "main")
+        commit("unrelated.txt", "main moves on\n")
+        git("switch", "hiding")
+        git("merge", "--no-commit", "main")
+        (root / "feature-only.txt").write_text("edited inside the merge\n")
+        git("add", "feature-only.txt")
+        git("commit", "-m", "Merge main")
+        expect("edit hidden in a merge of a file the PR edits rejected", False, "  feature-only.txt\n")
+
         # A pushed merge cannot be rewritten; declaring the edit makes it visible.
         git("switch", "reverting")
         git("commit", "--allow-empty", "-m", "Declare merge adaptation", "-m", "Merge-adapts: other.txt")
