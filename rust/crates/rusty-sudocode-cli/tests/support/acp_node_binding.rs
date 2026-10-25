@@ -219,7 +219,8 @@ async fn live_pending_node_recovers_send_and_the_original_receiver() {
     )
     .unwrap();
 
-    let outgoing = format!("PENDING_NODE_SEND_{}", uuid::Uuid::new_v4());
+    // The newly created native SID already distinguishes this fixture run.
+    let outgoing = format!("PENDING_NODE_SEND_{sid}");
     let (_, sent) = client
         .send_request(
             "_sudocode/a2a/send",
@@ -250,7 +251,7 @@ async fn live_pending_node_recovers_send_and_the_original_receiver() {
         "session startup, configuration recovery and direct send must not infer"
     );
 
-    let incoming = format!("PENDING_NODE_RECEIVE_{}", uuid::Uuid::new_v4());
+    let incoming = format!("PENDING_NODE_RECEIVE_{sid}");
     observer
         .send(runtime::agent_mailbox::MailboxEnvelope {
             from: observer_name.clone(),
