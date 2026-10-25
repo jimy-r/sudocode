@@ -204,15 +204,19 @@ print(result)
         // re-running the invoice is.
         // The returned outputFile is the source of truth. Resolve it in the
         // fixture rather than asking the model to substitute a placeholder.
-        let report = completed_invoice_report(&captured);
-        expected_report = Some(report.canonicalize().unwrap());
+        let report = completed_invoice_report(&captured).canonicalize().unwrap();
+        let workspace = env.workspace_root().canonicalize().unwrap();
+        let relative = report
+            .strip_prefix(&workspace)
+            .expect("the completed report belongs to this fixture workspace");
+        let read = serde_json::json!({
+            "path": format!("./{}", relative.to_string_lossy().replace('\\', "/")),
+        });
+        expected_report = Some(report);
         let verification = agent_input(
             &model,
             "Explore",
-            &format!(
-                "Read exactly {} and return the actual invoice output. Only read this report: do not run commands or create another report.",
-                serde_json::to_string(&report).unwrap()
-            ),
+            &format!("Call read_file exactly once with exactly this input object: {read}. Copy the supplied relative path unchanged, including its leading './' and forward slashes. Return the actual invoice output. Only read this report: do not run commands or create another report."),
         );
         let marker = common::turn_status_marker(&cli);
         cli.send(&agent_call_prompt(
@@ -310,7 +314,9 @@ print(result)
                         } else {
                             env.workspace_root().join(path)
                         };
-                        let actual = path.canonicalize().expect("report file must exist");
+                        let actual = path.canonicalize().unwrap_or_else(|error| {
+                            panic!("report file {path:?} must exist: {error}")
+                        });
                         let reports = env
                             .workspace_root()
                             .join(".sudocode-agents")

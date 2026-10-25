@@ -135,14 +135,14 @@ fn assert_saved_send(env: &TestEnv) -> std::path::PathBuf {
 fn assert_cards(cli: &pty_expect::PtySession, timeout: Duration) {
     let screen = common::expect_screen_settled(
         cli,
-        |screen| screen.contains("AgentList") && screen.contains("Written to inbox"),
+        |screen| screen.contains("AgentList") && screen.contains("Sent to inbox"),
         timeout,
         "discovery and delivery cards",
     );
     for expected in [
         "peer  ",
         UNIFIED_SEND_RECIPIENT,
-        "Send →",
+        &format!("Send → {UNIFIED_SEND_RECIPIENT} · Sent to inbox"),
         "Summary: directory address roundtrip",
         BODY,
     ] {
@@ -155,6 +155,15 @@ fn assert_cards(cli: &pty_expect::PtySession, timeout: Duration) {
     assert!(
         !screen.contains("mailbox_path:"),
         "physical paths should stay in the source result"
+    );
+    let send_card = screen
+        .split_once("╭─ Send →")
+        .and_then(|(_, card)| card.split_once("╰─"))
+        .expect("the completed send card is framed")
+        .0;
+    assert!(
+        !send_card.contains("To: "),
+        "recipient must not be repeated in the card: {send_card}"
     );
 }
 
