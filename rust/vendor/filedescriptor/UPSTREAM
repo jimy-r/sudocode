@@ -1,0 +1,8 @@
+filedescriptor 0.8.3
+https://github.com/wezterm/wezterm
+Commit: 4c619a44dc07ad611d28a8af0416f25462d6b3ad
+Published crate SHA256: e40758ed24c9b2eeb76c35fb0aebc66c626084edd827e07e1552279814c6682d
+Local change: defer probing a displaced Win32 standard handle until after redirection.
+GetNamedPipeInfo during redirect can wait on the old handle's full synchronous write.
+The existing safe redirect API and public surface remain unchanged.
+All workspace and PTY consumers use this one patched dependency.
