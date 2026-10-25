@@ -89,25 +89,24 @@ mod platform {
 
 /// Win32 stderr cannot be made nonblocking like a Unix pipe. One reader drains
 /// the real pipe into a bounded queue; the UI tick never waits for pipe IO.
-/// `filedescriptor` already backs the repository's PTY dependency. Its safe
-/// handle/redirect API keeps the workspace's unsafe-code prohibition intact.
+/// Pipe creation reuses the PTY dependency. Standard-handle ownership uses std
+/// OwnedHandle and the existing Win32 wrapper crate, without pipe-type probes.
 #[cfg(windows)]
 mod platform {
     use std::io::{self, Read};
-    use std::os::windows::io::{AsRawHandle, IntoRawHandle};
+    use std::os::windows::io::{AsHandle, OwnedHandle};
     use std::sync::mpsc::{self, Receiver};
     use std::sync::{Arc, OnceLock};
     use std::thread::JoinHandle;
 
-    use filedescriptor::{FileDescriptor, Pipe, StdioDescriptor};
+    use filedescriptor::Pipe;
 
     const CAPTURE_CHUNKS: usize = 16;
     const CHUNK_BYTES: usize = 4096;
 
     pub struct StderrRedirect {
-        original: FileDescriptor,
-        writer: Option<FileDescriptor>,
-        retired_writer: Option<FileDescriptor>,
+        original: OwnedHandle,
+        writer: Option<OwnedHandle>,
         active: bool,
         captured: Option<Receiver<Vec<u8>>>,
         reader: Option<JoinHandle<()>>,
@@ -118,8 +117,10 @@ mod platform {
         pub fn activate() -> Option<Self> {
             // Standard streams can share a Win32 handle (for example 2>&1).
             // Own a duplicate, never the handle still installed on stdout.
-            let original = FileDescriptor::dup(&io::stderr()).ok()?;
+            let original = io::stderr().as_handle().try_clone_to_owned().ok()?;
             let Pipe { mut read, write } = Pipe::new().ok()?;
+            let writer: OwnedHandle = write.as_file().ok()?.into();
+            drop(write);
             let (tx, rx) = mpsc::sync_channel(CAPTURE_CHUNKS);
             let wake = Arc::new(OnceLock::<std::thread::Thread>::new());
             let notify = Arc::clone(&wake);
@@ -144,10 +145,10 @@ mod platform {
                     }
                 })
                 .ok()?;
-            let previous = match redirect(&write) {
+            let previous = match redirect(&writer) {
                 Ok(previous) => previous,
                 Err(_) => {
-                    drop(write);
+                    drop(writer);
                     drop(rx);
                     let _ = reader.join();
                     return None;
@@ -155,8 +156,7 @@ mod platform {
             };
             Some(Self {
                 original: previous.unwrap_or(original),
-                writer: Some(write),
-                retired_writer: None,
+                writer: Some(writer),
                 active: true,
                 captured: Some(rx),
                 reader: Some(reader),
@@ -175,12 +175,11 @@ mod platform {
         pub fn suspend(&mut self) -> io::Result<()> {
             if self.active {
                 let previous = redirect(&self.original)?;
-                // Keep both the displaced handle and its old duplicate alive:
-                // even closing a duplicate can wait for synchronous pipe IO.
-                // The classic rearm holds stderr before its redirect mutex, so
-                // it can retire this one saved handle after the writer drains.
+                // std OwnedHandle drops call CloseHandle without probing the
+                // pipe. The displaced handle stays alive; dropping the other
+                // duplicate neither closes the last writer nor queries it.
                 if let Some(previous) = previous {
-                    self.retired_writer = self.writer.replace(previous);
+                    self.writer = Some(previous);
                 }
                 self.active = false;
             }
@@ -195,7 +194,6 @@ mod platform {
                         self.original = previous;
                     }
                     self.active = true;
-                    drop(self.retired_writer.take());
                 }
             }
             Ok(())
@@ -213,19 +211,8 @@ mod platform {
     }
 
     #[inline]
-    fn redirect(source: &FileDescriptor) -> io::Result<Option<FileDescriptor>> {
-        let previous = FileDescriptor::redirect_stdio(source, StdioDescriptor::Stderr)
-            .map_err(io::Error::other)?;
-        // The API transfers the displaced handle, which may still be installed
-        // on another standard stream. Relinquish that borrowed global handle;
-        // only unshared displaced handles belong to this redirect operation.
-        if previous.as_raw_handle() == io::stdout().as_raw_handle()
-            || previous.as_raw_handle() == io::stdin().as_raw_handle()
-        {
-            let _ = previous.into_raw_handle();
-            return Ok(None);
-        }
-        Ok(Some(previous))
+    fn redirect(source: &OwnedHandle) -> io::Result<Option<OwnedHandle>> {
+        stdin_peek::replace_stderr_handle(source.as_handle())
     }
 
     impl Drop for StderrRedirect {
@@ -235,7 +222,6 @@ mod platform {
             // on a full queue. EOF normally ends the reader immediately. Do not
             // block UI shutdown waiting for a library's retained stderr clone.
             drop(self.captured.take());
-            drop(self.retired_writer.take());
             drop(self.writer.take());
             drop(self.reader.take());
         }

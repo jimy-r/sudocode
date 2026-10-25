@@ -1,6 +1,6 @@
 [workspace]
 members = ["crates/*"]
-exclude = ["vendor/command-group", "vendor/filedescriptor"]
+exclude = ["vendor/command-group"]
 resolver = "2"
 
 [workspace.package]
@@ -82,8 +82,3 @@ strip = "symbols"
 [profile.cohost-release-windows]
 inherits = "cohost-release"
 opt-level = "s"
-
-# One patched dependency for capture and its existing PTY consumers; provenance
-# and the bounded Win32 redirection fix are in vendor/filedescriptor/UPSTREAM.
-[patch.crates-io]
-filedescriptor = { path = "vendor/filedescriptor" }

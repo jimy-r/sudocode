@@ -102,20 +102,24 @@ first character and explains why the old classic path bypassed the printer.
 The upstream fix keeps input ownership in rustyline; no local cursor painter,
 fork or second decoding policy is introduced.
 
-The Windows `filedescriptor` dependency is a single vendored copy shared with
-its existing PTY consumers, with exact upstream/crate provenance in `UPSTREAM`.
-Its standard-handle replacement defers classification of the displaced handle:
-probing a full synchronous pipe before `SetStdHandle` can wait before the
-caller can release its drainer. Capture also retains the one old writer
-duplicate until rearm after the classic stderr lock, instead of closing it
-inside suspension. This adds no workspace unsafe-code exception. The original
-Windows full-pipe failure, five-second gates and fifteen-second parent budget
-remain; only actual new Windows execution qualifies this candidate.
+Windows uses std `OwnedHandle` for standard-stream ownership and cloning.
+The existing Win32 wrapper crate provides the small standard-handle replacement
+operation, preserving aliases to stdout/stdin and returning a displaced handle
+only after a successful swap. No pipe/socket classification runs during this
+handoff. The existing `filedescriptor` dependency still creates the pipe, before
+it has pending IO. W7's isolated native probe contradicted the earlier duplicate-
+close hypothesis: a non-last duplicate closes promptly; `GetNamedPipeInfo` waits
+behind synchronous IO. That query was reachable through generic duplication,
+raw-handle construction and drop. The temporary vendored candidate is withdrawn;
+no dependency fork or new unsafe-code exception remains. The existing isolated
+Win32 FFI surface grows only by this owned standard-handle swap, documented in
+the PR. Original five-second gates and fifteen-second parent budgets remain;
+only new Windows execution qualifies the candidate.
 
-Unix keeps its nonblocking-pipe implementation. Windows now captures the real
-Win32 stderr handle through the already-locked `filedescriptor` dependency;
-one pipe reader feeds a bounded queue, and the UI tick drains without waiting
-for IO. No workspace `unsafe` exception or engine/renderer channel is added.
+Unix keeps its nonblocking-pipe implementation. Windows owns its real stderr
+handle through std and the existing isolated Win32 wrapper; one pipe reader
+feeds a bounded queue, and the UI tick drains without waiting for IO. The CLI
+retains its absolute unsafe-code prohibition and its existing renderer seam.
 Windows retains a separate restore handle, preserving stdout/stdin handles
 when standard streams share a target. Terminal handoff restores the original
 stderr target and resume reinstalls capture. Suspension retains the actual
