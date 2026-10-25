@@ -396,9 +396,10 @@ fn repeated_file_read_has_one_frame_per_saved_command() {
     let config = env.workspace_root().join(".nexus/sudocode");
     std::fs::create_dir_all(&config).unwrap();
     std::fs::write(config.join("settings.json"), r#"{"thinking":false}"#).unwrap();
+    let gate = env.workspace_root().join("continue-file-batch");
     let batch = serde_json::json!([
-        {"id":"spacing_one", "name":"bash", "input":{"command":"cat spacing-one.txt"}, "stream_text_chunks":["Spacing intro.\n\n"]},
-        {"id":"spacing_two", "name":"bash", "input":{"command":"cat spacing-two.txt"}},
+        {"id":"spacing_one", "name":"bash", "input":{"command":"cat spacing-one.txt"}, "stream_prelude":"Spacing intro.\n\n"},
+        {"id":"spacing_two", "name":"bash", "input":{"command":"cat spacing-two.txt"}, "stream_wait_for":gate},
         {"id":"spacing_one_again", "name":"bash", "input":{"command":"cat spacing-one.txt"}},
     ]);
     let prompt = env.prompt(
@@ -415,6 +416,15 @@ fn repeated_file_read_has_one_frame_per_saved_command() {
     );
     let marker = common::turn_status_marker(&sess);
     sess.send("\r").unwrap();
+    // The provider emits the intro before tool calls, then holds back the
+    // repeated read until both earlier commands have actually returned.
+    common::expect_screen(
+        &sess,
+        |s| s.contains("ONE_END") && s.contains("TWO_END"),
+        common::DEFAULT_TIMEOUT,
+        "first file reads finish before the remaining tool is streamed",
+    );
+    std::fs::write(&gate, "continue").unwrap();
     common::expect_turn_complete_after(
         &sess,
         &marker,
