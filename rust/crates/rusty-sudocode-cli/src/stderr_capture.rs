@@ -107,6 +107,7 @@ mod platform {
     pub struct StderrRedirect {
         original: FileDescriptor,
         writer: Option<FileDescriptor>,
+        retired_writer: Option<FileDescriptor>,
         active: bool,
         captured: Option<Receiver<Vec<u8>>>,
         reader: Option<JoinHandle<()>>,
@@ -155,6 +156,7 @@ mod platform {
             Some(Self {
                 original: previous.unwrap_or(original),
                 writer: Some(write),
+                retired_writer: None,
                 active: true,
                 captured: Some(rx),
                 reader: Some(reader),
@@ -173,12 +175,12 @@ mod platform {
         pub fn suspend(&mut self) -> io::Result<()> {
             if self.active {
                 let previous = redirect(&self.original)?;
-                // Keep the actual displaced pipe handle alive. Closing it can
-                // wait for a synchronous WriteFile while the caller is still
-                // needed to release/drain that write. The old uninstalled
-                // duplicate is not an IO owner and can be dropped instead.
+                // Keep both the displaced handle and its old duplicate alive:
+                // even closing a duplicate can wait for synchronous pipe IO.
+                // The classic rearm holds stderr before its redirect mutex, so
+                // it can retire this one saved handle after the writer drains.
                 if let Some(previous) = previous {
-                    self.writer = Some(previous);
+                    self.retired_writer = self.writer.replace(previous);
                 }
                 self.active = false;
             }
@@ -193,6 +195,7 @@ mod platform {
                         self.original = previous;
                     }
                     self.active = true;
+                    drop(self.retired_writer.take());
                 }
             }
             Ok(())
@@ -232,6 +235,7 @@ mod platform {
             // on a full queue. EOF normally ends the reader immediately. Do not
             // block UI shutdown waiting for a library's retained stderr clone.
             drop(self.captured.take());
+            drop(self.retired_writer.take());
             drop(self.writer.take());
             drop(self.reader.take());
         }

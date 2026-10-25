@@ -53,6 +53,18 @@ send retry or second background reconnect loop to aggregate.
 | Telemetry sink write/rotation failures | Reuse a fallible writer | The regular sink keeps its fallback. The retry reporter calls the same serializer/rotation path through `try_record`, and owns a bounded terminal fallback if opening or writing the log fails; it does not recursively report a log failure through that log. |
 | CLI commands, examples, build/install and test harness scripts | Keep command output | Their failure output is the requested command result, not unsolicited background noise. |
 
+## Delivery observation ownership
+
+The landed `DeliveryEvent` is the domain observation at each claim, poll,
+commit refusal and rejected batch. The event is captured once, then its inline
+observer feeds the existing bounded delivery log and, for actual operation
+errors, the shared retry reporter. Both consumers get the same holder, optional
+offset/tail, stall, typed lease loss and repeat count. Claim failures keep unknown
+positions null. Consumer refusal and lease loss remain structured attribution,
+not transport reconnect notices. Retry timings, eligibility and acknowledgment
+are unchanged. The receiver-error status work in #1041 remains a separate
+composition boundary until its source lands; no second status registry is added.
+
 ## Terminal ownership
 
 A bounded notice still must not write over live input. Both terminal owners
@@ -89,6 +101,16 @@ keys when the external printer is enabled. That stalled fast bursts after the
 first character and explains why the old classic path bypassed the printer.
 The upstream fix keeps input ownership in rustyline; no local cursor painter,
 fork or second decoding policy is introduced.
+
+The Windows `filedescriptor` dependency is a single vendored copy shared with
+its existing PTY consumers, with exact upstream/crate provenance in `UPSTREAM`.
+Its standard-handle replacement defers classification of the displaced handle:
+probing a full synchronous pipe before `SetStdHandle` can wait before the
+caller can release its drainer. Capture also retains the one old writer
+duplicate until rearm after the classic stderr lock, instead of closing it
+inside suspension. This adds no workspace unsafe-code exception. The original
+Windows full-pipe failure, five-second gates and fifteen-second parent budget
+remain; only actual new Windows execution qualifies this candidate.
 
 Unix keeps its nonblocking-pipe implementation. Windows now captures the real
 Win32 stderr handle through the already-locked `filedescriptor` dependency;
