@@ -645,9 +645,9 @@ fn streaming_text_is_a_safe_steering_boundary_without_waiting_for_block_stop() {
     submit(&mut session, &prompt, "\r");
     common::expect_screen(
         &session,
-        |_| ready.exists(),
+        |view| ready.exists() && view.contains("STREAM_TEXT_BEFORE_STEER"),
         common::DEFAULT_TIMEOUT,
-        "text streamed but block is open",
+        "text rendered while its block is still open",
     );
     submit(
         &mut session,
@@ -663,7 +663,10 @@ fn streaming_text_is_a_safe_steering_boundary_without_waiting_for_block_stop() {
     let captured = requests(&env);
     assert_eq!(captured.len(), 2);
     let context = captured[1]["messages"].to_string();
-    assert!(context.contains("STREAM_TEXT_BEFORE_STEER") && context.contains("FYI_TEXT_STEER"));
+    assert!(
+        context.contains("STREAM_TEXT_BEFORE_STEER") && context.contains("FYI_TEXT_STEER"),
+        "continuation must retain rendered text and steering: {context}"
+    );
     assert!(!context.contains("Interrupted"));
     assert!(!release.exists());
     finish(&mut session);
