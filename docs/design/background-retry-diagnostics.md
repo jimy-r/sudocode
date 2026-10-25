@@ -107,13 +107,11 @@ The existing Win32 wrapper crate provides the small standard-handle replacement
 operation, preserving aliases to stdout/stdin and returning a displaced handle
 only after a successful swap. No pipe/socket classification runs during this
 handoff. The existing `filedescriptor` dependency still creates the pipe, before
-it has pending IO. W7's isolated native probe contradicted the earlier duplicate-
-close hypothesis: a non-last duplicate closes promptly; `GetNamedPipeInfo` waits
-behind synchronous IO. That query was reachable through generic duplication,
-raw-handle construction and drop. The temporary vendored candidate is withdrawn;
-no dependency fork or new unsafe-code exception remains. The existing isolated
-Win32 FFI surface grows only by this owned standard-handle swap, documented in
-the PR. Original five-second gates and fifteen-second parent budgets remain;
+it has pending IO. `GetNamedPipeInfo` waits behind synchronous IO and was
+reachable through generic duplication, raw-handle construction and drop. Std
+ownership avoids those queries. No dependency fork or new unsafe-code exception
+is introduced; the existing isolated Win32 FFI surface grows only by the owned
+standard-handle swap documented in the PR. Original five-second gates and fifteen-second parent budgets remain;
 only new Windows execution qualifies the candidate.
 
 Unix keeps its nonblocking-pipe implementation. Windows owns its real stderr
