@@ -2726,11 +2726,13 @@ fn stall_cause_mid_batch(consumer_accepts: bool) {
         "m2 is never handed over before the stall, and once after it: {m2:?}"
     );
     assert!(m2[0] > decided, "m2 only comes with the redelivered batch");
-    let (released, reached_node) = probe
+    let release = probe
         .reader_releases()
         .into_iter()
-        .find(|(at, _)| *at >= decided)
+        .find(|release| release.requested >= decided)
         .expect("the tail let the reader go after the stall");
+    let released = release.requested;
+    let reached_node = release.reached_node;
     let reacquired = probe
         .reader_acquisitions()
         .into_iter()
