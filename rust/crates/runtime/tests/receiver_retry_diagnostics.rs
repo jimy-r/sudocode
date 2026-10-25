@@ -130,6 +130,20 @@ fn child_receiver() {
             "original message from peer-b"
         ]
     );
+    for peer in ["peer-a", "peer-b"] {
+        let events = runtime::mailbox::delivery_events();
+        assert!(
+            events.iter().any(|event| {
+                event.peer == peer
+                    && event.stall == runtime::mailbox::DeliveryStall::ClaimFailed
+                    && event.holder.is_empty()
+                    && event.offset.is_none()
+                    && event.tail.is_none()
+                    && event.loss.is_none()
+            }),
+            "the same real claim failure must reach the structured consumer: {events:?}"
+        );
+    }
 }
 
 #[test]
@@ -174,8 +188,11 @@ fn concurrent_reader_failures_share_one_notice_and_recover_without_lost_messages
                         .as_str()
                         .is_some_and(|error| error.contains("write reader register"))
                     && props["context"]["operation"] == "claim"
+                    && props["context"]["stall"] == "ClaimFailed"
+                    && props["context"]["holder"] == ""
                     && props["context"]["offset"].is_null()
                     && props["context"]["tail"].is_null()
+                    && props["context"]["loss"].is_null()
             }),
             "missing real register error for {peer}: {records:?}"
         );
