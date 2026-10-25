@@ -9,13 +9,13 @@ use crossterm::style::ContentStyle;
 use engine_core::{Tip, TipPriority};
 use std::collections::BTreeMap;
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Hash)]
 pub(super) struct FooterHints<'a> {
     pub transient: Option<&'a str>,
     pub controls: Option<&'a str>,
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone, Default, Hash)]
 pub(super) struct FooterTips {
     model: BTreeMap<TipPriority, Tip>,
     cache: Option<Tip>,

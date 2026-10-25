@@ -2168,28 +2168,35 @@ fn ReplApp(mut hooks: Hooks) -> impl Into<AnyElement<'static>> {
     };
     let explicit_hint = footer_hint.read().clone();
     let native_hint = explicit_hint.as_ref().map(|(text, _)| text.as_str());
-    let footer_text = Arc::new(footer_tips.read().render(
-        &perm,
-        &browser,
-        submitted,
-        turn_active,
-        FooterHints {
+    // Spinner and draft ticks do not change footer content. Keep only the
+    // current full/compact pair, invalidating on every visible dependency.
+    let (footer_text, footer_summary) = {
+        let tips = footer_tips.read();
+        let hints = FooterHints {
             transient: native_hint,
             controls,
-        },
-        w,
-    ));
-    let footer_summary = Arc::new(footer_tips.read().render(
-        "compact · enlarge to expand",
-        &browser,
-        submitted,
-        turn_active,
-        FooterHints {
-            transient: native_hint,
-            controls,
-        },
-        w,
-    ));
+        };
+        hooks.use_memo(
+            || {
+                let render = |permission| {
+                    Arc::new(tips.render(permission, &browser, submitted, turn_active, hints, w))
+                };
+                (render(&perm), render("compact · enlarge to expand"))
+            },
+            (
+                &*tips,
+                &perm,
+                browser.footer_label(false),
+                browser.footer_label(true),
+                browser.focus,
+                submitted,
+                turn_active,
+                hints,
+                w,
+                crate::render::ColorSupport::detect(),
+            ),
+        )
+    };
     let task_panel = browser.is_panel().then(|| browser.panel(w, usize::MAX));
     let task_focus = browser.focus;
     drop(browser);
