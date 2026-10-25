@@ -161,7 +161,12 @@ history refreshes the existing continuation, never the latest sibling's view.
 An identity/workspace/owner change or a closed/deleted writer remains an error.
 The original conflict PTY still requires a successful normal exit. A rejected
 identity refresh exercises normal error exit without a TLS teardown abort and
-checks that the changed transcript is untouched. A real record-history runtime
+checks that the changed transcript is untouched. New and resumed sessions use
+one renderer dispatcher and propagate returned errors to the existing top-level
+error handler. A failed final save on resume must not print an error and then
+return success. The rejection fixture changes both history and identity, and
+checks the stale-history precondition before submitting compaction; a metadata
+edit alone does not force this refresh branch. A real record-history runtime
 case retains the original writer across refresh and a subsequent model turn
 while excluding a sibling's committed private history. These fixtures do not
 establish the cause of the original Windows TLS abort on their own.
