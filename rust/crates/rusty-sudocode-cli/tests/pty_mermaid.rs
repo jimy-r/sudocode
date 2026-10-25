@@ -45,7 +45,8 @@ fn mermaid_stream_and_replay_preserve_input_and_original_markdown() {
             "complete prompt across wrapped input rows",
         );
         session.send("\r").unwrap();
-        let screen = common::expect_screen_settled(
+        // The gated turn intentionally keeps the status spinner alive.
+        let screen = common::expect_screen(
             &session,
             |s| {
                 s.contains("请求")
