@@ -34,20 +34,9 @@ fn task_env(label: &str) -> (TestEnv, ReleaseOnDrop) {
 }
 
 fn expect_input_ready(session: &PtySession, budget: Duration, context: &str) {
-    common::expect_screen_settled(
+    common::expect_screen_rows_settled(
         session,
-        |_| {
-            session.render(|screen| {
-                // contents() joins soft-wrapped rows. At 80 columns the input
-                // can otherwise appear to contain the following rule/footer.
-                let rows = screen
-                    .raw()
-                    .rows(0, screen.raw().size().1)
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                rows.contains('\u{276f}') && common::input_line_of(&rows).is_empty()
-            })
-        },
+        |rows| rows.contains('\u{276f}') && common::input_line_of(rows).is_empty(),
         budget,
         context,
     );
@@ -446,7 +435,7 @@ fn task_updates_do_not_take_keyboard_ownership_from_questions() {
             json!({"id":"question","name":"AskUserQuestion","input":{"questions":[{"id":"choice","header":"Choice","question":"Select the second answer","options":[{"label":"First","value":"First","description":"First option"},{"label":"Second","value":"Second","description":"Second option"}],"multiSelect":false}]}}),
         ],
     );
-    common::expect_screen_settled(
+    common::expect_screen_rows_settled(
         &session,
         |view| {
             view.lines()
@@ -459,7 +448,7 @@ fn task_updates_do_not_take_keyboard_ownership_from_questions() {
     screen(&session, "1 terminal");
     let before = common::turn_status_marker(&session);
     session.send("\x1b[B").unwrap();
-    common::expect_screen_settled(
+    common::expect_screen_rows_settled(
         &session,
         |view| {
             view.lines()

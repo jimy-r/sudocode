@@ -52,6 +52,17 @@ fn screen_contents(screen: &pty_expect::Screen<'_>) -> String {
     screen.contents()
 }
 
+/// Preserve physical row boundaries for assertions about inline UI layout.
+/// `contents()` joins soft-wrapped rows, including a full-width rule followed
+/// by a question header in ConPTY. Transcript assertions still use that view.
+fn screen_rows(screen: &pty_expect::Screen<'_>) -> String {
+    screen
+        .raw()
+        .rows(0, screen.raw().size().1)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 /// Find a persisted session transcript below a fixture's session store.
 pub fn find_session_transcript(dir: &std::path::Path) -> Option<PathBuf> {
     for entry in fs::read_dir(dir).ok()? {
@@ -161,9 +172,30 @@ pub fn expect_screen<F>(sess: &PtySession, pred: F, budget: Duration, context: &
 where
     F: Fn(&str) -> bool,
 {
+    expect_screen_view(sess, pred, budget, context, screen_contents)
+}
+
+/// Wait for a layout predicate without joining soft-wrapped physical rows.
+pub fn expect_screen_rows<F>(sess: &PtySession, pred: F, budget: Duration, context: &str) -> String
+where
+    F: Fn(&str) -> bool,
+{
+    expect_screen_view(sess, pred, budget, context, screen_rows)
+}
+
+fn expect_screen_view<F>(
+    sess: &PtySession,
+    pred: F,
+    budget: Duration,
+    context: &str,
+    contents: fn(&pty_expect::Screen<'_>) -> String,
+) -> String
+where
+    F: Fn(&str) -> bool,
+{
     let deadline = Instant::now() + at_least(budget);
     loop {
-        let screen = sess.render(screen_contents);
+        let screen = sess.render(contents);
         if pred(&screen) {
             return screen;
         }
@@ -194,12 +226,38 @@ pub fn expect_screen_settled<F>(
 where
     F: Fn(&str) -> bool,
 {
+    expect_screen_settled_view(sess, pred, budget, context, screen_contents)
+}
+
+/// Wait for stable physical rows with the same deadline and settling contract.
+pub fn expect_screen_rows_settled<F>(
+    sess: &PtySession,
+    pred: F,
+    budget: Duration,
+    context: &str,
+) -> String
+where
+    F: Fn(&str) -> bool,
+{
+    expect_screen_settled_view(sess, pred, budget, context, screen_rows)
+}
+
+fn expect_screen_settled_view<F>(
+    sess: &PtySession,
+    pred: F,
+    budget: Duration,
+    context: &str,
+    contents: fn(&pty_expect::Screen<'_>) -> String,
+) -> String
+where
+    F: Fn(&str) -> bool,
+{
     let deadline = Instant::now() + at_least(budget);
     let mut previous: Option<String> = None;
     let mut stable = 0u32;
     let mut satisfied = false;
     loop {
-        let screen = sess.render(screen_contents);
+        let screen = sess.render(contents);
         if pred(&screen) {
             satisfied = true;
             if previous.as_deref() == Some(screen.as_str()) {
