@@ -254,6 +254,7 @@ async fn live_pending_node_recovers_send_and_the_original_receiver() {
     let incoming = format!("PENDING_NODE_RECEIVE_{sid}");
     observer
         .send(runtime::agent_mailbox::MailboxEnvelope {
+            delivery: runtime::turn_input::InputDelivery::Steer,
             from: observer_name.clone(),
             to: actor,
             body: incoming.clone(),
