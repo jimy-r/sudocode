@@ -220,7 +220,7 @@ impl ColorTheme {
         let label = if is_warning {
             self.warning
         } else {
-            self.soft_green(support)
+            Color::Reset
         };
         ActivityColors {
             logo: support.color(self.logo),

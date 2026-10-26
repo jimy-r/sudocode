@@ -14,7 +14,7 @@
 //!
 //! ```text
 //! [PendingSlot]   ← in-flight tools and queued messages
-//! [StatusSlot]    ← activity | turn_result | empty
+//! [StatusSlot]    ← foreground | background | turn_result | empty
 //! [TodoSlot]      ← todo summary and items | empty
 //! ──── separator ────
 //! [InputSlot]     ← text_input | question_panel
@@ -155,11 +155,16 @@ mod stderr_redirect {
 
 /// ChromeSlot: status area above the separator. One variant renders at a time.
 ///
-/// Priority: Activity > TurnResult > Empty.
+/// Priority: Foreground > Background > TurnResult > Empty.
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum StatusSlot {
     /// Running model, tool, or retry activity; input panels own waiting states.
     Active(String),
+    /// Static task conclusion; shares the footer's event-fed task projection.
+    Background {
+        full: Arc<StyledText>,
+        summary: Arc<StyledText>,
+    },
     /// Turn result (tokens/cost/ctx). Cleared when the next turn starts.
     TurnResult(Arc<StyledText>),
     /// Nothing — slot not rendered, saves vertical space.
@@ -386,7 +391,10 @@ pub enum UiCommand {
     },
     ShowQuestion(QuestionPromptView),
     ClearQuestion,
-    SetTurnResult(Arc<StyledText>),
+    SetTurnResult {
+        text: Arc<StyledText>,
+        turn: u32,
+    },
     SetTip(engine_core::Tip),
     SetCacheTip(Option<engine_core::Tip>),
     BeginTurn,
@@ -448,10 +456,11 @@ impl UiCommandSender {
         let _ = self.tx.send(UiCommand::ClearQuestion);
     }
 
-    pub(crate) fn set_turn_result(&self, text: &crate::render::StyledLine) {
-        let _ = self
-            .tx
-            .send(UiCommand::SetTurnResult(Arc::new(text.structured())));
+    pub(crate) fn set_turn_result(&self, text: &crate::render::StyledLine, turn: u32) {
+        let _ = self.tx.send(UiCommand::SetTurnResult {
+            text: Arc::new(text.structured()),
+            turn,
+        });
     }
 
     pub fn show_input_hint(&self, text: &str) {
@@ -1371,7 +1380,7 @@ fn ReplApp(mut hooks: Hooks) -> impl Into<AnyElement<'static>> {
     let mut frame = hooks.use_state(|| 0usize);
     let mut foreground_state = hooks.use_state(|| EngineState::Idle);
     let mut tool_progress = hooks.use_state(|| None::<String>);
-    let mut turn_result = hooks.use_state(|| None::<Arc<StyledText>>);
+    let mut turn_result = hooks.use_state(|| None::<(u32, Arc<StyledText>)>);
     let mut has_submitted = hooks.use_state(|| false);
     let mut input_slot = hooks.use_state(|| InputSlot::TextInput);
     let mut should_exit = hooks.use_state(|| false);
@@ -1938,8 +1947,8 @@ fn ReplApp(mut hooks: Hooks) -> impl Into<AnyElement<'static>> {
                         Ok(UiCommand::SetTip(tip)) => footer_tips.write().set(tip),
                         Ok(UiCommand::SetCacheTip(tip)) => footer_tips.write().cache(tip),
                         Ok(UiCommand::BeginTurn) => footer_tips.write().begin_turn(),
-                        Ok(UiCommand::SetTurnResult(text)) => {
-                            turn_result.set(Some(text));
+                        Ok(UiCommand::SetTurnResult { text, turn }) => {
+                            turn_result.set(Some((turn, text)));
                         }
                         Ok(UiCommand::UpdateTodos(todos)) => {
                             if let Ok(mut items) = todo_items_for_future.lock() {
@@ -2110,7 +2119,18 @@ fn ReplApp(mut hooks: Hooks) -> impl Into<AnyElement<'static>> {
     let submitted = *has_submitted.read();
     let turn_active = activity_state != EngineState::Idle;
 
-    // StatusSlot: Activity > TurnResult > Empty
+    let mut browser = tasks
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    // Output-only task events do not invalidate these bounded static strings.
+    // Both surfaces consume the browser's existing event projection, even idle.
+    let completed_turn = turn_result.read().as_ref().map(|(turn, _)| *turn);
+    let background_status = hooks.use_memo(
+        || browser.summary().status_lines(w, completed_turn),
+        (browser.summary(), w, completed_turn),
+    );
+
+    // StatusSlot: Foreground > Background > TurnResult > Empty
     let status_slot = if activity_state == EngineState::Running {
         // Reuse the existing status row and shared column layout. No additional
         // live rows can spill into scrollback as tool output grows.
@@ -2135,7 +2155,12 @@ fn ReplApp(mut hooks: Hooks) -> impl Into<AnyElement<'static>> {
         // The existing question/approval panel owns this interaction. No
         // animation or duplicate waiting instruction above InputSlot.
         StatusSlot::Empty
-    } else if let Some(ref tr) = *turn_result.read() {
+    } else if let Some((full, summary)) = &background_status {
+        StatusSlot::Background {
+            full: full.clone(),
+            summary: summary.clone(),
+        }
+    } else if let Some((_, ref tr)) = *turn_result.read() {
         StatusSlot::TurnResult(tr.clone())
     } else {
         StatusSlot::Empty
@@ -2163,9 +2188,6 @@ fn ReplApp(mut hooks: Hooks) -> impl Into<AnyElement<'static>> {
 
     let perm = permission_mode.clone();
     let sep = "\u{2500}".repeat(w);
-    let mut browser = tasks
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let pending_input = pending
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -2258,13 +2280,15 @@ fn ReplApp(mut hooks: Hooks) -> impl Into<AnyElement<'static>> {
     let question_style = chrome_style(chrome_theme.primary);
     let status_text = match &status_slot {
         StatusSlot::Active(s) => ansi(s),
+        StatusSlot::Background { full, .. } => full.clone(),
         StatusSlot::TurnResult(s) => s.clone(),
-        StatusSlot::Empty => Default::default(),
+        StatusSlot::Empty => Arc::default(),
     };
     let status_summary = match &status_slot {
-        StatusSlot::Active(_) => "Status: turn active",
-        StatusSlot::TurnResult(_) => "Status: last turn (collapsed)",
-        StatusSlot::Empty => "",
+        StatusSlot::Active(_) => ansi("Status: turn active"),
+        StatusSlot::Background { summary, .. } => summary.clone(),
+        StatusSlot::TurnResult(_) => ansi("Status: last turn (collapsed)"),
+        StatusSlot::Empty => Arc::default(),
     };
     let heading = ansi_with_style(
         question
@@ -2336,7 +2360,7 @@ fn ReplApp(mut hooks: Hooks) -> impl Into<AnyElement<'static>> {
                     128usize.div_ceil(w.max(1))
                 },
                 full: status_text,
-                summary: ansi(status_summary),
+                summary: status_summary.clone(),
             },
             Slot {
                 minimum_full_rows: 0,
@@ -2350,9 +2374,16 @@ fn ReplApp(mut hooks: Hooks) -> impl Into<AnyElement<'static>> {
             },
         ],
         format!(
-            "{running} tools · {queued} queued · {} todos · {} status",
+            "{running} tools · {queued} queued · {} todos · {}",
             todos.len(),
-            usize::from(!matches!(status_slot, StatusSlot::Empty))
+            if matches!(status_slot, StatusSlot::Background { .. }) {
+                status_summary.text.clone()
+            } else {
+                format!(
+                    "{} status",
+                    usize::from(!matches!(status_slot, StatusSlot::Empty))
+                )
+            }
         ),
         &mut measured,
     );

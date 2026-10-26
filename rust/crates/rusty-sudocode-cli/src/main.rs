@@ -3478,7 +3478,7 @@ fn run_repl_iocraft_dispatch(
     let repl = repl_ui::spawn_repl_ui(&permission_label, &banner, seed_todos, Some(dequeue_hook));
     let (repl_output, repl_ui_cmd, input_rx, repl_spinner, repl_join) = repl.split();
     if let Some(status) = resume_status {
-        repl_ui_cmd.set_turn_result(&status);
+        repl_ui_cmd.set_turn_result(&status, cli.lifecycle.usage_snapshot().turns());
     }
     repl_ui_cmd.set_cache_tip(cli.cache_ttl_tip());
     let pending_question_answer: PendingQuestionAnswer = Arc::new(Mutex::new(None));
@@ -4080,7 +4080,10 @@ fn run_repl_iocraft_dispatch(
                             }
                             if refresh_context {
                                 if let Some(status) = cli_lock.resume_status_line() {
-                                    repl_ui_cmd.set_turn_result(&status);
+                                    repl_ui_cmd.set_turn_result(
+                                        &status,
+                                        cli_lock.lifecycle.usage_snapshot().turns(),
+                                    );
                                 }
                             }
                             if refresh_context
@@ -5156,7 +5159,7 @@ impl LiveCli {
         let token_budget = crate::render::parse_token_budget(input);
         let model = self.lifecycle.current_model();
         let mut spinner = SpinnerHandle::new(
-            render::activity::THINKING_LABEL,
+            render::activity::WORKING_LABEL,
             Some(model.as_str()),
             TerminalRenderer::new().color_theme(),
             token_budget,
@@ -5285,9 +5288,9 @@ impl LiveCli {
             // ChromeSlot already renders it above the separator, and printing
             // it again duplicated the line in the terminal history.
             (Some(ui), Some(_)) => {
-                ui.set_turn_result(&line);
+                ui.set_turn_result(&line, turns);
             }
-            (Some(ui), None) => ui.set_turn_result(&line),
+            (Some(ui), None) => ui.set_turn_result(&line, turns),
             (None, Some(out)) => out.println(&line.to_string()),
             (None, None) => self.out_println(line.to_string()),
         }
