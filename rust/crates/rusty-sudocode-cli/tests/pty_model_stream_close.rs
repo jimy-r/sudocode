@@ -1977,7 +1977,9 @@ fn dropped_stream_continues_from_the_partial_reply() {
 
 #[test]
 fn completed_tool_is_not_rerun_when_the_stream_drops_after_it() {
-    check_liveness(ResponseKind::ToolThenDrop, "2", 2, true);
+    // The stream must drop after the tool finishes; an unfinished tool is
+    // cancelled instead. Leave the tool ample time on a loaded runner.
+    check_liveness(ResponseKind::ToolThenDrop, "8", 2, true);
 }
 
 #[test]
