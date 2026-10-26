@@ -1608,6 +1608,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tools",
+ "tracing",
 ]
 
 [[package]]
@@ -5770,6 +5771,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
+ "tracing",
 ]
 
 [[package]]

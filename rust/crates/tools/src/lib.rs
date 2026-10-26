@@ -2419,6 +2419,10 @@ pub struct AgentListRow {
     pub task_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub role: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description_updated_at: Option<String>,
 }
 
 /// Collect the addressable agents this session can reach, plus the workers it
@@ -2452,12 +2456,25 @@ pub fn collect_agent_list(
         .iter()
         .filter_map(|(id, runtime)| runtime.mailbox_root.as_ref().map(|_| id.clone()))
         .collect();
-    Ok(merge_agent_list(
-        &peers,
-        subagents,
-        &active_tasks,
-        active_only,
-    ))
+    let mut rows = merge_agent_list(&peers, subagents, &active_tasks, active_only);
+    if runtime::experiments::is_enabled(runtime::experiments::Experiment::PeerDescriptions) {
+        for row in rows.iter_mut().filter(|row| row.kind == "peer") {
+            match mailbox
+                .description_store(&row.name)
+                .and_then(|store| store.read())
+            {
+                Ok(Some(description)) => {
+                    row.description = Some(description.description);
+                    row.description_updated_at = Some(description.updated_at);
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    tracing::warn!(%error, agent = %row.name, "peer description unavailable")
+                }
+            }
+        }
+    }
+    Ok(rows)
 }
 
 /// Pure core of [`collect_agent_list`], sources injected so it is testable
@@ -2488,6 +2505,8 @@ pub fn merge_agent_list(
                 kind: "peer".to_string(),
                 task_id: None,
                 role: None,
+                description: None,
+                description_updated_at: None,
             });
     }
 
@@ -2506,6 +2525,8 @@ pub fn merge_agent_list(
                 kind: "subagent".to_string(),
                 task_id: Some(snap.agent_id.clone()),
                 role,
+                description: None,
+                description_updated_at: None,
             });
     }
 

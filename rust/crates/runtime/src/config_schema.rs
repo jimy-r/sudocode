@@ -389,6 +389,11 @@ const TEAMMATE_MODE_OPTIONS: &[&str] = &["tmux", "in-process", "auto"];
 /// there would validate and then fail to load.
 const EXPERIMENTAL_CHILDREN: &[FieldSchema] = &[
     FieldSchema::leaf(
+        "peerDescriptions",
+        FieldType::Bool,
+        "Publish persistent peer descriptions with existing compaction calls",
+    ),
+    FieldSchema::leaf(
         "sharedSessionHistory",
         FieldType::Bool,
         "Independent runtime continuations from completed session turns",

@@ -5,6 +5,7 @@
 //! that drives interactive and one-shot turns.
 
 pub mod agent_color;
+pub mod agent_description;
 pub mod agent_mailbox;
 pub mod agent_types;
 pub mod background_tasks;

@@ -1300,7 +1300,9 @@ fn response_content(request: &Value, number: usize) -> Value {
     let last = request["messages"].as_array().unwrap().last().unwrap()["content"].to_string();
     let searching = !compact && !last.contains("tool_result") && last.contains("discover ");
     let saving = !compact && !last.contains("tool_result") && last.contains("SAVE_GLOBAL_MEMORY");
-    if saving {
+    if !compact && !last.contains("tool_result") && last.contains("LIST_PEER_DESCRIPTIONS") {
+        json!({"type":"tool_use", "id":format!("peer-list-{number}"), "name":"agent_list", "input":{}})
+    } else if saving {
         let system = prompt_text(request);
         let directory = system
             .split("Global memory: `")
@@ -1321,9 +1323,338 @@ fn response_content(request: &Value, number: usize) -> Value {
         json!({"type":"tool_use","id":format!("search_{number}"),"name":"ToolSearch","input":{"query":format!("select:{name}")}})
     } else {
         json!({"type":"text","text": if compact {
-            mock_anthropic_service::CANNED_COMPACTION_SUMMARY.to_string()
+            let checkpoint = if last.contains("PEER_DESCRIPTION_PLAIN_INVALID") {
+                mock_anthropic_service::CANNED_COMPACTION_SUMMARY.replace("<summary>", "").replace("</summary>", "")
+            } else {
+                mock_anthropic_service::CANNED_COMPACTION_SUMMARY.to_owned()
+            };
+            if !last.contains("Optional checkpoint metadata:") || last.contains("PEER_DESCRIPTION_MISSING") {
+                checkpoint
+            } else if last.contains("PEER_DESCRIPTION_INVALID") || last.contains("PEER_DESCRIPTION_PLAIN_INVALID") {
+                format!("{checkpoint}\n<agent-description>{{\"unexpected\":true}}</agent-description>")
+            } else if last.contains("PEER_DESCRIPTION_UNTERMINATED") {
+                format!("{checkpoint}\n<agent-description>broken optional metadata")
+            } else {
+                assert!(last.contains("CURRENT_PEER_WORK"), "description must receive the latest preserved intent");
+                let description = if last.contains("PEER_DESCRIPTION_RAW") {
+                    "Investigating peer discovery"
+                } else {
+                    "\"Investigating peer discovery\""
+                };
+                format!("{checkpoint}\n<agent-description>{description}</agent-description>\n")
+            }
         } else { format!("PREFIX_REPLY_{number}") }})
     }
+}
+
+fn peer_description_settings(env: &TestEnv, agent: &str) {
+    std::fs::write(
+        env.config_home().join("settings.json"),
+        json!({
+            "agentName": agent,
+            "experimental": {"peerDescriptions": true},
+        })
+        .to_string(),
+    )
+    .unwrap();
+}
+
+#[test]
+fn peer_descriptions_survive_compaction_restart_and_real_discovery_without_changing_prefix() {
+    for raw_metadata in [false, true] {
+        assert_peer_description_lifecycle(raw_metadata);
+    }
+}
+
+fn assert_peer_description_lifecycle(raw_metadata: bool) {
+    let env = TestEnv::new_mock("peer-description-lifecycle");
+    let capture = Capture::new();
+    let path = fixture(&env, &capture);
+    peer_description_settings(&env, "description-author");
+    let namespace = runtime::mailbox::local_pair_root_in(env.config_home());
+    let metadata = namespace.join("agents/description-author/description.json");
+    let empty = runtime::mailbox::Mailbox::workspace_local(&namespace, "empty-peer".into());
+    empty.ensure_presence().unwrap();
+    let mut cli = spawn_with_env(
+        &env,
+        &path,
+        &[("SUDOCODE_EXPERIMENT_PEER_DESCRIPTIONS", "0")],
+    );
+    turn(
+        &mut cli,
+        &format!(
+            "CURRENT_PEER_WORK: investigate peer discovery after changing tasks. {}",
+            if raw_metadata {
+                "PEER_DESCRIPTION_RAW"
+            } else {
+                ""
+            }
+        ),
+    );
+    turn(&mut cli, "Continue with this assignment.");
+    assert!(
+        !metadata.exists(),
+        "ordinary turns leave a new peer undescribed"
+    );
+    let ordinary = capture.bodies().pop().unwrap();
+    let original = std::fs::read(&path).unwrap();
+    cli.send("/compact\r").unwrap();
+    cli.expect("Messages removed").unwrap();
+    common::expect_input_line_cleared(&cli, WAIT, "baseline checkpoint committed");
+    let baseline = capture.bodies().pop().unwrap();
+    exit(&mut cli);
+    assert!(
+        !metadata.exists(),
+        "disabled compaction leaves metadata absent"
+    );
+    std::fs::write(&path, original).unwrap();
+    let mut cli = spawn(&env, &path);
+    cli.send("/compact\r").unwrap();
+    cli.expect("Messages removed").unwrap();
+    common::expect_input_line_cleared(&cli, WAIT, "peer description committed");
+    let published = std::fs::read(&metadata).unwrap();
+    let description: Value = serde_json::from_slice(&published).unwrap();
+    assert_eq!(description["description"], "Investigating peer discovery");
+    assert!(description["updated_at"].as_str().is_some());
+    let compact = capture.bodies().pop().unwrap();
+    assert_peer_compaction_prefix(&ordinary, &baseline, &compact);
+    turn(&mut cli, "Continue after the description checkpoint.");
+    exit(&mut cli);
+    let saved = Session::load_from_path(&path).unwrap();
+    assert_eq!(description["source_session_id"], saved.session_id);
+    let continuation = checkpoint_text(&saved);
+    assert!(!continuation.contains("agent-description"));
+    assert!(!continuation.contains("Optional checkpoint metadata:"));
+    drop(saved);
+    let mut resumed = spawn(&env, &path);
+    turn(&mut resumed, "Continue after process restart.");
+    exit(&mut resumed);
+    assert_eq!(
+        published,
+        std::fs::read(&metadata).unwrap(),
+        "resume preserves metadata and its actual update time"
+    );
+    for request in capture.bodies() {
+        fixed_prefix(&ordinary, &request);
+        if !request.to_string().contains(COMPACT) {
+            assert!(!request.to_string().contains("<agent-description>"));
+            assert!(!request
+                .to_string()
+                .contains("Optional checkpoint metadata:"));
+        }
+    }
+
+    assert_peer_description_discovery(&env, &capture, &description);
+}
+
+fn assert_peer_compaction_prefix(ordinary: &Value, baseline: &Value, compact: &Value) {
+    fixed_prefix(ordinary, compact);
+    fixed_prefix(baseline, compact);
+    let baseline_messages = baseline["messages"].as_array().unwrap();
+    let compact_messages = compact["messages"].as_array().unwrap();
+    assert_eq!(
+        &baseline_messages[..baseline_messages.len() - 1],
+        &compact_messages[..compact_messages.len() - 1],
+        "enabling descriptions preserves every historical cache marker"
+    );
+    let mut summarized_prefix = compact.clone();
+    let instruction = summarized_prefix["messages"]
+        .as_array_mut()
+        .unwrap()
+        .pop()
+        .unwrap();
+    assert!(instruction.to_string().contains("CURRENT_PEER_WORK"));
+    assert!(!instruction
+        .to_string()
+        .contains("Output only a <summary> block"));
+    assert!(!instruction
+        .to_string()
+        .contains("plain text: a <summary> block."));
+    assert!(!instruction
+        .to_string()
+        .contains("plain text only — a <summary> block."));
+    history_prefix(&summarized_prefix, ordinary);
+}
+
+fn assert_peer_description_discovery(env: &TestEnv, capture: &Capture, description: &Value) {
+    // A new peer, driven through its real model/tool loop, reads the same namespace.
+    peer_description_settings(env, "description-observer");
+    let mut observer = env.spawn(&["--permission-mode", "read-only"]);
+    observer.resize(60, 160).unwrap();
+    common::expect_input_line_cleared(&observer, WAIT, "description observer ready");
+    turn(&mut observer, "LIST_PEER_DESCRIPTIONS");
+    let listing = capture
+        .bodies()
+        .iter()
+        .rev()
+        .find_map(|request| {
+            request["messages"]
+                .as_array()?
+                .iter()
+                .rev()
+                .find_map(|message| {
+                    message["content"].as_array()?.iter().find_map(|block| {
+                        (block["type"] == "tool_result")
+                            .then(|| block["content"].as_array())
+                            .flatten()
+                            .map(|content| {
+                                content
+                                    .iter()
+                                    .filter_map(|block| block["text"].as_str())
+                                    .collect::<String>()
+                            })
+                            .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+                            .filter(|value| value["agents"].is_array())
+                    })
+                })
+        })
+        .expect("real agent_list result reaches the provider");
+    let peers = listing["agents"].as_array().unwrap();
+    let author = peers
+        .iter()
+        .find(|row| row["name"] == "description-author")
+        .unwrap();
+    assert_eq!(author["description"], description["description"]);
+    assert_eq!(author["description_updated_at"], description["updated_at"]);
+    assert!(
+        author.get("active").is_none(),
+        "description freshness does not assert runtime liveness"
+    );
+    assert!(peers
+        .iter()
+        .any(|row| row["name"] == "empty-peer" && row.get("description").is_none()));
+    common::expect_screen_settled(
+        &observer,
+        |screen| {
+            screen.contains("Investigating peer discovery") && screen.contains("updated just now")
+        },
+        WAIT,
+        "peer description and age are visible",
+    );
+    exit(&mut observer);
+}
+
+#[test]
+fn optional_peer_metadata_never_causes_a_checkpoint_repair_request() {
+    for mode in ["MISSING", "INVALID", "PLAIN_INVALID", "UNTERMINATED"] {
+        let env = TestEnv::new_mock("peer-description-optional");
+        let capture = Capture::new();
+        let path = fixture(&env, &capture);
+        peer_description_settings(&env, "description-author");
+        let directory = runtime::mailbox::local_pair_root_in(env.config_home())
+            .join("agents/description-author");
+        std::fs::create_dir_all(&directory).unwrap();
+        let metadata = directory.join("description.json");
+        let previous = json!({"description":"Earlier ongoing work", "updated_at":"2026-10-01T00:00:00Z", "source_session_id":"previous-session"}).to_string();
+        std::fs::write(&metadata, &previous).unwrap();
+        let mut cli = spawn(&env, &path);
+        turn(
+            &mut cli,
+            &format!("PEER_DESCRIPTION_{mode}: current assignment changed."),
+        );
+        cli.send("/compact\r").unwrap();
+        cli.expect("Messages removed").unwrap();
+        common::expect_input_line_cleared(
+            &cli,
+            WAIT,
+            "valid checkpoint with optional metadata omitted",
+        );
+        exit(&mut cli);
+        assert_eq!(previous.as_bytes(), std::fs::read(metadata).unwrap());
+        assert_eq!(
+            capture
+                .bodies()
+                .iter()
+                .filter(|request| request.to_string().contains(COMPACT))
+                .count(),
+            1,
+            "optional metadata must not spend another model call"
+        );
+        let saved = Session::load_from_path(&path).unwrap();
+        assert!(!checkpoint_text(&saved).contains("agent-description"));
+    }
+}
+
+#[test]
+fn peer_description_survives_failed_checkpoint_and_pruning_without_a_model_call() {
+    let env = TestEnv::new_mock("peer-description-maintenance");
+    let capture = Capture::new();
+    let path = fixture(&env, &capture);
+    peer_description_settings(&env, "description-author");
+    let directory =
+        runtime::mailbox::local_pair_root_in(env.config_home()).join("agents/description-author");
+    std::fs::create_dir_all(&directory).unwrap();
+    let metadata = directory.join("description.json");
+    let previous = json!({"description":"Earlier ongoing work", "updated_at":"2026-10-01T00:00:00Z", "source_session_id":"previous-session"}).to_string();
+    std::fs::write(&metadata, &previous).unwrap();
+    capture
+        .rejections
+        .lock()
+        .unwrap()
+        .push_back("invalid max_tokens recovery-test-rejection".into());
+    let mut cli = spawn(&env, &path);
+    cli.send("/compact\r").unwrap();
+    cli.expect("recovery-test-rejection").unwrap();
+    common::expect_input_line_cleared(&cli, WAIT, "failed checkpoint preserves description");
+    exit(&mut cli);
+    assert_eq!(previous.as_bytes(), std::fs::read(&metadata).unwrap());
+
+    let config_path = env.config_home().join("sudocode.json");
+    let mut config: Value = serde_json::from_slice(&std::fs::read(&config_path).unwrap()).unwrap();
+    config["models"]["claude-sonnet"]["contextWindow"] = json!(50_000);
+    config["models"]["claude-sonnet"]["maxOutputTokens"] = json!(1024);
+    std::fs::write(config_path, config.to_string()).unwrap();
+    let mut session = Session::load_from_path(&path).unwrap();
+    session
+        .push_message(ConversationMessage::assistant(vec![
+            ContentBlock::ToolUse {
+                id: "large-diagnostic".into(),
+                name: "bash".into(),
+                input: "{}".into(),
+                thought_signature: None,
+            },
+        ]))
+        .unwrap();
+    session
+        .push_message(ConversationMessage::tool_result(
+            "large-diagnostic",
+            "bash",
+            format!("HEAD_DIAGNOSTIC {} TAIL_DIAGNOSTIC", "x".repeat(160_000)),
+            false,
+        ))
+        .unwrap();
+    session.save_to_path(&path).unwrap();
+    drop(session);
+    let count = capture.bodies().len();
+    let mut cli = spawn(&env, &path);
+    turn(
+        &mut cli,
+        "CURRENT_PEER_WORK: continue after pruning diagnostic output.",
+    );
+    exit(&mut cli);
+    let requests = capture.bodies();
+    assert_eq!(requests.len(), count + 1, "pruning adds no summary request");
+    assert!(requests.last().unwrap()["messages"]
+        .to_string()
+        .contains("middle pruned"));
+    assert_eq!(previous.as_bytes(), std::fs::read(metadata).unwrap());
+    let saved = Session::load_from_path(&path).unwrap();
+    assert_eq!(
+        saved.last_compaction_report.unwrap().method.as_deref(),
+        Some("tool_pruning")
+    );
+}
+
+fn checkpoint_text(session: &Session) -> String {
+    session.messages()[0]
+        .blocks
+        .iter()
+        .filter_map(|block| match block {
+            ContentBlock::Text { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn respond(socket: &mut TcpStream, status: &str, mime: &str, body: &str) {
