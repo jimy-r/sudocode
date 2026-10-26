@@ -279,7 +279,7 @@ pub fn input_line_of(screen: &str) -> String {
         .unwrap_or_default()
 }
 
-/// Current `InputSlot` and `FooterSlot`, excluding obsolete UI that an extreme
+/// Current InputSlot and FooterSlot, excluding obsolete UI that an extreme
 /// resize may have pushed into retained scrollback. Unlike `input_line_of`,
 /// this also locates question, picker and size-warning bodies without a prompt.
 /// Do not use it for duplicate-free resize assertions: those must inspect the
