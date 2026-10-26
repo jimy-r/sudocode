@@ -10,6 +10,8 @@
 mod common;
 #[path = "support/node_home.rs"]
 mod node_home;
+#[path = "support/sync_input.rs"]
+mod sync_input;
 
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -26,6 +28,7 @@ const BUDGET: Duration = Duration::from_secs(30);
 fn send_from(pair_root: &Path, peer: &str, body: &str) {
     Mailbox::workspace_local(pair_root, peer.to_string())
         .send(MailboxEnvelope {
+            delivery: runtime::turn_input::InputDelivery::Steer,
             from: peer.to_string(),
             to: AGENT.to_string(),
             body: body.to_string(),
@@ -117,10 +120,7 @@ fn a_peer_message_waits_at_the_sync_prompt_and_runs_on_enter() {
         std::thread::sleep(Duration::from_millis(100));
     }
 
-    // A committed reader is not a re-armed prompt. Wait for this actual turn
-    // and the ready input row before submitting the next command.
-    common::expect_turn_complete_after(&session, &marker, BUDGET, "peer turn completed");
-    common::expect_input_line_cleared(&session, BUDGET, "status at ready prompt");
+    sync_input::expect_prompt_after_turn(&session, &marker, BUDGET, "status at ready prompt");
 
     // And the session says how it receives, not just that it does.
     session.send("/status\r").expect("send /status");
