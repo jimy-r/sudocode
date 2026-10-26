@@ -1909,6 +1909,22 @@ impl DeliveryEvent {
     /// A refused consumer or lost lease is not a transport reconnect warning.
     #[inline]
     fn observe(self, diagnostics: &telemetry::RetryDiagnostics, scope: &str, error: Option<&str>) {
+        // A refused commit may mean ordinary lease expiry/transfer, not an
+        // I/O failure. Keep its captured attribution without announcing a
+        // transport outage. A renewal error or register-write error still
+        // carries the original operation error to the retry reporter.
+        let error = if matches!(
+            self.loss,
+            Some(
+                LeaseLoss::NotHeld { .. }
+                    | LeaseLoss::LateSuccess { .. }
+                    | LeaseLoss::Lapsed { .. }
+            )
+        ) {
+            None
+        } else {
+            error
+        };
         let failure = error.map(|error| {
             let operation = match self.stall {
                 DeliveryStall::ClaimFailed => "claim",
@@ -2035,7 +2051,7 @@ fn spawn_conversation_tail(
                                 .observe(
                                     &diagnostics,
                                     &scope,
-                                    Some(&e),
+                                    Some(&e.message),
                                 );
                                 break;
                             }
