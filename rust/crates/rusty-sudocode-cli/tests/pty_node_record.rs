@@ -115,12 +115,19 @@ fn ordinary_task_with_unavailable_a2a(env: &TestEnv, home: &Path, label: &str, e
     session.set_default_timeout(common::at_least(Duration::from_secs(30)));
     common::expect_input_line_cleared(&session, Duration::from_secs(30), label);
     session.send("/status\r").expect("inspect A2A status");
-    session
-        .expect(r"node \(unavailable:")
-        .expect("selected node namespace, not disk");
-    session
-        .expect(expected)
-        .unwrap_or_else(|e| panic!("[{label}] status must name the cause {expected:?}: {e}"));
+    // /status is rendered chrome. ConPTY can wrap a long credential path
+    // between words in the cause, and redraws need not follow a stream cursor.
+    // Require both facts on the actual screen; preserve the full cause check
+    // and report that screen if either fact is missing.
+    common::expect_screen(
+        &session,
+        |screen| {
+            common::screen_contains(screen, "node (unavailable:")
+                && common::screen_contains(screen, expected)
+        },
+        Duration::from_secs(30),
+        &format!("[{label}] selected node namespace and cause {expected:?}"),
+    );
     common::expect_input_line_cleared(&session, Duration::from_secs(30), "status done");
     let prompt = env.prompt(
         "Reply with exactly NODE_CONFIG_TASK_OK.",
