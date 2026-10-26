@@ -2,6 +2,7 @@ name: Shared services E2E
 
 on:
   pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
     branches: [main]
     paths:
       - 'rust/**'
@@ -17,6 +18,8 @@ concurrency:
 
 jobs:
   services:
+    # Not on draft PRs; see the heavy-job note in rust-ci.yml.
+    if: ${{ !(github.event_name == 'pull_request' && github.event.pull_request.draft) }}
     name: Shared services (${{ matrix.os }})
     strategy:
       fail-fast: false
