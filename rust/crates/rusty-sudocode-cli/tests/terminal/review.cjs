@@ -4,10 +4,11 @@ const path = require('node:path');
 const assert = require('node:assert/strict');
 const { createHost } = require('../../../../../e2e/terminal-resize/host.cjs');
 
-function countLines(host, expected) {
+function countLines(host, expected, kind) {
   const lines = host.snapshot().split('\n');
+  const bullet = kind === 'plan' ? /^\s*│\s*[•*-]\s/ : /^\s*[•*-]\s/;
   return Array.from({ length: expected }, (_, i) => lines.filter(line =>
-    /^\s*[•*-]\s/.test(line) && line.includes(`ReviewLine${String(i).padStart(3, '0')}:`)).length);
+    bullet.test(line) && line.includes(`ReviewLine${String(i).padStart(3, '0')}:`)).length);
 }
 
 async function review(host, config) {
@@ -28,7 +29,7 @@ async function review(host, config) {
     for (let i = 0; i < 70; i++) assert.equal(lines.filter(line =>
       line.trim() === `EarlierReviewHistory${String(i).padStart(3, '0')}`).length, 1,
       'resumed history survives review');
-    assert.deepEqual(countLines(host, config.expected), Array(config.expected).fill(1),
+    assert.deepEqual(countLines(host, config.expected, config.kind), Array(config.expected).fill(1),
       `every rendered line is available exactly once\n${host.snapshot()}`);
   };
   history();
@@ -101,7 +102,7 @@ async function review(host, config) {
   fs.writeFileSync(path.join(config.logRoot, 'review-result.json'), JSON.stringify({
     kind: config.kind, lines: config.expected, reading_position: reading,
     reading_updates: readingUpdates,
-    after: countLines(host, config.expected),
+    after: countLines(host, config.expected, config.kind),
   }, null, 2));
 }
 
