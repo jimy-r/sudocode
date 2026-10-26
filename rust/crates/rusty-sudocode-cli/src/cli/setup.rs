@@ -2,7 +2,7 @@
 
 use std::error::Error;
 use std::io::IsTerminal;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use clap::ValueEnum;
 use runtime::nexus_mailbox::NodeRecord;
@@ -27,6 +27,8 @@ struct Preference {
     #[serde(rename = "schemaVersion")]
     version: u8,
     mode: RuntimeMode,
+    #[serde(rename = "ownerRoot", default, skip_serializing_if = "Option::is_none")]
+    owner_root: Option<PathBuf>,
 }
 
 fn path() -> PathBuf {
@@ -66,14 +68,19 @@ fn choose() -> Result<Option<RuntimeMode>> {
     })
 }
 
-fn activate(mode: RuntimeMode) -> Result<Value> {
+fn activate(mode: RuntimeMode, owner_root: Option<&Path>) -> Result<Value> {
     if mode == RuntimeMode::Shared {
         if let Some(record) = NodeRecord::load()? {
-            let service = service_host::ensure_local_box(record.endpoint())
+            let service = service_host::ensure_local_box(record.endpoint(), owner_root)
                 .map_err(|error| error as Box<dyn Error>)?;
             return Ok(json!({"mode": mode, "service": service,
                 "box": {"source": "node_record", "endpoint": record.endpoint(),
                     "agentAuthentication": "pending"}, "domainJoinAccepted": false}));
+        }
+        if owner_root.is_some() {
+            return Err(
+                "A selected local owner requires the original configured Box record".into(),
+            );
         }
         let service =
             service_host::start_local_services().map_err(|error| error as Box<dyn Error>)?;
@@ -83,16 +90,33 @@ fn activate(mode: RuntimeMode) -> Result<Value> {
     Ok(json!({"mode": mode, "service": null, "box": null, "domainJoinAccepted": false}))
 }
 
-pub(crate) fn run(mode: Option<RuntimeMode>, check: bool, format: CliOutputFormat) -> Result<()> {
+pub(crate) fn selected_owner_root() -> Result<Option<PathBuf>> {
+    Ok(preference()?.and_then(|preference| preference.owner_root))
+}
+
+pub(crate) fn run(
+    mode: Option<RuntimeMode>,
+    owner_root: Option<PathBuf>,
+    check: bool,
+    format: CliOutputFormat,
+) -> Result<()> {
     let previous = preference()?;
+    let owner_root = owner_root.or_else(|| {
+        previous
+            .as_ref()
+            .and_then(|preference| preference.owner_root.clone())
+    });
+    if owner_root.as_ref().is_some_and(|root| !root.is_absolute()) {
+        return Err("Local Box owner root must be absolute".into());
+    }
     let output = if check {
         let configured_box = NodeRecord::load()?.map(|record| {
             json!({"source": "node_record", "endpoint": record.endpoint(),
                 "agentAuthentication": "pending"})
         });
-        json!({"mode": previous.map(|preference| preference.mode),
+        json!({"mode": previous.map(|preference| preference.mode), "ownerRoot": owner_root,
             "box": configured_box,
-            "services": service_host::inspect_local_services().map_err(|error| error as Box<dyn Error>)?,
+            "services": service_host::inspect_local_services_at(owner_root.as_deref()).map_err(|error| error as Box<dyn Error>)?,
             "domainJoinAccepted": false})
     } else {
         let selected = match mode {
@@ -102,12 +126,17 @@ pub(crate) fn run(mode: Option<RuntimeMode>, check: bool, format: CliOutputForma
         let Some(mode) = selected else {
             return Ok(());
         };
-        let output = activate(mode)?;
+        let mut output = activate(mode, owner_root.as_deref())?;
+        output["ownerRoot"] = json!(owner_root);
         let path = path();
         std::fs::create_dir_all(path.parent().ok_or("missing configuration directory")?)?;
         StdFsBackend.write_atomic(
             &path.to_string_lossy(),
-            &serde_json::to_vec(&Preference { version: 1, mode })?,
+            &serde_json::to_vec(&Preference {
+                version: 1,
+                mode,
+                owner_root,
+            })?,
         )?;
         output
     };
@@ -134,10 +163,10 @@ pub(crate) fn startup_prompt() -> Result<()> {
     }
     if let Some(preference) = preference()? {
         if preference.mode == RuntimeMode::Shared {
-            activate(preference.mode)?;
+            activate(preference.mode, preference.owner_root.as_deref())?;
         }
     } else if !runtime::config::default_config_home().exists() {
-        run(None, false, CliOutputFormat::Text)?;
+        run(None, None, false, CliOutputFormat::Text)?;
     }
     Ok(())
 }

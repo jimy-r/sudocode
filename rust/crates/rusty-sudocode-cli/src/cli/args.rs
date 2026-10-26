@@ -199,6 +199,9 @@ enum Cmd {
     Setup {
         #[arg(long, value_enum, conflicts_with = "check")]
         mode: Option<super::setup::RuntimeMode>,
+        /// Save an absolute registered Box owner root independently of frontend services
+        #[arg(long)]
+        owner_root: Option<PathBuf>,
         /// Inspect preferences and services without installing or starting them
         #[arg(long)]
         check: bool,
@@ -322,9 +325,13 @@ pub(crate) enum ServiceSub {
         /// Absolute path to the operator's pinned resume-only declaration
         #[arg(long)]
         config: PathBuf,
+        #[arg(long)]
+        owner_root: Option<PathBuf>,
     },
     /// Stop only this explicitly owned shared Box after coordinating all users
     StopLocalBox {
+        #[arg(long)]
+        owner_root: Option<PathBuf>,
         #[arg(long)]
         node_id: String,
         #[arg(long)]
@@ -343,6 +350,7 @@ pub(crate) enum ServiceSub {
 pub(crate) enum CliAction {
     Setup {
         mode: Option<super::setup::RuntimeMode>,
+        owner_root: Option<PathBuf>,
         check: bool,
         output_format: CliOutputFormat,
     },
@@ -757,8 +765,13 @@ fn convert_cli_to_action(cli: Cli) -> Result<CliAction, String> {
                 yes,
             }),
             Cmd::Logout => Ok(CliAction::Logout),
-            Cmd::Setup { mode, check } => Ok(CliAction::Setup {
+            Cmd::Setup {
                 mode,
+                owner_root,
+                check,
+            } => Ok(CliAction::Setup {
+                mode,
+                owner_root,
                 check,
                 output_format,
             }),

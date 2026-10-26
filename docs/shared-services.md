@@ -44,12 +44,17 @@ their existing owner. To make a manually operated local Node recoverable, its
 operator registers a private, resume-only declaration once:
 
 ```sh
-scode service register-local-box --config /absolute/path/owner.json
-scode setup --mode shared
+scode service register-local-box --config /absolute/path/owner.json --owner-root /absolute/path/box-owner
+scode setup --mode shared --owner-root /absolute/path/box-owner
 ```
 
 Registration starts nothing and refuses an existing profile or a service root
-that already has local data. The version-1 declaration contains these fields:
+that already has local data. `--owner-root` selects a private lifecycle root for
+this Box independently of an existing SudoWork service root. Setup saves that
+absolute root with the runtime preference; future startup and setup reuse it
+without an environment override. It does not move, delete or change the other
+service's data. Omitting it retains the ordinary service-root default. The
+version-1 declaration contains these fields:
 
 | Field | Meaning |
 | --- | --- |
@@ -84,7 +89,8 @@ shutdown, restart and installation replacement are refused for this shared-Box
 profile. After coordinating a maintenance outage, the local operator can stop
 only that owner with `scode service stop-local-box --node-id ID
 --binary-sha256 SHA256 --acknowledge-shared-outage`. This command is not exposed
-through the frontend process channel and refuses an external owner, a different
+through the frontend process channel. It uses the saved owner root (or an
+explicit `--owner-root`) and refuses an external owner, a different
 target, or an active managed runtime. It drains broker requests, terminates and
 waits for its own Node child, then waits for the supervisor lifetime lock to
 release. The result explicitly reports `gracefulRaftDrain:false`: process

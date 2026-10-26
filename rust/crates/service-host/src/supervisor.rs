@@ -342,8 +342,12 @@ fn wait_for_retirement(root: &Path) -> Result<()> {
 
 /// Operator-only exact-target stop. Ordinary frontend shutdown cannot stop a
 /// shared Box. The stop uses `Child::kill`/`wait`, not a claimed graceful Raft drain.
-pub fn stop_local_box(node_id: &str, binary_sha256: &str) -> Result<Value> {
-    let root = artifacts::root()?;
+pub fn stop_local_box(
+    node_id: &str,
+    binary_sha256: &str,
+    owner_root: Option<&Path>,
+) -> Result<Value> {
+    let root = artifacts::owner_root(owner_root)?;
     let profile = LocalBox::load(&root)?.ok_or("No registered local Box")?;
     profile.validate()?;
     let params =
@@ -439,7 +443,11 @@ fn control_operation(root: &Path, method: &str) -> Result<Value> {
 
 /// Inspect the same runtime used by frontend channels without installing or starting it.
 pub fn inspect_local_services() -> Result<Value> {
-    let root = artifacts::root()?;
+    inspect_local_services_at(None)
+}
+
+pub fn inspect_local_services_at(owner_root: Option<&Path>) -> Result<Value> {
+    let root = artifacts::owner_root(owner_root)?;
     let profile = LocalBox::load(&root)?;
     let installed = if let Some(profile) = &profile {
         profile.validate()?;
@@ -487,9 +495,12 @@ pub fn start_local_services() -> Result<Value> {
 
 /// Resume only an explicitly registered local owner matching the client record.
 /// A remote or unregistered Box remains a connection target, with no process effect.
-pub fn ensure_local_box(endpoint: &str) -> Result<Option<Value>> {
-    let root = artifacts::root()?;
+pub fn ensure_local_box(endpoint: &str, owner_root: Option<&Path>) -> Result<Option<Value>> {
+    let root = artifacts::owner_root(owner_root)?;
     let Some(profile) = LocalBox::load(&root)? else {
+        if owner_root.is_some() {
+            return Err("The selected owner root has no registered local Box".into());
+        }
         return Ok(None);
     };
     if profile.box_endpoint != endpoint {

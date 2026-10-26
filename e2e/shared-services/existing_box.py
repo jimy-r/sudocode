@@ -58,7 +58,18 @@ def run(args, root):
     env = client_environment(services)
     # Native bootstrap gets a private OS environment, not the operator's Node
     # bootstrap, auth, model, or discovery configuration.
-    env = {key: value for key, value in env.items() if not key.upper().startswith('NEXUS_')}
+    keep = {'PATH', 'SYSTEMROOT', 'WINDIR', 'COMSPEC', 'PATHEXT', 'TEMP', 'TMP',
+        'SYSTEMDRIVE', 'NUMBER_OF_PROCESSORS', 'PROCESSOR_ARCHITECTURE',
+        'HOME', 'USERPROFILE', 'SCODE_SERVICE_ROOT', 'SCODE_GLOBAL_CONFIG_DIR',
+        'SCODE_PROJECT_CONFIG_DIR', 'SUDO_CODE_CONFIG_HOME', 'SCODE_CHECK_UPDATES'}
+    env = {key: value for key, value in env.items() if key.upper() in keep}
+    # Reproduce an existing SudoWork service root. Recovery must use a durable
+    # explicitly selected owner, not replace that data or need an env override.
+    frontend = root / 'frontend-services'
+    sentinel = frontend / 'data/original-sudowork-state'
+    sentinel.parent.mkdir(parents=True)
+    sentinel.write_bytes(b'keep-existing-frontend-state')
+    env['SCODE_SERVICE_ROOT'] = str(frontend)
     with socket.socket() as listener:
         listener.bind(('127.0.0.1', 0))
         port = listener.getsockname()[1]
@@ -99,8 +110,11 @@ def run(args, root):
         assert (result.returncode == 0) == expected, (result.stdout + result.stderr).decode(errors='replace')
         return json.loads(result.stdout) if expected else result
 
-    def setup(environment=None):
-        return cli(['setup', '--mode', 'shared', '--output-format', 'json'], environment=environment)
+    def setup(environment=None, owner_root=None):
+        arguments = ['setup', '--mode', 'shared', '--output-format', 'json']
+        if owner_root:
+            arguments += ['--owner-root', str(owner_root)]
+        return cli(arguments, environment=environment)
 
     def broker(method):
         discovery = json.loads((services / 'run/service.json').read_bytes())
@@ -133,13 +147,17 @@ def run(args, root):
                 ('localEndpoint', f'192.0.2.1:{port}'), ('args', ['--force'])]:
             bad = root / 'bad.json'
             bad.write_text(json.dumps(profile | {field: bad_value}))
-            cli(['service', 'register-local-box', '--config', str(bad)], expected=False)
+            cli(['service', 'register-local-box', '--config', str(bad), '--owner-root', str(services)], expected=False)
             assert not (services / 'run/local-box.json').exists()
-        registered = cli(['service', 'register-local-box', '--config', str(config)])
+        cli(['service', 'register-local-box', '--config', str(config)], expected=False)
+        assert sentinel.read_bytes() == b'keep-existing-frontend-state'
+        registered = cli(['service', 'register-local-box', '--config', str(config), '--owner-root', str(services)])
         assert registered['registered'] and registered['started'] is False
         assert not (services / 'run/service.json').exists()
-        cli(['service', 'register-local-box', '--config', str(config)], expected=False)
-        external = setup()['service']
+        cli(['service', 'register-local-box', '--config', str(config), '--owner-root', str(services)], expected=False)
+        external = setup(owner_root=services)['service']
+        preference = json.loads(Path(env['SCODE_GLOBAL_CONFIG_DIR']).joinpath('runtime-profile.json').read_bytes())
+        assert preference['ownerRoot'] == str(services)
         assert external['managed'] is False and bootstrap.poll() is None
         assert not (services / 'run/service.json').exists()
         print('PASS: explicit pins/refusals; registration and occupied-Box reuse start no replacement', flush=True)
@@ -189,6 +207,7 @@ def run(args, root):
             assert after[zone]['config'] == old['config'], (zone, old, after[zone])
         assert setup()['service']['instance'] == discovery['instance']
         assert record.read_bytes() == original_record
+        assert sentinel.read_bytes() == b'keep-existing-frontend-state'
         print('PASS: concurrent real CLI recovery preserves Node/CA/body/all zone memberships and frontend closure', flush=True)
         stop = ['service', 'stop-local-box', '--node-id', profile['nodeId'],
             '--binary-sha256', profile['binarySha256']]

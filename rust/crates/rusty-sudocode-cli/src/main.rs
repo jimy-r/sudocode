@@ -857,23 +857,32 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     match action {
         CliAction::Setup {
             mode,
+            owner_root,
             check,
             output_format,
-        } => cli::setup::run(mode, check, output_format)?,
+        } => cli::setup::run(mode, owner_root, check, output_format)?,
         CliAction::Service { action } => {
             use cli::args::ServiceSub;
             let result = match action {
                 ServiceSub::Daemon => service_host::run_daemon(),
                 ServiceSub::Stdio => service_host::run_stdio(),
-                ServiceSub::RegisterLocalBox { config } => {
-                    service_host::register_local_box(&config).map(|result| println!("{result}"))
+                ServiceSub::RegisterLocalBox { config, owner_root } => {
+                    service_host::register_local_box(&config, owner_root.as_deref())
+                        .map(|result| println!("{result}"))
                 }
                 ServiceSub::StopLocalBox {
                     node_id,
                     binary_sha256,
+                    owner_root,
                     acknowledge_shared_outage: true,
-                } => service_host::stop_local_box(&node_id, &binary_sha256)
-                    .map(|result| println!("{result}")),
+                } => {
+                    let owner_root = match owner_root {
+                        Some(root) => Some(root),
+                        None => cli::setup::selected_owner_root()?,
+                    };
+                    service_host::stop_local_box(&node_id, &binary_sha256, owner_root.as_deref())
+                        .map(|result| println!("{result}"))
+                }
                 ServiceSub::StopLocalBox { .. } => {
                     return Err("A shared Box stop requires explicit outage acknowledgement".into())
                 }

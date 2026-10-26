@@ -236,8 +236,8 @@ impl LocalBox {
 
 /// Explicit local operator entry only; not an RPC or an Agent tool. Registration
 /// publishes no client record, starts nothing, and refuses replacement.
-pub fn register_local_box(config: &Path) -> Result<Value> {
-    let root = artifacts::root()?;
+pub fn register_local_box(config: &Path, owner_root: Option<&Path>) -> Result<Value> {
+    let root = artifacts::owner_root(owner_root)?;
     let profile: LocalBox = serde_json::from_slice(&fs::read(config)?)?;
     profile.validate()?;
     let registration = super::supervisor::lock_file(&root, "registration.lock")?;
