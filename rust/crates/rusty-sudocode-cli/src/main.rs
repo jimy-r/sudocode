@@ -16,6 +16,7 @@ mod background_completion;
 mod bash_mode;
 mod cancel;
 mod cli;
+mod clipboard_image;
 mod init;
 mod input;
 mod input_chrome;
@@ -2430,15 +2431,9 @@ fn run_repl_loop(mut cli: LiveCli) -> Result<(), Box<dyn std::error::Error>> {
                 print!("\x1b[J");
                 let _ = io::stdout().flush();
                 let trimmed = input.trim().to_string();
-                *cli.pending_images.borrow_mut() = editor
-                    .borrow_mut()
-                    .take_images()
-                    .into_values()
-                    .map(|(data, mime_type)| runtime::ContentBlock::Image { data, mime_type })
-                    .collect();
                 // An empty line only comes back while peer messages wait: the
                 // user handing the prompt back so they run, at the loop's top.
-                if trimmed.is_empty() && cli.pending_images.borrow().is_empty() {
+                if trimmed.is_empty() {
                     continue;
                 }
                 if matches!(trimmed.as_str(), "/exit" | "/quit") {
@@ -4348,7 +4343,6 @@ fn spawn_iocraft_turn(
 /// (audit finding B). It physically cannot drive a turn except through
 /// `engine_handle` (no `EngineDelegate`), and cannot reach into the runtime.
 struct LiveCli {
-    pending_images: RefCell<Vec<runtime::ContentBlock>>,
     /// The turn seam: `commands.send(Prompt/Cancel/PermissionAnswer/…)`,
     /// `events.recv()`. The ONLY way turns cross.
     engine_handle: EngineHandle,
@@ -4712,7 +4706,6 @@ impl LiveCli {
         }
 
         Ok(Self {
-            pending_images: RefCell::new(Vec::new()),
             engine_handle,
             lifecycle,
             prompt_history: Vec::new(),
@@ -4929,8 +4922,7 @@ impl LiveCli {
         // the call regardless of whether a `ui` overlay is present.
         let mut renderer =
             render.then(|| EngineEventRenderer::new(spinner_ref.cloned(), output.cloned()));
-        let mut blocks = runtime::image_input::prompt_blocks(input, &runtime::StdFsBackend)?;
-        blocks.append(&mut self.pending_images.borrow_mut());
+        let blocks = runtime::image_input::prompt_blocks(input, &runtime::StdFsBackend)?;
         self.engine_handle.commands.send(EngineCommand::Prompt {
             blocks,
             context: None,
