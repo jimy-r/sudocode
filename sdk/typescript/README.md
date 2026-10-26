@@ -48,11 +48,14 @@ scode binary, node record, certificate or model credential bundle.
 
 The bridge's ACP capability handshake does not certify the Nexus backend
 protocol. Record the full CLI source/hash and the daemon release separately.
-Starting with scode 0.2.36 (Nexus pin v0.8.23), remote filesystem operations
-require `InspectTarget` to resolve the operation-authorized target before
-classifying linked streams. Pair that CLI with a daemon implementing the
-v0.8.23 contract. An older node returning `UNIMPLEMENTED` fails the operation;
-there is no legacy fallback that guesses link targets or bypasses authority.
+Starting with scode 0.2.36 (Nexus pin v0.8.23), `InspectTarget` resolves the
+operation-authorized target, including linked streams. The current backend also
+supports older nodes for classification: only an `Unsupported` target query
+uses the entry's own authenticated `Stat` type, without following a link.
+Target-based authorization still requires `InspectTarget` and fails closed when
+it is unavailable. Permission, transport and other errors do not select this
+compatibility branch. Qualify the exact CLI/node pair rather than infer backend
+compatibility from an ACP initialize response.
 
 For a frozen older node, retain its independently tested compatible CLI.
 Changing the bridge package or successfully initializing ACP does not upgrade
