@@ -131,6 +131,14 @@ failure. Retrying task-completion persistence uses the same reporting policy.
 See [background retry diagnostics](design/background-retry-diagnostics.md)
 for the shared implementation and repository audit.
 
+Background receiver errors are available as `Last RX error` in `/status` and
+`last_receiver_error` in the structured peer status. This is the most recent
+failure in the current process, not a claim that the node remains offline.
+It is retained with the receiver's transient state and removed when its last
+receiver stops. Hosts can also subscribe to structured tracing. An unchanged
+receiver-seat error is recorded once; retries continue without writing into
+the terminal's input area.
+
 This does not start Nexus or mint an agent credential. A missing record still
 selects the same-machine disk namespace for that process. When a node was
 selected, its tools and original receiver share one binding: the receiver

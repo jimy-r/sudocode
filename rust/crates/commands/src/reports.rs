@@ -620,7 +620,7 @@ fn format_peer_report(peer: &runtime::mailbox::PeerStatus) -> String {
             "receiving; waiting messages run at the next prompt (press Enter)"
         }
         ("receiving", _) => "receiving",
-        ("standby", _) => "standing by: another instance of this agent is receiving",
+        ("standby", _) => "standing by: waiting for the receiver seat",
         ("unavailable", _) => "unavailable; ordinary session remains usable",
         _ => "not running in this process",
     };
@@ -632,14 +632,19 @@ fn format_peer_report(peer: &runtime::mailbox::PeerStatus) -> String {
         }
         _ => "decided when this process first claims a conversation",
     };
-    format!(
+    let mut report = format!(
         "Peers
   Agent            {}
   Namespace        {namespace}
   Receiver         {receiver}
   Cursor           {cursor}",
         peer.agent
-    )
+    );
+    if let Some(error) = &peer.last_receiver_error {
+        use std::fmt::Write as _;
+        let _ = write!(report, "\n  Last RX error    {error}");
+    }
+    report
 }
 
 // ===========================================================================

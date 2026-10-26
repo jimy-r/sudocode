@@ -11,6 +11,10 @@
 //! that maps agent names to inbox paths. Everything above this layer is
 //! backend-agnostic.
 
+// Receivers run behind terminal editors. Diagnostics belong in the shared
+// receiver observation and tracing path, never directly on terminal streams.
+#![deny(clippy::print_stderr, clippy::print_stdout)]
+
 use std::sync::Arc;
 
 use crate::agent_mailbox::MailboxEnvelope;
@@ -1548,6 +1552,9 @@ pub struct PeerStatus {
     pub cursor: &'static str,
     /// The last local node-binding error, when it could not yet be resolved.
     pub error: Option<String>,
+    /// Most recent background receiver failure in this process. Historical:
+    /// receiving can recover while this diagnostic remains inspectable.
+    pub last_receiver_error: Option<String>,
 }
 
 /// The cursor guarantee each agent's readers got in this process, as decided
@@ -1577,13 +1584,14 @@ pub fn cursor_guarantee(agent: &str) -> Option<crate::cursor_fence::CursorGuaran
 }
 
 #[derive(Default)]
-struct ReceiverCounts {
+struct ReceiverObservation {
+    last_error: Option<String>,
     unavailable: usize,
     standby: usize,
     receiving: usize,
 }
 
-impl ReceiverCounts {
+impl ReceiverObservation {
     #[inline]
     fn count_mut(&mut self, state: ReceiverState) -> &mut usize {
         match state {
@@ -1597,11 +1605,11 @@ impl ReceiverCounts {
 /// Receiver state in this process, per agent. These are runtime observations,
 /// not persisted delivery positions or proof that a remote peer is online.
 static RECEIVER_STATES: std::sync::OnceLock<
-    std::sync::Mutex<std::collections::HashMap<String, ReceiverCounts>>,
+    std::sync::Mutex<std::collections::HashMap<String, ReceiverObservation>>,
 > = std::sync::OnceLock::new();
 
 fn receiver_states(
-) -> std::sync::MutexGuard<'static, std::collections::HashMap<String, ReceiverCounts>> {
+) -> std::sync::MutexGuard<'static, std::collections::HashMap<String, ReceiverObservation>> {
     RECEIVER_STATES
         .get_or_init(std::sync::Mutex::default)
         .lock()
@@ -1618,6 +1626,24 @@ pub fn receiver_state(agent: &str) -> Option<ReceiverState> {
         Some(counts) if counts.unavailable > 0 => Some(ReceiverState::Unavailable),
         _ => None,
     }
+}
+
+/// Last background failure, retained with the receiver's transient state.
+#[must_use]
+pub fn last_receiver_error(agent: &str) -> Option<String> {
+    receiver_states()
+        .get(agent)
+        .and_then(|state| state.last_error.clone())
+}
+
+/// Background services never own the terminal. Hosts can inspect the same
+/// latest diagnostic through peer status or subscribe to structured tracing.
+fn report_receiver_error(mailbox: &Mailbox, label: &str, error: String) {
+    tracing::warn!(receiver = label, agent = mailbox.self_id(), %error, "mailbox receiver failed");
+    receiver_states()
+        .entry(mailbox.self_id().to_string())
+        .or_default()
+        .last_error = Some(error);
 }
 
 /// One receiver's entry in [`receiver_state`], withdrawn when it stops.
@@ -1796,7 +1822,7 @@ fn receive_while_seated(
         sleep_unless_aborted(abort, CONVERSATION_DISCOVERY_MS);
     }
     if let Some(loss) = seat.loss() {
-        eprintln!("[{}] receiver seat lost: {loss}", diagnostics.component());
+        report_receiver_error(mailbox, diagnostics.component(), format!("receiver seat lost: {loss}"));
     }
     // Joining is what makes the receiver's handle mean "the receiver has
     // stopped". Without it the caller's join returns while N tails are still
@@ -2159,9 +2185,10 @@ fn spawn_conversation_tail(
                     diagnostics.succeeded(&scope);
                 }
                 if let Some(loss) = reader.lease.loss() {
-                    eprintln!(
-                        "[{}] reader for {peer} lost: {loss}",
-                        diagnostics.component()
+                    report_receiver_error(
+                        &mailbox,
+                        diagnostics.component(),
+                        format!("reader for {peer} lost: {loss}"),
                     );
                 }
             }

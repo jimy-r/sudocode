@@ -225,6 +225,13 @@ pub fn node(agent: &str) -> Option<Arc<Node>> {
 }
 
 impl Node {
+    /// The actual authenticated backend shared with this actor's mailbox.
+    /// Resolve only when a configured Nexus model mount needs it.
+    #[inline]
+    pub fn fs(&self) -> Result<Arc<dyn FsBackend>, String> {
+        self.binding.backend()
+    }
+
     #[inline]
     #[must_use]
     pub fn mailbox(&self) -> Arc<Mailbox> {
@@ -262,5 +269,6 @@ pub fn status(agent: &str) -> runtime::mailbox::PeerStatus {
         cursor: runtime::mailbox::cursor_guarantee(agent)
             .map_or("none", runtime::cursor_fence::CursorGuarantee::as_str),
         error,
+        last_receiver_error: runtime::mailbox::last_receiver_error(agent),
     }
 }
