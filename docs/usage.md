@@ -424,6 +424,14 @@ plan, or clear conversation history.
 `write_plan` saves the complete Markdown document, including Context,
 Constraints, and Acceptance Criteria, before presenting it for review. The
 saved document is the source for both the preview and the approved tool result.
+Both REPLs show it in a distinct `Plan · awaiting review` frame with the saved
+file path. Reasoning stays above the review, and the choices stay below it.
+Completed `WritePlan` cards show the review decision and file path rather than
+abbreviated plan arguments. Revision feedback and cancellation are normal
+review outcomes; failures to save or validate a plan remain errors.
+On resume, review documents are reconstructed from their recorded tool inputs
+with the same document composer. A later edit to the current plan file does
+not rewrite an earlier proposal in conversation history.
 If it changes while review is pending, it must be presented again for approval.
 “Clear context & execute” discards exploration messages after the current tool
 exchange completes, then continues execution in the same turn without another

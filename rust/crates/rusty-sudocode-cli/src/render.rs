@@ -642,6 +642,55 @@ impl TerminalRenderer {
         }
     }
 
+    /// Both REPLs and the document inspector present the exact saved source.
+    /// Plan framing reuses the normal Markdown engine and transcript frame.
+    #[must_use]
+    pub(crate) fn render_question_document(
+        &self,
+        content: &runtime::PromptText,
+        presentation: &runtime::QuestionPresentation,
+        width: usize,
+    ) -> String {
+        match presentation {
+            runtime::QuestionPresentation::Question => {
+                let rendered = self.render_prompt_text(content, width);
+                let mut text = String::new();
+                rendered.write_ansi(0..rendered.text.len(), &mut text);
+                text
+            }
+            runtime::QuestionPresentation::PlanReview { plan_file } => {
+                self.render_plan_document(content, plan_file, "awaiting review", width)
+            }
+        }
+    }
+
+    /// A complete review document in history, shared by live review and resume.
+    #[must_use]
+    pub(crate) fn render_plan_document(
+        &self,
+        content: &runtime::PromptText,
+        plan_file: &str,
+        state: &str,
+        width: usize,
+    ) -> String {
+        let rendered = self.render_prompt_text(content, left_frame::body_width(width));
+        let mut text = String::new();
+        rendered.write_ansi(0..rendered.text.len(), &mut text);
+        let path = format!("File: {plan_file}");
+        format!(
+            "\n{}\n",
+            left_frame::render(
+                &format!("Plan · {state}"),
+                [path.as_str(), "", text.as_str()]
+                    .into_iter()
+                    .skip(if plan_file.is_empty() { 2 } else { 0 }),
+                width,
+                theme().tool_borders().running,
+                true,
+            )
+        )
+    }
+
     #[must_use]
     pub(crate) fn render_markdown_with_width(&self, markdown: &str, width: usize) -> String {
         let normalized = normalize_nested_fences(markdown);

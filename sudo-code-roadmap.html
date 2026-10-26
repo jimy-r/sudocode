@@ -2120,6 +2120,17 @@ impact, lowest implementation cost first:</p>
 
 <h4>Inline rendering design principles</h4>
 
+<p><strong>Plan review presentation.</strong> The existing question boundary
+carries explicit plan-review intent and the authoritative saved-file path.
+Both REPLs and the document inspector use the shared Markdown renderer and
+left frame to separate the complete plan from preceding reasoning and the
+decision controls. Structured review results distinguish approval, revision,
+cancellation and draft saving; ordinary review feedback is not a tool error.
+The completed card retains the decision, path and feedback without repeating
+abbreviated input fields. Acceptance: <code>pty_plan_presentation</code>,
+<code>pty_plan_markdown</code>, <code>pty_plan_review</code> and
+<code>pty_plan_confirm</code>, including real-provider review and revision.</p>
+
 <p><strong>Todo semantic emphasis.</strong> All summary quantities, including
 zero, use bold terminal foreground; labels and punctuation use readable muted
 color without an extra dim attribute. A shared count-span role applies to every

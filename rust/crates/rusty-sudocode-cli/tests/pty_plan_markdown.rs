@@ -136,7 +136,7 @@ fn assert_styles(sess: &PtySession, expected: &[(&str, bool, bool)]) -> String {
                         // the same Markdown after the document entered history.
                         let row = rows.iter().rposition(|row| {
                             row.contains(needle)
-                                && !matches!(row.trim_start().chars().next(), Some('❯' | '╭' | '│'))
+                                && !matches!(row.trim_start().chars().next(), Some('❯' | '╭'))
                         })?;
                         let byte = rows[row].find(needle)?;
                         let col = rows[row][..byte].width();
@@ -317,8 +317,13 @@ fn assert_requests(env: &TestEnv, plan: &str, clear: bool) {
                 .collect::<Vec<_>>()
                 .join("\n")
         });
+    let review: runtime::plan_store::PlanReviewResult = serde_json::from_str(&text).unwrap();
+    assert_eq!(
+        review.status,
+        runtime::plan_store::PlanReviewStatus::Approved
+    );
     assert!(
-        text.contains(plan),
+        review.message.contains(plan),
         "execution must receive the reviewed file, including framing"
     );
     assert!(

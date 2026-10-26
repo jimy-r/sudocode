@@ -2850,6 +2850,7 @@ fn show_effort_selection(
     Some(show_slash_selection(
         ui,
         repl_ui::QuestionPromptView {
+            presentation: runtime::QuestionPresentation::Question,
             title: Some("Reasoning effort".to_string()),
             description: Some(
                 format!(
@@ -2918,6 +2919,7 @@ impl IocraftQuestionPrompter {
     fn show_field(&self, request: &runtime::QuestionPromptRequest, index: usize) {
         let field = &request.fields[index];
         self.ui.show_question(repl_ui::QuestionPromptView {
+            presentation: request.presentation.clone(),
             title: request.title.clone(),
             description: request.description.clone(),
             index,
@@ -3042,6 +3044,7 @@ impl runtime::PermissionPrompter for IocraftQuestionPrompter {
         request: &runtime::PermissionRequest,
     ) -> runtime::PromptReply<runtime::PermissionPromptDecision> {
         let question = runtime::QuestionPromptRequest {
+            presentation: runtime::QuestionPresentation::Question,
             title: Some(format!("Approve {}?", request.tool_name)),
             description: Some(
                 format!(
@@ -3966,6 +3969,7 @@ fn run_repl_iocraft_dispatch(
                             pending_slash_selection = Some(show_slash_selection(
                                 &repl_ui_cmd,
                                 repl_ui::QuestionPromptView {
+                                    presentation: runtime::QuestionPresentation::Question,
                                     title: Some("Model".to_string()),
                                     description: Some(format!("Current: {current}").into()),
                                     index: 0,
@@ -4544,24 +4548,34 @@ impl runtime::QuestionPrompter for CliQuestionPrompter {
         &mut self,
         request: &runtime::QuestionPromptRequest,
     ) -> Result<Vec<runtime::QuestionPromptAnswer>, String> {
-        if let Some(title) = &request.title {
+        let is_plan = matches!(
+            request.presentation,
+            runtime::QuestionPresentation::PlanReview { .. }
+        );
+        if let Some(title) = request.title.as_ref().filter(|_| !is_plan) {
             println!();
             println!("{title}");
         }
         if let Some(description) = &request.description {
-            let rendered = TerminalRenderer::new().render_prompt_text(
+            let text = TerminalRenderer::new().render_question_document(
                 description,
-                render::query_terminal_width().saturating_sub(2),
+                &request.presentation,
+                render::query_terminal_width().saturating_sub(if is_plan { 0 } else { 2 }),
             );
-            let mut text = String::new();
-            rendered.write_ansi(0..rendered.text.len(), &mut text);
-            for line in text.lines() {
-                println!("  {line}");
+            if is_plan {
+                println!("{text}");
+            } else {
+                for line in text.lines() {
+                    println!("  {line}");
+                }
             }
         }
         let mut answers = Vec::new();
         for field in &request.fields {
-            if !field.prompt.is_empty() && request.title.as_deref() != Some(field.prompt.as_str()) {
+            if is_plan
+                || (!field.prompt.is_empty()
+                    && request.title.as_deref() != Some(field.prompt.as_str()))
+            {
                 println!();
                 println!("{}", field.prompt);
             }
