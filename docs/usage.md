@@ -315,6 +315,23 @@ combining sequences whose widths legacy console hosts cannot reliably preserve;
 the original Unicode text is retained without normalization. A clipped paragraph or an
 unusually long result summary can still change its visible position.
 
+Completed `mermaid` fences render as terminal diagrams through the same Markdown
+path for streamed answers, replay and Markdown prompts. The renderer reuses
+Codex's pinned native engine; no browser, JavaScript runtime or external process
+is needed. Diagram borders use the existing theme and `NO_COLOR` remains supported.
+
+Use compact flowcharts, sequence diagrams, flat state diagrams, class diagrams
+or ER diagrams. Prefer `flowchart TD` on narrow terminals. See the upstream
+[supported syntax and limits](../rust/vendor/codex-mermaid/README.md): this is a
+bounded subset rather than full Mermaid support. Unfinished fences stay source;
+unsupported syntax or diagrams that cannot fit show a reason and the original
+source. Control characters in source fallback display as escapes. The persisted
+Markdown stays unchanged, and replay renders against its current terminal width;
+diagrams already committed to native scrollback do not reflow on resize.
+
+The default system prompt advertises when a diagram helps and how to stay within
+this subset. Explicit system-prompt replacement still replaces those defaults.
+
 The live UI retains the existing formatter colors and supported text styles:
 tool-card borders show status without extra icons: muted while waiting for
 hooks, approval, or an execution slot; amber while running; the code theme's
