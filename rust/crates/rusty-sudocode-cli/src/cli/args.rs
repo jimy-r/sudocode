@@ -310,13 +310,29 @@ enum AcpSub {
     },
 }
 
-#[derive(Debug, Subcommand)]
-enum ServiceSub {
+#[derive(Debug, Clone, PartialEq, Eq, Subcommand)]
+pub(crate) enum ServiceSub {
     /// Serve capabilities on a newline-delimited process channel
     Stdio,
     /// Run the OS-user service supervisor
     #[command(hide = true)]
     Daemon,
+    /// Register explicit local ownership of an existing authenticated Box; start nothing
+    RegisterLocalBox {
+        /// Absolute path to the operator's pinned resume-only declaration
+        #[arg(long)]
+        config: PathBuf,
+    },
+    /// Stop only this explicitly owned shared Box after coordinating all users
+    StopLocalBox {
+        #[arg(long)]
+        node_id: String,
+        #[arg(long)]
+        binary_sha256: String,
+        /// Confirm the coordinated shared outage; this is process termination
+        #[arg(long, required = true)]
+        acknowledge_shared_outage: bool,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -331,7 +347,7 @@ pub(crate) enum CliAction {
         output_format: CliOutputFormat,
     },
     Service {
-        is_daemon: bool,
+        action: ServiceSub,
     },
     Headless(super::headless::HeadlessOptions),
     DumpManifests {
@@ -746,9 +762,7 @@ fn convert_cli_to_action(cli: Cli) -> Result<CliAction, String> {
                 check,
                 output_format,
             }),
-            Cmd::Service { action } => Ok(CliAction::Service {
-                is_daemon: matches!(action, ServiceSub::Daemon),
-            }),
+            Cmd::Service { action } => Ok(CliAction::Service { action }),
             Cmd::Export { session, output } => Ok(CliAction::Export {
                 session_reference: session,
                 output_path: output,

@@ -37,6 +37,65 @@ An updated CLI does not silently restart the shared Nexus service: setup refuses
 a running service with a different native Nexus version. Service transitions
 continue through the lifecycle owner's explicit drain/upgrade operation.
 
+## Recover an existing local Box
+
+A machine connection record does not grant process ownership. Remote Boxes keep
+their existing owner. To make a manually operated local Node recoverable, its
+operator registers a private, resume-only declaration once:
+
+```sh
+scode service register-local-box --config /absolute/path/owner.json
+scode setup --mode shared
+```
+
+Registration starts nothing and refuses an existing profile or a service root
+that already has local data. The version-1 declaration contains these fields:
+
+| Field | Meaning |
+| --- | --- |
+| `schemaVersion` | `1` |
+| `boxEndpoint` | Exact endpoint in the existing client `node.json` |
+| `binary`, `binarySha256` | Absolute existing native executable and lowercase SHA-256 |
+| `dataDir`, `identityDir` | Separate absolute original persistence directories |
+| `nodeId` | Original opaque Node ID, as a decimal string |
+| `caSha256`, `certificateSha256` | Original `dataDir/tls/ca.pem` and `node.pem` SHA-256 |
+| `localEndpoint` | Numeric loopback address on the Node's existing port |
+| `advertiseAddr`, `bindAddr`, `hostname`, `serverName` | Existing native listener and TLS declaration |
+| `acceptEnrollments` | Optional existing native enrollment-listener choice; defaults to false |
+
+The native Node ID file contains eight big-endian bytes; it is not a text file.
+Registration and every recovery validate the executable, Node ID, TLS pins,
+metastore, root Raft storage and every persisted zone's Raft storage. Missing
+state is refused rather than initialized. The Node's persisted configuration
+decides native resume; the supervisor does not pass `cluster-init`, peers,
+tokens, force, insecure flags or caller-supplied Nexus environment settings.
+No installation, version transition, client-record publication or credential
+mint occurs on this path. A rotated Node certificate requires a new explicit
+operator ownership transition rather than silently accepting a changed pin.
+
+After multi-agent selection, startup resumes only the registered owner matching
+the saved Box endpoint. A live external owner is authenticated and reused; it
+is never killed or replaced. A stopped Node resumes through the same supervisor
+and lifetime lock, with an additional lock in its original data directory.
+Closing the selecting CLI leaves that shared owner running. The broker exposes
+only lifecycle status for this profile: it does not turn the Node's privileged
+readiness certificate into an Agent file, Vault or session credential. Ordinary
+shutdown, restart and installation replacement are refused for this shared-Box
+profile. After coordinating a maintenance outage, the local operator can stop
+only that owner with `scode service stop-local-box --node-id ID
+--binary-sha256 SHA256 --acknowledge-shared-outage`. This command is not exposed
+through the frontend process channel and refuses an external owner, a different
+target, or an active managed runtime. It drains broker requests, terminates and
+waits for its own Node child, then waits for the supervisor lifetime lock to
+release. The result explicitly reports `gracefulRaftDrain:false`: process
+termination is not graceful Raft leadership transfer. Coordinating standalone
+Agent users and checking the real per-zone quorum remain the operator's task.
+
+This registration supports an existing native authenticated cluster using its
+default on-disk storage layout. Cohost/plugin-specific boot declarations need
+their product's deployment owner. It is not a new Node admission, a Raft
+membership change, OS boot registration or HA qualification.
+
 ```mermaid
 flowchart LR
     Desktop[Sudowork frontend] --> Channel[scode service stdio]

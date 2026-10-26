@@ -95,7 +95,9 @@ once; a different error or a new outage after a successful receiver-seat check
 is reported again. Connection retries continue without repeatedly scrolling the
 input area.
 
-This does not start Nexus or mint an agent credential. A missing record still
+The connection record alone does not start Nexus or mint an agent credential.
+An explicit [local-owner registration](shared-services.md#recover-an-existing-local-box)
+can resume the same locally owned Box after multi-agent selection. A missing record still
 selects the same-machine disk namespace. Record parsing, missing credential
 files and credential identity mismatches still stop startup; a lazy client is
 not proof that TLS authentication will succeed. Changing an already running session

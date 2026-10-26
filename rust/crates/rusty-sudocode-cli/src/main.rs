@@ -860,11 +860,23 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             check,
             output_format,
         } => cli::setup::run(mode, check, output_format)?,
-        CliAction::Service { is_daemon } => {
-            let result = if is_daemon {
-                service_host::run_daemon()
-            } else {
-                service_host::run_stdio()
+        CliAction::Service { action } => {
+            use cli::args::ServiceSub;
+            let result = match action {
+                ServiceSub::Daemon => service_host::run_daemon(),
+                ServiceSub::Stdio => service_host::run_stdio(),
+                ServiceSub::RegisterLocalBox { config } => {
+                    service_host::register_local_box(&config).map(|result| println!("{result}"))
+                }
+                ServiceSub::StopLocalBox {
+                    node_id,
+                    binary_sha256,
+                    acknowledge_shared_outage: true,
+                } => service_host::stop_local_box(&node_id, &binary_sha256)
+                    .map(|result| println!("{result}")),
+                ServiceSub::StopLocalBox { .. } => {
+                    return Err("A shared Box stop requires explicit outage acknowledgement".into())
+                }
             };
             result.map_err(|error| error as Box<dyn std::error::Error>)?;
         }

@@ -69,7 +69,9 @@ fn choose() -> Result<Option<RuntimeMode>> {
 fn activate(mode: RuntimeMode) -> Result<Value> {
     if mode == RuntimeMode::Shared {
         if let Some(record) = NodeRecord::load()? {
-            return Ok(json!({"mode": mode, "service": null,
+            let service = service_host::ensure_local_box(record.endpoint())
+                .map_err(|error| error as Box<dyn Error>)?;
+            return Ok(json!({"mode": mode, "service": service,
                 "box": {"source": "node_record", "endpoint": record.endpoint(),
                     "agentAuthentication": "pending"}, "domainJoinAccepted": false}));
         }
