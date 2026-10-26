@@ -17,6 +17,8 @@
 mod common;
 #[path = "support/node_home.rs"]
 mod node_home;
+#[path = "support/sync_input.rs"]
+mod sync_input;
 
 use std::time::{Duration, Instant};
 
@@ -57,6 +59,7 @@ fn the_next_instance_receives_a_message_the_crashed_one_left_unrun() {
     let pair_root = local_pair_root_in(env.config_home());
     Mailbox::workspace_local(&pair_root, PEER.to_string())
         .send(MailboxEnvelope {
+            delivery: runtime::turn_input::InputDelivery::Steer,
             from: PEER.to_string(),
             to: AGENT.to_string(),
             body: "for the sync REPL PARITY_SCENARIO:single_turn_text".to_string(),
@@ -121,28 +124,50 @@ fn the_next_instance_receives_a_message_the_crashed_one_left_unrun() {
         std::thread::sleep(Duration::from_millis(100));
     }
 
-    // A durable read position can advance before the input row is rearmed.
-    // Reuse the shared turn/ready gate before asking for a fresh receiver report.
     let ready_deadline = Instant::now() + BUDGET;
-    common::expect_turn_complete_after(&second, &turn_marker, BUDGET, "redelivered peer turn");
-    common::expect_input_line_cleared(
+    sync_input::expect_prompt_after_turn(
         &second,
+        &turn_marker,
         ready_deadline.saturating_duration_since(Instant::now()),
         "status at the rearmed prompt",
     );
-    second.send("/status\r").expect("query the new receiver");
+    submit_line(&mut second, "/status", ready_deadline);
     common::expect_screen_settled(
         &second,
         |screen| {
-            screen.contains("receiving; waiting messages run at the next prompt")
+            common::screen_contains(screen, "receiving; waiting messages run at the next prompt")
                 && common::input_line_of(screen).is_empty()
         },
         ready_deadline.saturating_duration_since(Instant::now()),
         "the new receiver reports ownership and restores its input row",
     );
 
-    second.send("/exit\r").expect("exit the REPL");
-    assert_eq!(second.expect_eof().expect("the REPL exits"), 0);
+    submit_line(&mut second, "/exit", ready_deadline);
+    let exit = second.expect_eof().unwrap_or_else(|error| {
+        panic!(
+            "the REPL did not exit: {error:?}\nPTY:\n{}",
+            second.render(|screen| screen.contents())
+        );
+    });
+    assert_eq!(exit, 0);
+}
+
+/// Observe the command in the live editor before Enter: a status block can
+/// appear before raw input is rearmed, discarding a batched submit key.
+fn submit_line(sess: &mut pty_expect::PtySession, line: &str, deadline: Instant) {
+    common::expect_input_line_cleared(
+        sess,
+        deadline.saturating_duration_since(Instant::now()),
+        "ready for the next command",
+    );
+    sess.send(line).expect("type command");
+    common::expect_screen_settled(
+        sess,
+        |screen| common::input_line_of(screen) == line,
+        deadline.saturating_duration_since(Instant::now()),
+        "command reached the live editor",
+    );
+    sess.send("\r").expect("submit the rendered command");
 }
 
 fn spawn_instance(env: &TestEnv) -> pty_expect::PtySession {
