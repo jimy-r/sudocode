@@ -130,6 +130,15 @@ It is not a global autojoin entry for arbitrary Codex conversations. The
 records the native startup/context boundaries and acceptance required for that
 mode, including idle-start behavior and authorized Agent enrollment.
 
+`connectCodex({codexArgv, socket?}, onNotification?)` exposes the existing native
+proxy transport for context inspection. It returns `initialized`, `request` and
+an idempotent `close` that stops only its own proxy. The callback below uses this
+same implementation. Native requests are sent once; lost replies are not
+retried. The helper does not start a native server, select an Agent, enroll an
+identity or discover other frontend endpoints. Native notifications are
+observations, not proof of network admission. Close the connection in `finally`
+after a read-only `thread/loaded/list` / `thread/read` inspection.
+
 `codexCallback` is an optional adapter, separate from the ACP transport. It
 connects to the existing native app-server proxy/socket and original loaded
 thread. It steers an active turn or starts an idle turn through the native

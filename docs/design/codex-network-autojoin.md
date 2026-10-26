@@ -13,6 +13,13 @@ This document records the source investigation and implementation boundaries.
 It does not claim that this mode is implemented or installed. The current
 fixed-session bridge and the live six-peer deployment retain their behavior.
 
+The first code slice extracts that callback's native connection into the shared
+`connectCodex` API. Inventory and notification consumers can use the same
+transport implementation. Process integrations cover the real stdio proxy
+boundary, installed-package exports, existing callback routing and response
+loss. This connection helper supplies no enrollment or automatic discovery;
+the admission and lifecycle gates below still apply.
+
 ## Reuse the existing layers
 
 - `sdk/typescript` owns the portable ACP client, direct send/list, MCP host,
