@@ -68,6 +68,18 @@ thread identity. The native protocol includes `thread/loaded/list`,
 the existing proxy must be proven before selecting a discovery strategy. A
 protocol name alone is not proof that a connection receives all lifecycle events.
 
+A read-only check of the existing Mac native `0.163.0` endpoint succeeded with
+`initialize`, `thread/loaded/list` and `thread/read(includeTurns:false)`. It
+returned the original active root thread and its expected workspace; no new
+thread, turn, model request or scode process was started. That endpoint contained
+one loaded thread. The standard per-user control socket was absent, while this
+installation used an explicitly configured private socket. These observations
+prove the existing binding, not universal discovery. In the inspected CLI source,
+`app-server proxy` without `--sock` only selects the standard socket and connects;
+it does not discover every independently embedded or custom-socket frontend.
+An installer must therefore qualify native endpoint ownership and discovery for
+its supported Codex launch mode before claiming that restart covers every root.
+
 The next native proof must distinguish concurrent root threads in one workspace,
 start/resume without a model turn, and frontend closure. Prefer the smallest
 owner that this proof supports; do not introduce another background controller
