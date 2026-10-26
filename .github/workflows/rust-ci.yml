@@ -34,6 +34,8 @@ on:
       - spec/cache_metrics.json
       - spec/prompt_cache_observations.json
   pull_request:
+    # `ready_for_review` starts the full run when a draft is marked ready.
+    types: [opened, synchronize, reopened, ready_for_review]
     branches:
       - main
     paths:
@@ -203,7 +205,12 @@ jobs:
         run: diff -u --strip-trailing-cr .nexus-protocol-source/proto/nexus/grpc/vfs/vfs.proto rust/crates/nexus-vfs-client/proto/nexus/grpc/vfs/vfs.proto
 
   test-workspace:
-    if: *standard_ci
+    # Heavy jobs skip draft PRs: agents iterate on drafts, and every push
+    # cancelled a run that had already spent its runner time. A required check
+    # skipped on a draft reports success, but a draft cannot enter the merge
+    # queue, marking it ready runs these jobs on the same commit, and the queue
+    # runs them again on the commit that becomes main.
+    if: &full_ci ${{ !inputs.render_performance && !inputs.live_only && !(github.event_name == 'pull_request' && github.event.pull_request.draft) }}
     name: cargo test --workspace (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     strategy:
@@ -265,7 +272,7 @@ jobs:
         run: cargo test --workspace --features engine-acp/mailbox
 
   terminal-resize:
-    if: *standard_ci
+    if: *full_ci
     name: Real terminal resize (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     timeout-minutes: 35
@@ -337,7 +344,7 @@ jobs:
           if-no-files-found: warn
 
   a2a-live:
-    if: *standard_ci
+    if: *full_ci
     needs: one-nexus-vfs-pin
     name: nexus-A2A live (real daemon)
     runs-on: ubuntu-latest
@@ -548,7 +555,7 @@ jobs:
           echo "vendored vfs.proto matches pinned nexus-vfs $NEXUS_PROTO_COMMIT"
 
   bench-compile:
-    if: *standard_ci
+    if: *full_ci
     name: cargo bench --no-run (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     strategy:
@@ -591,7 +598,7 @@ jobs:
           if-no-files-found: warn
 
   clippy-workspace:
-    if: *standard_ci
+    if: *full_ci
     name: cargo clippy --workspace (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     strategy:
