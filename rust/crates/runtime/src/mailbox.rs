@@ -1646,6 +1646,23 @@ fn report_receiver_error(mailbox: &Mailbox, label: &str, error: String) {
         .last_error = Some(error);
 }
 
+/// One operational observation feeds the existing status/tracing owner and
+/// the shared retry policy. Neither consumer changes the operation's result.
+#[inline]
+fn observe_receiver_failure(
+    mailbox: &Mailbox,
+    diagnostics: &telemetry::RetryDiagnostics,
+    scope: &str,
+    error: &str,
+) {
+    report_receiver_error(
+        mailbox,
+        diagnostics.component(),
+        format!("{scope}: {error}"),
+    );
+    diagnostics.failed(scope, error);
+}
+
 /// One receiver's entry in [`receiver_state`], withdrawn when it stops.
 struct ReceiverStateEntry {
     agent: String,
@@ -1724,11 +1741,33 @@ impl Drop for ReceiverStateEntry {
 /// conversation's read position, so a tail finishing a delivery while the agent
 /// seat changes hands cannot be read twice. [`receiver_state`] reports which of
 /// the two this process is doing.
+#[inline]
 pub fn spawn_inbox_poller(
     mailbox: Arc<Mailbox>,
     block_ms: u64,
     label: &'static str,
     abort: crate::HookAbortSignal,
+    sink: impl Fn(&MailboxEnvelope) -> bool + Send + Sync + 'static,
+) -> std::thread::JoinHandle<()> {
+    spawn_inbox_poller_with_notices(
+        mailbox,
+        block_ms,
+        label,
+        abort,
+        telemetry::RetryNotices::LogOnly,
+        sink,
+    )
+}
+
+/// The same receiver for a host which explicitly owns retry presentation.
+/// Terminal notices require a host-owned capture/printer; ordinary receivers
+/// expose errors through their existing status, tracing and local log instead.
+pub fn spawn_inbox_poller_with_notices(
+    mailbox: Arc<Mailbox>,
+    block_ms: u64,
+    label: &'static str,
+    abort: crate::HookAbortSignal,
+    notices: telemetry::RetryNotices,
     sink: impl Fn(&MailboxEnvelope) -> bool + Send + Sync + 'static,
 ) -> std::thread::JoinHandle<()> {
     let sink: Arc<dyn Fn(&MailboxEnvelope) -> bool + Send + Sync> = Arc::new(sink);
@@ -1743,17 +1782,25 @@ pub fn spawn_inbox_poller(
                 agent: mailbox.self_id().to_string(),
                 state: None,
             };
-            let diagnostics = Arc::new(telemetry::RetryDiagnostics::new(
-                label,
-                mailbox.self_id(),
-                "Message receiving is interrupted; retrying in the background.",
-                "Message receive checks recovered.",
-            ));
+            let diagnostics = Arc::new(
+                telemetry::RetryDiagnostics::new(
+                    label,
+                    mailbox.self_id(),
+                    "Message receiving is interrupted; retrying in the background.",
+                    "Message receive checks recovered.",
+                )
+                .with_notices(notices),
+            );
             while !abort.is_aborted() {
                 state.set(ReceiverState::Unavailable);
                 if !announced {
                     if let Err(e) = mailbox.ensure_presence() {
-                        diagnostics.failed("presence announcement", &e);
+                        observe_receiver_failure(
+                            &mailbox,
+                            &diagnostics,
+                            "presence announcement",
+                            &e,
+                        );
                         sleep_unless_aborted(&abort, CONVERSATION_DISCOVERY_MS);
                         continue;
                     }
@@ -1769,7 +1816,7 @@ pub fn spawn_inbox_poller(
                         continue;
                     }
                     Err(e) => {
-                        diagnostics.failed("receiver seat", &e);
+                        observe_receiver_failure(&mailbox, &diagnostics, "receiver seat", &e);
                         sleep_unless_aborted(&abort, CONVERSATION_DISCOVERY_MS);
                         continue;
                     }
@@ -1817,12 +1864,16 @@ fn receive_while_seated(
                     tailing.insert(peer, tail);
                 }
             }
-            Err(e) => diagnostics.failed("conversation discovery", &e),
+            Err(e) => observe_receiver_failure(mailbox, diagnostics, "conversation discovery", &e),
         }
         sleep_unless_aborted(abort, CONVERSATION_DISCOVERY_MS);
     }
     if let Some(loss) = seat.loss() {
-        report_receiver_error(mailbox, diagnostics.component(), format!("receiver seat lost: {loss}"));
+        report_receiver_error(
+            mailbox,
+            diagnostics.component(),
+            format!("receiver seat lost: {loss}"),
+        );
     }
     // Joining is what makes the receiver's handle mean "the receiver has
     // stopped". Without it the caller's join returns while N tails are still
@@ -2005,24 +2056,14 @@ impl DeliveryEvent {
     /// All consumers receive the facts captured at the original decision.
     /// A refused consumer or lost lease is not a transport reconnect warning.
     #[inline]
-    fn observe(self, diagnostics: &telemetry::RetryDiagnostics, scope: &str, error: Option<&str>) {
-        // A refused commit may mean ordinary lease expiry/transfer, not an
-        // I/O failure. Keep its captured attribution without announcing a
-        // transport outage. I/O refusals keep the commit's returned message;
-        // an earlier worker failure supplies its typed loss, not raw I/O text.
-        let error = if matches!(
-            self.loss,
-            Some(
-                LeaseLoss::NotHeld { .. }
-                    | LeaseLoss::LateSuccess { .. }
-                    | LeaseLoss::Lapsed { .. }
-            )
-        ) {
-            None
-        } else {
-            error
-        };
-        let failure = error.map(|error| {
+    fn observe(
+        self,
+        mailbox: &Mailbox,
+        diagnostics: &telemetry::RetryDiagnostics,
+        scope: &str,
+        error: Option<&str>,
+    ) {
+        let observation = error.map(|error| {
             let operation = match self.stall {
                 DeliveryStall::ClaimFailed => "claim",
                 DeliveryStall::PollFailed => "poll",
@@ -2030,21 +2071,37 @@ impl DeliveryEvent {
                 DeliveryStall::ConsumerRefused => "consumer",
                 DeliveryStall::LeaseLost => "lease",
             };
-            let context = serde_json::Map::from_iter([
-                ("peer".into(), self.peer.clone().into()),
-                ("holder".into(), self.holder.clone().into()),
-                ("operation".into(), operation.into()),
-                ("offset".into(), self.offset.into()),
-                ("tail".into(), self.tail.into()),
-                ("stall".into(), format!("{:?}", self.stall).into()),
-                ("loss".into(), self.loss.map(|loss| loss.to_string()).into()),
-                ("repeats".into(), self.repeats.into()),
-            ]);
-            (error, context)
+            // Keep the captured cause in status even when expiry/transfer is
+            // not an I/O outage. Never re-query the lease after the refusal.
+            let context = if matches!(
+                self.loss,
+                Some(
+                    LeaseLoss::NotHeld { .. }
+                        | LeaseLoss::LateSuccess { .. }
+                        | LeaseLoss::Lapsed { .. }
+                )
+            ) {
+                None
+            } else {
+                Some(serde_json::Map::from_iter([
+                    ("peer".into(), self.peer.clone().into()),
+                    ("holder".into(), self.holder.clone().into()),
+                    ("operation".into(), operation.into()),
+                    ("offset".into(), self.offset.into()),
+                    ("tail".into(), self.tail.into()),
+                    ("stall".into(), format!("{:?}", self.stall).into()),
+                    ("loss".into(), self.loss.map(|loss| loss.to_string()).into()),
+                    ("repeats".into(), self.repeats.into()),
+                ]))
+            };
+            (error, format!("{operation} {scope}: {error}"), context)
         });
         global_delivery_log().record(self);
-        if let Some((error, context)) = failure {
-            diagnostics.failed_with(scope, error, context);
+        if let Some((error, status, context)) = observation {
+            report_receiver_error(mailbox, diagnostics.component(), status);
+            if let Some(context) = context {
+                diagnostics.failed_with(scope, error, context);
+            }
         }
     }
 }
@@ -2088,7 +2145,7 @@ fn spawn_conversation_tail(
                             None,
                             0,
                         )
-                        .observe(&diagnostics, &scope, Some(&e));
+                        .observe(&mailbox, &diagnostics, &scope, Some(&e));
                         sleep_unless_aborted(&abort, block_ms.max(1));
                         continue;
                     }
@@ -2110,6 +2167,7 @@ fn spawn_conversation_tail(
                                     0,
                                 )
                                 .observe(
+                                    &mailbox,
                                     &diagnostics,
                                     &scope,
                                     Some(&e),
@@ -2146,6 +2204,7 @@ fn spawn_conversation_tail(
                                     0,
                                 )
                                 .observe(
+                                    &mailbox,
                                     &diagnostics,
                                     &scope,
                                     Some(&e.message),
@@ -2177,7 +2236,12 @@ fn spawn_conversation_tail(
                                 loss,
                                 stall_repeats,
                             )
-                            .observe(&diagnostics, &scope, None);
+                            .observe(
+                                &mailbox,
+                                &diagnostics,
+                                &scope,
+                                None,
+                            );
                         }
                         sleep_unless_aborted(&abort, retry_delay_ms);
                         retry_delay_ms = retry_delay_ms.saturating_mul(2).min(READER_RENEW_MS);

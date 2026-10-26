@@ -15,13 +15,22 @@ use serde_json::{Map, Value};
 const REMINDER_INTERVAL: Duration = Duration::from_secs(60);
 const RECOVERY_QUIET_PERIOD: Duration = Duration::from_secs(2);
 
-/// Aggregated, rate-limited stderr notices with detailed local file records.
+/// Presentation belongs to the service's host; aggregation and local logging
+/// use the same policy regardless of whether that host owns terminal output.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RetryNotices {
+    Terminal,
+    LogOnly,
+}
+
+/// Aggregated local file records with optional, rate-limited terminal notices.
 ///
 /// A scope identifies one independently failing operation, such as a receiver
 /// seat or a conversation. Success clears only that scope. Recovery requires
 /// every observed failure to clear and a subsequent healthy check after a short
 /// quiet period; one healthy worker cannot declare its siblings recovered.
 pub struct RetryDiagnostics {
+    notices: RetryNotices,
     component: &'static str,
     subject: String,
     pending: &'static str,
@@ -58,6 +67,7 @@ impl RetryDiagnostics {
         recovered: &'static str,
     ) -> Self {
         Self {
+            notices: RetryNotices::Terminal,
             component,
             subject: subject.into(),
             pending,
@@ -65,6 +75,16 @@ impl RetryDiagnostics {
             state: Mutex::default(),
             log: OnceLock::new(),
         }
+    }
+
+    /// A service with structured status can retain all local records without
+    /// writing into a terminal it does not own. The caller still owns its
+    /// operation errors, including when the diagnostic file cannot be opened.
+    #[inline]
+    #[must_use]
+    pub fn with_notices(mut self, notices: RetryNotices) -> Self {
+        self.notices = notices;
+        self
     }
 
     /// Record an already-failed attempt; the caller retains the actual error.
@@ -199,6 +219,9 @@ impl RetryDiagnostics {
     /// retry a partial terminal write: it may already have displayed a prefix.
     #[inline]
     fn notice(&self, scope: &str, text: std::fmt::Arguments<'_>) {
+        if self.notices == RetryNotices::LogOnly {
+            return;
+        }
         if let Err(error) = writeln!(std::io::stderr().lock(), "[{}] {text}", self.component) {
             let context = Map::from_iter([("kind".into(), format!("{:?}", error.kind()).into())]);
             // This is the existing fallible file path, never another terminal

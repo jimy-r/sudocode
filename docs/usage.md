@@ -122,12 +122,13 @@ missing credential files or an identity mismatch leave A2A unavailable with
 the actual cause in `/status` and tool results. They do not redirect messages
 to a disk inbox or prevent ordinary model and workspace work.
 
-Background receive failures share a short notice across the receiver's
-conversations, with at most one reminder per minute during an interruption.
-Detailed errors and repeat counts are retained in the local diagnostic log
-named by the notice. Once all observed failures clear and checks stay healthy,
-one recovery notice is shown. A healthy peer does not hide another peer's
-failure. Retrying task-completion persistence uses the same reporting policy.
+Background receive failures share one diagnostic reporter across the receiver's
+conversations. It retains the first error, changed errors and repeat counts in
+the existing rotated local `scode.log` / `sudoclaw.log`; `SCODE_LOG_PATH` can
+select the file. A healthy peer does not hide another peer's failure. Retrying
+task-completion persistence uses the same reporting implementation. Services
+which own terminal notices emit at most one reminder per minute and report
+recovery only after all observed failures clear and checks stay healthy.
 See [background retry diagnostics](design/background-retry-diagnostics.md)
 for the shared implementation and repository audit.
 
@@ -135,9 +136,9 @@ Background receiver errors are available as `Last RX error` in `/status` and
 `last_receiver_error` in the structured peer status. This is the most recent
 failure in the current process, not a claim that the node remains offline.
 It is retained with the receiver's transient state and removed when its last
-receiver stops. Hosts can also subscribe to structured tracing. An unchanged
-receiver-seat error is recorded once; retries continue without writing into
-the terminal's input area.
+receiver stops. Hosts can also subscribe to structured tracing. Ordinary
+receivers use this status and the local log without emitting terminal notices;
+retries continue without writing into the terminal's input area.
 
 This does not start Nexus or mint an agent credential. A missing record still
 selects the same-machine disk namespace for that process. When a node was
@@ -155,6 +156,11 @@ Changing a running session from disk to node remains an explicit handoff.
 Receiver ownership and a selected node endpoint in `/status` are not proof
 that a remote peer is online. Cohost continues using its injected mailbox and
 requires its host services.
+
+An ordinary HTTP model can run while A2A is unavailable. A model explicitly
+configured through a `nexus://` mount still needs the selected node's
+authenticated filesystem; model traffic keeps that mount's authorization and
+hooks.
 
 ### CLI packages
 

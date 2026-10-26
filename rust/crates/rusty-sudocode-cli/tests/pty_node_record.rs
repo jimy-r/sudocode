@@ -200,7 +200,14 @@ fn startup_and_resume_with_credential(has_credential: bool) {
             Duration::from_secs(30),
             &format!("offline {mode} fresh"),
         );
-        expect_receiver_diagnostic(&mut fresh, if has_credential { "connect" } else { "ask the node owner to mint" });
+        expect_receiver_diagnostic(
+            &mut fresh,
+            if has_credential {
+                "connect"
+            } else {
+                "ask the node owner to mint"
+            },
+        );
         check_draft(&mut fresh);
         fresh
             .send(&format!("{prompt}\r"))
@@ -246,7 +253,14 @@ fn startup_and_resume_with_credential(has_credential: bool) {
             Duration::from_secs(30),
             &format!("offline {mode} resume"),
         );
-        expect_receiver_diagnostic(&mut resumed, if has_credential { "connect" } else { "ask the node owner to mint" });
+        expect_receiver_diagnostic(
+            &mut resumed,
+            if has_credential {
+                "connect"
+            } else {
+                "ask the node owner to mint"
+            },
+        );
         check_draft(&mut resumed);
         resumed.send("/exit\r").expect("exit resumed session");
         assert_eq!(resumed.expect_eof().expect("resumed session exits"), 0);

@@ -717,7 +717,7 @@ pub(crate) fn build_runtime_with_plugin_state(
         workspace_root,
         agent_name,
     });
-    let mut client = match EngineApiClient::new(
+    let mut client = match EngineApiClient::new_with_access(
         session_id,
         &config.sudocode_config,
         &config.model,
@@ -725,12 +725,14 @@ pub(crate) fn build_runtime_with_plugin_state(
         tool_registry.clone(),
         config.enable_tools,
         config.allowed_tools.clone(),
-        &engine_core::ModelAccess {
-            fs: match &peer {
-                Some(crate::peer::Peer::Node(node)) => node.fs(),
-                _ => Arc::clone(&host.fs),
-            },
-            require_mount: host.require_model_mount,
+        |uses_mount| {
+            Ok(engine_core::ModelAccess {
+                fs: match (&peer, uses_mount) {
+                    (Some(crate::peer::Peer::Node(node)), true) => node.fs()?,
+                    _ => Arc::clone(&host.fs),
+                },
+                require_mount: host.require_model_mount,
+            })
         },
     ) {
         Ok(client) => client,

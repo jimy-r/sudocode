@@ -10,19 +10,23 @@ existing retry policy and error results. One service shares a reporter across
 its workers; the reporter has no connection, receiver, task, timer thread or
 authority to acknowledge work.
 
-The first failure prints one short notice with the local diagnostic log path.
-Ongoing failures produce at most one reminder per minute, across all scopes.
 The first error, changed errors and repeat counts go to the existing rotated
 local `scode.log` / `sudoclaw.log` sink (`SCODE_LOG_PATH` still overrides it).
 These are local diagnostic events, not model messages or remote telemetry.
-An unavailable log falls back to a rate-limited terminal notice retaining the
-original cause. Notices use fallible stderr writes: a closed terminal or a
+`RetryNotices` selects presentation without changing aggregation. Ordinary
+receivers use `LogOnly` and retain their latest error in the existing receiver
+status and tracing channel. They never write a terminal notice. Completion
+persistence and hosts which explicitly own terminal presentation use `Terminal`:
+the first failure prints a short notice with the log path, and ongoing failures
+produce at most one reminder per minute across all scopes. In that mode an
+unavailable log falls back to a bounded notice retaining the original cause.
+Notices use fallible stderr writes: a closed terminal or a
 descriptor handoff must not panic the observing service. The original operation
 is recorded before its notice. A failed notice gets a separate local
 `background_retry_terminal_unavailable` event with its IO error kind; it is
-never retried, since a prefix may already have been displayed. If both outputs
-are unavailable, reporting remains best effort and does not change the work's
-actual result.
+never retried, since a prefix may already have been displayed. Reporting remains
+best effort and does not change the work's actual result. A log-only caller
+continues to own its operation error even when the diagnostic file is unavailable.
 
 A scope identifies an independently failing operation. A healthy conversation
 does not clear a different conversation's failure. Recovery is reported only
@@ -43,23 +47,24 @@ send retry or second background reconnect loop to aggregate.
 
 | Area | Decision | Reason |
 |---|---|---|
-| `runtime/src/mailbox.rs`: receiver seat, conversation discovery, reader claim, poll and commit | Share one reporter per receiver | Independent workers retry in the background and previously printed every error. Original waits, locks, leases, cursor writes and delivery decisions are retained. |
+| `runtime/src/mailbox.rs`: receiver seat, conversation discovery, reader claim, poll and commit | Share one reporter per receiver and the existing status owner | One captured observation supplies status/tracing and aggregated local records. Ordinary receivers select log-only presentation. Original waits, locks, leases, cursor writes and delivery decisions are retained. |
 | `engine-core/src/subagent_completion.rs` and `subagent_completion/control.rs`: terminal persistence | Share one reporter per completion state | The observation and delivery paths report the same retained terminal events. Scope uses the existing lifecycle source key (assistant-message identity plus tool-call ID), shared with the pending map; reporting does not change qualification, persistence, retries or receipts. |
 | `api/src/http_transport.rs`, request scope and renderer retry events | Keep existing mechanism | Finite provider retries already have their own budget, lifecycle logs and UI notifier. Adding another reporter would duplicate progress and could obscure request failure. |
 | `runtime/src/mcp_server_manager.rs`, MCP transports/lifecycle | Keep existing mechanism | Initialization limits, connection state, typed refusal and explicit reconnect already belong to the manager. There is no matching unbounded per-tick stderr loop to replace. |
 | `sdk/typescript/src`: canonical ACP/MCP/callback host | Keep explicit protocol errors | The child stderr has its own configured local file. Per-command audit errors and per-notification callback errors are separate outcomes; no automatic send/reconnect retry exists. Adding a TypeScript copy of the Rust reporter would duplicate policy without a matching loop. |
 | `nexus-vfs-client/src/lib.rs` | Keep error propagation | The transport returns errors to its caller and repairs its channel; the receiver is the reporting owner. Logging again here would duplicate the same incident. |
 | `runtime/src/bash.rs`, tools, todo/config persistence, startup and ACP reply-send errors | Keep explicit errors | These report an individual operation or an uncertain result, rather than an owned background retry loop. In particular an uncertain send must never acquire automatic retry. |
-| Telemetry sink write/rotation failures | Reuse a fallible writer | The regular sink keeps its fallback. The retry reporter calls the same serializer/rotation path through `try_record`, and owns a bounded terminal fallback if opening or writing the log fails; it does not recursively report a log failure through that log. |
+| Telemetry sink write/rotation failures | Reuse a fallible writer | The regular sink keeps its fallback. The retry reporter calls the same serializer/rotation path through `try_record`. Terminal presentation owns a bounded fallback; log-only services retain their existing status/error owner. Neither recursively reports a log failure through that log. |
 | CLI commands, examples, build/install and test harness scripts | Keep command output | Their failure output is the requested command result, not unsolicited background noise. |
 
 ## Delivery observation ownership
 
 The landed `DeliveryEvent` is the domain observation at each claim, poll,
 commit refusal and rejected batch. The event is captured once, then its inline
-observer feeds the existing bounded delivery log and, for actual operation
-errors, the shared retry reporter. Both consumers get the same holder, optional
-offset/tail, stall, typed lease loss and repeat count. Claim failures keep unknown
+observer feeds the existing bounded delivery log, receiver status/tracing and,
+for actual I/O errors, the shared retry reporter. These consumers use the same
+captured cause, holder, optional offset/tail, stall, typed lease loss and repeat
+count. Claim failures keep unknown
 positions null. Consumer refusal and lease loss remain structured attribution,
 not transport reconnect notices. This includes a commit refused because its
 lease lapsed, moved to another holder or answered too late: the captured
@@ -67,13 +72,13 @@ lease lapsed, moved to another holder or answered too late: the captured
 errors returned by the commit's own confirmation retain that returned message.
 If the background worker already lost the lease, the commit returns a generic
 ownership-loss message; its typed loss retains the worker's error kind, site and
-timing, not the original I/O error text. Existing one-off reader/seat-loss
-notices remain visible through terminal capture; they are distinct from the
-aggregated transport reconnect notices. The real-node
+timing, not the original I/O error text. Reader/seat-loss causes remain visible
+through the existing status and tracing channel; they are distinct from the
+aggregated transport reconnect records. The real-node
 composition fixture checks both a lapse without an I/O failure and a subsequent register
 I/O refusal in the same original receiver. Retry timings, eligibility and acknowledgment
-are unchanged. The receiver-error status work in #1041 remains a separate
-composition boundary until its source lands; no second status registry is added.
+are unchanged. The receiver's existing state map owns the latest error and
+retires it when its last receiver stops; no second status registry is added.
 
 ## Terminal ownership
 
@@ -83,8 +88,7 @@ tick drains into its output handle. The synchronous LineEditor forwards into
 its native external printer, which preserves the draft and cursor; peer-waiting
 notices use that same handle. Its forwarding worker stops after the editor
 disconnects the print queue, then restores stderr before joining.
-The receiver only queues display text, so a blocked terminal print cannot
-hold up receiver shutdown. The sync capture is active only around readline;
+The default receiver emits no display text. The sync capture is active only around readline;
 turns and external terminal programs inherit the original stderr target.
 Error exits also abort/join the receiver and clear the shared editor in normal
 stack cleanup. Its capture worker is never left for thread-local destruction
@@ -143,7 +147,10 @@ real host locks, conversation discovery, two receiver tails, register writes
 and natural commits. Only writes to two exact reader registers fail. It asserts
 multiple actual retries, one aggregated notice, no early recovery when one peer
 is still failing, detailed errors/repeat counts in the log and delivery of both
-original messages after the fault clears. This reaches the reader-claim error
+original messages after the fault clears. The same fixture also runs through
+the default log-only receiver, requiring no terminal notice, both peers' actual
+errors in the local log, the retained latest status error after recovery and
+its removal after the receiver stops. This reaches the reader-claim error
 branch; it is not a claim of a real TLS outage or a lease-renewal test.
 Additional process cases refuse the log open and, on Linux, fail the actual
 write through `/dev/full`, guarding against a second stderr spam loop.

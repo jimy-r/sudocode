@@ -15,7 +15,9 @@ use std::time::{Duration, Instant};
 use lease_fault::{FaultyBackend, Probe};
 use runtime::agent_mailbox::{kinds, MailboxEnvelope};
 use runtime::fs_backend::StdFsBackend;
-use runtime::mailbox::{spawn_inbox_poller, InboxConvention, Mailbox};
+use runtime::mailbox::{
+    spawn_inbox_poller, spawn_inbox_poller_with_notices, InboxConvention, Mailbox,
+};
 use runtime::HookAbortSignal;
 
 const AGENT: &str = "retry-receiver";
@@ -62,26 +64,33 @@ fn child_receiver() {
         .collect();
     let seen = Arc::new(Mutex::new(Vec::new()));
     let abort = HookAbortSignal::new();
-    let receiver = spawn_inbox_poller(
-        Arc::new(Mailbox::new(
-            Arc::new(FaultyBackend::new(
-                Arc::new(StdFsBackend),
-                Arc::clone(&probe),
-            )),
-            AGENT.into(),
-            convention,
+    let mailbox = Arc::new(Mailbox::new(
+        Arc::new(FaultyBackend::new(
+            Arc::new(StdFsBackend),
+            Arc::clone(&probe),
         )),
-        50,
-        "retry-fixture",
-        abort.clone(),
-        {
-            let seen = Arc::clone(&seen);
-            move |message| {
-                seen.lock().unwrap().push(message.body.clone());
-                true
-            }
-        },
-    );
+        AGENT.into(),
+        convention,
+    ));
+    let consume = {
+        let seen = Arc::clone(&seen);
+        move |message: &MailboxEnvelope| {
+            seen.lock().unwrap().push(message.body.clone());
+            true
+        }
+    };
+    let receiver = if std::env::var_os("SCODE_RETRY_STATUS_ONLY").is_some() {
+        spawn_inbox_poller(mailbox, 50, "retry-fixture", abort.clone(), consume)
+    } else {
+        spawn_inbox_poller_with_notices(
+            mailbox,
+            50,
+            "retry-fixture",
+            abort.clone(),
+            telemetry::RetryNotices::Terminal,
+            consume,
+        )
+    };
     wait_for("both actual claim paths retried", || {
         paths.iter().all(|p| probe.register_write_attempts(p) >= 4)
     });
@@ -123,8 +132,19 @@ fn child_receiver() {
     }
     // Discovery and empty polls continue making real healthy checks.
     std::thread::sleep(Duration::from_millis(2_300));
+    let last_error = runtime::mailbox::last_receiver_error(AGENT)
+        .expect("the same real receiver error remains inspectable after recovery");
+    assert!(last_error.contains("INJECTED"), "{last_error}");
+    println!(
+        "FIXTURE_RX_OBSERVATION {}",
+        serde_json::json!({"last_error":last_error})
+    );
     abort.abort();
     receiver.join().unwrap();
+    assert!(
+        runtime::mailbox::last_receiver_error(AGENT).is_none(),
+        "the existing receiver observation retires with its last owner"
+    );
     let mut bodies = seen.lock().unwrap().clone();
     bodies.sort();
     assert_eq!(
@@ -205,6 +225,45 @@ fn concurrent_reader_failures_share_one_notice_and_recover_without_lost_messages
         .any(|record| record["attributes"]["suppressed_repeats"]
             .as_u64()
             .is_some_and(|n| n >= 3)));
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn default_receiver_retains_status_and_log_without_terminal_notices() {
+    let root = std::env::temp_dir().join(format!("receiver-status-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&root).unwrap();
+    let log = root.join("diagnostics.jsonl");
+    let output = fixture_command(&root, &log)
+        .env("SCODE_RETRY_STATUS_ONLY", "1")
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(output.status.success(), "{stderr}\n{stdout}");
+    assert!(
+        !stderr.contains("Message receiving is interrupted;"),
+        "{stderr}"
+    );
+    assert!(
+        !stderr.contains("Message receive checks recovered."),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("INJECTED"), "{stderr}");
+    assert!(stdout.contains("FIXTURE_RX_OBSERVATION"), "{stdout}");
+    let records = read_records(&log);
+    for peer in ["peer-a", "peer-b"] {
+        assert!(
+            records.iter().any(|record| {
+                let p = &record["attributes"];
+                p["context"]["peer"] == peer
+                    && p["context"]["operation"] == "claim"
+                    && p["error"]
+                        .as_str()
+                        .is_some_and(|error| error.contains("INJECTED"))
+            }),
+            "the default receiver must retain the actual cause for {peer}: {records:?}"
+        );
+    }
     std::fs::remove_dir_all(root).unwrap();
 }
 
