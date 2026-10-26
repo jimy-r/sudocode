@@ -16,12 +16,45 @@ import urllib.request
 import uuid
 
 
+def client_environment(root):
+    """A fresh test user must never discover the operator's configured Box."""
+    home = root / 'home'
+    home.mkdir(exist_ok=True)
+    return os.environ | {
+        'HOME': str(home), 'USERPROFILE': str(home),
+        'SCODE_SERVICE_ROOT': str(root),
+        'SCODE_GLOBAL_CONFIG_DIR': str(root / 'config'),
+        'SCODE_PROJECT_CONFIG_DIR': str(root / 'project-config'),
+        'SUDO_CODE_CONFIG_HOME': str(root / 'config'),
+        'SCODE_CHECK_UPDATES': '0',
+    }
+
+
+@contextmanager
+def caller_with_existing_box(root):
+    """Every child must ignore the invoking user's unrelated Box record."""
+    home = root / 'caller-home'
+    record = home / '.nexus/run/node.json'
+    record.parent.mkdir(parents=True)
+    body = b'{UNRELATED_CALLER_BOX_MUST_NOT_BE_READ}'
+    record.write_bytes(body)
+    previous = {name: os.environ.get(name) for name in ['HOME', 'USERPROFILE']}
+    os.environ.update(HOME=str(home), USERPROFILE=str(home))
+    try:
+        yield
+    finally:
+        for name, value in previous.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+        assert record.read_bytes() == body, 'Acceptance modified the caller Box record'
+
+
 class Rpc:
     def __init__(self, binary, root):
-        env = os.environ | {'SCODE_SERVICE_ROOT': str(root),
-                            'SUDO_CODE_CONFIG_HOME': str(root / 'config'),
-                            'SCODE_CHECK_UPDATES': '0', 'RUST_LOG': 'info',
-                            'NEXUS_IDENTITY_DIR': str(root / 'unrelated-identity')}
+        env = client_environment(root) | {'RUST_LOG': 'info',
+            'NEXUS_IDENTITY_DIR': str(root / 'unrelated-identity')}
         self.child = subprocess.Popen([str(binary), 'service', 'stdio'], env=env,
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
             text=True, encoding='utf-8',
@@ -96,9 +129,7 @@ def check_cli_setup(binary, root, rpc):
         if time.monotonic() > deadline:
             raise AssertionError('Previous service owner did not retire')
         time.sleep(0.1)
-    env = os.environ | {'SCODE_SERVICE_ROOT': str(root),
-        'SCODE_GLOBAL_CONFIG_DIR': str(root / 'setup-config'),
-        'SCODE_CHECK_UPDATES': '0'}
+    env = client_environment(root) | {'SCODE_GLOBAL_CONFIG_DIR': str(root / 'setup-config')}
 
     def setup(mode):
         child = subprocess.Popen([str(binary), 'setup', '--mode', mode,
@@ -214,7 +245,7 @@ def run(binary, root):
 
         started = a.request('sessions.call', {'method': 'managed_agent.start_session_v1', 'params': {
             'agent_id': 'service-acceptance', 'spawn_spec': {'cmd': str(binary), 'args': ['acp'],
-            'env': os.environ | {'SCODE_CHECK_UPDATES': '0', 'SUDO_CODE_CONFIG_HOME': str(root / 'config')},
+            'env': client_environment(root),
             'cwd': str(root)}}})
         session = started['session_id']
         # Obtain the endpoint from the control-plane result, keeping address SSOT.
@@ -281,7 +312,8 @@ if __name__ == '__main__':
     with tempfile.TemporaryDirectory(prefix='scode-services-') as temporary:
         root = Path(temporary)
         try:
-            run(options.scode.resolve(), root)
+            with caller_with_existing_box(root):
+                run(options.scode.resolve(), root)
         except BaseException:
             if options.artifacts:
                 for log in root.rglob('runtime*.log'):
