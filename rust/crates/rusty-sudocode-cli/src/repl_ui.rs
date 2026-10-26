@@ -2410,6 +2410,12 @@ fn ReplApp(mut hooks: Hooks) -> impl Into<AnyElement<'static>> {
         .as_ref()
         .map_or(0, |text| text.text.lines().count());
     let slot_width = Size::Length(u32::from(term_width));
+    // Present an empty live frame before exiting. iocraft otherwise retains
+    // its last canvas, leaving status/todos above the next resumed session.
+    // The ordinary history writer has already committed conversation output.
+    if *should_exit.read() {
+        return element! { View(height: 0) };
+    }
     element! {
         View(width: u32::from(term_width), flex_direction: FlexDirection::Column,
             max_height: u32::from(term_height.saturating_sub(1)), overflow: Overflow::Hidden) {
