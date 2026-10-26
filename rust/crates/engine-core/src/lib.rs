@@ -86,6 +86,7 @@ mod attachment;
 pub mod cache_advisor;
 pub mod cache_metrics;
 pub mod cache_report;
+pub mod cache_ttl;
 mod engine_client;
 pub use attachment::{CompletionRetirement, EngineAttachment};
 mod session;

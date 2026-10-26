@@ -388,7 +388,7 @@ pub enum UiCommand {
     ClearQuestion,
     SetTurnResult(Arc<StyledText>),
     SetTip(engine_core::Tip),
-    SetCacheTip(Option<engine_core::Tip>),
+    SetCacheTip(CacheTip),
     BeginTurn,
     /// Update the `TodoSlot` panel with the current todo list.
     UpdateTodos(Vec<runtime::Todo>),
@@ -469,7 +469,7 @@ impl UiCommandSender {
         let _ = self.tx.send(UiCommand::BeginTurn);
     }
 
-    pub(crate) fn set_cache_tip(&self, tip: Option<engine_core::Tip>) {
+    pub(crate) fn set_cache_tip(&self, tip: CacheTip) {
         let _ = self.tx.send(UiCommand::SetCacheTip(tip));
     }
 
@@ -943,6 +943,15 @@ impl Write for OutputSender {
     }
 }
 
+/// The cache-TTL footer tip, the advice behind it, and whether the tip offers
+/// a switch (a footer stop that opens the TTL panel).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(crate) struct CacheTip {
+    pub tip: Option<engine_core::Tip>,
+    pub advice: Option<engine_core::cache_advisor::TtlAdvice>,
+    pub actionable: bool,
+}
+
 /// Events from the iocraft UI to the coordinator thread.
 #[derive(Debug, PartialEq, Eq)]
 pub enum InputEvent {
@@ -962,6 +971,11 @@ pub enum InputEvent {
     /// Inspect the frozen review without answering it.
     InspectDocument(String),
     StopBackgroundTask(String),
+    /// A prompt-cache TTL chosen in the TTL panel.
+    SetCacheTtl {
+        choice: engine_core::cache_ttl::TtlChoice,
+        force_now: bool,
+    },
     /// Esc flushes pending input, or cancels when none is pending.
     Abort,
     /// Ctrl+C always cancels, even with pending input.
@@ -1468,14 +1482,31 @@ fn ReplApp(mut hooks: Hooks) -> impl Into<AnyElement<'static>> {
                             (TaskFocus::Footer, KeyCode::Char(_)) if !modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) => {
                                 browser.close();
                             }
+                            (TaskFocus::Footer | TaskFocus::Tip, KeyCode::Left | KeyCode::Right) => {
+                                browser.move_footer_stop(code == KeyCode::Right);
+                            }
+                            (TaskFocus::Tip, KeyCode::Enter | KeyCode::Down) => browser.open_ttl(),
+                            (TaskFocus::Tip, KeyCode::Esc | KeyCode::Up) => browser.close(),
+                            (TaskFocus::Tip, KeyCode::Char(_)) if !modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) => {
+                                browser.close();
+                            }
+                            (TaskFocus::Ttl, KeyCode::Up | KeyCode::Down) => browser.move_ttl(code == KeyCode::Down),
+                            (TaskFocus::Ttl, KeyCode::Esc) => browser.close_ttl(),
+                            (TaskFocus::Ttl, KeyCode::Enter | KeyCode::Char('n')) => {
+                                let _ = input_tx_for_events.send(InputEvent::SetCacheTtl {
+                                    choice: browser.ttl_choice(),
+                                    force_now: code == KeyCode::Char('n'),
+                                });
+                                browser.close();
+                            }
                             _ => {}
                         }
                         frame.set(frame.get().wrapping_add(1));
                         return;
                     }
-                    if code == KeyCode::Down && browser.has_tasks() && history_cursor.get().is_none()
+                    if code == KeyCode::Down && browser.has_footer_stop() && history_cursor.get().is_none()
                         && input_value.read().is_empty() {
-                        browser.focus = TaskFocus::Footer;
+                        browser.focus_footer();
                         frame.set(frame.get().wrapping_add(1));
                         return;
                     }
@@ -1936,7 +1967,14 @@ fn ReplApp(mut hooks: Hooks) -> impl Into<AnyElement<'static>> {
                             }
                         }
                         Ok(UiCommand::SetTip(tip)) => footer_tips.write().set(tip),
-                        Ok(UiCommand::SetCacheTip(tip)) => footer_tips.write().cache(tip),
+                        Ok(UiCommand::SetCacheTip(view)) => {
+                            footer_tips.write().cache(view.tip);
+                            tasks_for_future
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                .set_cache_advice(view.advice, view.actionable);
+                            frame.set(frame.get().wrapping_add(1));
+                        }
                         Ok(UiCommand::BeginTurn) => footer_tips.write().begin_turn(),
                         Ok(UiCommand::SetTurnResult(text)) => {
                             turn_result.set(Some(text));
@@ -2480,7 +2518,7 @@ fn ReplApp(mut hooks: Hooks) -> impl Into<AnyElement<'static>> {
                             !modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT),
                         _ => false,
                     };
-                    if browser.focus == TaskFocus::Footer && edits_draft {
+                    if matches!(browser.focus, TaskFocus::Footer | TaskFocus::Tip) && edits_draft {
                         browser.close();
                     }
                     if !reviewable || browser.focus != TaskFocus::Input
@@ -2543,7 +2581,7 @@ fn ReplApp(mut hooks: Hooks) -> impl Into<AnyElement<'static>> {
                         View(width: 2, flex_shrink: 0.0) { Text(content: prompt_label) }
                         TextInput(
                             value: val,
-                            has_focus: reviewable && matches!(task_focus, TaskFocus::Input | TaskFocus::Footer),
+                            has_focus: reviewable && matches!(task_focus, TaskFocus::Input | TaskFocus::Footer | TaskFocus::Tip),
                             multiline: true,
                             auto_grow: false,
                             on_edit: Some(on_edit),
