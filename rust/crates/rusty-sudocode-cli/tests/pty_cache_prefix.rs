@@ -1927,12 +1927,18 @@ fn a_saved_1h_waits_for_a_cold_prefix_after_a_restart() {
     let from = capture.bodies().len();
     turn(&mut cli, "A quick restart finds the prefix warm.");
     let warm = sent_1h_since(&capture, from);
-    assert!(!warm.is_empty() && warm.iter().all(|one_hour| !one_hour), "{warm:?}");
+    assert!(
+        !warm.is_empty() && warm.iter().all(|one_hour| !one_hour),
+        "{warm:?}"
+    );
     compact(&mut cli, "compaction after the restart");
     let from = capture.bodies().len();
     turn(&mut cli, "Cold after the compaction.");
     let cold = sent_1h_since(&capture, from);
-    assert!(!cold.is_empty() && cold.iter().all(|one_hour| *one_hour), "{cold:?}");
+    assert!(
+        !cold.is_empty() && cold.iter().all(|one_hour| *one_hour),
+        "{cold:?}"
+    );
     exit(&mut cli);
 }
 fn exit(cli: &mut PtySession) {
