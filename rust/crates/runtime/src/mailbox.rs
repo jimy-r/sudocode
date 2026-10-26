@@ -1911,8 +1911,8 @@ impl DeliveryEvent {
     fn observe(self, diagnostics: &telemetry::RetryDiagnostics, scope: &str, error: Option<&str>) {
         // A refused commit may mean ordinary lease expiry/transfer, not an
         // I/O failure. Keep its captured attribution without announcing a
-        // transport outage. A renewal error or register-write error still
-        // carries the original operation error to the retry reporter.
+        // transport outage. I/O refusals keep the commit's returned message;
+        // an earlier worker failure supplies its typed loss, not raw I/O text.
         let error = if matches!(
             self.loss,
             Some(
