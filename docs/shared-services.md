@@ -5,8 +5,10 @@ supervisor in a service root. The default root is `~/.nexus-vfs`;
 `SCODE_SERVICE_ROOT` selects an absolute root for a container or an isolated test.
 
 The CLI offers runtime selection on its first interactive launch with a fresh
-configuration home. Local execution installs no service. Shared local services
-use this same supervisor and verified artifact installer as SudoWork. Existing
+configuration home. Single-agent mode skips Nexus setup. Multi-agent mode first
+reuses the Box configured in `~/.nexus/run/node.json`. If no Box is configured,
+it prepares local services using the same supervisor and verified artifact
+installer as SudoWork. Existing
 configuration homes keep their current behavior until explicit setup:
 
 ```sh
@@ -19,8 +21,16 @@ The preference lives in the CLI's configuration home, while service lifetime
 remains owned by the OS-user supervisor. Selecting local does not stop services
 used by another frontend. Inspection installs and starts nothing. ACP, service
 stdio, headless commands and resume do not display the onboarding picker.
-Shared mode prepares local services; cross-domain enrollment and participant
-authorization are separate, and setup reports `domainJoinAccepted:false`.
+`shared` selects multi-agent mode. A configured Box takes precedence even if it
+is temporarily offline or the new Agent still needs credentials: setup never
+replaces that choice with a second local service. Malformed records report their
+original validation error. Setup preserves the record and its credential bundles;
+the normal session connection checks this Agent's own credentials and the Box's
+TLS identity. Finding a record alone is not successful authentication: inspection
+reports `agentAuthentication:pending`, and setup reports `domainJoinAccepted:false`.
+Cross-domain enrollment and participant authorization remain separate. Agent
+attachment does not add a Nexus node or change Raft voter membership. Automatic
+discovery currently means the saved machine connection, not untrusted LAN peers.
 
 CLI release discovery and explicit `scode update` already share one installer.
 An updated CLI does not silently restart the shared Nexus service: setup refuses

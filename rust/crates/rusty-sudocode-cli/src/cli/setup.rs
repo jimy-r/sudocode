@@ -5,6 +5,7 @@ use std::io::IsTerminal;
 use std::path::PathBuf;
 
 use clap::ValueEnum;
+use runtime::nexus_mailbox::NodeRecord;
 use runtime::{FsBackend, StdFsBackend};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -52,8 +53,8 @@ fn choose() -> Result<Option<RuntimeMode>> {
     let choice = dialoguer::Select::with_theme(&dialoguer::theme::ColorfulTheme::default())
         .with_prompt("Choose how to run scode")
         .items(&[
-            "Local only (no service installation)",
-            "Shared local services (install Nexus)",
+            "Single agent (skip Nexus setup)",
+            "Multi-agent (reuse configured Box; otherwise prepare local Nexus)",
             "Decide later",
         ])
         .default(0)
@@ -66,18 +67,29 @@ fn choose() -> Result<Option<RuntimeMode>> {
 }
 
 fn activate(mode: RuntimeMode) -> Result<Value> {
-    let service = if mode == RuntimeMode::Shared {
-        Some(service_host::start_local_services().map_err(|error| error as Box<dyn Error>)?)
-    } else {
-        None
-    };
-    Ok(json!({"mode": mode, "service": service, "domainJoinAccepted": false}))
+    if mode == RuntimeMode::Shared {
+        if let Some(record) = NodeRecord::load()? {
+            return Ok(json!({"mode": mode, "service": null,
+                "box": {"source": "node_record", "endpoint": record.endpoint(),
+                    "agentAuthentication": "pending"}, "domainJoinAccepted": false}));
+        }
+        let service =
+            service_host::start_local_services().map_err(|error| error as Box<dyn Error>)?;
+        return Ok(json!({"mode": mode, "service": service, "box": null,
+            "domainJoinAccepted": false}));
+    }
+    Ok(json!({"mode": mode, "service": null, "box": null, "domainJoinAccepted": false}))
 }
 
 pub(crate) fn run(mode: Option<RuntimeMode>, check: bool, format: CliOutputFormat) -> Result<()> {
     let previous = preference()?;
     let output = if check {
+        let configured_box = NodeRecord::load()?.map(|record| {
+            json!({"source": "node_record", "endpoint": record.endpoint(),
+                "agentAuthentication": "pending"})
+        });
         json!({"mode": previous.map(|preference| preference.mode),
+            "box": configured_box,
             "services": service_host::inspect_local_services().map_err(|error| error as Box<dyn Error>)?,
             "domainJoinAccepted": false})
     } else {
@@ -102,7 +114,12 @@ pub(crate) fn run(mode: Option<RuntimeMode>, check: bool, format: CliOutputForma
     } else if check {
         println!("{}", serde_json::to_string_pretty(&output)?);
     } else {
-        println!("Runtime preference saved. Collaboration enrollment is a separate step.");
+        println!("Runtime preference saved.");
+        if let Some(endpoint) = output["box"]["endpoint"].as_str() {
+            println!("Using configured Box at {endpoint}. Agent credentials are checked when the session connects.");
+        } else if output["mode"] == "shared" {
+            println!("Local services are ready. Collaboration enrollment is a separate step.");
+        }
     }
     Ok(())
 }
