@@ -196,7 +196,11 @@ grpcurl_bin() {
     MINGW*|MSYS*|CYGWIN*) os=windows; suffix=zip ;;
     *) echo "!! no grpcurl and no prebuilt binary for $(uname -s) — install grpcurl and retry" >&2; return 1 ;;
   esac
-  local arch; arch="$(uname -m)"; [ "$arch" = x86_64 ] || [ "$arch" = arm64 ] || arch=x86_64
+  local arch
+  case "$(uname -m)" in
+    aarch64|arm64) arch=arm64 ;;
+    *) arch=x86_64 ;;
+  esac
   mkdir -p "$(dirname "$cache")"
   local url="https://github.com/fullstorydev/grpcurl/releases/download/v${version}/grpcurl_${version}_${os}_${arch}.${suffix}"
   local download="$cache.dl.$suffix"
