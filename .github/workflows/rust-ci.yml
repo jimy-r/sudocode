@@ -706,6 +706,32 @@ jobs:
           ANTHROPIC_BASE_URL: https://api.sudorouter.ai
           SUDOCODE_TEST_MODEL: *live_model
         run: cargo test --locked -p engine-acp --features mailbox --test session_mailbox_live -- --ignored --nocapture
+      - name: Deliver offline Nexus mail through a real model and first receiver start
+        working-directory: .
+        env:
+          SUDO_CODE_CONFIG_HOME: ${{ runner.temp }}/scode-nexus-offline-config
+          SCODE_LIVE_AUTH_PROFILE: sudorouter
+          PROXY_AUTH_TOKEN: ${{ secrets.SUDOROUTER_CI_API_KEY }}
+        run: |
+          node - <<'NODE'
+          const fs = require('fs');
+          const path = require('path');
+          const key = process.env.PROXY_AUTH_TOKEN;
+          if (!key) throw new Error('SUDOROUTER_CI_API_KEY is required for the offline Nexus PTY');
+          const dir = process.env.SUDO_CODE_CONFIG_HOME;
+          fs.mkdirSync(dir, { recursive: true });
+          fs.writeFileSync(path.join(dir, 'sudocode.json'), JSON.stringify({
+            auth_modes: { proxy: { sudorouter: { apiKey: key, baseUrl: 'https://api.sudorouter.ai/v1' } } },
+            models: {}
+          }), { mode: 0o600 });
+          NODE
+          bash e2e/nexus-a2a/run-live-offline.sh
+      - name: Remove offline Nexus model credentials
+        if: always()
+        env:
+          SUDO_CODE_CONFIG_HOME: ${{ runner.temp }}/scode-nexus-offline-config
+        run: |
+          node -e "require('fs').rmSync(require('path').join(process.env.SUDO_CODE_CONFIG_HOME, 'sudocode.json'), { force: true })"
       - name: Summarize ACP model routing and usage
         if: always()
         working-directory: .
