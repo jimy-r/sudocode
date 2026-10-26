@@ -791,7 +791,10 @@ impl SessionDriver {
             .map_err(|_| "engine session closed".into())
     }
 
-    pub(crate) fn shutdown(&self) -> bool {
+    /// Release this host's owner and await the engine's final storage lifetime.
+    /// Aborting a wire task schedules its drop; it does not release its owner yet.
+    pub(crate) fn shutdown(self: Arc<Self>) -> bool {
+        let retirement = self.completion_retirement();
         self.unbind();
         let handle = self
             .handle
@@ -806,7 +809,8 @@ impl SessionDriver {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .recv_timeout(Duration::from_secs(30))
             .is_ok();
-        reaped && stopped
+        drop(self);
+        reaped && stopped && retirement.wait(Duration::from_secs(30))
     }
 }
 

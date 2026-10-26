@@ -1755,6 +1755,7 @@ impl SessionRegistry {
             let _ = entry.driver.send(engine_core::EngineCommand::Cancel);
             entry.abort.abort();
             drop(entry.engine);
+            drop(entry.subagents);
             if !entry.driver.shutdown() {
                 eprintln!("ACP session teardown timed out");
             }
