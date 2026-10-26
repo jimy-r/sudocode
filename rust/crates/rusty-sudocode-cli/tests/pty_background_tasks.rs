@@ -1,5 +1,7 @@
 //! Background task discovery, inspection and control through the real terminal.
 mod common;
+#[path = "support/wire_requests.rs"]
+mod wire_requests;
 
 use common::TestEnv;
 use pty_expect::PtySession;
@@ -32,20 +34,9 @@ fn task_env(label: &str) -> (TestEnv, ReleaseOnDrop) {
 }
 
 fn expect_input_ready(session: &PtySession, budget: Duration, context: &str) {
-    common::expect_screen_settled(
+    common::expect_screen_rows_settled(
         session,
-        |_| {
-            session.render(|screen| {
-                // contents() joins soft-wrapped rows. At 80 columns the input
-                // can otherwise appear to contain the following rule/footer.
-                let rows = screen
-                    .raw()
-                    .rows(0, screen.raw().size().1)
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                rows.contains('\u{276f}') && common::input_line_of(&rows).is_empty()
-            })
-        },
+        |rows| rows.contains('\u{276f}') && common::input_line_of(rows).is_empty(),
         budget,
         context,
     );
@@ -275,6 +266,41 @@ fn failed_background_shell_exposes_unread_result_and_exit_code() {
 }
 
 #[test]
+fn task_command_enter_opens_the_list_without_also_opening_details() {
+    let (env, _release) = task_env("background-task-command-key-owner");
+    let mut session = start(
+        &env,
+        &[shell(
+            "key-owner",
+            "echo TASK_COMMAND_RESULT; exit 7",
+            "Task command keyboard ownership",
+        )],
+    );
+    screen(&session, "1 new result");
+    // The editor drains its event batch before parent hooks are polled. Ctrl+A/E
+    // give the asynchronous /ps command time to reach the UI in that batch.
+    // Its submission Enter must never also navigate the newly opened panel.
+    for cursor_pairs in [0, 64, 1024, 8192] {
+        let input = format!("/ps\r{}", "\x01\x05".repeat(cursor_pairs));
+        session.send(&input).unwrap();
+        common::expect_screen_settled(
+            &session,
+            |s| {
+                common::input_and_footer_of(s).is_some_and(|area| {
+                    area.contains("Enter details") && !area.contains("Esc task list")
+                })
+            },
+            common::DEFAULT_TIMEOUT,
+            &format!("/ps Enter opens only the list ({cursor_pairs} cursor pairs)"),
+        );
+        session.send("\x1b").unwrap();
+        expect_input_ready(&session, common::DEFAULT_TIMEOUT, "task list closed");
+    }
+    session.send("/exit\r").unwrap();
+    assert_eq!(session.expect_eof().unwrap(), 0);
+}
+
+#[test]
 fn inspecting_running_task_does_not_acknowledge_its_future_result() {
     let (env, _release) = task_env("background-result-after-peek");
     let calls = [shell(
@@ -444,7 +470,7 @@ fn task_updates_do_not_take_keyboard_ownership_from_questions() {
             json!({"id":"question","name":"AskUserQuestion","input":{"questions":[{"id":"choice","header":"Choice","question":"Select the second answer","options":[{"label":"First","value":"First","description":"First option"},{"label":"Second","value":"Second","description":"Second option"}],"multiSelect":false}]}}),
         ],
     );
-    common::expect_screen(
+    common::expect_screen_rows_settled(
         &session,
         |view| {
             view.lines()
@@ -455,28 +481,50 @@ fn task_updates_do_not_take_keyboard_ownership_from_questions() {
         "actual question options, rather than the echoed prompt",
     );
     screen(&session, "1 terminal");
-    session.send("\x1b[B\r").unwrap();
-    common::expect_input_line_cleared(&session, Duration::from_secs(90), "question answered");
+    let before = common::turn_status_marker(&session);
+    session.send("\x1b[B").unwrap();
+    common::expect_screen_rows_settled(
+        &session,
+        |view| {
+            view.lines()
+                .any(|line| line.trim_start().starts_with("> [2] Second"))
+        },
+        Duration::from_secs(90),
+        "second answer selected before confirming",
+    );
+    session.send("\r").unwrap();
+    expect_parent_complete(&session, &before);
     if env.is_mock() {
-        let bodies = env.captured_message_bodies();
+        let results: Vec<Value> = env
+            .captured_message_bodies()
+            .iter()
+            .flat_map(|body| {
+                wire_requests::request_tool_blocks(&serde_json::from_str(body).unwrap())
+            })
+            .filter(|block| block["type"] == "tool_result" && block["tool_use_id"] == "question")
+            .map(|block| {
+                assert_ne!(block["is_error"], true, "question failed: {block}");
+                let content = &block["content"];
+                let text = content.as_str().map(str::to_owned).unwrap_or_else(|| {
+                    content
+                        .as_array()
+                        .expect("question text blocks")
+                        .iter()
+                        .map(|part| part["text"].as_str().expect("question text"))
+                        .collect::<Vec<_>>()
+                        .join("")
+                });
+                serde_json::from_str(&text).expect("question result JSON")
+            })
+            .collect();
         assert!(
-            bodies.iter().any(|body| {
-                let request: Value = serde_json::from_str(body).unwrap();
-                request["messages"]
-                    .as_array()
-                    .unwrap()
-                    .iter()
-                    .any(|message| {
-                        message["content"].as_array().is_some_and(|blocks| {
-                            blocks.iter().any(|block| {
-                                block["type"] == "tool_result"
-                                    && block["tool_use_id"] == "question"
-                                    && block["content"].to_string().contains("Second")
-                            })
-                        })
-                    })
-            }),
-            "actual selected answer must reach provider"
+            !results.is_empty()
+                && results.iter().all(|result| {
+                    result["answers"][0]["value"] == "Second"
+                        && result["answers"][0]["label"] == "Second"
+                }),
+            "actual selected answer must reach provider: question_results={results:?}; screen={}",
+            common::screen_tail(&session, 5000)
         );
     }
     open(&mut session);
@@ -588,6 +636,90 @@ fn exiting_during_a_foreground_tool_reaps_both_process_groups() {
         }
         std::thread::sleep(Duration::from_millis(25));
     }
+}
+
+/// The tools promise "end your turn — you will be notified". A shell that
+/// finishes while the prompt is idle must reach the model by itself: nobody
+/// types after the launch turn ends.
+#[test]
+fn a_background_shell_finishing_at_an_idle_prompt_reports_to_the_model() {
+    let (env, _release) = task_env("background-idle-wake");
+    let mut session = start(
+        &env,
+        &[shell(
+            "wake",
+            "while [ ! -f release ]; do sleep 0.1; done; echo IDLE_WAKE_OUTPUT",
+            "Idle wake fixture",
+        )],
+    );
+    let before = common::turn_status_marker(&session);
+    let launched = env.is_mock().then(|| env.captured_message_count());
+    fs::write(env.workspace_root().join("release"), "go").unwrap();
+    common::expect_screen(
+        &session,
+        |s| s.contains("Background task \"Idle wake fixture\" completed (exit 0)"),
+        common::LIVE_TURN_BUDGET,
+        "completion shown in scrollback",
+    );
+    common::expect_turn_complete_after(
+        &session,
+        &before,
+        common::LIVE_TURN_BUDGET,
+        "the completion ran a turn with no human input",
+    );
+    if let Some(launched) = launched {
+        let bodies = env.captured_message_bodies();
+        let woke = &bodies[launched..];
+        assert!(
+            woke.iter()
+                .any(|body| body.contains("<task-notification>")
+                    && body.contains("IDLE_WAKE_OUTPUT")),
+            "the model never received the finished shell: {woke:?}"
+        );
+    }
+    expect_input_ready(&session, common::DEFAULT_TIMEOUT, "back at input");
+    session.send("/exit\r").unwrap();
+    assert_eq!(session.expect_eof().unwrap(), 0);
+}
+
+/// `/exit` while the provider is still answering ends that turn (`Close`
+/// aborts in-flight work). A finished task now starts turns at idle, so a
+/// turn under a racing `/exit` is ordinary and must not hold shutdown.
+#[test]
+fn exiting_while_the_provider_is_answering_cancels_the_turn() {
+    let (env, _release) = task_env("exit-cancels-streaming-turn");
+    if !env.is_mock() {
+        // The stall is a mock control; a live provider has no such switch.
+        return;
+    }
+    // Never released: the mock holds its stream until its own deadline.
+    let stall = env.workspace_root().join("stream-never-released");
+    let calls = [
+        json!({"id":"stalled","name":"Bash","input":{"command":"echo unreachable","description":"Stalled stream fixture"},"stream_wait_for":stall}),
+    ];
+    let mut session = spawn_for_calls(&env, &calls);
+    session.resize(40, 100).unwrap();
+    expect_input_ready(&session, Duration::from_secs(30), "ready");
+    send_calls(&env, &mut session, &calls);
+    let deadline = Instant::now() + common::DEFAULT_TIMEOUT;
+    while env.captured_message_count() == 0 {
+        assert!(
+            Instant::now() < deadline,
+            "the turn never reached the provider"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    // Let the stream reach its stall point before leaving.
+    std::thread::sleep(Duration::from_millis(500));
+    let exit_started = Instant::now();
+    session.set_default_timeout(Duration::from_secs(45));
+    session.send("/exit\r").unwrap();
+    assert_eq!(session.expect_eof().unwrap(), 0);
+    let took = exit_started.elapsed();
+    assert!(
+        took < Duration::from_secs(10),
+        "exit waited for the stalled turn instead of cancelling it: {took:?}"
+    );
 }
 
 /// Run the same real-shell workload against baseline and candidate releases.
