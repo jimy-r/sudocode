@@ -38,6 +38,45 @@ from the immutable sibling `vX.Y.Z` directory. A versioned mirror directory pins
 its own version. The publisher verifies the complete mirror before promoting the
 pointer; the client verifies the downloaded archive's SHA-256 before installation.
 
+## Persistent peer descriptions
+
+Enable `experimental.peerDescriptions` in settings to let model-backed
+compaction publish a short description of each peer's ongoing work:
+
+```json
+{"experimental":{"peerDescriptions":true}}
+```
+
+The existing compaction call produces optional description metadata alongside
+its checkpoint. It adds no separate summarizer or repair request. New agents
+have no description until one is published. Tool-output pruning, skipped or
+failed compaction, and ordinary turns preserve the previous description and
+its timestamp. Child agents retain their existing task descriptions.
+
+The source of truth is `/agents/<name>/description.json` in the actual peer
+mailbox namespace. Without a Nexus node, that path is relative to
+`~/.nexus/sudocode/local-mailbox/`. The record contains `description`,
+`updated_at`, and `source_session_id`. It survives process exit and resume;
+resuming an older session does not restore an older description. The owning
+agent publishes only after its checkpoint commits. A description changed
+during compaction is preserved. Native filesystem locks exclude concurrent
+writers; node backends retain their advisory lease guarantee unless they
+provide conditional writes.
+
+`agent_list` reads these records and returns optional `description` and
+`description_updated_at` fields. Terminal cards show the description and its
+age. Missing or unreadable metadata never removes an otherwise reachable peer.
+The timestamp records the last description refresh and does not assert that a
+peer is running. Descriptions persist until replaced or explicitly removed.
+
+Stored descriptions are not injected into ordinary system prompts or compacted
+continuations. Description instructions and a bounded hint of the latest
+preserved user intent are appended only to the existing final compaction
+instruction. Cached system/tool definitions, historical messages, and the
+retained recent tail keep their existing bytes and boundaries. The experiment
+is off by default; disabling it preserves the original request and listing
+shape.
+
 ## Editing a prompt
 
 `Ctrl+U` clears the current draft. You can immediately continue typing or paste

@@ -2337,6 +2337,33 @@ Logged here so the insight isn't lost to discussion-only memory.</p>
 
 <h2 id="goal-4">Goal 4 · Agent storage, communication and execution</h2>
 
+<h3 id="peer-descriptions">Persistent peer descriptions</h3>
+<p><b>CCB validation.</b> Read <code>claude-code-best/src/memdir/memoryAge.ts</code>,
+<code>memoryScan.ts</code>, and <code>memoryTypes.ts</code> at <code>8d80e740</code>.
+The reference separates short relevance descriptions from memory bodies and
+shows age so recalled observations can be rechecked. An isolated official
+Claude Code <code>2.1.310</code> Windows binary (SHA-256
+<code>f9a3920634ae3b961ee92c2eb58d0051f5f8852b120983d0a4f57b6a5efeba61</code>)
+also stamps modification time and session provenance. Five executions of its
+exact extracted age helper confirm its two-day freshness note. Those findings
+support runtime timestamps and provenance; they do not establish a per-file
+expiry policy or a peer-description feature in Claude Code.</p>
+<p>The <code>peerDescriptions</code> experiment is off by default. The existing
+model-backed compaction call may return a short description after its checkpoint.
+The runtime strips metadata from continuation context and publishes it only
+after the checkpoint commits. Discovery reads the same persistent agent file.
+There is no scheduled model call, automatic expiry, or child-agent profile
+change. Pruning and failed or incomplete metadata preserve the prior record.
+PTY acceptance covers compaction, process restart, peer discovery, optional
+metadata failures, and exact historical cache-marker equality with the feature
+off and on. Native and in-process cohost tests cover persistent storage and
+stale writes. Live Sudorouter acceptance with <code>claude-opus-4-8</code>
+verified one completed compaction response and discovery from a second real-model
+session after the author exited. Two provider-usage samples are observations,
+not a cache-efficiency benchmark; deployed Moss and gRPC daemon journeys remain
+outside this experiment's acceptance. See <a href="docs/usage.md#persistent-peer-descriptions">usage</a>
+for storage and the backend concurrency guarantee.</p>
+
 <p id="collaboration-as-unit">Product principles and the component overview live in
 <a href="README.md#position-in-the-larger-picture">README</a>.
 The <a href="docs/design/agent-context-storage-matrix.html#agent-delivery-contract">Agent storage contract</a>
