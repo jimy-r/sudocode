@@ -63,9 +63,14 @@ offset/tail, stall, typed lease loss and repeat count. Claim failures keep unkno
 positions null. Consumer refusal and lease loss remain structured attribution,
 not transport reconnect notices. This includes a commit refused because its
 lease lapsed, moved to another holder or answered too late: the captured
-`CommitRefusal.loss` determines that category. A renewal I/O error or register
-write error still retains its original cause in the retry log. The real-node
-composition fixture checks both a silent lease lapse and a subsequent register
+`CommitRefusal.loss` determines that category. Register-write errors and renewal
+errors returned by the commit's own confirmation retain that returned message.
+If the background worker already lost the lease, the commit returns a generic
+ownership-loss message; its typed loss retains the worker's error kind, site and
+timing, not the original I/O error text. Existing one-off reader/seat-loss
+notices remain visible through terminal capture; they are distinct from the
+aggregated transport reconnect notices. The real-node
+composition fixture checks both a lapse without an I/O failure and a subsequent register
 I/O refusal in the same original receiver. Retry timings, eligibility and acknowledgment
 are unchanged. The receiver-error status work in #1041 remains a separate
 composition boundary until its source lands; no second status registry is added.
