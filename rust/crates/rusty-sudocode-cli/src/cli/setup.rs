@@ -156,8 +156,9 @@ pub(crate) fn run(
 }
 
 /// Existing installations retain their current behavior until explicit setup.
+/// Interactive resume honors that choice without offering first-run onboarding.
 /// Protocol/headless callers never read a prompt or provision background services.
-pub(crate) fn startup_prompt() -> Result<()> {
+pub(crate) fn startup_prompt(allow_onboarding: bool) -> Result<()> {
     if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
         return Ok(());
     }
@@ -165,7 +166,7 @@ pub(crate) fn startup_prompt() -> Result<()> {
         if preference.mode == RuntimeMode::Shared {
             activate(preference.mode, preference.owner_root.as_deref())?;
         }
-    } else if !runtime::config::default_config_home().exists() {
+    } else if allow_onboarding && !runtime::config::default_config_home().exists() {
         run(None, None, false, CliOutputFormat::Text)?;
     }
     Ok(())

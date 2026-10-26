@@ -844,10 +844,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     startup::measure("legacy_config", auto_migrate_legacy_config);
     let is_interactive_session = matches!(&action, CliAction::Repl { .. })
         || matches!(&action, CliAction::ResumeSession { commands, output_format: CliOutputFormat::Text, .. } if commands.is_empty());
-    if matches!(&action, CliAction::Repl { .. }) {
-        cli::setup::startup_prompt()?;
-    }
     if is_interactive_session {
+        cli::setup::startup_prompt(matches!(&action, CliAction::Repl { .. }))?;
         cli::update::startup_prompt()?;
     }
     // Informational commands (help, version, config, login, logout) are

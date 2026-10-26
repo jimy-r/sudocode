@@ -78,8 +78,10 @@ No installation, version transition, client-record publication or credential
 mint occurs on this path. A rotated Node certificate requires a new explicit
 operator ownership transition rather than silently accepting a changed pin.
 
-After multi-agent selection, startup resumes only the registered owner matching
-the saved Box endpoint. A live external owner is authenticated and reused; it
+After multi-agent selection, fresh interactive startup and interactive
+`scode --resume` resume only the registered owner matching the saved Box
+endpoint. Resume never offers first-run setup. Protocol/headless entrypoints
+do not provision services. A live external owner is authenticated and reused; it
 is never killed or replaced. A stopped Node resumes through the same supervisor
 and lifetime lock, with an additional lock in its original data directory.
 Closing the selecting CLI leaves that shared owner running. The broker exposes

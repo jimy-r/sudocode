@@ -273,3 +273,53 @@ fn first_interactive_launch_offers_setup_before_a_session_is_started() {
     assert_eq!(preference["mode"], "local");
     assert!(!services.exists());
 }
+
+#[test]
+fn interactive_resume_checks_the_saved_owner_before_opening_a_session() {
+    let env = common::TestEnv::new("runtime-resume-owner");
+    let services = env.workspace_root().join("unregistered-owner");
+    let home = env.workspace_root().join("home");
+    configured_box(
+        env.workspace_root(),
+        &serde_json::json!({"version": 1, "endpoint": "127.0.0.1:1",
+            "agents_dir": env.workspace_root().join("existing-agents")}),
+    );
+    let preference =
+        serde_json::json!({"schemaVersion": 1, "mode": "shared", "ownerRoot": services});
+    let preference_path = env.config_home().join("runtime-profile.json");
+    std::fs::write(&preference_path, preference.to_string()).unwrap();
+    let before = std::fs::read(&preference_path).unwrap();
+    let mut child = env.spawn_with_env(
+        &["--resume"],
+        &[
+            ("HOME", &home.to_string_lossy()),
+            ("USERPROFILE", &home.to_string_lossy()),
+            ("SCODE_CHECK_UPDATES", "0"),
+        ],
+    );
+    child
+        .expect("The selected owner root has no registered local Box")
+        .unwrap();
+    assert_ne!(child.expect_eof().unwrap(), 0);
+    assert!(!services.exists());
+    assert_eq!(std::fs::read(preference_path).unwrap(), before);
+}
+
+#[test]
+fn interactive_resume_without_a_saved_choice_skips_onboarding() {
+    let env = common::TestEnv::new("runtime-resume-no-choice");
+    let config = env.workspace_root().join("fresh-configuration");
+    let services = env.workspace_root().join("resume-services");
+    let mut child = env.spawn_with_env(
+        &["--resume"],
+        &[
+            ("SCODE_GLOBAL_CONFIG_DIR", &config.to_string_lossy()),
+            ("SCODE_SERVICE_ROOT", &services.to_string_lossy()),
+            ("SCODE_CHECK_UPDATES", "0"),
+        ],
+    );
+    child.expect("no managed sessions found").unwrap();
+    assert_ne!(child.expect_eof().unwrap(), 0);
+    assert!(!config.join("runtime-profile.json").exists());
+    assert!(!services.exists());
+}
