@@ -11,6 +11,9 @@ function percentile(values, fraction) {
   return sorted[Math.ceil(sorted.length * fraction) - 1];
 }
 
+function hasForegroundActivity(text) {
+  return text.includes('Thinking...') || text.includes('Working...');
+}
 
 async function run(host, config) {
   const { child, state, wait, settle, viewport, snapshot, resizeFrame, sleep } = host;
@@ -177,11 +180,11 @@ async function run(host, config) {
         fs.writeFileSync(controlPath, JSON.stringify(control));
         const previous = snapshot().toLowerCase().split('cancelled').length;
         child.write(config.prompt + '\r');
-        await fastWait(() => fs.existsSync(control.start_ready) && viewport().includes('Thinking...'));
+        await fastWait(() => fs.existsSync(control.start_ready) && hasForegroundActivity(viewport()));
         const started = performance.now();
         child.write('\x1b');
         await fastWait(() => hasDraft('') && snapshot().toLowerCase().split('cancelled').length > previous
-          && !viewport().includes('Thinking...'));
+          && !hasForegroundActivity(viewport()));
         cancelSamples.push(performance.now() - started);
         fs.writeFileSync(control.start_release, 'release');
         fs.writeFileSync(control.release, 'release');
