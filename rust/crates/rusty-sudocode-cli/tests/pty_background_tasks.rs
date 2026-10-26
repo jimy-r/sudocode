@@ -836,11 +836,15 @@ fn release_background_task_input_measurement() {
             "Background output workload",
         )],
     );
-    common::expect_screen(
+    // start already waits for the parent turn; measure while the producer lives.
+    common::expect_screen_rows(
         &session,
-        |s| s.contains("Concurrency batch done.") && s.contains("ctx "),
+        |view| {
+            view.lines()
+                .any(|line| line.contains("danger-full-access") && line.contains("1 terminal"))
+        },
         Duration::from_secs(30),
-        "background launch complete",
+        "background producer active before measurement",
     );
     report_resources("background_before_wait");
     std::thread::sleep(Duration::from_secs(5));
