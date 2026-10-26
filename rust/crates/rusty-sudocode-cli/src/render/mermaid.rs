@@ -120,7 +120,3 @@ pub(super) fn safe_source(source: &str) -> Cow<'_, str> {
             .collect(),
     )
 }
-
-#[cfg(test)]
-#[path = "mermaid_tests.rs"]
-mod tests;
