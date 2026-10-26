@@ -209,8 +209,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
-    steps:
+        os: [ubuntu-latest, windows-latest]
+    steps: &test_workspace_steps
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: actions/setup-python@v5
@@ -264,6 +264,18 @@ jobs:
           RUST_TEST_NOCAPTURE: ${{ runner.os == 'Windows' && '1' || '0' }}
         run: cargo test --workspace --features engine-acp/mailbox
 
+  test-workspace-macos:
+    # macOS is the scarcest runner pool (about 5 slots shared by every
+    # sudoprivacy repo). It runs in the merge queue and on main, never on a
+    # pull request: nothing reaches main without passing it on the exact
+    # merge commit, and the queue cannot be bypassed. On a pull request the
+    # job is skipped by `if`, which still reports the required check (as
+    # skipped) without allocating a runner. Same steps as `test-workspace`.
+    if: ${{ !inputs.render_performance && !inputs.live_only && github.event_name != 'pull_request' }}
+    name: cargo test --workspace (macos-latest)
+    runs-on: macos-latest
+    steps: *test_workspace_steps
+
   terminal-resize:
     if: *standard_ci
     name: Real terminal resize (${{ matrix.os }})
@@ -272,7 +284,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        os: ${{ fromJSON(github.event_name == 'pull_request' && '["ubuntu-latest","windows-latest"]' || '["ubuntu-latest","macos-latest","windows-latest"]') }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -554,7 +566,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        os: ${{ fromJSON(github.event_name == 'pull_request' && '["ubuntu-latest","windows-latest"]' || '["ubuntu-latest","macos-latest","windows-latest"]') }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -597,8 +609,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
-    steps:
+        os: [ubuntu-latest, windows-latest]
+    steps: &clippy_workspace_steps
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -608,6 +620,18 @@ jobs:
           workspaces: rust -> target
       - name: Run workspace clippy
         run: cargo clippy --workspace
+
+  clippy-workspace-macos:
+    # macOS is the scarcest runner pool (about 5 slots shared by every
+    # sudoprivacy repo). It runs in the merge queue and on main, never on a
+    # pull request: nothing reaches main without passing it on the exact
+    # merge commit, and the queue cannot be bypassed. On a pull request the
+    # job is skipped by `if`, which still reports the required check (as
+    # skipped) without allocating a runner. Same steps as `clippy-workspace`.
+    if: ${{ !inputs.render_performance && !inputs.live_only && github.event_name != 'pull_request' }}
+    name: cargo clippy --workspace (macos-latest)
+    runs-on: macos-latest
+    steps: *clippy_workspace_steps
 
   live-api-smoke:
     name: Live API smoke test
