@@ -890,9 +890,19 @@ scode --model <vision-model> 'Describe @/absolute/path/screenshot.png'
 scode --model <vision-model> 'Describe @"screenshots/home page.png"'
 ```
 
-The synchronous REPL also submits clipboard images pasted alongside a text
-prompt. Image bytes are validated and preflighted before being sent; a missing
-or invalid referenced image produces an error rather than a text-only request.
+In the REPL, paste a clipboard image with **Alt+V**, with **Ctrl+V** where the
+terminal passes it through, or with the terminal's own paste (Cmd+V on macOS)
+when the clipboard holds only an image. On Windows Terminal, Ctrl+V is the
+terminal's text paste, so use Alt+V there. The image shows as `[Image #N]` in
+the default REPL and as its `@"path"` reference in the classic synchronous REPL,
+and it is attached on submit exactly like a typed reference: a copied image file
+is referenced where it is, and pasted image data is stored in the image cache
+first. For scripts and tests, `SUDOCODE_CLIPBOARD_IMAGE=<file>` stands in for
+the system clipboard, which is then never read: the clipboard holds only the
+image in that file, or no image when the file is not one.
+
+Image bytes are validated and preflighted before being sent; a missing or
+invalid referenced image produces an error rather than a text-only request.
 Repeated references to the same spelling of a path attach it once per prompt.
 
 Agents can inspect images using `Read` (`read_file`). For example, after the

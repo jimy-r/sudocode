@@ -598,6 +598,43 @@ fn apply_paste_to_buffer(
     }
 }
 
+/// Placeholders a `paste_store` entry can stand behind: a collapsed text paste
+/// (`[Pasted text #N ...]`) and a pasted image (`[Image #N]`, whose entry is the
+/// image's `@` reference).
+const PASTE_PLACEHOLDER_PREFIXES: [&str; 2] = ["[Pasted text #", "[Image #"];
+
+/// The earliest placeholder prefix in `text` and its offset.
+fn next_paste_placeholder(text: &str) -> Option<(usize, &'static str)> {
+    PASTE_PLACEHOLDER_PREFIXES
+        .iter()
+        .filter_map(|prefix| text.find(prefix).map(|at| (at, *prefix)))
+        .min_by_key(|(at, _)| *at)
+}
+
+/// Insert an `[Image #N]` placeholder for the pasted image at `cursor`. It
+/// expands to the image's `@` reference on submit, through the same store and
+/// expansion as a collapsed text paste.
+fn insert_image_placeholder(
+    current: &str,
+    cursor: usize,
+    path: &std::path::Path,
+    next_id: &mut u32,
+    store: &mut std::collections::HashMap<u32, String>,
+) -> TextInputEdit {
+    let id = *next_id;
+    *next_id += 1;
+    store.insert(id, crate::clipboard_image::reference(path));
+    let before = &current[..cursor];
+    let insertion = format!(
+        "{}[Image #{id}] ",
+        crate::clipboard_image::separator_before(before)
+    );
+    TextInputEdit {
+        value: format!("{before}{insertion}{}", &current[cursor..]),
+        cursor_offset: cursor + insertion.len(),
+    }
+}
+
 /// Core expansion engine shared by plain and display variants.
 ///
 /// Scans left to right and copies each placeholder's replacement into a fresh
@@ -613,13 +650,12 @@ fn expand_paste_inner(
     store: &std::collections::HashMap<u32, String>,
     wrap: Option<(&str, &str)>,
 ) -> String {
-    if store.is_empty() || !input.contains("[Pasted text #") {
+    if store.is_empty() || next_paste_placeholder(input).is_none() {
         return input.to_string();
     }
-    let placeholder_prefix = "[Pasted text #";
     let mut result = String::with_capacity(input.len());
     let mut rest = input;
-    while let Some(rel_start) = rest.find(placeholder_prefix) {
+    while let Some((rel_start, placeholder_prefix)) = next_paste_placeholder(rest) {
         result.push_str(&rest[..rel_start]);
         let after_prefix = &rest[rel_start + placeholder_prefix.len()..];
 
@@ -656,7 +692,7 @@ fn expand_paste_inner(
     result
 }
 
-/// Replace all `[Pasted text #N ...]` placeholders with the real text (plain).
+/// Replace all paste placeholders with their real text (plain).
 fn expand_paste_placeholders(
     input: &str,
     store: &std::collections::HashMap<u32, String>,
@@ -2531,6 +2567,52 @@ fn ReplApp(mut hooks: Hooks) -> impl Into<AnyElement<'static>> {
                         TerminalEvent::Key(KeyEvent { code, modifiers, .. })
                             if *code == KeyCode::Char('c') && modifiers.contains(KeyModifiers::CONTROL) =>
                             Some(TextInputEdit { value: String::new(), cursor_offset: 0 }),
+                        // Image paste: an empty bracketed paste (Cmd+V on macOS
+                        // with only an image on the clipboard), or Ctrl+V/Alt+V.
+                        TerminalEvent::Paste(pasted) if pasted.is_empty() => {
+                            match crate::clipboard_image::read_image_for_paste() {
+                                Ok(Some(path)) => {
+                                    let mut id = next_paste_id.get();
+                                    let edit = insert_image_placeholder(current, cursor, &path, &mut id, &mut paste_store.write());
+                                    next_paste_id.set(id);
+                                    Some(edit)
+                                }
+                                Ok(None) => None,
+                                Err(error) => {
+                                    footer_tips.write().set(engine_core::Tip {
+                                        priority: engine_core::TipPriority::Normal,
+                                        message: format!("Could not read the clipboard: {error}"),
+                                    });
+                                    None
+                                }
+                            }
+                        }
+                        TerminalEvent::Key(KeyEvent { code: KeyCode::Char(key), modifiers, kind, .. })
+                            if key.eq_ignore_ascii_case(&'v')
+                                && modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+                                && *kind != KeyEventKind::Release => {
+                            let unchanged = TextInputEdit { value: current.to_string(), cursor_offset: cursor };
+                            if crate::clipboard_image::is_held_repeat(current) {
+                                return Some(unchanged);
+                            }
+                            let message = match crate::clipboard_image::read_image() {
+                                Ok(Some(path)) => {
+                                    let mut id = next_paste_id.get();
+                                    let edit = insert_image_placeholder(current, cursor, &path, &mut id, &mut paste_store.write());
+                                    next_paste_id.set(id);
+                                    crate::clipboard_image::note_paste_key(&edit.value);
+                                    return Some(edit);
+                                }
+                                Ok(None) => crate::clipboard_image::NO_IMAGE_NOTICE.to_string(),
+                                Err(error) => format!("Could not read the clipboard: {error}"),
+                            };
+                            crate::clipboard_image::note_paste_key(current);
+                            footer_tips.write().set(engine_core::Tip {
+                                priority: engine_core::TipPriority::Normal,
+                                message,
+                            });
+                            Some(unchanged)
+                        }
                         TerminalEvent::Paste(pasted) => {
                             let mut id = next_paste_id.get();
                             let mut store = paste_store.write();
