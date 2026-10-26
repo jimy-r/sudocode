@@ -191,7 +191,11 @@ fn multi_agent_setup_preserves_invalid_box_records_without_provisioning() {
             .output()
             .unwrap();
         assert!(!result.status.success());
-        assert!(String::from_utf8_lossy(&result.stderr).contains(expected));
+        let failure: serde_json::Value = serde_json::from_slice(&result.stdout).unwrap();
+        assert!(
+            failure["error"].as_str().unwrap().contains(expected),
+            "expected {expected:?}, received {failure}"
+        );
         assert_eq!(std::fs::read(&path).unwrap(), record.as_bytes());
         assert!(!root.path().join("config/runtime-profile.json").exists());
         assert!(!root.path().join("services").exists());
