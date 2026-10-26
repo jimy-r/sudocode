@@ -18,7 +18,7 @@ fn discovered_agent_list_address_delivers_to_the_peer() {
         UNIFIED_SEND_RECIPIENT.into(),
     );
     peer.ensure_presence().unwrap();
-    let mut cli = env.spawn(&["--permission-mode", "danger-full-access"]);
+    let mut cli = spawn_interactive(&env, &["--permission-mode", "danger-full-access"]);
     cli.resize(50, 120).unwrap();
     common::expect_input_line_cleared(&cli, env.timeout(), "directory ready");
     if env.is_mock() {
@@ -80,12 +80,15 @@ fn discovered_agent_list_address_delivers_to_the_peer() {
     cli.send("/exit\r").unwrap();
     assert_eq!(cli.expect_eof().unwrap(), 0);
     let path = assert_saved_send(&env);
-    let mut resumed = env.spawn(&[
-        "--resume",
-        path.to_str().unwrap(),
-        "--permission-mode",
-        "read-only",
-    ]);
+    let mut resumed = spawn_interactive(
+        &env,
+        &[
+            "--resume",
+            path.to_str().unwrap(),
+            "--permission-mode",
+            "read-only",
+        ],
+    );
     resumed.resize(70, 120).unwrap();
     common::expect_input_line_cleared(&resumed, env.timeout(), "restored directory ready");
     assert_cards(&resumed, env.timeout());
@@ -93,6 +96,12 @@ fn discovered_agent_list_address_delivers_to_the_peer() {
     common::expect_input_line(&resumed, "/exit", env.timeout(), "resumed exit typed");
     resumed.send("\r").unwrap();
     assert_eq!(resumed.expect_eof().unwrap(), 0);
+}
+
+fn spawn_interactive(env: &TestEnv, args: &[&str]) -> pty_expect::PtySession {
+    // Exercise the shipped async input path without the legacy image-paste
+    // binding reading the developer's clipboard. Replay tests cover both modes.
+    env.spawn_with_env(args, &[("SUDOCODE_INTERRUPT_QUEUE_MODE", "queue")])
 }
 
 fn assert_saved_send(env: &TestEnv) -> std::path::PathBuf {
