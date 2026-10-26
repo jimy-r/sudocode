@@ -239,6 +239,14 @@ NEXUS_A2A_TEST_ENDPOINT="$ENDPOINT" NEXUS_A2A_TEST_CERT_DIR="$CLIENT_BUNDLE" \
 NEXUS_A2A_TEST_ENDPOINT="$ENDPOINT" NEXUS_A2A_TEST_CERT_DIR="$CLIENT_BUNDLE" \
   "${CARGO_TEST[@]}" live_refusal_under_a_held_lease_is_recorded_as_consumer_refused -- --ignored --nocapture
 
+# A lease whose renewal never answers lapses on its own (INJECTED: the renewal
+# is held in flight), and its stall carries the lapse; a commit refused by its
+# register write (INJECTED, with the lease lost meanwhile) carries no lease loss.
+echo "== [deterministic] a stall carries the loss that caused it, captured when it happened =="
+NEXUS_A2A_TEST_ENDPOINT="$ENDPOINT" NEXUS_A2A_TEST_CERT_DIR="$CLIENT_BUNDLE" \
+  "${CARGO_TEST[@]}" live_stall_from_a_lapsed_lease_is_recorded_as_lease_lost_with_its_age -- --ignored --nocapture
+NEXUS_A2A_TEST_ENDPOINT="$ENDPOINT" NEXUS_A2A_TEST_CERT_DIR="$CLIENT_BUNDLE" \
+  "${CARGO_TEST[@]}" live_commit_refused_by_its_register_write_records_no_lease_loss -- --ignored --nocapture
 # The receiver seat trusts only fresh renewals: a late reply, a partition and a
 # slow-but-successful renewal are injected by the test-only wrapper; the node's
 # TTL is what any takeover waits on.
