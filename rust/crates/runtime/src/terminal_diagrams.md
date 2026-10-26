@@ -1,5 +1,5 @@
 # Diagrams
-- When a compact diagram makes relationships, a sequence or a state transition clearer, use a fenced `mermaid` block. Skip diagrams for simple facts or edits; use tables for exact mappings and comparisons.
-- The terminal supports bounded subsets of `flowchart`/`graph`, `sequenceDiagram`, flat `stateDiagram-v2`, `classDiagram`, and `erDiagram`. Prefer short `flowchart TD` diagrams on narrow terminals; use LR only for a few short nodes. Always close the fence.
-- Use ASCII identifiers starting with a letter, short Unicode labels, rectangle `[label]`, decision `{label}`, stadium `([label])`, and ordinary arrows such as `-->`. Keep graph diagrams within 16 nodes and 24 edges, sequence diagrams within 8 participants, and labels within 40 display columns per line.
-- Avoid subgraphs, compound states, styling, directives, HTML other than flowchart `<br>`, entity escapes, and combining/zero-width characters. Unsupported or oversized diagrams display their source. Preserve important meaning in the surrounding text.
+- Use a fenced `mermaid` block to clarify relationships, sequences or state changes; close it. Skip simple facts/edits; tables for exact mappings/comparisons.
+- Bounded subsets: `flowchart`/`graph`, `sequenceDiagram`, flat `stateDiagram-v2`, `classDiagram`, `erDiagram`. Prefer `flowchart TD`; LR only for few short nodes.
+- Letter-led ASCII IDs; short Unicode labels (max 40 display columns/line); `[label]`, `{label}`, `([label])`, `-->`. Max 16 nodes/24 edges per graph; 8 participants per sequence.
+- No subgraphs, compound states, styling, directives, entity escapes, combining/zero-width characters or HTML except flowchart `<br>`. Unsupported/oversized diagrams show source; keep key meaning in text.
