@@ -83,7 +83,7 @@ async function run(host, config) {
       await fastWait(text => text.includes('Pasted') || text.includes('TOOL_BATCH:'));
       child.write('\r');
       if (config.spec.kind === 'background')
-        await settle(text => text.includes('Concurrency batch done.') && text.includes('ctx '));
+        await settle(text => text.includes('Concurrency batch done.') && text.includes('· turn '));
       else await wait(text => text.includes('╭─ Bash('));
       await keys('stream');
       if (config.spec.kind === 'background') {
