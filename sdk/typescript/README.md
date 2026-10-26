@@ -124,6 +124,12 @@ namespace; the wrapper does not accept a caller-selected sender.
 
 ## Optional Codex callback adapter and existing-thread migration
 
+The current bridge binds one explicitly configured ACP SID and callback thread.
+It is not a global autojoin entry for arbitrary Codex conversations. The
+[Codex autojoin investigation](../../docs/design/codex-network-autojoin.md)
+records the native startup/context boundaries and acceptance required for that
+mode, including idle-start behavior and authorized Agent enrollment.
+
 `codexCallback` is an optional adapter, separate from the ACP transport. It
 connects to the existing native app-server proxy/socket and original loaded
 thread. It steers an active turn or starts an idle turn through the native
