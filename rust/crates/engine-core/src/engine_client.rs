@@ -697,6 +697,8 @@ fn runtime_error_from_api(
         RuntimeError::context_window_blocked(message)
     } else if error.is_thinking_replay_rejected() {
         RuntimeError::thinking_replay_rejected(message)
+    } else if error.is_interrupted_stream() {
+        RuntimeError::stream_interrupted(message)
     } else {
         RuntimeError::new(message).retryable(error.is_retryable())
     }
