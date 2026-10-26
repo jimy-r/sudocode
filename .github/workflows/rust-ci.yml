@@ -206,10 +206,11 @@ jobs:
 
   test-workspace:
     # Heavy jobs skip draft PRs: agents iterate on drafts, and every push
-    # cancelled a run that had already spent its runner time. A required check
-    # skipped on a draft reports success, but a draft cannot enter the merge
-    # queue, marking it ready runs these jobs on the same commit, and the queue
-    # runs them again on the commit that becomes main.
+    # cancelled a run that had already spent its runner time. A skipped matrix
+    # job never expands its name, so the per-OS required checks stay "expected"
+    # on a draft instead of reporting success. Marking the PR ready runs them
+    # on the same commit, and the merge queue runs them again on the commit
+    # that becomes main.
     if: &full_ci ${{ !inputs.render_performance && !inputs.live_only && !(github.event_name == 'pull_request' && github.event.pull_request.draft) }}
     name: cargo test --workspace (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
