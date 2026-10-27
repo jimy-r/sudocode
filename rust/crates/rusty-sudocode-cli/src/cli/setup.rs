@@ -172,7 +172,14 @@ pub(crate) fn startup_prompt(allow_onboarding: bool) -> Result<()> {
                 // The mailbox keeps this selected namespace and its actual
                 // error. Automatic preparation must not block ordinary work;
                 // explicit `setup`/`--check` still report their failures.
-                tracing::warn!(%error, "configured Box preparation unavailable; continuing standalone startup");
+                telemetry::RetryDiagnostics::new(
+                    "nexus-setup",
+                    "configured Box",
+                    "preparation unavailable",
+                    "ready",
+                )
+                .with_notices(telemetry::RetryNotices::LogOnly)
+                .failed("automatic_shared_setup", &error.to_string());
             }
         }
     } else if allow_onboarding && !runtime::config::default_config_home().exists() {
