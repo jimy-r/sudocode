@@ -429,8 +429,15 @@ request or combining usage from the two responses. HTTP failures before a
 response starts remain eligible for the normal transport retry policy.
 
 Incoming peer messages appear in a separate `Message from <peer>` frame with
-muted content and a blue peer name. This presentation does not alter the
-message envelope or content supplied to the model.
+muted framing and a blue peer name. Sender-supplied `Summary:` text appears above
+the complete body and is preferred in the one-line queued preview. Live display
+and resumed history use the same presentation; older messages without a summary
+continue to show their body. The summary travels with the existing envelope into
+the saved turn and model context.
+
+Outgoing `send` cards keep the summary concise and preview up to six source
+lines of the body, with a character cap. Lines wrap to the terminal width; a
+truncation notice points to the complete message preserved in the session.
 
 Queued messages use muted labels and normal-intensity bodies, and Todo
 items distinguish active and completed states. This uses the same palette as

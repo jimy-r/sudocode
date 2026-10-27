@@ -2,6 +2,7 @@
 
 mod a2a;
 mod plan;
+pub(super) use a2a::summary_preview;
 
 use std::fmt::Write as _;
 

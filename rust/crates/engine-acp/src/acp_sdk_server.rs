@@ -901,8 +901,7 @@ async fn ensure_a2a_receiver(
                 let _ = ack.send(false);
                 continue;
             };
-            let body = runtime::agent_mailbox::neutralize_untrusted_markup(&message.body);
-            let text = format!("[message from {}]\n\n{body}", message.from);
+            let text = message.to_prompt(runtime::agent_mailbox::MailboxPromptFraming::Bracketed);
             // A retried mailbox cursor must refer to the same still-pending input.
             use std::hash::{Hash, Hasher};
             let mut digest = std::collections::hash_map::DefaultHasher::new();
@@ -955,6 +954,10 @@ async fn ensure_a2a_receiver(
             if !committed {
                 break;
             }
+            let mut a2a = json!({"from":message.from,"kind":message.kind});
+            if let Some(summary) = &message.summary {
+                a2a["summary"] = json!(summary);
+            }
             let notification = SessionNotification::new(
                 session_id.clone(),
                 SessionUpdate::UserMessageChunk(ContentChunk::new(ContentBlock::Text(
@@ -963,7 +966,7 @@ async fn ensure_a2a_receiver(
             )
             .meta(Map::from_iter([(
                 String::from("sudocode"),
-                json!({"a2a":{"from":message.from,"kind":message.kind}}),
+                json!({"a2a":a2a}),
             )]));
             let _ = cx.send_notification(notification);
             // Optional auto-reply observes the same engine events, but never holds
