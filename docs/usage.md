@@ -159,29 +159,59 @@ remains owned by global `settings.json` and project `settings.local.json`.
 ### Standalone sessions and the local Nexus node
 
 Standalone `scode` reads `~/.nexus/run/node.json` when selecting its peer
-namespace. With a readable record and credential files for this agent,
-starting or resuming a session does not wait for the node to answer. Ordinary
-model and workspace work can continue while the node is offline. The receiver
-retries its existing node connection, and A2A tools report node IO errors;
-they do not redirect messages to a disk inbox. An uncertain send result must
-not be retried automatically.
+namespace. Starting or resuming an ordinary session does not require that node
+to answer or this agent's bundle to be ready. A present but unusable record,
+missing credential files or an identity mismatch leave A2A unavailable with
+the actual cause in `/status` and tool results. They do not redirect messages
+to a disk inbox or prevent ordinary model and workspace work.
+
+Background receive failures share one diagnostic reporter across the receiver's
+conversations. It retains the first error, changed errors and repeat counts in
+the existing rotated local `scode.log` / `sudoclaw.log`; `SCODE_LOG_PATH` can
+select the file. A healthy peer does not hide another peer's failure. Retrying
+task-completion persistence uses the same reporting implementation. Services
+which own terminal notices emit at most one reminder per minute and report
+recovery only after all observed failures clear and checks stay healthy.
+See [background retry diagnostics](design/background-retry-diagnostics.md)
+for the shared implementation and repository audit.
 
 Background receiver errors are available as `Last RX error` in `/status` and
 `last_receiver_error` in the structured peer status. This is the most recent
 failure in the current process, not a claim that the node remains offline.
 It is retained with the receiver's transient state and removed when its last
-receiver stops. Hosts can also subscribe to structured tracing. An unchanged
-receiver-seat error is recorded once; retries continue without writing into
-the terminal's input area.
+receiver stops. Hosts can also subscribe to structured tracing. Ordinary
+receivers use this status and the local log without emitting terminal notices;
+retries continue without writing into the terminal's input area.
 
 The connection record alone does not start Nexus or mint an agent credential.
 An explicit [local-owner registration](shared-services.md#recover-an-existing-local-box)
-can resume the same locally owned Box after multi-agent selection. A missing record still
-selects the same-machine disk namespace. Record parsing, missing credential
-files and credential identity mismatches still stop startup; a lazy client is
-not proof that TLS authentication will succeed. Changing an already running session
-from disk to node remains an explicit handoff. Receiver ownership and a selected
-node endpoint in `/status` are not proof that a remote peer is online.
+can resume the same locally owned Box after shared selection. A missing record still
+selects the same-machine disk namespace for that process. When a node was
+selected, its tools and original receiver share one binding: the receiver
+retries local configuration and credential resolution, then retries node IO
+through the same client. Preparing the missing bundle can therefore make
+that binding usable without starting another receiver. A failed or uncertain
+send is never automatically resent. Receiver `unavailable` means the receiver
+could not initialize; `standby` means another instance holds its seat.
+
+Automatic shared-service preparation keeps ordinary startup usable when that
+configured record is unusable; the receiver retains the selected namespace and
+reports its cause. Explicit `scode setup` and `setup --check` still return their
+actual failures. A dangling node-record symlink is a configured but unusable
+record, not permission to prepare a replacement service.
+
+A constructed client is not proof that TLS authentication succeeds. The
+client's credentials remain fixed after construction; rotation or replacing
+an unusable constructed client is not covered by local binding retries.
+Changing a running session from disk to node remains an explicit handoff.
+Receiver ownership and a selected node endpoint in `/status` are not proof
+that a remote peer is online. Cohost continues using its injected mailbox and
+requires its host services.
+
+An ordinary HTTP model can run while A2A is unavailable. A model explicitly
+configured through a `nexus://` mount still needs the selected node's
+authenticated filesystem; model traffic keeps that mount's authorization and
+hooks.
 
 ### CLI packages
 

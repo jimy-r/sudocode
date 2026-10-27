@@ -25,6 +25,7 @@ mod render;
 mod render_engine;
 mod repl_ui;
 mod startup;
+mod stderr_capture;
 mod windows_console;
 
 use engine_acp::AcpError;
@@ -939,7 +940,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             permission_mode,
             auth_mode,
             reasoning_effort,
-        ),
+        )?,
         CliAction::ListSessions { output_format } => {
             list_sessions_cli(output_format)?;
         }
@@ -1636,7 +1637,7 @@ fn run_resume(
     permission_mode: PermissionMode,
     auth_mode: Option<AuthMode>,
     reasoning_effort: Option<String>,
-) {
+) -> Result<(), Box<dyn std::error::Error>> {
     let session_reference = session_path.display().to_string();
     let (handle, session) = match load_session_reference(&session_reference) {
         Ok(loaded) => loaded,
@@ -1674,7 +1675,7 @@ fn run_resume(
                     "message_count": session.messages().len(),
                 })
             );
-            return;
+            return Ok(());
         }
         // No commands — enter the interactive REPL with the restored session.
         let mut cli = match LiveCli::new(
@@ -1698,15 +1699,9 @@ fn run_resume(
             std::process::exit(1);
         }
         // Enter the REPL loop (it renders banner + any existing messages).
-        let mode = input_queue::QueueMode::from_env();
-        if !matches!(mode, input_queue::QueueMode::Off) {
-            if let Err(e) = run_repl_iocraft_dispatch(cli, mode) {
-                eprintln!("{}{e}{}", ansi_fg(theme().error), RESET);
-            }
-        } else if let Err(e) = run_repl_loop(cli) {
-            eprintln!("{}{e}{}", ansi_fg(theme().error), RESET);
-        }
-        return;
+        // Propagate terminal/save errors to the same top-level handler used
+        // by a new REPL, after the loop has cleaned up its receiver/editor.
+        return dispatch_repl(cli);
     }
 
     let mut session = session;
@@ -1830,6 +1825,7 @@ fn run_resume(
             }
         }
     }
+    Ok(())
 }
 
 #[derive(Debug, Clone)]
@@ -2356,6 +2352,14 @@ fn run_repl(
         auth_mode,
     )?;
 
+    dispatch_repl(cli)
+}
+
+/// New and resumed sessions share renderer selection and error propagation.
+#[inline]
+fn dispatch_repl(cli: LiveCli) -> Result<(), Box<dyn std::error::Error>> {
+    // Select the input owner once for both entry paths. Either loop's returned
+    // error reaches main's normal diagnostic and nonzero-exit handling.
     // The default async REPL accepts steering during a running turn.
     // Explicit startup `off` retains the legacy synchronous receive loop.
     let mode = input_queue::QueueMode::from_env();
@@ -2379,6 +2383,7 @@ fn run_repl_loop(mut cli: LiveCli) -> Result<(), Box<dyn std::error::Error>> {
     // raw-mode state. Thread-local because the sync REPL turn runs on this
     // thread; `LiveCli` must stay `Send` for the iocraft path.
     SYNC_REPL_EDITOR.with(|cell| *cell.borrow_mut() = Some(Rc::clone(&editor)));
+    let _editor_scope = SyncReplEditorScope;
     println!("{}", cli.startup_banner());
 
     // The session's one receiver, on the same peer namespace its `send` tool
@@ -2401,22 +2406,23 @@ fn run_repl_loop(mut cli: LiveCli) -> Result<(), Box<dyn std::error::Error>> {
         },
         peer_abort.clone(),
     );
-    // The notice is written straight to the terminal rather than through
-    // rustyline's external printer. On Unix that printer makes rustyline
-    // `select()` on the raw tty before every key while its own read buffer
-    // already holds the rest of a fast burst of input, so typed or pasted text
-    // stalls after its first character.
-    let peer_receiver = engine_host::peer::attach(&cli.lifecycle.agent_name())?.spawn_receiver(
+    // The same native output handle preserves the current input for notices
+    // and stderr. Rustyline 19 checks already-buffered input before selecting,
+    // fixing the fast-burst stall that previously ruled this printer out.
+    let notice_printer = editor.borrow().background_printer();
+    let peer_receiver = engine_host::peer::attach(&cli.lifecycle.agent_name()).spawn_receiver(
         peer_abort.clone(),
         move |message| {
-            let mut out = io::stdout().lock();
-            let _ = write!(
-                out,
-                "\r\nMessage from {} is waiting; it runs before the next prompt (press Enter)\r\n",
+            let notice = format!(
+                "Message from {} is waiting; it runs before the next prompt (press Enter)\n",
                 message.from
             );
-            let _ = out.flush();
-            drop(out);
+            if let Some(printer) = &notice_printer {
+                let _ = printer.print(notice);
+            } else {
+                // Noninteractive/unsupported terminals have no active editor.
+                let _ = write!(io::stdout().lock(), "{notice}");
+            }
             deliver(message)
         },
     );
@@ -2464,94 +2470,94 @@ fn run_repl_loop(mut cli: LiveCli) -> Result<(), Box<dyn std::error::Error>> {
     // Track session metrics for session_ended event
     let session_start = Instant::now();
 
-    loop {
-        run_pending_peer_turns(&mut cli, &pending_peer_turns, &waiting_turns);
-        editor
-            .borrow_mut()
-            .set_completions(cli.repl_completion_candidates().unwrap_or_default());
-        input_chrome::print_before_prompt(cli.lifecycle.current_permission_mode().as_str());
-        let read = editor.borrow_mut().read_line()?;
-        match read {
-            input::ReadOutcome::Submit(input) => {
-                // Clear the pre-printed bottom sep + footer. After
-                // readline, cursor is at the start of the bottom sep
-                // line. \x1b[J clears from cursor to end of screen.
-                print!("\x1b[J");
-                let _ = io::stdout().flush();
-                let trimmed = input.trim().to_string();
-                // An empty line only comes back while peer messages wait: the
-                // user handing the prompt back so they run, at the loop's top.
-                if trimmed.is_empty() {
-                    continue;
-                }
-                if matches!(trimmed.as_str(), "/exit" | "/quit") {
-                    cli.persist_session()?;
-                    break;
-                }
-                // `!<cmd>` bash mode: run it here, no model turn.
-                if let Some(command) = bash_mode::parse_bang_command(&trimmed) {
-                    println!("{}", bash_mode::render_input_line(command));
-                    cli.run_bash_mode(command);
-                    continue;
-                }
-                match SlashCommand::parse(&trimmed) {
-                    Ok(Some(command)) => {
-                        match cli.handle_repl_command(command) {
-                            Ok(true) => {
-                                if let Err(e) = cli.persist_session() {
+    let loop_result = (|| -> Result<(), Box<dyn std::error::Error>> {
+        loop {
+            run_pending_peer_turns(&mut cli, &pending_peer_turns, &waiting_turns);
+            editor
+                .borrow_mut()
+                .set_completions(cli.repl_completion_candidates().unwrap_or_default());
+            input_chrome::print_before_prompt(cli.lifecycle.current_permission_mode().as_str());
+            let read = editor.borrow_mut().read_line()?;
+            match read {
+                input::ReadOutcome::Submit(input) => {
+                    // Clear the pre-printed bottom sep + footer. After
+                    // readline, cursor is at the start of the bottom sep
+                    // line. \x1b[J clears from cursor to end of screen.
+                    print!("\x1b[J");
+                    let _ = io::stdout().flush();
+                    let trimmed = input.trim().to_string();
+                    // An empty line only comes back while peer messages wait: the
+                    // user handing the prompt back so they run, at the loop's top.
+                    if trimmed.is_empty() {
+                        continue;
+                    }
+                    if matches!(trimmed.as_str(), "/exit" | "/quit") {
+                        cli.persist_session()?;
+                        break;
+                    }
+                    // `!<cmd>` bash mode: run it here, no model turn.
+                    if let Some(command) = bash_mode::parse_bang_command(&trimmed) {
+                        println!("{}", bash_mode::render_input_line(command));
+                        cli.run_bash_mode(command);
+                        continue;
+                    }
+                    match SlashCommand::parse(&trimmed) {
+                        Ok(Some(command)) => {
+                            match cli.handle_repl_command(command) {
+                                Ok(true) => {
+                                    if let Err(e) = cli.persist_session() {
+                                        eprintln!("{}{e}{}", ansi_fg(theme().error), RESET);
+                                    }
+                                }
+                                Ok(false) => {}
+                                Err(e) => {
                                     eprintln!("{}{e}{}", ansi_fg(theme().error), RESET);
                                 }
                             }
-                            Ok(false) => {}
-                            Err(e) => {
-                                eprintln!("{}{e}{}", ansi_fg(theme().error), RESET);
-                            }
+                            continue;
+                        }
+                        Ok(None) => {}
+                        Err(error) => {
+                            eprintln!("{}{error}{}", ansi_fg(theme().error), RESET);
+                            continue;
+                        }
+                    }
+                    // Bare-word skill dispatch: if the first token of the input
+                    // matches a known skill name, invoke it as `/skills <input>`
+                    // rather than forwarding raw text to the LLM (ROADMAP #36).
+                    let cwd = std::env::current_dir().unwrap_or_default();
+                    let plugin_outcome = cli.lifecycle.plugin_load_outcome();
+                    if let Some(prompt) = try_resolve_bare_skill_prompt_with_plugins(
+                        &cwd,
+                        &trimmed,
+                        Some(&plugin_outcome),
+                    ) {
+                        cli.record_prompt_history(&trimmed);
+                        if let Err(e) = cli.run_turn_interactive(&prompt) {
+                            eprintln!("{}{e}{}", ansi_fg(theme().error), RESET);
                         }
                         continue;
                     }
-                    Ok(None) => {}
-                    Err(error) => {
-                        eprintln!("{}{error}{}", ansi_fg(theme().error), RESET);
-                        continue;
-                    }
-                }
-                // Bare-word skill dispatch: if the first token of the input
-                // matches a known skill name, invoke it as `/skills <input>`
-                // rather than forwarding raw text to the LLM (ROADMAP #36).
-                let cwd = std::env::current_dir().unwrap_or_default();
-                let plugin_outcome = cli.lifecycle.plugin_load_outcome();
-                if let Some(prompt) = try_resolve_bare_skill_prompt_with_plugins(
-                    &cwd,
-                    &trimmed,
-                    Some(&plugin_outcome),
-                ) {
                     cli.record_prompt_history(&trimmed);
-                    if let Err(e) = cli.run_turn_interactive(&prompt) {
+                    if let Err(e) = cli.run_turn_interactive(&trimmed) {
                         eprintln!("{}{e}{}", ansi_fg(theme().error), RESET);
                     }
-                    continue;
                 }
-                cli.record_prompt_history(&trimmed);
-                if let Err(e) = cli.run_turn_interactive(&trimmed) {
-                    eprintln!("{}{e}{}", ansi_fg(theme().error), RESET);
+                input::ReadOutcome::Exit => {
+                    cli.persist_session()?;
+                    break;
                 }
-            }
-            input::ReadOutcome::Exit => {
-                cli.persist_session()?;
-                break;
             }
         }
-    }
+        Ok(())
+    })();
 
     // Dropping the queue refuses whatever is still waiting, which unblocks the
     // receiver so it can be joined; those messages stay unread.
     peer_abort.abort();
     drop(pending_peer_turns);
     let _ = peer_receiver.join();
-
-    // Release the shared editor from the thread-local before this thread's frame
-    // unwinds.
-    SYNC_REPL_EDITOR.with(|cell| *cell.borrow_mut() = None);
+    loop_result?;
 
     // Record token usage and session ended event
     let duration_ms = session_start.elapsed().as_millis() as u64;
@@ -3715,10 +3721,10 @@ fn run_repl_iocraft_dispatch(
     // here: the session already resolved it (config `agentName`, else derived
     // from its workspace) and signs outbound messages with it, and a second
     // derivation from the process directory is how a peer's reply arrives at
-    // an inbox nothing is polling. `attach` reuses the node dial the session
-    // build already made, so it cannot newly fail here.
+    // an inbox nothing is polling. `attach` reuses the session's selected
+    // mailbox, including a pending binding that this receiver retries.
     let mailbox_abort = runtime::HookAbortSignal::new();
-    let mailbox_receiver = engine_host::peer::attach(&session_agent_name)?.spawn_receiver(
+    let mailbox_receiver = engine_host::peer::attach(&session_agent_name).spawn_receiver(
         mailbox_abort.clone(),
         peer_turn_sink(
             coord_tx.clone(),
@@ -4636,6 +4642,17 @@ thread_local! {
     /// that owns the editor.
     static SYNC_REPL_EDITOR: RefCell<Option<Rc<RefCell<input::LineEditor>>>> =
         const { RefCell::new(None) };
+}
+
+/// Release the editor in ordinary stack cleanup, including errors before the
+/// prompt loop starts. Its capture worker must not be joined by TLS teardown.
+struct SyncReplEditorScope;
+
+impl Drop for SyncReplEditorScope {
+    #[inline]
+    fn drop(&mut self) {
+        SYNC_REPL_EDITOR.with(|cell| *cell.borrow_mut() = None);
+    }
 }
 
 /// Read one choice line through the sync REPL's shared editor, so mid-turn
