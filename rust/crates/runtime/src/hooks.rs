@@ -545,7 +545,22 @@ impl HookRunner {
             child.env("HOOK_TOOL_OUTPUT", tool_output);
         }
 
-        match child.output_with_stdin(payload.as_bytes(), abort_signal) {
+        // The tool input and output also reach the hook through its environment.
+        // Linux refuses any single environment string over 128 KiB and macOS caps
+        // the total near 1 MiB, so a large tool call would stop the hook from
+        // starting at all. When that happens the hook never ran, so retry once
+        // without those two variables: stdin still carries the complete payload.
+        let mut execution = child.output_with_stdin(payload.as_bytes(), abort_signal);
+        if execution
+            .as_ref()
+            .is_err_and(|error| error.kind() == ErrorKind::ArgumentListTooLong)
+        {
+            child
+                .env_remove("HOOK_TOOL_INPUT")
+                .env_remove("HOOK_TOOL_OUTPUT");
+            execution = child.output_with_stdin(payload.as_bytes(), abort_signal);
+        }
+        match execution {
             Ok(CommandExecution::Finished(output)) => {
                 let stdout = process_text::decode_process_output(&output.stdout)
                     .text
@@ -988,6 +1003,11 @@ impl CommandWithStdin {
         V: AsRef<OsStr>,
     {
         self.command.env(key, value);
+        self
+    }
+
+    fn env_remove(&mut self, key: &str) -> &mut Self {
+        self.command.env_remove(key);
         self
     }
 
