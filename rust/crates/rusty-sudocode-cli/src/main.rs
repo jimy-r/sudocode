@@ -847,6 +847,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let is_interactive_session = matches!(&action, CliAction::Repl { .. })
         || matches!(&action, CliAction::ResumeSession { commands, output_format: CliOutputFormat::Text, .. } if commands.is_empty());
     if is_interactive_session {
+        cli::setup::startup_prompt(matches!(&action, CliAction::Repl { .. }))?;
         cli::update::startup_prompt()?;
     }
     // Informational commands (help, version, config, login, logout) are
@@ -854,11 +855,37 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     // If an ensure_authenticated() call is ever added below this point it
     // MUST be guarded by `if !action.is_informational()`.
     match action {
-        CliAction::Service { is_daemon } => {
-            let result = if is_daemon {
-                service_host::run_daemon()
-            } else {
-                service_host::run_stdio()
+        CliAction::Setup {
+            mode,
+            owner_root,
+            check,
+            output_format,
+        } => cli::setup::run(mode, owner_root, check, output_format)?,
+        CliAction::Service { action } => {
+            use cli::args::ServiceSub;
+            let result = match action {
+                ServiceSub::Daemon => service_host::run_daemon(),
+                ServiceSub::Stdio => service_host::run_stdio(),
+                ServiceSub::RegisterLocalBox { config, owner_root } => {
+                    service_host::register_local_box(&config, owner_root.as_deref())
+                        .map(|result| println!("{result}"))
+                }
+                ServiceSub::StopLocalBox {
+                    node_id,
+                    binary_sha256,
+                    owner_root,
+                    acknowledge_shared_outage: true,
+                } => {
+                    let owner_root = match owner_root {
+                        Some(root) => Some(root),
+                        None => cli::setup::selected_owner_root()?,
+                    };
+                    service_host::stop_local_box(&node_id, &binary_sha256, owner_root.as_deref())
+                        .map(|result| println!("{result}"))
+                }
+                ServiceSub::StopLocalBox { .. } => {
+                    return Err("A shared Box stop requires explicit outage acknowledgement".into())
+                }
             };
             result.map_err(|error| error as Box<dyn std::error::Error>)?;
         }

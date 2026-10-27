@@ -180,11 +180,21 @@ fn startup_and_resume_with_credential(has_credential: bool) {
         let home = home.to_string_lossy();
         let log = env.workspace_root().join("receiver-diagnostics.jsonl");
         let log_text = log.to_string_lossy();
+        // A saved multi-agent choice must keep this Box rather than provision a
+        // second service when the configured one is temporarily unreachable.
+        std::fs::write(
+            env.config_home().join("runtime-profile.json"),
+            r#"{"schemaVersion":1,"mode":"shared"}"#,
+        )
+        .unwrap();
+        let services = env.workspace_root().join("unexpected-services");
+        let services_env = services.to_string_lossy();
         let vars = [
             ("HOME", home.as_ref()),
             ("USERPROFILE", home.as_ref()),
             ("SUDOCODE_INTERRUPT_QUEUE_MODE", mode),
             ("SCODE_LOG_PATH", log_text.as_ref()),
+            ("SCODE_SERVICE_ROOT", services_env.as_ref()),
             ("PAGER", ""),
         ];
         let prompt = env.prompt("Reply with exactly OFFLINE_NODE_REPLY.", "single_turn_text");
@@ -265,6 +275,10 @@ fn startup_and_resume_with_credential(has_credential: bool) {
         resumed.send("/exit\r").expect("exit resumed session");
         assert_eq!(resumed.expect_eof().expect("resumed session exits"), 0);
         assert_no_disk_namespace(&env);
+        assert!(
+            !services.exists(),
+            "offline Box must not start another Nexus"
+        );
     }
 }
 
