@@ -178,11 +178,14 @@ npm run test:codex-lifecycle -- --codex /absolute/path/to/codex --output /absolu
 ```
 
 The same `test/nativeCodexLifecycle.cjs` orchestrator runs on both platforms.
-Unix uses `test/fixtures/nativeCodexTui.py` for its PTY. Windows must supply a
-real ConPTY driver with `--driver '<JSON argv>'`; no Windows driver is bundled
-yet. A missing driver fails before starting native processes. Use the actual
-`codex.exe`, not `codex.cmd`. `--temp-root` selects an existing private temporary
-directory when the platform's default socket path would be too long.
+Unix defaults to `test/fixtures/nativeCodexTui.py`. Windows uses the bundled
+`test/fixtures/nativeCodexTui.windows.py`, which calls ConPTY through Python's
+standard library without another package. Select that driver with
+`--driver '<JSON argv>'`, containing the available Python executable and the
+absolute script path. A missing driver fails before starting native processes;
+there is no protocol-only fallback. Use the actual `codex.exe`, not `codex.cmd`.
+`--temp-root` selects an existing private temporary directory when the platform's
+default socket path would be too long.
 
 The fixture performs these steps:
 
