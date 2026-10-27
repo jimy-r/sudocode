@@ -48,9 +48,11 @@ for(const key of ['PATH','SystemRoot','WINDIR','COMSPEC','PATHEXT','TMPDIR','TEM
   if(process.env[key]!==undefined)childEnv[key]=process.env[key];
 }
 const userHome=path.join(root,'user-home');fs.mkdirSync(userHome);
+const loopbackHosts='127.0.0.1,localhost,::1';
 Object.assign(childEnv,{CODEX_HOME:isolatedHome,HOME:userHome,USERPROFILE:userHome,XDG_CONFIG_HOME:path.join(root,'xdg'),
   APPDATA:path.join(root,'roaming'),LOCALAPPDATA:path.join(root,'local'),
-  NATIVE_LIFECYCLE_FIXTURE_KEY:'isolated-fixture-only',TERM:'xterm-256color'});
+  NATIVE_LIFECYCLE_FIXTURE_KEY:'isolated-fixture-only',TERM:'xterm-256color',
+  NO_PROXY:loopbackHosts,no_proxy:loopbackHosts});
 const receipt = {
   at: new Date().toISOString(), scenario:options.case, platform:process.platform, driverArgv,
   probeSourceSha256:crypto.createHash('sha256').update(fs.readFileSync(__filename)).digest('hex'),
@@ -71,10 +73,18 @@ const waitUntil = async (test, ms, label) => {
   const end = Date.now()+ms;
   while (!test()) { if (Date.now()>end) throw new Error(label+' timeout'); await new Promise(resolve=>setTimeout(resolve,25)); }
 };
-let seedEnabled=false;
+let phase='idle';
+const heldResponses=new Set();
 const endpoint = http.createServer((req,res)=>{
-  receipt.modelRequests.push({method:req.method,url:req.url,phase:seedEnabled?'seed':'lifecycle'});
-  if(seedEnabled && req.method==='POST' && req.url==='/v1/responses'){
+  receipt.modelRequests.push({method:req.method,url:req.url,phase});
+  if(phase==='cancelled-seed' && req.method==='POST' && req.url==='/v1/responses'){
+    // A 503 drives retries before the user item appears on some native builds.
+    // Keep this explicit cancelled seed pending until turn/interrupt or cleanup.
+    heldResponses.add(res);
+    res.once('close',()=>heldResponses.delete(res));
+    req.resume();return;
+  }
+  if(phase==='completed-seed' && req.method==='POST' && req.url==='/v1/responses'){
     req.resume();res.writeHead(200,{'content-type':'text/event-stream'});
     for(const event of [
       {type:'response.created',response:{id:'resp_fixture_seed'}},
@@ -132,7 +142,12 @@ const closeTui = async own => {
       {cwd:workspace,env:childEnv,stdio:['ignore','ignore','pipe']});
     nativeExited=once(native,'close');
     native.stderr.on('data',data=>{nativeStderr=(nativeStderr+data).slice(-16000);});
-    await waitUntil(()=>fs.existsSync(selectedSocket),10000,'isolated native listener');
+    await waitUntil(()=>{
+      // Windows AF_UNIX entries cannot be stat'ed; listing does not open them.
+      // The actual canonical connection below still verifies the listener.
+      try{return fs.readdirSync(path.dirname(selectedSocket)).includes(path.basename(selectedSocket));}
+      catch(error){if(error.code==='ENOENT')return false;throw error;}
+    },10000,'isolated native listener');
     const observer=await connect('observer',receipt.observerNotifications);
     {
       const spawnTui = async (label,args=[]) => {
@@ -182,7 +197,11 @@ const closeTui = async own => {
       receipt.modelRequestsBeforeSeed=0;
       if(seededResume){
         const original=receipt.created[0];
-        seedEnabled=!cancelledResume;
+        // Control the fixture name before seeding so the TUI does not create an
+        // unrelated title-generation worker. Every HTTP request still counts.
+        receipt.seedThreadName='Native lifecycle fixture';
+        await request(observer,'fixture seed','thread/name/set',{threadId:original.id,name:receipt.seedThreadName});
+        phase=cancelledResume?'cancelled-seed':'completed-seed';
         const turn=await request(observer,'fixture seed','turn/start',{threadId:original.id,
           input:[{type:'text',text:'Seed isolated native lifecycle history.'}]});
         receipt.seedTurnId=turn.turn.id;
@@ -203,12 +222,13 @@ const closeTui = async own => {
           if(Date.now()>end)throw new Error('Mock seed turn did not complete');
           await new Promise(resolve=>setTimeout(resolve,50));
         }
-        seedEnabled=false;
+        phase='post-seed';
         if(!cancelledResume)assert.equal(receipt.modelRequests.length,1,'Only one explicit mock seed inference is allowed');
         receipt.seedModelRequests=receipt.modelRequests.length;
         receipt.cleanup=[];
         for(const own of tuis)await closeTui(own);
         receipt.loadedAfterFrontendClose=(await request(observer,'observer','thread/loaded/list',{})).data;
+        phase='resume';
         const resumer=await spawnTui('resume',['resume',original.id]);
         const readyEnd=Date.now()+15000;
         let restored;
@@ -236,6 +256,9 @@ const closeTui = async own => {
     }
   } catch(error){receipt.result='FAIL';receipt.error={name:error.name,message:error.message};process.exitCode=1;}
   finally {
+    phase='cleanup';
+    for(const response of heldResponses)response.destroy();
+    heldResponses.clear();
     receipt.cleanup??=[];
     for(const own of tuis){
       try{await closeTui(own);}catch(error){receipt.cleanup.push(String(error));receipt.result='FAIL';process.exitCode=1;}

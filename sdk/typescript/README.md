@@ -190,6 +190,8 @@ The fixture performs these steps:
    `CODEX_HOME` owns the default control socket. Two real CLI processes run
    `codex --no-alt-screen --cd <same workspace>` and discover that existing
    native endpoint. No `--remote` override substitutes for this discovery.
+   Socket readiness lists its directory entry: Windows AF_UNIX reparse points
+   cannot be stat'ed. The actual canonical connection is the next barrier.
 2. An independent connection uses the shared `connectCodex`, observes actual
    `thread/started` notifications and checks both original IDs, idle state and
    canonical workspace with `thread/loaded/list` and `thread/read`. A listed ID
@@ -199,17 +201,23 @@ The fixture performs these steps:
 3. Each terminal driver types `/exit` one key at a time and then Return while
    continuing to drain output. A fast input burst can be treated as a multiline
    paste. All CLI exit codes must be zero; forced CLI termination fails the case.
-4. `cancelled-resume` starts a synthetic user turn, waits for its actual terminal
-   history, explicitly interrupts it, closes both CLIs and runs
+4. After the initial idle checks, both resume cases explicitly name the original
+   fixture thread with `thread/name/set`, preventing an unrelated automatic
+   title-generation worker. All HTTP requests still count. `cancelled-resume`
+   starts a synthetic user turn and holds its mock response open; a 503 can
+   drive retries before some native builds display the user item. It waits for
+   actual terminal history, explicitly interrupts the turn, closes both CLIs and runs
    `codex resume <original ID> --no-alt-screen --cd <workspace>`. It checks the
    restored ID, canonical cwd and visible original user history. The loopback
    mock's request count must not increase during resume.
-5. The loopback HTTP endpoint rejects model requests outside the explicit seed
-   phase. `completed-resume` instead serves one minimal Responses SSE seed and
-   requires the actual assistant history before testing resume. This separate
-   case has not qualified on Mac: the native runtime reported loopback HTTP 502
-   before that mock observed a request. Endpoint counters do not establish a
-   global inference-attempt count.
+5. The private child environment explicitly excludes loopback from proxies;
+   system proxy fallback otherwise caused HTTP 502 before the mock saw any
+   request on Mac and Windows. Outside the explicit seed phase the endpoint
+   rejects model requests. `completed-resume` serves exactly one minimal
+   Responses SSE seed and requires actual assistant history before testing
+   resume. Resume must add zero requests. Cancelled seed responses are destroyed
+   during cleanup. Endpoint counters do not establish a global inference-attempt
+   count.
 
 The platform driver's argv is followed by the complete native Codex argv. It
 owns exactly that CLI and reads `{"action":"close"}` from stdin. JSON lines on
