@@ -23,8 +23,11 @@ assert(['idle','cancelled-resume','completed-resume'].includes(options.case), 'U
 assert(options.output, 'An explicit evidence output directory is required');
 const evidence = path.resolve(options.output);
 fs.mkdirSync(evidence,{recursive:true,mode:0o700});
-const sourceRoot = path.resolve(__dirname,'../../..');
 const library = path.resolve(__dirname,'../dist/index.cjs');
+const buildManifest = JSON.parse(fs.readFileSync(path.resolve(__dirname,'../manifest.json'),'utf8'));
+const librarySha256 = crypto.createHash('sha256').update(fs.readFileSync(library)).digest('hex');
+assert.match(buildManifest.sourceCommit,/^[0-9a-f]{40}$/);
+assert.equal(buildManifest.files['dist/index.cjs'].sha256,librarySha256,'Use the hash-bound canonical library');
 const { connectCodex } = require(library);
 assert.equal(typeof connectCodex,'function','Build the canonical SDK including #1080 first');
 const driverArgv = options.driver ? JSON.parse(options.driver) : process.platform === 'win32' ? null
@@ -51,8 +54,11 @@ Object.assign(childEnv,{CODEX_HOME:isolatedHome,HOME:userHome,USERPROFILE:userHo
 const receipt = {
   at: new Date().toISOString(), scenario:options.case, platform:process.platform, driverArgv,
   probeSourceSha256:crypto.createHash('sha256').update(fs.readFileSync(__filename)).digest('hex'),
-  source: execFileSync('git', ['-C', sourceRoot, 'rev-parse', 'HEAD'], {encoding:'utf8'}).trim(),
-  librarySha256: crypto.createHash('sha256').update(fs.readFileSync(library)).digest('hex'),
+  source: buildManifest.sourceCommit, libraryBuildDirty: buildManifest.dirty,
+  librarySha256,
+  driverFiles:driverArgv.filter(arg=>fs.existsSync(arg) && fs.statSync(arg).isFile()).map(file=>({
+    file,sha256:crypto.createHash('sha256').update(fs.readFileSync(file)).digest('hex'),
+  })),
   nativeSha256: crypto.createHash('sha256').update(fs.readFileSync(configured.codexArgv[0])).digest('hex'),
   nativeVersion: execFileSync(configured.codexArgv[0], ['--version'], {encoding:'utf8',env:childEnv}).trim(),
   isolation: {root, isolatedCodexHome:true, liveEndpointUsed:false, nexusUsed:false, liveConfigChanged:false},
@@ -141,16 +147,28 @@ const closeTui = async own => {
       };
       for(const label of ['first','second'])await spawnTui(label);
       let inventory;
+      let loadedThreads=[];
+      receipt.readiness=[];
       const deadline=Date.now()+20000;
       do {
         inventory=await request(observer,'observer','thread/loaded/list',{});
-        if(inventory.data.length===2)break;
+        assert.equal(inventory.nextCursor,null,'The isolated inventory must be complete');
+        if(inventory.data.length===2){
+          loadedThreads=[];
+          for(const id of inventory.data){
+            const {thread}=await request(observer,'observer','thread/read',{threadId:id,includeTurns:false});
+            loadedThreads.push(thread);
+          }
+          const states=loadedThreads.map(thread=>({id:thread.id,status:thread.status.type}));
+          if(JSON.stringify(receipt.readiness.at(-1))!==JSON.stringify(states))receipt.readiness.push(states);
+          if(loadedThreads.every(thread=>thread.status.type==='idle'))break;
+        }
         if(Date.now()>deadline)throw new Error('Two actual idle TUIs not visible on default endpoint');
         await new Promise(resolve=>setTimeout(resolve,150));
       }while(true);
       receipt.created=[];
-      for(const id of inventory.data){
-        const {thread}=await request(observer,'observer','thread/read',{threadId:id,includeTurns:false});
+      for(const thread of loadedThreads){
+        const id=thread.id;
         assert.equal(fs.realpathSync(thread.cwd),fs.realpathSync(workspace));assert.equal(thread.status.type,'idle');
         receipt.created.push({id,cwd:thread.cwd,status:thread.status,source:thread.source,
           hasParentField:Object.hasOwn(thread,'parentThreadId'),parentThreadId:thread.parentThreadId??null,

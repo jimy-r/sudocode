@@ -165,8 +165,10 @@ after a read-only `thread/loaded/list` / `thread/read` inspection.
 
 ### Opt-in native Codex lifecycle fixture
 
-Run from this SDK checkout after `npm run build`, using an already installed
-native Codex executable. This test does not download or install Codex, connect
+Run from this SDK checkout after `npm run build`, or from a transferred fixture
+kit containing its canonical `manifest.json` and hash-matched `dist/index.cjs`,
+using an already installed native Codex executable. A transferred kit needs no
+Git checkout, npm install or rebuild. This test does not download or install Codex, connect
 to Nexus, enroll an Agent, change the user's configuration or modify a live
 frontend. It retains its temporary configuration and receipts for inspection.
 
@@ -190,7 +192,10 @@ The fixture performs these steps:
    native endpoint. No `--remote` override substitutes for this discovery.
 2. An independent connection uses the shared `connectCodex`, observes actual
    `thread/started` notifications and checks both original IDs, idle state and
-   canonical workspace with `thread/loaded/list` and `thread/read`.
+   canonical workspace with `thread/loaded/list` and `thread/read`. A listed ID
+   can still read as `notLoaded` during initialization. The original 20-second
+   startup deadline covers both inventory and actual idle readiness; a started
+   event alone is not the barrier.
 3. Each terminal driver types `/exit` one key at a time and then Return while
    continuing to drain output. A fast input burst can be treated as a multiline
    paste. All CLI exit codes must be zero; forced CLI termination fails the case.
