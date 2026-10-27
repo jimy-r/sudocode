@@ -573,7 +573,11 @@ one contextual tip. General startup guidance also lives here. The highest
 priority applicable tip wins: immediate local interaction feedback, then model
 tips ordered `urgent` > `important` > `normal`, with local cache advice at
 `important` priority. At equal priority an explicit model tip takes precedence
-over cache advice. Routine `/help` guidance fills otherwise unused space.
+over cache advice. Routine `/help` guidance fills otherwise unused space,
+led by the workspace's position: `⎇ <branch>`, or `⎇ <short commit>` when HEAD
+is detached. The position is state rather than advice, so every tip takes the
+slot from it; it is read at startup and refreshed when each turn ends, and the
+per-turn status line no longer repeats it.
 While a turn runs, only urgent tips are shown.
 
 The model has an always-loaded, read-only `set_tip` tool:
