@@ -639,6 +639,7 @@ jobs:
           set -euo pipefail
           driver=$(python -c 'import json; from pathlib import Path; records=[json.loads(line) for line in Path("target/prompt-viewport-driver.jsonl").read_text().splitlines()]; paths=[row["executable"] for row in records if row.get("reason")=="compiler-artifact" and row.get("target",{}).get("name")=="pty_prompt_viewport" and row.get("executable")]; assert len(paths)==1, paths; print(paths[0])')
           python ../scripts/benchmark_prompt_viewport.py --driver "$driver" --binary target/release/scode --output "$RUNNER_TEMP/prompt-viewport-measurements"
+          python ../scripts/benchmark_prompt_viewport.py --observer browser --driver "$driver" --binary target/release/scode --output "$RUNNER_TEMP/prompt-viewport-browser-comparison"
       - name: Retain viewport samples and failed terminal traces
         if: always() && runner.os == 'Linux'
         uses: actions/upload-artifact@v4
@@ -653,6 +654,13 @@ jobs:
         with:
           name: prompt-viewport-browser
           path: ${{ runner.temp }}/prompt-viewport-browser/
+          if-no-files-found: warn
+      - name: Retain paired browser CPU, memory and painted-key measurements
+        if: always() && runner.os == 'Linux'
+        uses: actions/upload-artifact@v4
+        with:
+          name: prompt-viewport-browser-comparison
+          path: ${{ runner.temp }}/prompt-viewport-browser-comparison/
           if-no-files-found: warn
       - name: Check complete process startup budget
         shell: bash

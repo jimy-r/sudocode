@@ -434,7 +434,8 @@ fn viewport_terminal_measurements() {
 #[test]
 #[ignore = "real browser painting, wheel and native selection; requires Playwright Chromium"]
 fn viewport_browser_interaction() {
-    run_viewport_observer("prompt_viewport_browser.cjs", true);
+    let enabled = std::env::var("SCODE_VIEWPORT_MEASURE_ENABLED").as_deref() != Ok("0");
+    run_viewport_observer("prompt_viewport_browser.cjs", enabled);
 }
 
 fn run_viewport_observer(observer: &str, enabled: bool) {
