@@ -2466,9 +2466,13 @@ terminal sources, reservations and acknowledgements to the originating context.
 Opening a second context preserves the first context's active trace. Deletion
 uses the shared durable storage identity and is coordinated with every admitted
 writer. Completion ownership and cache behavior stay behind the existing engine
-boundary.</td><td>Two active prompts and independent task completions; reconnect
+boundary. The accepted immediate deletion and automatic cleanup contract is
+recorded in <a href="docs/design/agent-context-storage-matrix.html#q1-deletion-contract">Q1</a>;
+its remote implementation and backend acceptance remain open.</td><td>Two active prompts and independent task completions; reconnect
 and ACK retries; deletion racing with append; crash recovery with one sibling
-still alive. Verify the existing completion protocol's delivery guarantees.</td></tr>
+still alive. Verify old writers and ACKs are rejected, automatic cleanup resumes
+after restart, and physical removal waits for actual client retirement on Native
+OS FS and authenticated Nexus. Verify the existing completion protocol's delivery guarantees.</td></tr>
 <tr><td>Agent links and runtime routing</td><td><code>SessionStore</code> verifies
 the caller's authorized Agent link and target access. The service supplies the
 current execution identity and repository context. <code>agent_list</code>
