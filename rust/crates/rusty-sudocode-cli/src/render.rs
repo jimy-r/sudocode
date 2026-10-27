@@ -336,7 +336,7 @@ impl SpinnerHandle {
                 if !paused {
                     let thinking = is_thinking.load(Ordering::SeqCst);
                     let current_label = if thinking {
-                        activity::REASONING_LABEL
+                        activity::THINKING_LABEL
                     } else {
                         &label
                     };
