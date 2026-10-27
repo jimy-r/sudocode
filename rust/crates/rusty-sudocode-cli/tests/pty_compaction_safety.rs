@@ -284,7 +284,7 @@ fn serve(
         let truncated = mode == "truncated"
             || (mode == "budget-truncated-then-success" && number == 1)
             || (long_summary && request["max_tokens"].as_u64().unwrap_or(0) < 10_000);
-        let text = match mode {
+        let mut text = match mode {
             "empty" => String::new(),
             "growing" => "unhelpful repetition ".repeat(20_000),
             // The transport deliberately supplies complete but oversized
@@ -306,6 +306,13 @@ fn serve(
             _ if long_summary => format!("<summary>PROJECT_ALPHA {}CHECKPOINT_COMPLETE</summary>", "fact ".repeat(7_200)),
             _ => format!("<summary>Consolidated checkpoint {number}: preserve project ALPHA and pending deployment. Next: verify tests.</summary>"),
         };
+        if compaction
+            && request
+                .to_string()
+                .contains("Optional checkpoint metadata:")
+        {
+            text.push_str("\n<agent-description>\"Updated peer task\"</agent-description>");
+        }
         (
             "200 OK",
             json!({"id":"compact-fixture", "type":"message", "role":"assistant", "model":"claude-sonnet-4-6", "content":[{"type":"text", "text":text}], "stop_reason":if truncated {"max_tokens"} else {"end_turn"}, "usage":{"input_tokens":1000,"output_tokens":if long_summary {10_000} else {50}}}),
@@ -1420,6 +1427,7 @@ fn pruning_below_the_request_budget_still_summarizes_until_the_ratio_is_met() {
 fn cancelling_a_delayed_checkpoint_preserves_the_resumable_source() {
     let provider = Provider::new("budget-delayed");
     let env = budget_env("cancel-before-checkpoint-commit", &provider);
+    let (description_path, description_before) = seed_peer_description(&env);
     let path = budget_fixture(&env);
     let original = Session::load_from_path(&path).unwrap();
     let mut cli = env.spawn(&["--resume", path.to_str().unwrap(), "/compact"]);
@@ -1442,6 +1450,29 @@ fn cancelling_a_delayed_checkpoint_preserves_the_resumable_source() {
     assert_eq!(report.completed_responses, 0);
     assert_eq!(restored.maintenance_usage.len(), 1);
     assert!(restored.maintenance_usage[0].usage.is_none());
+    assert_eq!(std::fs::read(description_path).unwrap(), description_before);
+}
+
+fn seed_peer_description(env: &TestEnv) -> (PathBuf, Vec<u8>) {
+    let settings_path = env.config_home().join("settings.json");
+    let mut settings: Value = std::fs::read(&settings_path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap_or_else(|| json!({}));
+    settings["agentName"] = json!("checkpoint-owner");
+    settings["experimental"]["peerDescriptions"] = json!(true);
+    std::fs::write(settings_path, settings.to_string()).unwrap();
+    let directory =
+        runtime::mailbox::local_pair_root_in(env.config_home()).join("agents/checkpoint-owner");
+    std::fs::create_dir_all(&directory).unwrap();
+    let path = directory.join("description.json");
+    let bytes = serde_json::to_vec(&json!({
+        "description":"Previously committed peer work", "updated_at":"2026-10-01T00:00:00Z",
+        "source_session_id":"previous-session",
+    }))
+    .unwrap();
+    std::fs::write(&path, &bytes).unwrap();
+    (path, bytes)
 }
 
 #[test]
@@ -1449,6 +1480,7 @@ fn a_concurrent_edit_to_existing_history_prevents_checkpoint_installation() {
     for before_run in [false, true] {
         let provider = Provider::new("budget-revision-conflict");
         let env = budget_env("durable-source-revision-conflict", &provider);
+        let (description_path, description_before) = seed_peer_description(&env);
         let path = budget_fixture(&env);
         let args = if before_run {
             vec!["--resume", path.to_str().unwrap()]
@@ -1515,6 +1547,7 @@ fn a_concurrent_edit_to_existing_history_prevents_checkpoint_installation() {
         let restored = Session::load_from_path(&path).unwrap();
         assert_eq!(restored.messages(), external.messages());
         assert_eq!(restored.compaction, external.compaction);
+        assert_eq!(std::fs::read(description_path).unwrap(), description_before);
         assert_eq!(
             compaction_request_count(&provider),
             usize::from(!before_run)
