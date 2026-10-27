@@ -98,6 +98,16 @@ fn scrolling_keeps_the_editor_and_context_and_preserves_the_draft() {
             "Default",
             "filled composer"
         );
+        assert_ne!(
+            format!(
+                "{:?}",
+                raw.cell(input_row.try_into().unwrap(), 0)
+                    .unwrap()
+                    .fgcolor()
+            ),
+            "Default",
+            "fallback surface keeps readable text"
+        );
     });
     let before = session.render(|screen| {
         screen
@@ -187,6 +197,14 @@ fn shaded_prompts_replay_into_native_history_on_exit() {
             .rows(0, raw.size().1)
             .position(|row| row.contains("Say hello briefly"))
             .expect("submitted user prompt visible");
+        assert_eq!(
+            format!(
+                "{:?}",
+                raw.cell(row.try_into().unwrap(), 0).unwrap().fgcolor()
+            ),
+            "Idx(0)",
+            "light prompt surface keeps dark text"
+        );
         assert_ne!(
             format!(
                 "{:?}",
@@ -286,9 +304,37 @@ fn older_history_remains_readable_after_many_pages() {
     session.send(&"\x1b[5~".repeat(150)).unwrap();
     common::expect_screen(
         &session,
-        |s| s.contains("ArchiveRow000") && !s.contains("ArchiveRow599"),
+        |s| s.contains("Auth mode") && !s.contains("ArchiveRow599"),
         env.timeout(),
-        "old rows remain available after paging beyond the layout cache",
+        "paging reaches the startup record beyond the layout cache",
+    );
+    // The banner can occupy more than one viewport. Walk overlapping pages
+    // forward to the first answer instead of assuming the banner's height.
+    for _ in 0..16 {
+        if session.render(|screen| screen.contents().contains("ArchiveRow000")) {
+            break;
+        }
+        let before = session.render(|screen| {
+            screen
+                .raw()
+                .rows(0, screen.raw().size().1)
+                .take(20)
+                .collect::<Vec<_>>()
+                .join("\n")
+        });
+        session.send("\x1b[6~").unwrap();
+        common::expect_screen_rows(
+            &session,
+            |screen| screen.lines().take(20).collect::<Vec<_>>().join("\n") != before,
+            env.timeout(),
+            "page forward from the startup banner",
+        );
+    }
+    common::expect_screen(
+        &session,
+        |s| s.contains("ArchiveRow000"),
+        env.timeout(),
+        "the first answer remains readable after cache eviction",
     );
     common::expect_input_line(
         &session,

@@ -2602,6 +2602,10 @@ fn ReplApp(mut hooks: Hooks) -> impl Into<AnyElement<'static>> {
         .as_ref()
         .and_then(|_| crate::render::prompt_style(true).background_color)
         .and_then(ansi_text::ui_color);
+    let input_foreground = transcript
+        .as_ref()
+        .and_then(|_| crate::render::prompt_style(true).foreground_color)
+        .and_then(ansi_text::ui_color);
     let header_background = transcript
         .as_ref()
         .and_then(|_| crate::render::prompt_style(false).background_color)
@@ -2670,8 +2674,8 @@ fn ReplApp(mut hooks: Hooks) -> impl Into<AnyElement<'static>> {
                 };
                 element! {
                     View(flex_direction: FlexDirection::Row) {
-                        Text(content: prompt_label)
-                        Text(content: filter_display)
+                        Text(content: prompt_label, color: input_foreground)
+                        Text(content: filter_display, color: input_foreground)
                     }
                 }
             } else {
@@ -2805,8 +2809,9 @@ fn ReplApp(mut hooks: Hooks) -> impl Into<AnyElement<'static>> {
                 });
                 element! {
                     View(flex_direction: FlexDirection::Row, height: 100pct, width: 100pct) {
-                        View(width: 2, flex_shrink: 0.0) { Text(content: prompt_label) }
+                        View(width: 2, flex_shrink: 0.0) { Text(content: prompt_label, color: input_foreground) }
                         TextInput(
+                            color: input_foreground,
                             value: val,
                             has_focus: reviewable && matches!(task_focus, TaskFocus::Input | TaskFocus::Footer | TaskFocus::Tip),
                             multiline: true,

@@ -57,6 +57,9 @@ pub(crate) fn prompt_style(live: bool) -> ContentStyle {
                     .expect("blended channel")
             };
             ContentStyle {
+                // A fallback background must remain legible when the terminal
+                // cannot report its default foreground on Windows.
+                foreground_color: Some(if light { Color::Black } else { Color::White }),
                 background_color: Some(support.color(Color::Rgb {
                     r: blend(r),
                     g: blend(g),
