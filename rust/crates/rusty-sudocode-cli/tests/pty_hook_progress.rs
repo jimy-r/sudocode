@@ -173,7 +173,8 @@ fn early_hook_exit_preserves_its_decision_with_unread_tool_input() {
                             .map(|offset| body[offset..].chars().take(500).collect::<String>())
                     })
                     .collect();
-                panic!("{error}; captured batch markers: {markers:?}");
+                let screen = session.render(|s| s.contents());
+                panic!("{error}; captured batch markers: {markers:?}\nPTY screen:\n{screen}");
             });
         common::expect_turn_complete_after(
             &session,
