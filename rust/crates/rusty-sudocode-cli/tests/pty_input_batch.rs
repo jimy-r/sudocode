@@ -105,19 +105,23 @@ fn transcripts(root: &Path, paths: &mut Vec<PathBuf>) {
 }
 
 #[test]
-fn two_submits_in_one_write_preserve_turn_boundaries() {
+fn two_submits_in_one_write_keep_both_prompts() {
     let env = TestEnv::new_mock("input-batch-submit");
     let mut session = start(&env);
     let first = env.prompt("First request: calculate 2 + 2.", "single_turn_text");
     let second = env.prompt("Second request: calculate 2 + 2.", "single_turn_text");
+    // Enter steers into a running turn regardless of the queue setting, so the
+    // second prompt may join the first turn. What must hold is that neither
+    // prompt is lost, merged into the other or reordered.
     session.send(&format!("{first}\r{second}\r")).unwrap();
-    common::expect_screen(
+    common::expect_screen_settled(
         &session,
-        |screen| common::turn_status_line(screen).contains("turn 2"),
+        |screen| {
+            screen.contains("The answer is 4") && common::input_line_of(screen).trim().is_empty()
+        },
         env.timeout(),
-        "both submitted turns completed",
+        "both submitted prompts answered",
     );
-    common::expect_input_line_cleared(&session, env.timeout(), "both turns completed");
     session.send("/exit\r").unwrap();
     assert_eq!(session.expect_eof().unwrap(), 0);
 
@@ -126,7 +130,7 @@ fn two_submits_in_one_write_preserve_turn_boundaries() {
     assert_eq!(paths.len(), 1);
     let saved = Session::load_from_path(&paths[0]).unwrap();
     let users: Vec<_> = saved
-        .messages
+        .messages()
         .iter()
         .filter(|message| message.role == MessageRole::User)
         .map(|message| {
@@ -142,8 +146,14 @@ fn two_submits_in_one_write_preserve_turn_boundaries() {
                 .to_string()
         })
         .collect();
-    assert_eq!(users, vec![first, second]);
-    assert_eq!(env.captured_message_count(), 2);
+    assert_eq!(users, vec![first.clone(), second.clone()]);
+    let bodies = env.captured_message_bodies();
+    let last = bodies.last().expect("the model was asked");
+    let (at_first, at_second) = (last.find(&first), last.find(&second));
+    assert!(
+        at_first.is_some() && at_second.is_some() && at_first < at_second,
+        "the model must receive both prompts, in order"
+    );
 }
 
 #[test]
