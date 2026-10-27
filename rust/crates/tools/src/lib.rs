@@ -6806,8 +6806,11 @@ pub fn compose_next_turn_from_envelopes(
         if let Some(rid) = &env.request_id {
             header.push_str(&format!(" request-id=\"{}\"", xml_attr_escape(rid)));
         }
+        if let Some(summary) = env.summary.as_deref().filter(|s| !s.trim().is_empty()) {
+            header.push_str(&format!(" summary=\"{}\"", xml_attr_escape(summary)));
+        }
         header.push('>');
-        // `from` and `request-id` are escaped above so a hostile envelope can't
+        // Header attributes are escaped above so a hostile envelope can't
         // break this synthetic prompt. The body is the same envelope from the
         // same stranger, and it is the field that can both close `</{tag}>`
         // early and impersonate a `<system-reminder>` — so it gets the same
@@ -6820,10 +6823,7 @@ pub fn compose_next_turn_from_envelopes(
     blocks.join("\n\n")
 }
 
-/// Minimal XML-attribute escape for the mailbox envelope headers.
-/// Only escapes `"` and `&` — the character set for `from` / request-id
-/// is `[A-Za-z0-9_-]` in practice, but a hostile envelope shouldn't
-/// break the synthetic prompt.
+/// Escape mailbox attributes while keeping multiline summaries on one header.
 fn xml_attr_escape(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for ch in s.chars() {
@@ -6832,6 +6832,9 @@ fn xml_attr_escape(s: &str) -> String {
             '"' => out.push_str("&quot;"),
             '<' => out.push_str("&lt;"),
             '>' => out.push_str("&gt;"),
+            '\n' => out.push_str("&#10;"),
+            '\r' => out.push_str("&#13;"),
+            '\t' => out.push_str("&#9;"),
             _ => out.push(ch),
         }
     }

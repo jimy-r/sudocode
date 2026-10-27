@@ -1,6 +1,7 @@
 //! Pure formatting and report functions extracted from `main.rs`.
 
 mod a2a;
+pub(super) use a2a::summary_preview;
 
 use std::fmt::Write as _;
 
