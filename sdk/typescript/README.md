@@ -223,7 +223,9 @@ the orchestrator cannot read a partially written snapshot.
 Receipts record executable/library/fixture hashes, versions, method names,
 notification IDs, per-phase mock requests and real process exits. Native server
 cleanup has bounded TERM/KILL phases and reports the actual result; forced
-server cleanup does not prove graceful server quiescence. Loaded threads may
+server cleanup does not prove graceful server quiescence. On Windows, both
+signals terminate the process, so graceful server shutdown always remains
+unproven regardless of the reported signal name. Loaded threads may
 outlive a disconnected CLI, and source labels alone do not establish root
 identity. These checks do not qualify Agent enrollment, a production handoff,
 all frontend launch modes or automatic network admission.

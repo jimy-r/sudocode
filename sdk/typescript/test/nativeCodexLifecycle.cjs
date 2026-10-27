@@ -230,7 +230,8 @@ const closeTui = async own => {
       }
       receipt.result='PASS';
       receipt.notProven=[...(seededResume?[]:['existing-history resume']),...(cancelledResume?['completed assistant-history resume']:[]),
-        'automatic authenticated Nexus enrollment','Windows actual TUI/default endpoint','current production private frontend migration','all Codex application launch modes'];
+        'automatic authenticated Nexus enrollment',...(process.platform==='win32'?[]:['Windows actual TUI/default endpoint']),
+        'current production private frontend migration','all Codex application launch modes'];
       return;
     }
   } catch(error){receipt.result='FAIL';receipt.error={name:error.name,message:error.message};process.exitCode=1;}
@@ -248,7 +249,9 @@ const closeTui = async own => {
       try{await bounded(nativeExited,5000,'isolated native exit');}
       catch(error){native.kill('SIGKILL');try{await bounded(nativeExited,3000,'isolated native forced exit');}catch(e){receipt.cleanup.push(String(e));receipt.result='FAIL';process.exitCode=1;}}
       receipt.cleanup.push({nativeExitCode:native.exitCode,nativeSignalCode:native.signalCode});
-      if(native.signalCode==='SIGKILL')receipt.notProven=[...new Set([...(receipt.notProven??[]),'graceful native server shutdown'])];
+      // Windows maps SIGTERM to TerminateProcess too; its signal name cannot
+      // establish graceful shutdown, even without reaching the SIGKILL phase.
+      if(process.platform==='win32' || native.signalCode==='SIGKILL')receipt.notProven=[...new Set([...(receipt.notProven??[]),'graceful native server shutdown'])];
     }
     await new Promise(resolve=>endpoint.close(resolve));
     receipt.nativeStderr=nativeStderr;
