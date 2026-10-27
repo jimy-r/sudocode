@@ -194,6 +194,12 @@ that binding usable without starting another receiver. A failed or uncertain
 send is never automatically resent. Receiver `unavailable` means the receiver
 could not initialize; `standby` means another instance holds its seat.
 
+Automatic shared-service preparation keeps ordinary startup usable when that
+configured record is unusable; the receiver retains the selected namespace and
+reports its cause. Explicit `scode setup` and `setup --check` still return their
+actual failures. A dangling node-record symlink is a configured but unusable
+record, not permission to prepare a replacement service.
+
 A constructed client is not proof that TLS authentication succeeds. The
 client's credentials remain fixed after construction; rotation or replacing
 an unusable constructed client is not covered by local binding retries.

@@ -133,6 +133,27 @@ fn configured_box(root: &Path, record: &serde_json::Value) -> std::path::PathBuf
     path
 }
 
+#[cfg(unix)]
+#[test]
+fn a_dangling_box_record_is_not_permission_to_prepare_another_service() {
+    let root = tempfile::tempdir().unwrap();
+    let record = root.path().join("home/.nexus/run/node.json");
+    std::fs::create_dir_all(record.parent().unwrap()).unwrap();
+    std::os::unix::fs::symlink(root.path().join("missing-node-record"), &record).unwrap();
+    let result = command(root.path())
+        .args(["setup", "--mode", "shared", "--output-format", "json"])
+        .output()
+        .unwrap();
+    assert!(!result.status.success());
+    assert!(String::from_utf8_lossy(&result.stderr).contains("read node record"));
+    assert!(std::fs::symlink_metadata(&record)
+        .unwrap()
+        .file_type()
+        .is_symlink());
+    assert!(!root.path().join("services").exists());
+    assert!(!root.path().join("config/runtime-profile.json").exists());
+}
+
 #[test]
 fn multi_agent_setup_keeps_an_offline_box_without_installing_a_replacement() {
     let root = tempfile::tempdir().unwrap();

@@ -32,6 +32,17 @@ pub fn node_record_path() -> Option<PathBuf> {
     crate::user_paths::home_dir().map(|home| home.join(".nexus").join("run").join("node.json"))
 }
 
+/// Presence reserves the node namespace even for a dangling or unreadable path.
+/// It does not establish valid configuration, credentials or a live connection.
+#[must_use]
+#[inline]
+pub fn node_record_present() -> bool {
+    node_record_path().is_some_and(|path| {
+        !std::fs::symlink_metadata(path)
+            .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+    })
+}
+
 /// The fields of the node record `scode` reads. The record also names the
 /// node's deployment role and zone, which are the node owner's concern.
 #[derive(Debug, serde::Deserialize)]
@@ -53,7 +64,11 @@ impl NodeRecord {
         };
         let raw = match std::fs::read_to_string(&path) {
             Ok(raw) => raw,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error)
+                if error.kind() == std::io::ErrorKind::NotFound && !node_record_present() =>
+            {
+                return Ok(None);
+            }
             Err(error) => return Err(format!("read node record {}: {error}", path.display())),
         };
         let record: Self = serde_json::from_str(&raw)

@@ -194,11 +194,7 @@ pub fn node(agent: &str) -> Option<Arc<Node>> {
     let resolved = Config::from_node_record(agent);
     // A dangling record symlink is still a configured namespace. So is an
     // unreadable path: neither is permission to deliver to a different disk.
-    let absent = matches!(&resolved, Ok(None))
-        && runtime::nexus_mailbox::node_record_path().is_none_or(|path| {
-            std::fs::symlink_metadata(path)
-                .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
-        });
+    let absent = matches!(&resolved, Ok(None)) && !runtime::nexus_mailbox::node_record_present();
     let decided = if absent {
         None
     } else {

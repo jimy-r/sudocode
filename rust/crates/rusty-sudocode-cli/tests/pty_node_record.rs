@@ -101,6 +101,11 @@ fn unusable_node_configuration_leaves_the_session_usable_and_a2a_explicitly_unav
     for (label, make_record, expected) in cases {
         let env = TestEnv::new("node-record");
         node_home::pin_agent_name(env.workspace_root(), SESSION_AGENT);
+        std::fs::write(
+            env.config_home().join("runtime-profile.json"),
+            r#"{"schemaVersion":1,"mode":"shared"}"#,
+        )
+        .unwrap();
         let home = home_with_record(&env, &make_record(&env));
         ordinary_task_with_unavailable_a2a(&env, &home, label, expected);
     }
@@ -108,11 +113,14 @@ fn unusable_node_configuration_leaves_the_session_usable_and_a2a_explicitly_unav
 
 fn ordinary_task_with_unavailable_a2a(env: &TestEnv, home: &Path, label: &str, expected: &str) {
     let home = home.to_string_lossy();
+    let services = env.workspace_root().join("unexpected-services");
+    let services_env = services.to_string_lossy();
     let mut session = env.spawn_with_env(
         &["--permission-mode", "read-only"],
         &[
             ("HOME", home.as_ref()),
             ("USERPROFILE", home.as_ref()),
+            ("SCODE_SERVICE_ROOT", services_env.as_ref()),
             ("PAGER", ""),
         ],
     );
@@ -155,6 +163,10 @@ fn ordinary_task_with_unavailable_a2a(env: &TestEnv, home: &Path, label: &str, e
         "[{label}]"
     );
     assert_no_disk_namespace(env);
+    assert!(
+        !services.exists(),
+        "[{label}] selected Box must not be replaced"
+    );
 }
 
 /// Both renderers must start and restore a real completed turn without a node.
