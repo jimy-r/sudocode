@@ -1030,7 +1030,10 @@ impl GlobalToolRegistry {
             .iter()
             .find(|tool| tool.definition().name == name)
             .ok_or_else(|| format!("unsupported tool: {name}"))?
-            .execute(input)
+            .execute_with_call_id(
+                input,
+                ctx.and_then(|context| context.tool_use_id.as_deref()),
+            )
             .map_err(|error| error.to_string())
     }
 
@@ -1722,6 +1725,10 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
             input_schema: with_task_template(json!({
                 "type": "object",
                 "properties": {
+                    "delivery": {
+                        "type": "string", "enum": ["steer", "queue"],
+                        "description": "Interactive recipient: steer (default) offers this message within its current task; queue waits for its next turn. Other hosts deliver at their turn boundary. Neither cancels work or requires a change of direction."
+                    },
                     "to": {
                         "type": "string",
                         "description": "Recipient: agent name, pid, or \"*\" for broadcast."
@@ -2415,6 +2422,10 @@ pub struct AgentListRow {
     pub task_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub role: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description_updated_at: Option<String>,
 }
 
 /// Collect the addressable agents this session can reach, plus the workers it
@@ -2448,12 +2459,25 @@ pub fn collect_agent_list(
         .iter()
         .filter_map(|(id, runtime)| runtime.mailbox_root.as_ref().map(|_| id.clone()))
         .collect();
-    Ok(merge_agent_list(
-        &peers,
-        subagents,
-        &active_tasks,
-        active_only,
-    ))
+    let mut rows = merge_agent_list(&peers, subagents, &active_tasks, active_only);
+    if runtime::experiments::is_enabled(runtime::experiments::Experiment::PeerDescriptions) {
+        for row in rows.iter_mut().filter(|row| row.kind == "peer") {
+            match mailbox
+                .description_store(&row.name)
+                .and_then(|store| store.read())
+            {
+                Ok(Some(description)) => {
+                    row.description = Some(description.description);
+                    row.description_updated_at = Some(description.updated_at);
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    tracing::warn!(%error, agent = %row.name, "peer description unavailable")
+                }
+            }
+        }
+    }
+    Ok(rows)
 }
 
 /// Pure core of [`collect_agent_list`], sources injected so it is testable
@@ -2484,6 +2508,8 @@ pub fn merge_agent_list(
                 kind: "peer".to_string(),
                 task_id: None,
                 role: None,
+                description: None,
+                description_updated_at: None,
             });
     }
 
@@ -2502,6 +2528,8 @@ pub fn merge_agent_list(
                 kind: "subagent".to_string(),
                 task_id: Some(snap.agent_id.clone()),
                 role,
+                description: None,
+                description_updated_at: None,
             });
     }
 
@@ -3143,7 +3171,7 @@ fn resolve_sender(input: &SendMessageInput, mailbox: &runtime::mailbox::Mailbox)
 fn write_envelope(
     mailbox: &runtime::mailbox::Mailbox,
     recipient: &str,
-    from: &str,
+    input: &SendMessageInput,
     text: &str,
     summary: Option<&str>,
     kind: &str,
@@ -3151,7 +3179,8 @@ fn write_envelope(
 ) -> Result<PathBuf, String> {
     let recipient_sanitized = sanitize_recipient(recipient);
     let envelope = MailboxEnvelope {
-        from: from.to_string(),
+        delivery: input.delivery,
+        from: resolve_sender(input, mailbox),
         to: recipient.to_string(),
         body: text.to_string(),
         summary: summary.map(str::to_string),
@@ -3297,7 +3326,7 @@ fn run_send_message(
                 write_envelope(
                     &mailbox,
                     r,
-                    &sender,
+                    &input,
                     text,
                     summary,
                     mailbox_kinds::MESSAGE,
@@ -3327,7 +3356,7 @@ fn run_send_message(
         let path = write_envelope(
             &mailbox,
             &input.to,
-            &sender,
+            &input,
             text,
             input.summary.as_deref(),
             mailbox_kinds::MESSAGE,
@@ -3373,7 +3402,7 @@ fn run_send_message(
             write_envelope(
                 &mailbox,
                 &input.to,
-                &sender,
+                &input,
                 &body,
                 None,
                 mailbox_kinds::SHUTDOWN_REQUEST,
@@ -3424,7 +3453,7 @@ fn run_send_message(
             write_envelope(
                 &mailbox,
                 &input.to,
-                &sender,
+                &input,
                 &body,
                 None,
                 mailbox_kinds::SHUTDOWN_RESPONSE,
@@ -3458,7 +3487,7 @@ fn run_send_message(
             write_envelope(
                 &mailbox,
                 &input.to,
-                &sender,
+                &input,
                 &body,
                 None,
                 mailbox_kinds::PLAN_APPROVAL_RESPONSE,
@@ -4652,6 +4681,8 @@ struct CronDeleteInput {
 // fork-compatible error messages verbatim.
 #[derive(Debug, Deserialize)]
 struct SendMessageInput {
+    #[serde(default)]
+    delivery: runtime::turn_input::InputDelivery,
     to: String,
     message: Value,
     #[serde(default)]

@@ -26,7 +26,7 @@ fn send_receipt(target: &str, output: &Value) -> Option<String> {
         return None;
     }
     if target != "*" {
-        return Some("Written to inbox".into());
+        return Some("Sent to inbox".into());
     }
     let recipients = output.get("recipients")?.as_array()?;
     if recipients.is_empty() {
@@ -64,10 +64,8 @@ pub(super) fn send_card(
     let Some(target) = string(input, "to") else {
         return generic_tool_card("send", input, output, status);
     };
-    let header = format!("{} → {target}", tool_label("send"));
+    let mut header = format!("{} → {target}", tool_label("send"));
     let mut body = Vec::new();
-    // Keep the exact address in the wrapping body too: titles clip at narrow widths.
-    body.push(format!("To: {target}"));
     if let Some(summary) = string(input, "summary").filter(|s| !s.trim().is_empty()) {
         body.push(format!("Summary: {}", preview(summary)));
     }
@@ -110,7 +108,11 @@ pub(super) fn send_card(
         let Some(receipt) = send_receipt(target, output) else {
             return generic_tool_card("send", input, Some(output), status);
         };
-        body.insert(0, receipt);
+        if target == "*" {
+            body.insert(0, receipt);
+        } else {
+            let _ = write!(header, " · {receipt}");
+        }
         if let Some(signaled) = output.get("live_abort_signaled").and_then(Value::as_bool) {
             body.push(
                 if signaled {
@@ -167,6 +169,14 @@ pub(super) fn agent_list_card(
         let mut row = format!("{kind}  {name}");
         if address != name {
             let _ = write!(row, " · send_to={address}");
+        }
+        if let Some(description) = string(agent, "description") {
+            let _ = write!(row, " · {}", truncate_for_summary(description, 160));
+            if let Some(age) = string(agent, "description_updated_at")
+                .and_then(runtime::agent_description::relative_age)
+            {
+                let _ = write!(row, " · updated {age}");
+            }
         }
         if let Some(active) = agent.get("active").and_then(Value::as_bool) {
             row.push_str(if active { " · active" } else { " · inactive" });

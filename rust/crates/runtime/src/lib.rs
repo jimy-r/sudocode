@@ -5,6 +5,7 @@
 //! that drives interactive and one-shot turns.
 
 pub mod agent_color;
+pub mod agent_description;
 pub mod agent_mailbox;
 pub mod agent_types;
 pub mod background_tasks;
@@ -73,6 +74,7 @@ pub mod session_control;
 pub mod session_history;
 pub mod session_writer;
 pub mod test_support;
+pub mod turn_input;
 pub mod verification_watcher;
 pub use session::history;
 pub use session_control::SessionStore;

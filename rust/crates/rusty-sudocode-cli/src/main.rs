@@ -16,6 +16,7 @@ mod background_completion;
 mod bash_mode;
 mod cancel;
 mod cli;
+mod clipboard_image;
 mod init;
 mod input;
 mod input_chrome;
@@ -2168,6 +2169,27 @@ fn run_resume_command(
                 })),
             })
         }
+        SlashCommand::CacheTtl { value, .. } => {
+            // No live client here: a value can only become the saved default.
+            let message = match value.as_deref() {
+                Some(value) => {
+                    let pinned = match value {
+                        "1h" => Some(true),
+                        "5m" => Some(false),
+                        _ => None,
+                    };
+                    runtime::ConfigLoader::default_for(env::current_dir().unwrap_or_default())
+                        .save_cache_ttl_1h(pinned)?;
+                    format!("Saved · {value} as the prompt cache TTL for new sessions")
+                }
+                None => "The prompt cache TTL is shown in a running session: /cache ttl".to_owned(),
+            };
+            Ok(ResumeCommandOutcome {
+                session: session.clone(),
+                message: Some(message),
+                json: None,
+            })
+        }
         SlashCommand::History { count } => {
             let limit = parse_history_count(count.as_deref())
                 .map_err(|error| -> Box<dyn std::error::Error> { error.into() })?;
@@ -2307,11 +2329,8 @@ fn run_repl(
         auth_mode,
     )?;
 
-    // Env-gated opt-in to the async REPL that accepts input during a running
-    // turn (see `input_queue` module docs and
-    // `notes/plans/conversation-interrupt-queue-sudocode.md`). When set to
-    // anything other than `off` / unset, dispatch to the async loop. Default
-    // path below stays byte-identical to today's sync behavior.
+    // The default async REPL accepts steering during a running turn.
+    // Explicit startup `off` retains the legacy synchronous receive loop.
     let mode = input_queue::QueueMode::from_env();
     if !matches!(mode, input_queue::QueueMode::Off) {
         return run_repl_iocraft_dispatch(cli, mode);
@@ -2433,15 +2452,9 @@ fn run_repl_loop(mut cli: LiveCli) -> Result<(), Box<dyn std::error::Error>> {
                 print!("\x1b[J");
                 let _ = io::stdout().flush();
                 let trimmed = input.trim().to_string();
-                *cli.pending_images.borrow_mut() = editor
-                    .borrow_mut()
-                    .take_images()
-                    .into_values()
-                    .map(|(data, mime_type)| runtime::ContentBlock::Image { data, mime_type })
-                    .collect();
                 // An empty line only comes back while peer messages wait: the
                 // user handing the prompt back so they run, at the loop's top.
-                if trimmed.is_empty() && cli.pending_images.borrow().is_empty() {
+                if trimmed.is_empty() {
                     continue;
                 }
                 if matches!(trimmed.as_str(), "/exit" | "/quit") {
@@ -2719,16 +2732,15 @@ enum CoordinatorEvent {
     },
     /// A background shell or monitor the model started has ended.
     ///
-    /// Separate from [`Self::SubagentCompleted`] because the two want opposite
-    /// idle behaviour: a sub-agent result wakes a turn (the model delegated the
-    /// work and is waiting for it), while a background task must NOT seize an
-    /// idle prompt — the human may be mid-thought or exiting. It is queued and
-    /// delivered with the next turn, which still keeps the tool description's
-    /// promise that the model hears about it without polling.
+    /// Uses the same idle wake-up and active-turn intake as sub-agent results.
     BackgroundTaskCompleted {
         prompt: String,
         display: String,
     },
+    InputCommitted(u64),
+    InputDeferred(Vec<engine_events::TurnInput>),
+    PumpQueue,
+    TurnStarted,
     TurnComplete,
 }
 
@@ -3408,15 +3420,7 @@ impl Drop for ReplTurnCancelMonitor {
 /// line separates the echo from the turn output that follows, matching the
 /// spacing between other scrollback blocks.
 fn echo_submit_to_scrollback(output: &repl_ui::OutputSender, display: &str) {
-    let mut lines = display.split('\n');
-    if let Some(first) = lines.next() {
-        let mut rendered = format!("{}{}{} {first}", render::BOLD, render::PROMPT_GLYPH, RESET);
-        for line in lines {
-            rendered.push_str("\n  ");
-            rendered.push_str(line);
-        }
-        output.print_block(rendered);
-    }
+    output.print_block(cli::format::format_input_echo(display, render::query_terminal_width()).0);
 }
 
 /// Commit a received envelope through the same formatter used by replay.
@@ -3428,6 +3432,71 @@ fn echo_peer_to_scrollback(output: &repl_ui::OutputSender, prompt: &str) {
         &render::TerminalRenderer::new(),
     );
     output.print_block(rendered);
+}
+
+/// The footer's cache-TTL tip and whether it offers a switch.
+fn cache_tip(session_id: &str, model: &str) -> repl_ui::CacheTip {
+    let advice = engine_core::cache_advisor::ttl_advice(session_id, model);
+    let actionable = advice.as_ref().is_some_and(|advice| {
+        advice.pending.is_none()
+            && advice.has_saving
+            && advice.suggested_seconds != advice.effective_seconds
+    });
+    repl_ui::CacheTip {
+        tip: engine_core::cache_advisor::session_tip(session_id, model),
+        advice,
+        actionable,
+    }
+}
+
+/// Choose this session's prompt-cache TTL and save it as the default. Returns
+/// the one-line notice saying when it takes effect.
+fn apply_cache_ttl(
+    session_id: &str,
+    choice: engine_core::cache_ttl::TtlChoice,
+    force_now: bool,
+) -> String {
+    use engine_core::cache_ttl::TtlChoice;
+    engine_core::cache_ttl::choose(session_id, choice, force_now);
+    let saved = runtime::ConfigLoader::default_for(env::current_dir().unwrap_or_default())
+        .save_cache_ttl_1h(match choice {
+            TtlChoice::OneHour => Some(true),
+            TtlChoice::FiveMinutes => Some(false),
+            TtlChoice::Auto => None,
+        });
+    let when = match (choice, force_now) {
+        (TtlChoice::OneHour, false) => {
+            "1h from the next cold start (idle past the TTL, compact, resume)"
+        }
+        (TtlChoice::OneHour, true) => "1h from the next request (rewrites the cached prefix once)",
+        (TtlChoice::FiveMinutes, _) => "5m from the next request",
+        (TtlChoice::Auto, _) => {
+            "auto: the auth mode decides (1h on a subscription, 5m on an API key)"
+        }
+    };
+    match saved {
+        Ok(_) => format!("Saved · {when}"),
+        Err(error) => format!("Applied to this session · could not save: {error}"),
+    }
+}
+
+/// `Prompt cache TTL: …` for `/cache` and `/cache ttl`.
+fn cache_ttl_status(session_id: &str) -> String {
+    use engine_core::cache_ttl::TtlChoice;
+    let status = engine_core::cache_ttl::status(session_id);
+    let now = status
+        .effective_seconds
+        .map_or("not sent yet", engine_core::cache_advisor::ttl_label);
+    let pending = status.pending.map_or(String::new(), |pending| {
+        let (label, when) = match (pending.choice, pending.force_now) {
+            (TtlChoice::OneHour, false) => ("1h", "at the next cold start"),
+            (TtlChoice::OneHour, true) => ("1h", "from the next request"),
+            (TtlChoice::FiveMinutes, _) => ("5m", "from the next request"),
+            (TtlChoice::Auto, _) => ("auto", "from the next suitable request"),
+        };
+        format!(" · pending {label} {when}")
+    });
+    format!("Prompt cache TTL: {now}{pending}")
 }
 
 fn run_repl_iocraft_dispatch(
@@ -3450,14 +3519,16 @@ fn run_repl_iocraft_dispatch(
         }
     };
     let permission_label = cli.lifecycle.current_permission_mode().as_str().to_string();
+    // The TTL panel applies a choice without the LiveCli lock a turn holds.
+    let ttl_lifecycle = Arc::clone(&cli.lifecycle);
     // On resume, seed the status line with the session's running totals so the
     // ChromeSlot shows the previous result. Fresh-session guidance belongs
     // to the shared footer, leaving the upper status area empty until needed.
     let resume_status = cli.resume_status_line();
 
     // iocraft owns stdin (raw mode) and delivers Ctrl-C / ESC as key events;
-    // those `InputEvent::Abort`s cancel the in-flight turn by sending Cancel
-    // across the seam (no separate raw-mode HookAbortMonitor).
+    // Esc flushes pending input; Ctrl+C always sends Cancel across the seam.
+    // There is no separate raw-mode HookAbortMonitor.
     let commands = cli.engine_handle.commands.clone();
     let _ = commands.send(EngineCommand::BackgroundTask {
         action: engine_events::BackgroundTaskAction::Watch,
@@ -3475,7 +3546,9 @@ fn run_repl_iocraft_dispatch(
     // thread's `↑` handler: on empty-buffer `↑` the UI pops the newest human
     // queued message back into the input slot (skipping a2a/peer). Created
     // before the UI so the dequeue hook can capture it.
-    let coord = Arc::new(Mutex::new(input_queue::TurnInputCoordinator::new()));
+    let coord = Arc::new(Mutex::new(input_queue::TurnInputCoordinator::<
+        mpsc::Sender<()>,
+    >::new()));
     let dequeue_hook: repl_ui::UpArrowDequeueHook = {
         let coord = Arc::clone(&coord);
         Arc::new(move || {
@@ -3488,7 +3561,7 @@ fn run_repl_iocraft_dispatch(
     let repl = repl_ui::spawn_repl_ui(&permission_label, &banner, seed_todos, Some(dequeue_hook));
     let (repl_output, repl_ui_cmd, input_rx, repl_spinner, repl_join) = repl.split();
     if let Some(status) = resume_status {
-        repl_ui_cmd.set_turn_result(&status);
+        repl_ui_cmd.set_turn_result(&status, cli.lifecycle.usage_snapshot().turns());
     }
     repl_ui_cmd.set_cache_tip(cli.cache_ttl_tip());
     let pending_question_answer: PendingQuestionAnswer = Arc::new(Mutex::new(None));
@@ -3523,6 +3596,9 @@ fn run_repl_iocraft_dispatch(
                 // Its UI uses the same seam as every other engine consumer.
                 match &event {
                     EngineEvent::State(state) => activity.observe_engine_state(*state),
+                    EngineEvent::TurnStarted { .. } => {
+                        let _ = completion_tx.send(CoordinatorEvent::TurnStarted);
+                    }
                     EngineEvent::BackgroundTask(event) => {
                         task_ui.background_task(event.clone());
                         // The panel is for the human; the model is a second
@@ -3544,6 +3620,16 @@ fn run_repl_iocraft_dispatch(
                     }
                     EngineEvent::BackgroundTaskError { message, .. } => {
                         task_ui.background_task_error(message.clone());
+                        continue;
+                    }
+                    _ => {}
+                }
+                match &event {
+                    EngineEvent::InputCommitted(input) => {
+                        let _ = completion_tx.send(CoordinatorEvent::InputCommitted(input.id));
+                    }
+                    EngineEvent::InputDeferred(inputs) => {
+                        let _ = completion_tx.send(CoordinatorEvent::InputDeferred(inputs.clone()));
                         continue;
                     }
                     _ => {}
@@ -3612,7 +3698,6 @@ fn run_repl_iocraft_dispatch(
     );
     // Coordinator loop on the current thread. All events arrive through
     // `coord_rx` — no timeout-based polling needed.
-    let mut turn_active = false;
     let mut runner_handle: Option<thread::JoinHandle<()>> = None;
     // Pending interactive slash command state: when a slash command needs
     // user selection (e.g. `/model` without args), we show a question via
@@ -3647,10 +3732,53 @@ fn run_repl_iocraft_dispatch(
             event => event,
         };
         match event {
-            CoordinatorEvent::TurnComplete => {
-                turn_active = false;
+            CoordinatorEvent::TurnStarted => {
+                let command = coord.lock().unwrap().turn_started();
+                if let Some(command) = command {
+                    let _ = commands.send(command);
+                }
+            }
+            CoordinatorEvent::InputCommitted(id) => {
+                // This receipt means the prompt is durable, not just in a channel.
+                if let Some(receipt) = coord.lock().unwrap().committed(id) {
+                    let _ = receipt.send(());
+                }
+                repl_ui_cmd.pending_input_remove(id);
+            }
+            CoordinatorEvent::InputDeferred(inputs) => {
+                let inputs = {
+                    let mut queue = coord.lock().unwrap();
+                    inputs
+                        .into_iter()
+                        .filter(|input| queue.defer(input.id))
+                        .collect::<Vec<_>>()
+                };
+                for input in inputs {
+                    repl_ui_cmd.pending_input(input.view(), engine_events::InputDelivery::Queue);
+                }
+                if coord.lock().unwrap().can_start() {
+                    let _ = coord_tx.send(CoordinatorEvent::PumpQueue);
+                }
+            }
+            event @ (CoordinatorEvent::TurnComplete | CoordinatorEvent::PumpQueue) => {
+                if matches!(event, CoordinatorEvent::PumpQueue)
+                    && coord.lock().unwrap().is_running()
+                {
+                    continue;
+                }
+                if matches!(event, CoordinatorEvent::TurnComplete) {
+                    coord.lock().unwrap().finish_turn();
+                }
                 if let Some(h) = runner_handle.take() {
                     let _ = h.join();
+                }
+                if coord.lock().unwrap().is_paused() {
+                    repl_ui_cmd.pending_inputs_clear();
+                    let previews = coord.lock().unwrap().previews();
+                    for echo in previews {
+                        repl_ui_cmd.pending_input(echo, engine_events::InputDelivery::Queue);
+                    }
+                    continue;
                 }
                 let next = coord.lock().unwrap().drain_next();
                 if let Some(next) = next {
@@ -3660,18 +3788,21 @@ fn run_repl_iocraft_dispatch(
                     // kind (`❯` human / message frame for peers). Then clear the queued
                     // messages from the pending overlay: they're leaving the queue.
                     for echo in &next.echoes {
-                        match echo.kind {
+                        match echo.source {
                             input_queue::QueuedKind::Human => {
                                 echo_submit_to_scrollback(&repl_output, &echo.display)
                             }
                             input_queue::QueuedKind::Peer => {
                                 echo_peer_to_scrollback(&repl_output, &echo.display)
                             }
-                            input_queue::QueuedKind::Subagent => repl_output.println(&echo.display),
+                            input_queue::QueuedKind::Subagent
+                            | input_queue::QueuedKind::Background => {
+                                repl_output.println(&echo.display);
+                            }
                         }
                     }
-                    repl_ui_cmd.queued_messages_clear();
-                    turn_active = true;
+                    repl_ui_cmd.pending_inputs_clear();
+                    coord.lock().unwrap().start_turn();
                     runner_handle = Some(spawn_iocraft_turn(
                         Arc::clone(&cli_shared),
                         next,
@@ -3687,15 +3818,13 @@ fn run_repl_iocraft_dispatch(
             event @ (CoordinatorEvent::PeerMessage(..)
             | CoordinatorEvent::SubagentCompleted { .. }
             | CoordinatorEvent::BackgroundTaskCompleted { .. }) => {
-                // Peer messages and sub-agent results share human input's
-                // scheduling: run while idle, otherwise queue until the turn
-                // boundary. Keep their origin distinct in the UI and history.
-                // A background task's news must never seize an idle prompt:
-                // the human may be typing or exiting, and a turn started under
-                // their `/exit` leaves the session unable to shut down.
-                let mut wake_on_idle = true;
+                // Peer messages, sub-agent results and background completions
+                // share human input's scheduling: steer active work or queue the next
+                // turn. Keep their origin distinct in the UI and history.
+                let mut delivery = engine_events::InputDelivery::Steer;
                 let (prompt, display, kind, ack) = match event {
                     CoordinatorEvent::PeerMessage(msg, ack) => {
+                        delivery = msg.delivery;
                         let prompt = tools::compose_next_turn_from_envelopes(&[msg]);
                         (
                             prompt.clone(),
@@ -3708,26 +3837,39 @@ fn run_repl_iocraft_dispatch(
                         (prompt, display, input_queue::QueuedKind::Subagent, None)
                     }
                     CoordinatorEvent::BackgroundTaskCompleted { prompt, display } => {
-                        wake_on_idle = false;
-                        (prompt, display, input_queue::QueuedKind::Subagent, None)
+                        (prompt, display, input_queue::QueuedKind::Background, None)
                     }
                     _ => unreachable!(),
                 };
-                if !turn_active && wake_on_idle {
+                if coord.lock().unwrap().can_start() {
+                    if coord.lock().unwrap().has_idle_queue() {
+                        stage_turn_input(
+                            &coord,
+                            input_queue::QueuedInput::new(prompt, display.clone(), kind, ack),
+                            engine_events::InputDelivery::Queue,
+                            &commands,
+                            &repl_ui_cmd,
+                        );
+                        let _ = coord_tx.send(CoordinatorEvent::PumpQueue);
+                        continue;
+                    }
                     match kind {
-                        input_queue::QueuedKind::Subagent => repl_output.println(&display),
+                        input_queue::QueuedKind::Subagent | input_queue::QueuedKind::Background => {
+                            repl_output.println(&display);
+                        }
                         _ => echo_peer_to_scrollback(&repl_output, &display),
                     }
-                    let next = coord
-                        .lock()
-                        .unwrap()
-                        .submit_when_idle(input_queue::QueuedInput {
-                            text: prompt,
-                            display: display.clone(),
-                            kind,
-                            receipt: ack,
-                        });
-                    turn_active = true;
+                    let next =
+                        coord
+                            .lock()
+                            .unwrap()
+                            .submit_when_idle(input_queue::QueuedInput::new(
+                                prompt,
+                                display.clone(),
+                                kind,
+                                ack,
+                            ));
+                    coord.lock().unwrap().start_turn();
                     runner_handle = Some(spawn_iocraft_turn(
                         Arc::clone(&cli_shared),
                         next,
@@ -3738,22 +3880,18 @@ fn run_repl_iocraft_dispatch(
                         coord_tx.clone(),
                     ));
                 } else {
-                    let mut coord_lock = coord.lock().unwrap();
-                    coord_lock.submit_during_turn(
-                        input_queue::QueuedInput {
-                            text: prompt,
-                            display: display.clone(),
-                            kind,
-                            receipt: ack,
-                        },
-                        input_queue::QueueMode::Queue,
-                    );
-                    let preview = if kind == input_queue::QueuedKind::Peer {
-                        cli::received::queued_preview(&display)
+                    let delivery = if coord.lock().unwrap().can_steer() {
+                        delivery
                     } else {
-                        display
+                        engine_events::InputDelivery::Queue
                     };
-                    repl_ui_cmd.queued_message_push(&preview, false);
+                    stage_turn_input(
+                        &coord,
+                        input_queue::QueuedInput::new(prompt, display.clone(), kind, ack),
+                        delivery,
+                        &commands,
+                        &repl_ui_cmd,
+                    );
                 }
                 continue;
             }
@@ -3772,11 +3910,21 @@ fn run_repl_iocraft_dispatch(
                     }
                     break;
                 }
-                repl_ui::InputEvent::Abort => {
+                repl_ui::InputEvent::Abort if coord.lock().unwrap().has_pending_input() => {
+                    coord.lock().unwrap().resume();
+                    if coord.lock().unwrap().is_running() {
+                        let inputs = coord.lock().unwrap().flush();
+                        deliver_steering_inputs(&coord, inputs, &commands, &repl_ui_cmd);
+                    } else {
+                        let _ = coord_tx.send(CoordinatorEvent::PumpQueue);
+                    }
+                }
+                repl_ui::InputEvent::Abort | repl_ui::InputEvent::Cancel => {
                     pending_slash_selection = None;
                     cancel_pending_question_answer(&pending_question_answer);
                     repl_ui_cmd.clear_question();
                     if runner_handle.is_some() {
+                        coord.lock().unwrap().cancel_turn();
                         let _ = commands.send(EngineCommand::Cancel);
                     }
                 }
@@ -3784,6 +3932,12 @@ fn run_repl_iocraft_dispatch(
                     let _ = commands.send(EngineCommand::BackgroundTask {
                         action: engine_events::BackgroundTaskAction::Stop { id },
                     });
+                }
+                repl_ui::InputEvent::SetCacheTtl { choice, force_now } => {
+                    let session_id = ttl_lifecycle.session_handle().id;
+                    repl_output.println(&apply_cache_ttl(&session_id, choice, force_now));
+                    repl_ui_cmd
+                        .set_cache_tip(cache_tip(&session_id, &ttl_lifecycle.current_model()));
                 }
                 repl_ui::InputEvent::InspectDocument(document) => {
                     // The turn owns LiveCli while awaiting its answer. Pager
@@ -3801,7 +3955,17 @@ fn run_repl_iocraft_dispatch(
                         }
                     }
                 }
-                repl_ui::InputEvent::Submit { text, display } => {
+                event
+                @ (repl_ui::InputEvent::Submit { .. } | repl_ui::InputEvent::Queue { .. }) => {
+                    let (text, display, delivery) = match event {
+                        repl_ui::InputEvent::Submit { text, display } => {
+                            (text, display, engine_events::InputDelivery::Steer)
+                        }
+                        repl_ui::InputEvent::Queue { text, display } => {
+                            (text, display, engine_events::InputDelivery::Queue)
+                        }
+                        _ => unreachable!(),
+                    };
                     // `!<cmd>` bash mode: run it here, no model turn. The
                     // runner thread holds the `LiveCli` mutex for the whole
                     // turn, so during a turn the line is declined rather than
@@ -3809,7 +3973,7 @@ fn run_repl_iocraft_dispatch(
                     // the coordinator's job (see `echo_submit_to_scrollback`),
                     // in bash-mode dress, and only when the line actually runs.
                     if let Some(command) = bash_mode::parse_bang_command(&text) {
-                        if turn_active {
+                        if coord.lock().unwrap().is_running() {
                             repl_output.println(&format!(
                                 "{DIM}(a turn is running; wait for it to finish before running ! commands){RESET}"
                             ));
@@ -3822,11 +3986,30 @@ fn run_repl_iocraft_dispatch(
                         continue;
                     }
 
-                    // Try slash command dispatch.
+                    // Management may take the same session lock as the running
+                    // turn. Keep the input/control dispatcher nonblocking.
                     let trimmed = text.trim();
-                    let is_slash = match SlashCommand::parse(trimmed) {
+                    let parsed = SlashCommand::parse(trimmed);
+                    // Task inspection is local UI, so it remains available
+                    // during work without taking the session lock.
+                    if matches!(&parsed, Ok(Some(SlashCommand::Tasks { args: None }))) {
+                        repl_ui_cmd.open_tasks();
+                        continue;
+                    }
+                    if coord.lock().unwrap().is_running() && trimmed.starts_with('/') {
+                        let controls = repl_ui::running_input_controls(
+                            coord.lock().unwrap().has_pending_input(),
+                        );
+                        repl_output.println(&format!(
+                            "{}A turn is running; finish or cancel before changing session settings.\n{controls}{RESET}",
+                            theme().muted_fg(),
+                        ));
+                        continue;
+                    }
+                    // Try slash command dispatch.
+                    let is_slash = match parsed {
                         Ok(Some(SlashCommand::Memory)) => {
-                            if turn_active {
+                            if coord.lock().unwrap().is_running() {
                                 repl_output.println("A turn is running; wait for it to finish before editing memory.");
                             } else {
                                 pending_slash_selection = cli::memory_ui::select_memory(
@@ -3927,7 +4110,7 @@ fn run_repl_iocraft_dispatch(
                             true
                         }
                         Ok(Some(SlashCommand::Resume { session_path: None })) => {
-                            if turn_active {
+                            if coord.lock().unwrap().is_running() {
                                 repl_output.println("A turn is running; wait for it to finish before selecting a session.");
                             } else {
                                 pending_slash_selection = cli::session_ui::select_session(
@@ -3942,7 +4125,7 @@ fn run_repl_iocraft_dispatch(
                             if matches!(action.as_deref(), None | Some("list"))
                                 || (action.as_deref() == Some("delete") && target.is_some()) =>
                         {
-                            if turn_active {
+                            if coord.lock().unwrap().is_running() {
                                 repl_output.println("A turn is running; wait for it to finish before selecting or deleting a session.");
                             } else if action.as_deref() == Some("delete") {
                                 pending_slash_selection = cli::session_ui::confirm_delete(
@@ -3986,7 +4169,10 @@ fn run_repl_iocraft_dispatch(
                             }
                             if refresh_context {
                                 if let Some(status) = cli_lock.resume_status_line() {
-                                    repl_ui_cmd.set_turn_result(&status);
+                                    repl_ui_cmd.set_turn_result(
+                                        &status,
+                                        cli_lock.lifecycle.usage_snapshot().turns(),
+                                    );
                                 }
                             }
                             if refresh_context
@@ -4020,13 +4206,21 @@ fn run_repl_iocraft_dispatch(
                     // submit echoes now and runs; a during-turn submit is held
                     // in the queue overlay and echoed at the turn boundary when
                     // it actually flushes (see `drain_next`'s `echoes`).
-                    if !turn_active {
+                    if coord.lock().unwrap().has_idle_queue() {
+                        coord.lock().unwrap().resume();
+                        coord.lock().unwrap().submit_during_turn(
+                            input_queue::QueuedInput::human(text, display),
+                            input_queue::QueueMode::Queue,
+                        );
+                        let _ = coord_tx.send(CoordinatorEvent::PumpQueue);
+                    } else if !coord.lock().unwrap().is_running() {
+                        coord.lock().unwrap().resume();
                         echo_submit_to_scrollback(&repl_output, &display);
                         let next = coord
                             .lock()
                             .unwrap()
                             .submit_when_idle(input_queue::QueuedInput::human(text, display));
-                        turn_active = true;
+                        coord.lock().unwrap().start_turn();
                         runner_handle = Some(spawn_iocraft_turn(
                             Arc::clone(&cli_shared),
                             next,
@@ -4037,21 +4231,31 @@ fn run_repl_iocraft_dispatch(
                             coord_tx.clone(),
                         ));
                     } else {
-                        let mut coord_lock = coord.lock().unwrap();
-                        let outcome = coord_lock.submit_during_turn(
-                            input_queue::QueuedInput::human(text, display.clone()),
-                            input_queue::load_queue_mode(&shared_mode),
-                        );
-                        match outcome {
-                            input_queue::SubmitOutcome::Queued => {
-                                repl_ui_cmd.queued_message_push(&display, true);
-                            }
-                            input_queue::SubmitOutcome::Rejected => {
-                                repl_output.println(
-                                    &format!("{DIM}(a turn is running; set SUDOCODE_INTERRUPT_QUEUE_MODE=queue to queue instead){RESET}"),
-                                );
-                            }
+                        if delivery == engine_events::InputDelivery::Queue
+                            && !input_queue::load_queue_mode(&shared_mode).queue_enabled()
+                        {
+                            repl_output.println("Next-turn queue is disabled; use Enter to steer or /config set queue on while idle.");
+                            continue;
                         }
+                        let delivery = {
+                            let mut queue = coord.lock().unwrap();
+                            if delivery == engine_events::InputDelivery::Steer && queue.is_paused()
+                            {
+                                // Enter after Ctrl+C is an explicit request to
+                                // resume once the cancelled worker has settled.
+                                queue.resume();
+                                engine_events::InputDelivery::Queue
+                            } else {
+                                delivery
+                            }
+                        };
+                        stage_turn_input(
+                            &coord,
+                            input_queue::QueuedInput::human(text, display),
+                            delivery,
+                            &commands,
+                            &repl_ui_cmd,
+                        );
                     }
                 }
                 repl_ui::InputEvent::QuestionAnswer(text) => {
@@ -4148,6 +4352,48 @@ fn run_repl_iocraft_dispatch(
     std::process::exit(0);
 }
 
+fn stage_turn_input(
+    coord: &Arc<Mutex<input_queue::TurnInputCoordinator<mpsc::Sender<()>>>>,
+    input: input_queue::QueuedInput<mpsc::Sender<()>>,
+    delivery: engine_events::InputDelivery,
+    commands: &mpsc::Sender<EngineCommand>,
+    ui: &repl_ui::UiCommandSender,
+) {
+    match delivery {
+        engine_events::InputDelivery::Steer => {
+            let input = coord.lock().unwrap().steer(input);
+            deliver_steering_inputs(coord, vec![input], commands, ui);
+        }
+        engine_events::InputDelivery::Queue => {
+            let view = coord.lock().unwrap().enqueue(input);
+            ui.pending_input(view, engine_events::InputDelivery::Queue);
+        }
+    }
+}
+
+fn deliver_steering_inputs(
+    coord: &Arc<Mutex<input_queue::TurnInputCoordinator<mpsc::Sender<()>>>>,
+    inputs: Vec<engine_events::TurnInput>,
+    commands: &mpsc::Sender<EngineCommand>,
+    ui: &repl_ui::UiCommandSender,
+) {
+    // Keep row ids and tool/input ordering while preparation still owns delivery.
+    for input in &inputs {
+        ui.steering_push(input);
+    }
+    if inputs.is_empty() || !coord.lock().unwrap().can_deliver() {
+        return;
+    }
+    if let Err(mpsc::SendError(EngineCommand::Steer { inputs })) =
+        commands.send(EngineCommand::Steer { inputs })
+    {
+        for input in inputs {
+            coord.lock().unwrap().defer(input.id);
+            ui.pending_input(input.view(), engine_events::InputDelivery::Queue);
+        }
+    }
+}
+
 /// Spawn a runner thread for the iocraft REPL path. The runner locks
 /// `LiveCli`, calls `run_turn`, and sends the result via the output
 /// channel. The spinner state is wired so the streaming/tool layers
@@ -4194,7 +4440,6 @@ fn spawn_iocraft_turn(
 /// (audit finding B). It physically cannot drive a turn except through
 /// `engine_handle` (no `EngineDelegate`), and cannot reach into the runtime.
 struct LiveCli {
-    pending_images: RefCell<Vec<runtime::ContentBlock>>,
     /// The turn seam: `commands.send(Prompt/Cancel/PermissionAnswer/…)`,
     /// `events.recv()`. The ONLY way turns cross.
     engine_handle: EngineHandle,
@@ -4558,7 +4803,6 @@ impl LiveCli {
         }
 
         Ok(Self {
-            pending_images: RefCell::new(Vec::new()),
             engine_handle,
             lifecycle,
             prompt_history: Vec::new(),
@@ -4775,8 +5019,7 @@ impl LiveCli {
         // the call regardless of whether a `ui` overlay is present.
         let mut renderer =
             render.then(|| EngineEventRenderer::new(spinner_ref.cloned(), output.cloned()));
-        let mut blocks = runtime::image_input::prompt_blocks(input, &runtime::StdFsBackend)?;
-        blocks.append(&mut self.pending_images.borrow_mut());
+        let blocks = runtime::image_input::prompt_blocks(input, &runtime::StdFsBackend)?;
         self.engine_handle.commands.send(EngineCommand::Prompt {
             blocks,
             context: None,
@@ -5002,7 +5245,7 @@ impl LiveCli {
         let token_budget = crate::render::parse_token_budget(input);
         let model = self.lifecycle.current_model();
         let mut spinner = SpinnerHandle::new(
-            render::activity::THINKING_LABEL,
+            render::activity::WORKING_LABEL,
             Some(model.as_str()),
             TerminalRenderer::new().color_theme(),
             token_budget,
@@ -5069,8 +5312,8 @@ impl LiveCli {
     }
 
     /// Read the engine's frozen recommendation without copying pricing logic.
-    fn cache_ttl_tip(&self) -> Option<engine_core::Tip> {
-        engine_core::cache_advisor::session_tip(
+    fn cache_ttl_tip(&self) -> repl_ui::CacheTip {
+        cache_tip(
             &self.lifecycle.session_handle().id,
             &self.lifecycle.current_model(),
         )
@@ -5131,9 +5374,9 @@ impl LiveCli {
             // ChromeSlot already renders it above the separator, and printing
             // it again duplicated the line in the terminal history.
             (Some(ui), Some(_)) => {
-                ui.set_turn_result(&line);
+                ui.set_turn_result(&line, turns);
             }
-            (Some(ui), None) => ui.set_turn_result(&line),
+            (Some(ui), None) => ui.set_turn_result(&line, turns),
             (None, Some(out)) => out.println(&line.to_string()),
             (None, None) => self.out_println(line.to_string()),
         }
@@ -5537,6 +5780,22 @@ impl LiveCli {
                 let session = self.lifecycle.session_snapshot();
                 let usage = UsageTracker::from_session(&session).cumulative_usage();
                 self.out_println(format_cost_report(usage));
+                self.out_println(cache_ttl_status(&self.lifecycle.session_handle().id));
+                false
+            }
+            SlashCommand::CacheTtl { value, now } => {
+                use engine_core::cache_ttl::TtlChoice;
+                let session_id = self.lifecycle.session_handle().id;
+                let choice = match value.as_deref() {
+                    Some("1h") => Some(TtlChoice::OneHour),
+                    Some("5m") => Some(TtlChoice::FiveMinutes),
+                    Some("auto") => Some(TtlChoice::Auto),
+                    _ => None,
+                };
+                match choice {
+                    Some(choice) => self.out_println(apply_cache_ttl(&session_id, choice, now)),
+                    None => self.out_println(cache_ttl_status(&session_id)),
+                }
                 false
             }
             SlashCommand::Context { action } => {

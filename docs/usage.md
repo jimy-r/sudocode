@@ -38,6 +38,45 @@ from the immutable sibling `vX.Y.Z` directory. A versioned mirror directory pins
 its own version. The publisher verifies the complete mirror before promoting the
 pointer; the client verifies the downloaded archive's SHA-256 before installation.
 
+## Persistent peer descriptions
+
+Enable `experimental.peerDescriptions` in settings to let model-backed
+compaction publish a short description of each peer's ongoing work:
+
+```json
+{"experimental":{"peerDescriptions":true}}
+```
+
+The existing compaction call produces optional description metadata alongside
+its checkpoint. It adds no separate summarizer or repair request. New agents
+have no description until one is published. Tool-output pruning, skipped or
+failed compaction, and ordinary turns preserve the previous description and
+its timestamp. Child agents retain their existing task descriptions.
+
+The source of truth is `/agents/<name>/description.json` in the actual peer
+mailbox namespace. Without a Nexus node, that path is relative to
+`~/.nexus/sudocode/local-mailbox/`. The record contains `description`,
+`updated_at`, and `source_session_id`. It survives process exit and resume;
+resuming an older session does not restore an older description. The owning
+agent publishes only after its checkpoint commits. A description changed
+during compaction is preserved. Native filesystem locks exclude concurrent
+writers; node backends retain their advisory lease guarantee unless they
+provide conditional writes.
+
+`agent_list` reads these records and returns optional `description` and
+`description_updated_at` fields. Terminal cards show the description and its
+age. Missing or unreadable metadata never removes an otherwise reachable peer.
+The timestamp records the last description refresh and does not assert that a
+peer is running. Descriptions persist until replaced or explicitly removed.
+
+Stored descriptions are not injected into ordinary system prompts or compacted
+continuations. Description instructions and a bounded hint of the latest
+preserved user intent are appended only to the existing final compaction
+instruction. Cached system/tool definitions, historical messages, and the
+retained recent tail keep their existing bytes and boundaries. The experiment
+is off by default; disabling it preserves the original request and listing
+shape.
+
 ## Editing a prompt
 
 `Ctrl+U` clears the current draft. You can immediately continue typing or paste
@@ -51,6 +90,43 @@ not terminal wrapping, define these boundaries. Navigation and subsequent
 typing share the editor's current buffer and cursor, even in one key burst;
 no redraw is required between them. On an empty draft, `Up` recalls queued
 human messages before history, leaving inbound peer messages queued.
+
+## Steering, queueing and cancellation
+
+These controls apply to the default asynchronous REPL. Starting with
+`SUDOCODE_INTERRUPT_QUEUE_MODE=off` selects the legacy synchronous REPL,
+which retains turn-boundary delivery.
+
+While the model or tools are working:
+
+| Key | Behavior |
+| --- | --- |
+| Enter | Offer the message within the current task. |
+| Tab | Queue the message for the next turn; slash command completion keeps Tab. |
+| Esc with pending messages | Flush the entire queue into the current task. |
+| Esc without pending messages, or Ctrl+C | Cancel the current turn. Ctrl+C always cancels. |
+
+Steering adds ordinary input to the conversation, without an instruction to
+abandon the original task. The model can use a suggestion or treat it as FYI.
+Sampling yields at replayable text or before a tool is admitted. Consecutive
+thinking blocks remain complete and unchanged. Already admitted tools finish
+and their results reach the model before the new input.
+Flush preserves the unsent draft and does not add an interruption marker.
+Cancelling with Esc also keeps the unsent draft; Ctrl+C clears it.
+
+The pending area distinguishes `queued` from `steering`. A steering message
+stays visible until it enters the conversation. `Up` recalls explicitly queued
+human input, keeping peer messages and accepted steering out of the editor.
+Cancellation preserves unapplied messages without automatically restarting
+work; Enter or Esc resumes that retained queue. A second Ctrl+C within 800 ms
+exits. Session management commands require an idle turn and return immediately
+when work is active.
+
+For an interactive peer, `send` accepts `delivery: "steer"` (default) or
+`delivery: "queue"`. Peer provenance and message bodies remain intact. Other
+hosts deliver at their turn boundaries. Delivery intent never grants a peer
+permission to cancel the human's task; the existing structured subagent
+shutdown request remains a separate control operation.
 
 ## Global and project directories
 
@@ -86,10 +162,13 @@ retries its existing node connection, and A2A tools report node IO errors;
 they do not redirect messages to a disk inbox. An uncertain send result must
 not be retried automatically.
 
-While claiming the receiver seat, an unchanged connection error is printed
-once; a different error or a new outage after a successful receiver-seat check
-is reported again. Connection retries continue without repeatedly scrolling the
-input area.
+Background receiver errors are available as `Last RX error` in `/status` and
+`last_receiver_error` in the structured peer status. This is the most recent
+failure in the current process, not a claim that the node remains offline.
+It is retained with the receiver's transient state and removed when its last
+receiver stops. Hosts can also subscribe to structured tracing. An unchanged
+receiver-seat error is recorded once; retries continue without writing into
+the terminal's input area.
 
 This does not start Nexus or mint an agent credential. A missing record still
 selects the same-machine disk namespace. Record parsing, missing credential
@@ -236,6 +315,23 @@ combining sequences whose widths legacy console hosts cannot reliably preserve;
 the original Unicode text is retained without normalization. A clipped paragraph or an
 unusually long result summary can still change its visible position.
 
+Completed `mermaid` fences render as terminal diagrams through the same Markdown
+path for streamed answers, replay and Markdown prompts. The renderer reuses
+Codex's pinned native engine; no browser, JavaScript runtime or external process
+is needed. Diagram borders use the existing theme and `NO_COLOR` remains supported.
+
+Use compact flowcharts, sequence diagrams, flat state diagrams, class diagrams
+or ER diagrams. Prefer `flowchart TD` on narrow terminals. See the upstream
+[supported syntax and limits](../rust/vendor/codex-mermaid/README.md): this is a
+bounded subset rather than full Mermaid support. Unfinished fences stay source;
+unsupported syntax or diagrams that cannot fit show a reason and the original
+source. Control characters in source fallback display as escapes. The persisted
+Markdown stays unchanged, and replay renders against its current terminal width;
+diagrams already committed to native scrollback do not reflow on resize.
+
+The default system prompt advertises when a diagram helps and how to stay within
+this subset. Explicit system-prompt replacement still replaces those defaults.
+
 The live UI retains the existing formatter colors and supported text styles:
 tool-card borders show status without extra icons: muted while waiting for
 hooks, approval, or an execution slot; amber while running; the code theme's
@@ -377,8 +473,9 @@ same editor, preserving the complete text and cursor.
 The choice controls stay visible while the document is read in native history
 or the pager. If the terminal is too small to show those controls
 safely, an enlargement warning replaces the panel; confirmation and hidden
-edits are disabled, but Esc/Ctrl-C can still cancel. Resizing does not answer a
-question, alter the saved plan, or clear conversation history.
+edits are disabled. Ctrl+C can still cancel; Esc follows the pending-message
+controls described above. Resizing does not answer a question, alter the saved
+plan, or clear conversation history.
 
 `write_plan` saves the complete Markdown document, including Context,
 Constraints, and Acceptance Criteria, before presenting it for review. The
@@ -398,14 +495,16 @@ conversation. The current input draft is retained. For UI that fits within
 the viewport, resize clears only the live UI from its retained start position,
 without clearing the preceding conversation or purging terminal scrollback.
 
-While a turn is running, messages you submit wait in the staging area.
+While a turn is running, Enter steers the current task and Tab queues a message
+for the next turn. Pending messages stay visible in the staging area until
+consumed, with `queued` and `steering` labels indicating their delivery state.
 Each queued preview uses a muted label and normal-intensity message text;
 narrow windows shorten the label and clip the preview, not the queued text.
 Press ↑ on an empty input to bring all queued human messages back for editing,
 joined in their original submit order. Their staging entries disappear;
 peer/A2A messages remain queued. The cursor starts at the end of the recalled
-text, and further arrow presses use normal cursor navigation. Submitting it
-queues the edited text again. On an empty input with no queued human message,
+text, and further arrow presses use normal cursor navigation. Enter steers with
+the edited text; Tab queues it again. On an empty input with no queued human message,
 ↑ recalls prompt history.
 
 A line starting with `!` runs the rest as a shell command instead of
@@ -791,9 +890,19 @@ scode --model <vision-model> 'Describe @/absolute/path/screenshot.png'
 scode --model <vision-model> 'Describe @"screenshots/home page.png"'
 ```
 
-The synchronous REPL also submits clipboard images pasted alongside a text
-prompt. Image bytes are validated and preflighted before being sent; a missing
-or invalid referenced image produces an error rather than a text-only request.
+In the REPL, paste a clipboard image with **Alt+V**, with **Ctrl+V** where the
+terminal passes it through, or with the terminal's own paste (Cmd+V on macOS)
+when the clipboard holds only an image. On Windows Terminal, Ctrl+V is the
+terminal's text paste, so use Alt+V there. The image shows as `[Image #N]` in
+the default REPL and as its `@"path"` reference in the classic synchronous REPL,
+and it is attached on submit exactly like a typed reference: a copied image file
+is referenced where it is, and pasted image data is stored in the image cache
+first. For scripts and tests, `SUDOCODE_CLIPBOARD_IMAGE=<file>` stands in for
+the system clipboard, which is then never read: the clipboard holds only the
+image in that file, or no image when the file is not one.
+
+Image bytes are validated and preflighted before being sent; a missing or
+invalid referenced image produces an error rather than a text-only request.
 Repeated references to the same spelling of a path attach it once per prompt.
 
 Agents can inspect images using `Read` (`read_file`). For example, after the
