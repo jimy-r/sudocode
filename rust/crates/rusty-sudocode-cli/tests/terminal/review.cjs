@@ -11,6 +11,41 @@ function countLines(host, expected, kind) {
     bullet.test(line) && line.includes(`ReviewLine${String(i).padStart(3, '0')}:`)).length);
 }
 
+function documentStyles(host, config) {
+  const expected = [
+    ['Full review document', !config.isNoColor, false],
+    ['ReviewLine000', !config.isNoColor, false],
+    ['src/main.rs', false, !config.isNoColor],
+  ];
+  if (config.kind === 'plan') expected.push(['Context', !config.isNoColor, false]);
+  const buffer = host.terminal.buffer.active;
+  return expected.map(([needle, bold, colored]) => {
+    const matches = [];
+    for (let row = 0; row < buffer.length; row++) {
+      const line = buffer.getLine(row), text = line.translateToString(true);
+      const body = config.kind === 'plan' ? text.match(/^\s*│\s?(.*)$/)?.[1] : text;
+      if (body === undefined) continue;
+      const content = body.trim();
+      if (needle === 'ReviewLine000'
+        ? !/^[•*-]\s+ReviewLine000:/.test(content) : content !== needle) continue;
+      const at = text.indexOf(needle);
+      let offset = 0;
+      for (let col = 0; col < host.terminal.cols; col++) {
+        const cell = line.getCell(col);
+        const chars = cell.getChars() || (cell.getWidth() === 0 ? '' : ' ');
+        if (chars && offset === at) {
+          matches.push({ bold: Boolean(cell.isBold()), colored: cell.getFgColorMode() !== 0 });
+          break;
+        }
+        offset += chars.length;
+      }
+    }
+    assert.deepEqual(matches, [{ bold, colored }],
+      `${needle}: review styles survive history, resize and inspection (NoColor=${config.isNoColor})`);
+    return { needle, ...matches[0] };
+  });
+}
+
 async function review(host, config) {
   const hasControls = () => host.viewport().split('\n').some(line => config.kind === 'plan'
     ? /^\s*\[2\] Keep context & execute/.test(line)
@@ -31,6 +66,7 @@ async function review(host, config) {
       'resumed history survives review');
     assert.deepEqual(countLines(host, config.expected, config.kind), Array(config.expected).fill(1),
       `every rendered line is available exactly once\n${host.snapshot()}`);
+    documentStyles(host, config);
   };
   history();
   const inspect = async () => {
@@ -100,9 +136,10 @@ async function review(host, config) {
   if (frozenPlan !== null) assert.equal(fs.readFileSync(planPath, 'utf8'), frozenPlan,
     'inspection and rejection do not rewrite the frozen review source');
   fs.writeFileSync(path.join(config.logRoot, 'review-result.json'), JSON.stringify({
-    kind: config.kind, lines: config.expected, reading_position: reading,
+    kind: config.kind, no_color: config.isNoColor, lines: config.expected, reading_position: reading,
     reading_updates: readingUpdates,
     after: countLines(host, config.expected, config.kind),
+    styles: documentStyles(host, config),
   }, null, 2));
 }
 

@@ -193,19 +193,17 @@ fn assert_document(sess: &PtySession, no_color: bool) {
         ],
     );
     let start = text
-        .rfind("[Choose an action]")
-        .or_else(|| text.rfind("Choose an action\n"));
-    if let Some(start) = start {
-        let document = &text[start..];
-        assert!(
-            !document.contains("**Verify bold**"),
-            "emphasis must be rendered: {document}"
-        );
-        assert!(
-            !document.contains("```rust"),
-            "fences must be rendered: {document}"
-        );
-    }
+        .rfind("╭─ Plan · awaiting review")
+        .expect("the complete saved plan has its own review frame");
+    let document = &text[start..];
+    assert!(
+        !document.contains("**Verify bold**"),
+        "emphasis must be rendered: {document}"
+    );
+    assert!(
+        !document.contains("```rust"),
+        "fences must be rendered: {document}"
+    );
 }
 
 fn choose(sess: &mut PtySession, queue: bool, choice: &str) {
@@ -363,16 +361,9 @@ fn approve(queue: bool, clear: bool, no_color: bool) {
         "saved document: {saved}"
     );
     assert_document(&sess, no_color);
-    if queue {
-        sess.resize(100, 72).unwrap();
-        common::expect_screen(
-            &sess,
-            |s| s.contains("let verified = true;") && s.contains("Keep context & execute"),
-            env.timeout(),
-            "reflowed plan",
-        );
-        assert_document(&sess, no_color);
-    }
+    // The pinned native terminal in pty_review_scrollback verifies styles
+    // through resize and history movement in color and NoColor. This PTY's
+    // screen-only parser has no scrollback to inspect after that movement.
     let marker = common::turn_status_marker(&sess);
     choose(&mut sess, queue, if clear { "1" } else { "2" });
     common::expect_turn_complete_after(
