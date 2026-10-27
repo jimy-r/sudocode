@@ -1285,7 +1285,7 @@ fn run_cache_stats(output_format: CliOutputFormat) -> Result<(), Box<dyn std::er
     }
     println!("  interval data   per-session in JSON; response completion, expiry unconfirmed");
     if runtime::experiments::is_enabled(runtime::experiments::Experiment::CacheTtlAdvisor) {
-        println!("  TTL advice      advisory only; decisions and forward scenarios in JSON; requests unchanged");
+        println!("  TTL advice      unpinned sessions follow it (cache_ttl_1h pins); decisions and forward scenarios in JSON");
     }
     println!("  breaks          {unexpected} unexpected, {expected} expected");
     if !by_cause.is_empty() {
@@ -3464,16 +3464,23 @@ fn echo_peer_to_scrollback(output: &repl_ui::OutputSender, prompt: &str) {
     output.print_block(rendered);
 }
 
-/// The footer's cache-TTL tip and whether it offers a switch.
+/// The footer's cache-TTL tip and whether it offers a choice. Pinned, the tip
+/// suggests the other TTL; automatic, it is a stop only while a move to 1h
+/// waits for a cold point, which can be applied now or pinned instead.
 fn cache_tip(session_id: &str, model: &str) -> repl_ui::CacheTip {
     let advice = engine_core::cache_advisor::ttl_advice(session_id, model);
+    let just_switched = engine_core::cache_ttl::take_switch_notice(session_id);
     let actionable = advice.as_ref().is_some_and(|advice| {
-        advice.pending.is_none()
-            && advice.has_saving
-            && advice.suggested_seconds != advice.effective_seconds
+        if advice.auto {
+            !just_switched && advice.auto_target() == 3600 && advice.effective_seconds == 300
+        } else {
+            advice.pending.is_none()
+                && advice.has_saving
+                && advice.suggested_seconds != advice.effective_seconds
+        }
     });
     repl_ui::CacheTip {
-        tip: engine_core::cache_advisor::session_tip(session_id, model),
+        tip: engine_core::cache_advisor::session_tip(session_id, model, just_switched),
         advice,
         actionable,
     }
@@ -3500,8 +3507,18 @@ fn apply_cache_ttl(
         }
         (TtlChoice::OneHour, true) => "1h from the next request (rewrites the cached prefix once)",
         (TtlChoice::FiveMinutes, _) => "5m from the next request",
-        (TtlChoice::Auto, _) => {
+        (TtlChoice::Auto, _)
+            if !runtime::experiments::is_enabled(
+                runtime::experiments::Experiment::CacheTtlAdvisor,
+            ) =>
+        {
             "auto: the auth mode decides (1h on a subscription, 5m on an API key)"
+        }
+        (TtlChoice::Auto, false) => {
+            "auto: follows this session's cache stats (to 5m at once, to 1h at the next cold start)"
+        }
+        (TtlChoice::Auto, true) => {
+            "auto: follows this session's cache stats, from the next request"
         }
     };
     match saved {
@@ -3511,12 +3528,41 @@ fn apply_cache_ttl(
 }
 
 /// `Prompt cache TTL: …` for `/cache` and `/cache ttl`.
-fn cache_ttl_status(session_id: &str) -> String {
+fn cache_ttl_status(session_id: &str, model: &str) -> String {
+    use engine_core::cache_advisor::{ttl_label, MIN_INTERVALS};
     use engine_core::cache_ttl::TtlChoice;
     let status = engine_core::cache_ttl::status(session_id);
-    let now = status
-        .effective_seconds
-        .map_or("not sent yet", engine_core::cache_advisor::ttl_label);
+    let now = status.effective_seconds.map_or("not sent yet", ttl_label);
+    if status.auto {
+        let verdict = engine_core::cache_advisor::ttl_advice(session_id, model).map_or(
+            String::new(),
+            |advice| {
+                let target = advice.auto_target();
+                let heading = if target == advice.effective_seconds {
+                    String::new()
+                } else if target == 3600 {
+                    ", switching to 1h at the next cold start".to_owned()
+                } else {
+                    format!(", switching to {} at the next request", ttl_label(target))
+                };
+                if !advice.has_evidence {
+                    format!(
+                        ": collecting {}/{MIN_INTERVALS} reuse intervals{heading}",
+                        advice.intervals
+                    )
+                } else if advice.has_saving {
+                    format!(
+                        ": {} ≈{:.0}% cheaper here{heading}",
+                        ttl_label(advice.suggested_seconds),
+                        advice.saving_pct()
+                    )
+                } else {
+                    format!(": 5m and 1h within 10% here{heading}")
+                }
+            },
+        );
+        return format!("Prompt cache TTL: {now} · auto{verdict}");
+    }
     let pending = status.pending.map_or(String::new(), |pending| {
         let (label, when) = match (pending.choice, pending.force_now) {
             (TtlChoice::OneHour, false) => ("1h", "at the next cold start"),
@@ -5821,7 +5867,10 @@ impl LiveCli {
                 let session = self.lifecycle.session_snapshot();
                 let usage = UsageTracker::from_session(&session).cumulative_usage();
                 self.out_println(format_cost_report(usage));
-                self.out_println(cache_ttl_status(&self.lifecycle.session_handle().id));
+                self.out_println(cache_ttl_status(
+                    &self.lifecycle.session_handle().id,
+                    &self.lifecycle.current_model(),
+                ));
                 false
             }
             SlashCommand::CacheTtl { value, now } => {
@@ -5835,7 +5884,10 @@ impl LiveCli {
                 };
                 match choice {
                     Some(choice) => self.out_println(apply_cache_ttl(&session_id, choice, now)),
-                    None => self.out_println(cache_ttl_status(&session_id)),
+                    None => self.out_println(cache_ttl_status(
+                        &session_id,
+                        &self.lifecycle.current_model(),
+                    )),
                 }
                 false
             }
