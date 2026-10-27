@@ -846,6 +846,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let is_interactive_session = matches!(&action, CliAction::Repl { .. })
         || matches!(&action, CliAction::ResumeSession { commands, output_format: CliOutputFormat::Text, .. } if commands.is_empty());
     if is_interactive_session {
+        cli::setup::startup_prompt(matches!(&action, CliAction::Repl { .. }))?;
         cli::update::startup_prompt()?;
     }
     // Informational commands (help, version, config, login, logout) are
@@ -853,11 +854,37 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     // If an ensure_authenticated() call is ever added below this point it
     // MUST be guarded by `if !action.is_informational()`.
     match action {
-        CliAction::Service { is_daemon } => {
-            let result = if is_daemon {
-                service_host::run_daemon()
-            } else {
-                service_host::run_stdio()
+        CliAction::Setup {
+            mode,
+            owner_root,
+            check,
+            output_format,
+        } => cli::setup::run(mode, owner_root, check, output_format)?,
+        CliAction::Service { action } => {
+            use cli::args::ServiceSub;
+            let result = match action {
+                ServiceSub::Daemon => service_host::run_daemon(),
+                ServiceSub::Stdio => service_host::run_stdio(),
+                ServiceSub::RegisterLocalBox { config, owner_root } => {
+                    service_host::register_local_box(&config, owner_root.as_deref())
+                        .map(|result| println!("{result}"))
+                }
+                ServiceSub::StopLocalBox {
+                    node_id,
+                    binary_sha256,
+                    owner_root,
+                    acknowledge_shared_outage: true,
+                } => {
+                    let owner_root = match owner_root {
+                        Some(root) => Some(root),
+                        None => cli::setup::selected_owner_root()?,
+                    };
+                    service_host::stop_local_box(&node_id, &binary_sha256, owner_root.as_deref())
+                        .map(|result| println!("{result}"))
+                }
+                ServiceSub::StopLocalBox { .. } => {
+                    return Err("A shared Box stop requires explicit outage acknowledgement".into())
+                }
             };
             result.map_err(|error| error as Box<dyn std::error::Error>)?;
         }
@@ -2866,6 +2893,7 @@ fn show_effort_selection(
     Some(show_slash_selection(
         ui,
         repl_ui::QuestionPromptView {
+            presentation: runtime::QuestionPresentation::Question,
             title: Some("Reasoning effort".to_string()),
             description: Some(
                 format!(
@@ -2934,6 +2962,7 @@ impl IocraftQuestionPrompter {
     fn show_field(&self, request: &runtime::QuestionPromptRequest, index: usize) {
         let field = &request.fields[index];
         self.ui.show_question(repl_ui::QuestionPromptView {
+            presentation: request.presentation.clone(),
             title: request.title.clone(),
             description: request.description.clone(),
             index,
@@ -3058,6 +3087,7 @@ impl runtime::PermissionPrompter for IocraftQuestionPrompter {
         request: &runtime::PermissionRequest,
     ) -> runtime::PromptReply<runtime::PermissionPromptDecision> {
         let question = runtime::QuestionPromptRequest {
+            presentation: runtime::QuestionPresentation::Question,
             title: Some(format!("Approve {}?", request.tool_name)),
             description: Some(
                 format!(
@@ -4055,6 +4085,7 @@ fn run_repl_iocraft_dispatch(
                             pending_slash_selection = Some(show_slash_selection(
                                 &repl_ui_cmd,
                                 repl_ui::QuestionPromptView {
+                                    presentation: runtime::QuestionPresentation::Question,
                                     title: Some("Model".to_string()),
                                     description: Some(format!("Current: {current}").into()),
                                     index: 0,
@@ -4635,24 +4666,34 @@ impl runtime::QuestionPrompter for CliQuestionPrompter {
         &mut self,
         request: &runtime::QuestionPromptRequest,
     ) -> Result<Vec<runtime::QuestionPromptAnswer>, String> {
-        if let Some(title) = &request.title {
+        let is_plan = matches!(
+            request.presentation,
+            runtime::QuestionPresentation::PlanReview { .. }
+        );
+        if let Some(title) = request.title.as_ref().filter(|_| !is_plan) {
             println!();
             println!("{title}");
         }
         if let Some(description) = &request.description {
-            let rendered = TerminalRenderer::new().render_prompt_text(
+            let text = TerminalRenderer::new().render_question_document(
                 description,
-                render::query_terminal_width().saturating_sub(2),
+                &request.presentation,
+                render::query_terminal_width().saturating_sub(if is_plan { 0 } else { 2 }),
             );
-            let mut text = String::new();
-            rendered.write_ansi(0..rendered.text.len(), &mut text);
-            for line in text.lines() {
-                println!("  {line}");
+            if is_plan {
+                println!("{text}");
+            } else {
+                for line in text.lines() {
+                    println!("  {line}");
+                }
             }
         }
         let mut answers = Vec::new();
         for field in &request.fields {
-            if !field.prompt.is_empty() && request.title.as_deref() != Some(field.prompt.as_str()) {
+            if is_plan
+                || (!field.prompt.is_empty()
+                    && request.title.as_deref() != Some(field.prompt.as_str()))
+            {
                 println!();
                 println!("{}", field.prompt);
             }

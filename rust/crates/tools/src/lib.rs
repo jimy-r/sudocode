@@ -287,6 +287,7 @@ use runtime::{
     cron_registry::CronRegistry,
     current_workspace_root, dedupe_superseded_commit_events, edit_file, glob_search,
     permission_enforcer::{EnforcementResult, PermissionEnforcer},
+    plan_store::compose_task_framing,
     read_file,
     summary_compression::compress_summary_text,
     todo_store::TodoStore,
@@ -4200,17 +4201,6 @@ fn with_task_template(mut schema: serde_json::Value, required: bool) -> serde_js
     schema
 }
 
-/// Compose the shared task-framing sections into a markdown block, prepended to
-/// a plan body or a handed-off task prompt so both carry the same structure.
-fn compose_task_framing(context: &str, constraints: &str, acceptance: &str) -> String {
-    format!(
-        "## Context\n{}\n\n## Constraints\n{}\n\n## Acceptance Criteria\n{}\n",
-        context.trim(),
-        constraints.trim(),
-        acceptance.trim(),
-    )
-}
-
 /// Like [`compose_task_framing`] but for the optional `send` path: returns
 /// `None` when none of the three fields carry content (a plain chat message),
 /// so only a genuine task hand-off gets the framing block. Empty fields are
@@ -4238,14 +4228,19 @@ fn run_write_plan(input: WritePlanInput, fs: &Arc<dyn FsBackend>) -> Result<Stri
     }
     // The plan file is the SSOT — always structured: the three framing sections
     // (enforced as required params) then the plan body.
-    let framing = compose_task_framing(&input.context, &input.constraints, &input.acceptance);
-    let document = format!("{framing}\n{content}\n");
+    let document = runtime::plan_store::compose_document(
+        &input.context,
+        &input.constraints,
+        &input.acceptance,
+        content,
+    );
     let path = runtime::plan_store::write_plan(&document, fs)?;
-    to_pretty_json(json!({
-        "ok": true,
-        "planFile": path.display().to_string(),
-        "message": "Plan saved.",
-    }))
+    serde_json::to_string_pretty(&runtime::plan_store::PlanReviewResult::new(
+        runtime::plan_store::PlanReviewStatus::DraftSaved,
+        path.display().to_string(),
+        "Plan saved.".into(),
+    ))
+    .map_err(|error| error.to_string())
 }
 
 fn run_structured_output(input: StructuredOutputInput) -> Result<String, String> {
