@@ -252,7 +252,10 @@ fn final_snapshots(fixture: &Value) -> Vec<&Value> {
     };
     let mut finals: Vec<&Value> = Vec::new();
     for snapshot in fixture["snapshots"].as_array().unwrap() {
-        match finals.iter().position(|s| identity(s) == identity(snapshot)) {
+        match finals
+            .iter()
+            .position(|s| identity(s) == identity(snapshot))
+        {
             Some(position) => finals[position] = snapshot,
             None => finals.push(snapshot),
         }
@@ -358,6 +361,11 @@ fn usage_fixture_report(id: &str) -> (Value, Value) {
     let fixture = usage_fixture(id);
     let env = TestEnv::new_mock(&format!("cache-usage-{id}"));
     write_usage_fixture(&env, &fixture);
+    let report = cache_stats_report(&env);
+    (fixture, report)
+}
+
+fn cache_stats_report(env: &TestEnv) -> Value {
     let mut cli = env.spawn(&["cache", "stats", "--output-format", "json"]);
     cli.resize(180, 400).unwrap();
     cli.expect("forward_comparison").unwrap();
@@ -367,7 +375,7 @@ fn usage_fixture_report(id: &str) -> (Value, Value) {
     let last = screen.rfind('}').unwrap();
     let report: Value = serde_json::from_str(&screen[first..=last]).unwrap();
     assert_eq!(env.captured_message_count(), 0);
-    (fixture, report)
+    report
 }
 
 fn assert_report_counts_fixture(fixture: &Value, report: &Value) {
@@ -421,6 +429,137 @@ fn usage_fixture_counts_each_final_snapshot_once() {
         .collect();
     assert_eq!(twins.len(), 2, "matching usage must not merge requests");
     assert_ne!(twins[0]["request_id"], twins[1]["request_id"]);
+}
+
+#[test]
+fn growing_snapshots_replace_usage_without_merging_distinct_attempts() {
+    let fixture = usage_fixture("growing_snapshots_distinct_attempts");
+    let env = TestEnv::new_mock("cache-growing-attempts");
+    // Verify growth before adding the reused-ID attempt. Otherwise counting an
+    // extra partial snapshot and dropping that attempt can cancel each other.
+    let mut growing = fixture.clone();
+    growing["snapshots"].as_array_mut().unwrap().pop();
+    growing["expected"] = usage_fixture("repeated_final_snapshots")["expected"].clone();
+    growing["expected"]["duplicate_snapshots_ignored"] = json!(4);
+    assert_fixture_totals(&growing);
+    write_usage_fixture(&env, &growing);
+    assert_report_counts_fixture(&growing, &cache_stats_report(&env));
+
+    write_usage_fixture(&env, &fixture);
+    let report = cache_stats_report(&env);
+    let finals = assert_fixture_totals(&fixture);
+    assert_report_counts_fixture(&fixture, &report);
+    let attempts: Vec<_> = finals
+        .iter()
+        .filter(|s| s["request_id"] == "dedup-request-2")
+        .collect();
+    assert_eq!(attempts.len(), 2);
+    assert_ne!(
+        attempts[0]["request_started_ms"],
+        attempts[1]["request_started_ms"]
+    );
+    assert_eq!(attempts[0]["usage"], attempts[1]["usage"]);
+    assert_eq!(
+        attempts[0]["response_completed_ms"],
+        attempts[1]["response_completed_ms"]
+    );
+}
+
+#[test]
+fn stats_keep_attempt_metadata_and_malformed_adjacency_barriers() {
+    let env = TestEnv::new_mock("cache-attempt-barriers");
+    let fixture = usage_fixture("repeated_final_snapshots");
+    write_usage_fixture(&env, &fixture);
+    let path = env
+        .config_home()
+        .join("cache/prompt-cache")
+        .join(fixture["session_id"].as_str().unwrap())
+        .join("requests.jsonl");
+    let original = std::fs::read_to_string(&path).unwrap();
+    let row: Value = serde_json::from_str(original.lines().next().unwrap()).unwrap();
+    let mut rows = vec![row.clone()];
+    for (field, value) in [
+        ("attempts", json!(2)),
+        ("route_key", json!("other-route")),
+        ("context_segment", json!(1)),
+    ] {
+        let mut distinct = row.clone();
+        distinct["observation"][field] = value;
+        rows.push(distinct);
+    }
+    // Malformed data must interrupt adjacency; a later unidentified request is
+    // retained, rather than guessed to be another snapshot of the earlier one.
+    let mut unknown = row;
+    unknown
+        .as_object_mut()
+        .unwrap()
+        .remove("gateway_request_id");
+    let mut ledger = rows
+        .iter()
+        .map(Value::to_string)
+        .collect::<Vec<_>>()
+        .join("\n");
+    ledger.push_str("\n{partial row\n");
+    ledger.push_str(&unknown.to_string());
+    std::fs::write(path, ledger).unwrap();
+    let report = cache_stats_report(&env);
+    let session = &report["per_session"][0];
+    assert_eq!(session["completion_intervals"]["rows"], 5);
+    assert_eq!(session["completion_intervals"]["malformed_rows"], 1);
+    assert_eq!(session["completion_intervals"]["under_5m"], 3);
+    assert_eq!(session["ttl_advisor"]["coverage"]["rows"], 6);
+    assert_eq!(
+        session["ttl_advisor"]["coverage"]["legacy_or_malformed_rows"],
+        1
+    );
+    assert_eq!(
+        session["ttl_advisor"]["coverage"]["duplicate_snapshots_ignored"],
+        0
+    );
+}
+
+#[test]
+fn legacy_missing_usage_is_not_a_zero_usage_snapshot() {
+    let env = TestEnv::new_mock("cache-legacy-missing-usage");
+    std::fs::write(
+        env.config_home().join("settings.json"),
+        json!({"experimental":{"cacheTtlAdvisor":true}}).to_string(),
+    )
+    .unwrap();
+    let directory = env.config_home().join("cache/prompt-cache/legacy-usage");
+    std::fs::create_dir_all(&directory).unwrap();
+    let stats = engine_core::PromptCacheStats {
+        tracked_requests: 2,
+        ..Default::default()
+    };
+    std::fs::write(
+        directory.join("stats.json"),
+        serde_json::to_vec(&stats).unwrap(),
+    )
+    .unwrap();
+    let missing = json!({"gateway_request_id":"legacy-request", "model":"claude-opus-5-5",
+        "at_unix_secs":1000, "input_tokens":0, "cache_read_input_tokens":0});
+    let mut zero = missing.clone();
+    zero["cache_creation_input_tokens"] = json!(0);
+    std::fs::write(
+        directory.join("requests.jsonl"),
+        format!("{missing}\n{zero}\n"),
+    )
+    .unwrap();
+    let report = cache_stats_report(&env);
+    let session = &report["per_session"][0];
+    assert_eq!(session["completion_intervals"]["rows"], 2);
+    assert_eq!(session["completion_intervals"]["duplicate_rows_ignored"], 0);
+    assert_eq!(session["ttl_advisor"]["coverage"]["rows"], 2);
+    assert_eq!(
+        session["ttl_advisor"]["coverage"]["legacy_or_malformed_rows"],
+        2
+    );
+    assert_eq!(
+        session["ttl_advisor"]["coverage"]["duplicate_snapshots_ignored"],
+        0
+    );
+    assert_eq!(session["cache_efficiency"]["read_share_pct"], Value::Null);
 }
 
 #[test]
@@ -488,8 +627,7 @@ fn usage_fixture_compaction_keeps_one_session_and_both_totals() {
         .filter(|s| s["request_kind"] == "compaction")
         .count();
     assert_eq!(
-        report["per_session"][0]["ttl_advisor"]["coverage"]["ineligible_rows"],
-        compactions,
+        report["per_session"][0]["ttl_advisor"]["coverage"]["ineligible_rows"], compactions,
         "a compaction request counts in the session but is not an advisor interval"
     );
 }

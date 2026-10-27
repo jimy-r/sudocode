@@ -31,6 +31,7 @@ on:
       - scripts/publish_release_mirror.py
       - scripts/generate_cache_metrics.py
       - scripts/cache_metrics.py
+      - scripts/check_cache_usage_fixtures.py
       - spec/cache_metrics.json
       - spec/prompt_cache_observations.json
       - spec/cache_usage_fixtures.json
@@ -65,6 +66,7 @@ on:
       - scripts/publish_release_mirror.py
       - scripts/generate_cache_metrics.py
       - scripts/cache_metrics.py
+      - scripts/check_cache_usage_fixtures.py
       - spec/cache_metrics.json
       - spec/prompt_cache_observations.json
       - spec/cache_usage_fixtures.json
@@ -151,6 +153,14 @@ jobs:
         run: cargo fmt --all --check
       - name: Check generated cache metrics
         run: python3 ../scripts/generate_cache_metrics.py --check
+      - name: Validate public cache usage fixtures
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Check public cache usage fixtures
+        run: |
+          python3 -m pip install jsonschema==4.26.0
+          python3 ../scripts/check_cache_usage_fixtures.py
 
   boundary-gate:
     if: *standard_ci

@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "spec/cache_usage_fixtures.schema.json",
   "title": "Synthetic cache usage fixtures",
-  "description": "Proposed schema for synthetic usage snapshots and the totals a cache report must derive from them. Field names follow the Anthropic usage fields in spec/prompt_cache_observations.json.",
+  "description": "Shared schema for synthetic usage snapshots and the totals a cache report must derive from them. Field names follow the Anthropic usage fields in spec/prompt_cache_observations.json.",
   "type": "object",
   "required": ["schema_version", "scope", "schema", "metrics_spec", "evidence_scope", "counting_rules", "fixtures"],
   "additionalProperties": false,

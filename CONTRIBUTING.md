@@ -325,8 +325,26 @@ the same public file by commit and SHA-256. Cache efficiency formulas remain
 in [`spec/cache_metrics.json`](./spec/cache_metrics.json). Synthetic usage
 snapshots with expected totals live in
 [`spec/cache_usage_fixtures.json`](./spec/cache_usage_fixtures.json), with a
-proposed [schema](./spec/cache_usage_fixtures.schema.json) beside it. Report
+validated [schema](./spec/cache_usage_fixtures.schema.json) beside it. Report
 and scanner adapters should reproduce those totals.
+
+Completion intervals and TTL advisor coverage share the bounded ledger reader
+in `engine-core::cache_report`. With attempt timing, the final cumulative
+snapshot replaces earlier snapshots of the same request identity. Different
+attempt starts, attempt counts, routes, models and context segments stay
+separate. Legacy rows without attempt timing deduplicate only exact repeats;
+missing correlation IDs remain separate. Malformed rows interrupt adjacency.
+Missing usage fields remain unknown and do not match an explicit zero.
+The JSON stats report reads the ledger once for both views.
+
+The fixture PTYs exercise that reader, reporting and shared metric formulas.
+Their `stats.json` rollup is prefilled from expected totals, so they do not
+establish the runtime's accumulation of those totals, provider cache hits or
+measured TTL savings. The growing-snapshot fixture also retains two attempts
+that reuse a correlation ID. Reuse these public fixtures when adding scanner
+or runtime adapters, rather than maintaining another copy of the observations.
+Validate the schema with `python scripts/check_cache_usage_fixtures.py`
+(`jsonschema==4.26.0`); Rust CI runs this check, including invalid variants.
 
 ### Startup latency
 
