@@ -2940,8 +2940,8 @@ pub fn spawn_repl_ui(
             };
             let render = app.render_loop().ignore_ctrl_c();
             let render = if transcript.is_some() {
-                // Keep the existing inline damage writer: it updates changed
-                // cell ranges, while the fullscreen path rewrites whole rows.
+                // Keep the inline renderer in the main terminal buffer. Mouse
+                // reporting supplies navigation for the conversation viewport.
                 render.enable_mouse_capture()
             } else {
                 render

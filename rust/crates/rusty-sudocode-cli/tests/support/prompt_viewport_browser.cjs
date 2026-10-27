@@ -29,7 +29,7 @@ const server = http.createServer((request, response) => {
 const websocket = new WebSocketServer({ server });
 const report = { status: 'running', enabled: config.enabled, samples: [], frame_samples: [], checks: [], metrics: {}, resources: [],
   measurement: 'Real Chromium mouse/keyboard. Parsed keys use one browser clock; painted keys include dispatch, two animation frames and PNG readback. No physical display scanout measurement.',
-  resource_scope: 'Dedicated browser process tree, including renderer/GPU; summed RSS can count shared pages more than once. Observer Node process excluded. Memory accounting requires Linux/macOS.' };
+  resource_scope: 'Dedicated browser process tree, including renderer/GPU; summed RSS can count shared pages more than once. Peak sums per-process high-water RSS where available, otherwise phase samples. Observer Node process excluded. Memory accounting requires Linux/macOS.' };
 let child, browser, page, exited = false;
 const wire = [];
 websocket.on('connection', socket => {
@@ -63,7 +63,7 @@ websocket.on('connection', socket => {
       }).filter(Boolean);
       const memoryAvailable = process.platform !== 'win32';
       const rss = memoryAvailable ? rows.reduce((total, row) => total + row.rss_mib, 0) : null;
-      if (rss !== null) peak = Math.max(peak, rss);
+      if (rss !== null) peak = Math.max(peak, rows.reduce((total, row) => total + row.peak_mib, 0));
       const sample = { label, processes: rows, cpu_ms: [...cpu.values()].reduce((sum, value) => sum + value, 0), rss_mib: rss };
       report.resources.push(sample);
       return sample;

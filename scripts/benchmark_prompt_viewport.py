@@ -53,7 +53,7 @@ def main():
                   "e2e/terminal-resize/gui-policy.json", "e2e/terminal-resize/gui.html",
                   "e2e/terminal-resize/resources.cjs",
               ]},
-              "measurement": "Same binary, enabled/disabled. Headless CPU/output comparisons cover identical typing phases; extra scrolling and total costs remain in every sample. Browser painting includes two animation frames and PNG readback; browser RSS is phase-sampled."}
+              "measurement": "Same binary, enabled/disabled. Headless CPU/output comparisons cover identical typing phases; extra scrolling and total costs remain in every sample. Browser painting includes two animation frames and PNG readback; RSS uses phase samples and per-process high-water values where available."}
 
     def sample(stage, number, side, enabled):
         location = args.output / f"{stage}-{number:02d}-{side}"
