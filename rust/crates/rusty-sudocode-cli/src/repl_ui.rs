@@ -194,6 +194,7 @@ pub struct QuestionOptionView {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct QuestionPromptView {
+    pub presentation: runtime::QuestionPresentation,
     pub title: Option<String>,
     pub description: Option<runtime::PromptText>,
     pub index: usize,
@@ -1480,9 +1481,10 @@ fn ReplApp(mut hooks: Hooks) -> impl Into<AnyElement<'static>> {
                         InputSlot::FuzzySelect(state) => Some(&state.question),
                         _ => None,
                     };
-                    if let Some(description) = question.and_then(|q| q.description.as_ref()) {
+                    if let Some(question) = question.filter(|q| q.description.is_some()) {
                         let document = prompt_text::render_document(
-                            description,
+                            question.description.as_ref().expect("description checked"),
+                            &question.presentation,
                             crate::render::query_terminal_width(),
                         );
                         let _ = input_tx_for_events.send(InputEvent::InspectDocument(document));
@@ -1978,6 +1980,7 @@ fn ReplApp(mut hooks: Hooks) -> impl Into<AnyElement<'static>> {
                                 if let Some(description) = &question.description {
                                     let document = prompt_text::render_document(
                                         description,
+                                        &question.presentation,
                                         crate::render::query_terminal_width(),
                                     );
                                     write_iocraft_output(&stdout_for_future, &document, true);
@@ -2911,6 +2914,7 @@ mod tests {
 
     fn question_with_options() -> QuestionPromptView {
         QuestionPromptView {
+            presentation: runtime::QuestionPresentation::Question,
             title: Some("Setup".to_string()),
             description: None,
             index: 0,
@@ -2942,6 +2946,7 @@ mod tests {
     #[test]
     fn enter_in_question_mode_routes_answer_instead_of_prompt() {
         let question = QuestionPromptView {
+            presentation: runtime::QuestionPresentation::Question,
             title: None,
             description: None,
             index: 0,
