@@ -233,14 +233,14 @@ type BackendResolver = dyn Fn() -> Result<Arc<dyn FsBackend>, String> + Send + S
 /// Resolving must keep the selected namespace and return the actual backend;
 /// it must never substitute a local filesystem after an error.
 #[derive(Clone)]
-enum MailboxBackend {
+pub(crate) enum MailboxBackend {
     Fixed(Arc<dyn FsBackend>),
     Resolving(Arc<BackendResolver>),
 }
 
 impl MailboxBackend {
     #[inline]
-    fn resolve(&self) -> Result<Arc<dyn FsBackend>, String> {
+    pub(crate) fn resolve(&self) -> Result<Arc<dyn FsBackend>, String> {
         match self {
             Self::Fixed(backend) => Ok(Arc::clone(backend)),
             Self::Resolving(resolve) => resolve(),
@@ -487,7 +487,7 @@ impl Mailbox {
             ));
         }
         Ok(crate::agent_description::DescriptionStore::new(
-            Arc::clone(&self.backend),
+            self.backend.clone(),
             format!(
                 "{}/{agent}/{}",
                 self.convention.agents_dir(),
