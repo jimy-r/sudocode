@@ -145,7 +145,14 @@ fn a_dangling_box_record_is_not_permission_to_prepare_another_service() {
         .output()
         .unwrap();
     assert!(!result.status.success());
-    assert!(String::from_utf8_lossy(&result.stderr).contains("read node record"));
+    let failure: serde_json::Value = serde_json::from_slice(&result.stdout).unwrap();
+    assert!(
+        failure["error"]
+            .as_str()
+            .unwrap()
+            .contains("read node record"),
+        "received {failure}"
+    );
     assert!(std::fs::symlink_metadata(&record)
         .unwrap()
         .file_type()
@@ -296,15 +303,17 @@ fn first_interactive_launch_offers_setup_before_a_session_is_started() {
 }
 
 #[test]
-fn interactive_resume_checks_the_saved_owner_before_opening_a_session() {
+fn interactive_resume_keeps_an_unavailable_box_and_reports_the_actual_session_error() {
     let env = common::TestEnv::new("runtime-resume-owner");
     let services = env.workspace_root().join("unregistered-owner");
     let home = env.workspace_root().join("home");
-    configured_box(
+    let record = configured_box(
         env.workspace_root(),
         &serde_json::json!({"version": 1, "endpoint": "127.0.0.1:1",
             "agents_dir": env.workspace_root().join("existing-agents")}),
     );
+    let node_before = std::fs::read(&record).unwrap();
+    let log = env.workspace_root().join("setup-diagnostics.jsonl");
     let preference =
         serde_json::json!({"schemaVersion": 1, "mode": "shared", "ownerRoot": services});
     let preference_path = env.config_home().join("runtime-profile.json");
@@ -316,14 +325,19 @@ fn interactive_resume_checks_the_saved_owner_before_opening_a_session() {
             ("HOME", &home.to_string_lossy()),
             ("USERPROFILE", &home.to_string_lossy()),
             ("SCODE_CHECK_UPDATES", "0"),
+            ("SCODE_LOG_PATH", &log.to_string_lossy()),
         ],
     );
-    child
-        .expect("The selected owner root has no registered local Box")
-        .unwrap();
+    // Automatic Box preparation is not a session admission gate. No history
+    // exists in this fixture, so resume must reach its own error instead.
+    child.expect("no managed sessions found").unwrap();
     assert_ne!(child.expect_eof().unwrap(), 0);
     assert!(!services.exists());
     assert_eq!(std::fs::read(preference_path).unwrap(), before);
+    assert_eq!(std::fs::read(record).unwrap(), node_before);
+    let diagnostics = std::fs::read_to_string(log).unwrap();
+    assert!(diagnostics.contains("automatic_shared_setup"));
+    assert!(diagnostics.contains("The selected owner root has no registered local Box"));
 }
 
 #[test]
