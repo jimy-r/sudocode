@@ -442,6 +442,8 @@ pub trait ApiClient: Send {
 /// `engine_events::EngineEvent`s forwards all seven `AssistantEvent` variants,
 /// so every hook below must be forwarded from the loop.
 pub trait RuntimeObserver {
+    /// The initial user blocks, including attachments, reached durable history.
+    fn on_prompt_committed(&mut self) {}
     fn on_input_committed(&mut self, _input: &crate::turn_input::InputView) {}
     /// Non-fatal runtime maintenance notices, forwarded through the engine seam.
     fn on_notice(&mut self, _text: &str) {}
@@ -2025,6 +2027,9 @@ where
         self.session
             .push_user_blocks(prepared_blocks)
             .map_err(|error| RuntimeError::new(error.to_string()))?;
+        if let Some(observer) = observer.as_deref_mut() {
+            observer.on_prompt_committed();
+        }
         self.compaction_pending_input_tokens = 0;
 
         // Hook workers share the current observer's progress sink, so slow
@@ -2084,7 +2089,10 @@ where
                 let prepared = if input.source == crate::turn_input::InputSource::Human {
                     crate::image_input::prompt_blocks(input.text, self.session.fs_handle().as_ref())
                         .map_err(|error| RuntimeError::new(error.to_string()))
-                        .and_then(|blocks| self.prepare_input_blocks(blocks))
+                        .and_then(|mut blocks| {
+                            blocks.extend(input.attachments);
+                            self.prepare_input_blocks(blocks)
+                        })
                 } else {
                     Ok(vec![ContentBlock::Text { text: input.text }])
                 };
