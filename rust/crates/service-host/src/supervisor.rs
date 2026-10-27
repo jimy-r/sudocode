@@ -525,7 +525,17 @@ pub fn ensure_local_box(endpoint: &str, owner_root: Option<&Path>) -> Result<Opt
         .ok_or_else(|| "missing service status".into())
         .map(Some);
     }
-    if profile.external_running()? {
+    // An owner holding its lifetime lock may have bound the Node port before
+    // publishing authenticated readiness. Join its startup instead of probing
+    // that intermediate port as an externally owned Node.
+    let lifetime = lock_file(&root, "service.lock")?;
+    let external = match lifetime.try_lock_exclusive() {
+        Ok(()) => profile.external_running()?,
+        Err(error) if is_lock_contention(&error) => false,
+        Err(error) => return Err(error.into()),
+    };
+    drop(lifetime);
+    if external {
         return Ok(Some(profile.status(false)));
     }
     let discovery = ensure_runtime(&root, &http)?;
