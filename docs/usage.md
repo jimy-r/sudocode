@@ -4,6 +4,10 @@ Day-to-day `scode` workflows.
 
 ## Installation and updates
 
+Choose daemon-free execution or shared local services with
+[`scode setup`](shared-services.md). The runtime owner, installation behavior
+and separate collaboration-enrollment boundary are defined there.
+
 Install macOS/Linux with the [installer](../install.sh), or choose a platform
 package from [GitHub Releases](https://github.com/sudoprivacy/sudocode/releases/latest).
 Release builds check for updates in the background when an interactive terminal
@@ -170,7 +174,9 @@ receiver stops. Hosts can also subscribe to structured tracing. An unchanged
 receiver-seat error is recorded once; retries continue without writing into
 the terminal's input area.
 
-This does not start Nexus or mint an agent credential. A missing record still
+The connection record alone does not start Nexus or mint an agent credential.
+An explicit [local-owner registration](shared-services.md#recover-an-existing-local-box)
+can resume the same locally owned Box after multi-agent selection. A missing record still
 selects the same-machine disk namespace. Record parsing, missing credential
 files and credential identity mismatches still stop startup; a lazy client is
 not proof that TLS authentication will succeed. Changing an already running session
