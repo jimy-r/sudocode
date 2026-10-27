@@ -82,7 +82,8 @@ use cli::format::{
 };
 use cli::git::{
     enforce_broad_cwd_policy, git_output, parse_git_status_branch, parse_git_status_metadata,
-    parse_git_workspace_summary, resolve_git_branch_for, GitWorkspaceSummary,
+    parse_git_workspace_summary, resolve_git_branch_for, resolve_git_head_label_for,
+    GitWorkspaceSummary,
 };
 use cli::help::{
     print_help, print_help_topic, render_config_json, render_config_report, render_diff_json_for,
@@ -3600,6 +3601,7 @@ fn run_repl_iocraft_dispatch(
         repl_ui_cmd.set_turn_result(&status, cli.lifecycle.usage_snapshot().turns());
     }
     repl_ui_cmd.set_cache_tip(cli.cache_ttl_tip());
+    repl_ui_cmd.set_branch(workspace_head_label());
     let pending_question_answer: PendingQuestionAnswer = Arc::new(Mutex::new(None));
 
     // Route LiveCli output through iocraft's OutputSender so it goes
@@ -5009,9 +5011,6 @@ impl LiveCli {
         let cumulative_duration = (tracker.cumulative_duration_ms() > 0)
             .then(|| Duration::from_millis(tracker.cumulative_duration_ms()));
         let elapsed = tracker.latest_turn_duration_ms().map(Duration::from_millis);
-        let branch = env::current_dir()
-            .ok()
-            .and_then(|cwd| resolve_git_branch_for(&cwd));
         let account = self.lifecycle.current_billing_account();
         let status = TurnStatus {
             model: &model,
@@ -5022,7 +5021,6 @@ impl LiveCli {
             context_window: Some(context.window),
             elapsed,
             cumulative_duration,
-            branch: branch.as_deref(),
             account: account.name(),
         };
         Some(if context.estimated {
@@ -5399,9 +5397,6 @@ impl LiveCli {
         let turns = usage_tracker.turns();
         // The current request meter and compaction share the live route's window.
         let context = self.lifecycle.context_occupancy();
-        let branch = env::current_dir()
-            .ok()
-            .and_then(|cwd| resolve_git_branch_for(&cwd));
         // Read once per turn, from the engine's own selector rather than a
         // second copy of the precedence rules. A turn takes seconds; the config
         // read behind this does not register next to it.
@@ -5415,7 +5410,6 @@ impl LiveCli {
             context_window: Some(context.window),
             elapsed: Some(elapsed),
             cumulative_duration,
-            branch: branch.as_deref(),
             account: account.name(),
         };
         let line = if context.estimated {
@@ -5425,6 +5419,8 @@ impl LiveCli {
         };
         if let Some(ui) = ui {
             ui.set_cache_tip(self.cache_ttl_tip());
+            // A turn can switch branches (its tools run git), so refresh here.
+            ui.set_branch(workspace_head_label());
         }
         match (ui, output) {
             // Show in the ChromeSlot only (visible until the next turn). The
@@ -6921,6 +6917,13 @@ impl LiveCli {
         self.out_println(format_issue_report(context));
         Ok(())
     }
+}
+
+/// The footer's workspace label: the branch, or the short commit when detached.
+fn workspace_head_label() -> Option<String> {
+    env::current_dir()
+        .ok()
+        .and_then(|cwd| resolve_git_head_label_for(&cwd))
 }
 
 fn print_skills_for_outcome(

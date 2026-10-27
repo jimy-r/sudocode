@@ -299,6 +299,8 @@ pub enum UiCommand {
     },
     SetTip(engine_core::Tip),
     SetCacheTip(CacheTip),
+    /// The workspace's branch, or short commit when detached, for the footer.
+    SetBranch(Option<String>),
     BeginTurn,
     /// Update the `TodoSlot` panel with the current todo list.
     UpdateTodos(Vec<runtime::Todo>),
@@ -382,6 +384,10 @@ impl UiCommandSender {
 
     pub(crate) fn set_cache_tip(&self, tip: CacheTip) {
         let _ = self.tx.send(UiCommand::SetCacheTip(tip));
+    }
+
+    pub(crate) fn set_branch(&self, label: Option<String>) {
+        let _ = self.tx.send(UiCommand::SetBranch(label));
     }
 
     pub fn update_todos(&self, todos: Vec<runtime::Todo>) {
@@ -1924,6 +1930,7 @@ fn ReplApp(mut hooks: Hooks) -> impl Into<AnyElement<'static>> {
                                 .set_cache_advice(view.advice, view.actionable);
                             frame.set(frame.get().wrapping_add(1));
                         }
+                        Ok(UiCommand::SetBranch(label)) => footer_tips.write().branch(label),
                         Ok(UiCommand::BeginTurn) => footer_tips.write().begin_turn(),
                         Ok(UiCommand::SetTurnResult { text, turn }) => {
                             turn_result.set(Some((turn, text)));
