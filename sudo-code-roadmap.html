@@ -2031,18 +2031,20 @@ namespace for the new TUI work.</p>
 <h4>No alternate-screen / full-screen TUI mode — by rule</h4>
 
 <section id="prompt-viewport-experiment">
-<h5>Bounded prompt viewport experiment — 2026-10-27</h5>
+<h5>Bounded inline prompt viewport experiment — 2026-10-27</h5>
 <p><strong>Experimental; not validated or enabled by default.</strong> Reviewing an
 earlier answer while composing a queued follow-up currently moves the editor out
-of view in native terminal scrollback. Evaluate a narrow exception to the
-inline-only rule: an opt-in conversation viewport with a fixed composer, a
+of view in native terminal scrollback. Evaluate an opt-in inline conversation
+viewport with a fixed composer, a
 contextual prompt header and shaded user messages. The normal REPL, pipes, ACP,
 classic input and worker attach/detach retain their existing behavior. This is
 not approval for dashboards, split panes, a new renderer dependency or a
 <code>--tui</code> command.</p>
 <ul>
   <li>Use the existing iocraft renderer and engine boundary. Register the
-  temporary <code>promptViewport</code> experiment in the existing registry.</li>
+  temporary <code>promptViewport</code> experiment in the existing registry.
+  Stay in the main terminal buffer and reuse its cell-range damage writer;
+  do not enter alternate-screen mode.</li>
   <li>Keep immutable rendered history in a disposable disk spool, with bounded
   visible-row caches. Typing must not scan or rewrap accumulated history.</li>
   <li>Anchor reading to content while new output arrives. Keep prompt headers
@@ -2059,7 +2061,7 @@ not approval for dashboards, split panes, a new renderer dependency or a
 </ul>
 </section>
 
-<p>Apart from the bounded experiment above, earlier drafts of this plan included a "Phase 6 — full-screen TUI"
+<p>Earlier drafts of this plan included a "Phase 6 — full-screen TUI"
 sub-goal: a <code>--tui</code> flag wired to <code>ratatui</code>
 behind a <code>full-tui</code> cargo feature, with split-pane layout,
 scrollable conversation view, mouse support. <strong>This is forbidden

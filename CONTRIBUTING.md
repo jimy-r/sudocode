@@ -51,9 +51,6 @@ the code first.
 **Hard NOs (the ones contributors trip on most):**
 
 - **No `ratatui`, no alternate-screen mode, no `--tui` flag.**
-  The sole temporary exception is the opt-in
-  [bounded prompt viewport experiment](sudo-code-roadmap.html#prompt-viewport-experiment).
-  Its acceptance requirements do not change the normal inline REPL contract.
   sudocode is inline-only by rule. Even a feature-flagged
   `ratatui` dependency is rejected — its presence in `Cargo.lock`
   is the slippery slope toward an alternate-screen path that
