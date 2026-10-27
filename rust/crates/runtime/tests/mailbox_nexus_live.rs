@@ -101,6 +101,7 @@ fn send_to(
     auth: &str,
 ) -> Result<(), String> {
     mailbox(client, from, auth).send(MailboxEnvelope {
+        delivery: runtime::turn_input::InputDelivery::Steer,
         from: from.to_string(),
         to: to.to_string(),
         body: body.to_string(),
@@ -1907,7 +1908,6 @@ fn live_cohost_session_resume() {
 #[test]
 #[ignore = "requires the shared-history stage of e2e/nexus-a2a/run-cohost.sh"]
 fn live_cohost_shared_sid_concurrent_contexts() {
-    use runtime::history::{HistoryGraph, HistoryRecord};
     use serde_json::{json, Value};
     let operator = Arc::new(model_operator());
     let agent = format!("shared-sid-probe-{}", fresh());
@@ -2039,16 +2039,7 @@ fn live_cohost_shared_sid_concurrent_contexts() {
         cursor = frame.next_offset;
     }
     let history = String::from_utf8(durable).unwrap();
-    let graph = HistoryGraph::decode(history.as_bytes()).expect("committed v3 history");
-    let mut tool_origins = std::collections::BTreeSet::new();
-    for line in history.lines() {
-        let record: HistoryRecord = serde_json::from_str(line).unwrap();
-        if let Some(id) = record.message_id() {
-            if let Some(origin) = graph.tool_origin(id, "call_1") {
-                tool_origins.insert(origin.to_owned());
-            }
-        }
-    }
+    let tool_origins = shared_history_tool_origins(&history);
     assert_eq!(
         tool_origins.len(),
         2,
@@ -2062,23 +2053,35 @@ fn live_cohost_shared_sid_concurrent_contexts() {
     for label in ["A", "B"] {
         let own = format!("{label}_CONTEXT_PROMPT");
         let other = format!("{}_CONTEXT_PROMPT", if label == "A" { "B" } else { "A" });
+        let is_later_resume = label == "B";
         let captured: Vec<_> = requests
             .iter()
             .filter(|entry| entry.name.ends_with(".prompt"))
             .filter_map(|entry| operator.read(&listed_path("/model", &entry.name), "").ok())
             .filter_map(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
             .filter(|request| request["body"]["messages"].to_string().contains(&own))
+            .filter(|request| {
+                is_later_resume || !request["body"]["messages"].to_string().contains(&other)
+            })
             .collect();
         assert!(
             !captured.is_empty(),
             "actual model request for {label} missing"
         );
-        assert!(
-            captured
-                .iter()
-                .all(|request| !request["body"]["messages"].to_string().contains(&other)),
-            "contexts crossed"
-        );
+        for request in captured {
+            let messages = request["body"]["messages"].to_string();
+            assert_eq!(
+                messages.contains(&other),
+                is_later_resume,
+                "a later resume inherits the source's already written input"
+            );
+            if is_later_resume {
+                assert!(
+                    !messages.contains("A_MODEL_DONE"),
+                    "the source's later reply must stay outside the frozen continuation"
+                );
+            }
+        }
     }
     let linked_agent = format!("{agent}-linked");
     let mut linked_request = request.clone();
@@ -2141,7 +2144,7 @@ fn live_cohost_shared_sid_concurrent_contexts() {
         operator.read(&linked_file, "").unwrap(),
         b"linked Agent durable effect"
     );
-    let mut complete_history = history.into_bytes();
+    let mut linked_history = history.into_bytes();
     loop {
         let frame = operator
             .stream_read_at(&path, cursor, false, 0, "")
@@ -2151,18 +2154,61 @@ fn live_cohost_shared_sid_concurrent_contexts() {
         }
         assert!(frame.next_offset > cursor);
         cursor = frame.next_offset;
-        complete_history.extend(frame.data);
+        linked_history.extend(frame.data);
     }
-    let graph = HistoryGraph::decode(&complete_history).expect("linked Agent committed history");
-    let completed = graph.completed_session(None).unwrap();
-    assert_eq!(completed.session_id, sid);
-    assert_eq!(completed.identity.as_ref().unwrap().agent_name, agent);
-    assert!(completed.messages().iter().flat_map(|message| &message.blocks).any(|block|
+    let graph = runtime::history::HistoryGraph::decode(&linked_history).unwrap();
+    let restored = graph.resume_session().unwrap();
+    assert_eq!(restored.session_id, sid);
+    assert!(restored.messages().iter().flat_map(|message| &message.blocks).any(|block|
         matches!(block, runtime::ContentBlock::Text { text } if text.contains("linked Agent durable effect"))));
+    assert_eq!(
+        restored.identity.as_ref().unwrap().agent_name,
+        agent,
+        "linked context must preserve the durable session identity"
+    );
+    assert_eq!(
+        shared_history_tool_origins(std::str::from_utf8(&linked_history).unwrap()).len(),
+        3,
+        "the linked Agent's tool result requires its own assistant origin"
+    );
     println!(
         "COHOST SHARED SID OK: {sid}, linked Agent={linked_agent}, independent PIDs={},{}",
         first["session_id"], second["session_id"]
     );
+}
+
+fn shared_history_tool_origins(history: &str) -> std::collections::BTreeSet<String> {
+    use runtime::history::{HistoryGraph, HistoryRecord};
+    let graph = HistoryGraph::decode(history.as_bytes()).unwrap();
+    let contexts: std::collections::BTreeSet<_> = history
+        .lines()
+        .map(|line| serde_json::from_str::<HistoryRecord>(line).unwrap())
+        .map(|record| record.context_id().to_owned())
+        .collect();
+    let mut origins = std::collections::BTreeSet::new();
+    for context in contexts {
+        let session = graph.context_session(&context).unwrap();
+        for message in session.messages() {
+            if !message.blocks.iter().any(|block| {
+                matches!(block, runtime::ContentBlock::ToolResult { tool_use_id, .. } if tool_use_id == "call_1")
+            }) {
+                continue;
+            }
+            let identity = message.history.as_ref().unwrap();
+            let origin = &identity.tool_origins["call_1"];
+            assert!(
+                session.messages().iter().any(|assistant| {
+                    assistant.history.as_ref().is_some_and(|identity| identity.id == *origin)
+                    && assistant.blocks.iter().any(|block| {
+                        matches!(block, runtime::ContentBlock::ToolUse { id, .. } if id == "call_1")
+                    })
+                }),
+                "a restored result must resolve to its originating assistant"
+            );
+            origins.insert(origin.clone());
+        }
+    }
+    origins
 }
 
 /// Atomic reader claims and receipt recovery through mTLS, gRPC and Raft.
@@ -2364,15 +2410,16 @@ fn live_reader_commit_refused_on_renew_error_then_reacquired_from_durable_offset
         failed.requested >= delivered[0] && failed.returned <= delivered[1],
         "the failed renewal must be the commit's confirm(), between the two deliveries"
     );
-    let (released, reached_node) = probe
+    let release = probe
         .reader_releases()
         .into_iter()
-        .find(|(at, _)| *at >= failed.returned)
+        .find(|release| release.requested >= failed.returned)
         .expect("the tail released the reader after the refused commit");
     assert!(
-        reached_node,
+        release.reached_node,
         "not partitioned, so the release reached the node"
     );
+    let released = release.requested;
     let reacquired = probe
         .reader_acquisitions()
         .into_iter()
@@ -2388,9 +2435,12 @@ fn live_reader_commit_refused_on_renew_error_then_reacquired_from_durable_offset
         "the INJECTED claim delay must have held the window open"
     );
     let samples = samples.lock().unwrap().clone();
+    // Up to the re-acquisition, which the probe records once the lock is held
+    // and before the claim rewrites the register. A read concurrent with that
+    // write is a different question from whether the refused commit moved it.
     let held: Vec<_> = samples
         .iter()
-        .filter(|(start, end, _)| *start >= failed.returned && *end <= delivered[1])
+        .filter(|(start, end, _)| *start >= failed.returned && *end <= reacquired)
         .collect();
     // Three is an empirical floor, not an invariant: the 800ms window yields
     // dozens of samples, and three is enough to show the position held across
@@ -2417,12 +2467,652 @@ fn live_reader_commit_refused_on_renew_error_then_reacquired_from_durable_offset
         released.saturating_duration_since(failed.returned),
         reacquired.saturating_duration_since(failed.returned),
         delivered[1].saturating_duration_since(delivered[0]),
+        reached_node = release.reached_node,
     );
 
     abort.abort();
     handle.join().expect("receiver");
 }
 
+/// Which step stopped a delivery, as recorded on a REAL node through the
+/// test-only fault boundary (`common/lease_fault.rs`; the one failed renewal is
+/// INJECTED).
+///
+/// A gate message holds the receiver inside its consumer while two more
+/// messages are appended, so they arrive as one batch. On the first of them the
+/// consumer arms ONE failing reader renewal and waits until the reader's own
+/// renewal worker has hit it. No commit happens meanwhile, so that renewal can
+/// only be the worker's, and the lease is gone while the consumer is still
+/// deciding. Then:
+///
+/// - the consumer accepts: the lease check before the second message stops the
+///   batch, so the stall must be recorded as `LeaseLost`, never as
+///   `ConsumerRefused`;
+/// - the consumer refuses: it was handed the message under a valid lease and
+///   refused it, so the stall must be `ConsumerRefused`, never `LeaseLost`, even
+///   though the lease is gone by the time the batch is abandoned.
+///
+/// Either way the tail lets the reader go, re-acquires it and hands the batch
+/// over again from the durable offset.
+#[test]
+#[ignore = "requires the harness's real mTLS Nexus daemon"]
+fn live_stall_from_lease_lost_mid_batch_is_recorded_as_lease_lost() {
+    stall_cause_mid_batch(true);
+}
+
+/// See [`live_stall_from_lease_lost_mid_batch_is_recorded_as_lease_lost`].
+#[test]
+#[ignore = "requires the harness's real mTLS Nexus daemon"]
+fn live_refusal_under_a_held_lease_is_recorded_as_consumer_refused() {
+    stall_cause_mid_batch(false);
+}
+
+/// One fresh agent receiving on a REAL node behind the test-only fault boundary
+/// (`common/lease_fault.rs`), and what it delivered and recorded. Shared by the
+/// tests that pin how a stalled delivery is recorded.
+struct StallRig {
+    agent: String,
+    peer: String,
+    auth: String,
+    sender: Arc<NexusVfsClient>,
+    observer: Mailbox,
+    probe: Arc<lease_fault::Probe>,
+    seen: Arc<std::sync::Mutex<Vec<(String, Instant)>>>,
+    abort: runtime::HookAbortSignal,
+    receiver: Option<thread::JoinHandle<()>>,
+}
+
+impl StallRig {
+    /// Start the receiver. `consume` is asked about each message after it is
+    /// recorded as seen, and answers whether the consumer accepted it.
+    fn start(
+        name: &str,
+        consume: impl Fn(&lease_fault::Probe, &MailboxEnvelope) -> bool + Send + Sync + 'static,
+    ) -> Self {
+        let endpoint = std::env::var("NEXUS_A2A_TEST_ENDPOINT").expect("set daemon endpoint");
+        let auth = std::env::var("NEXUS_API_KEY").unwrap_or_default();
+        let tag = fresh();
+        let agent = format!("scode-{name}-{tag}");
+        let peer = format!("{name}-peer-{tag}");
+        let probe = lease_fault::Probe::new();
+        let node = runtime::fs_backend::NexusVfsFsBackend::from_arc_mtls(
+            dial(&endpoint),
+            auth.clone(),
+            "root",
+        );
+        let receiver = Arc::new(Mailbox::new(
+            Arc::new(lease_fault::FaultyBackend::new(
+                Arc::new(node),
+                Arc::clone(&probe),
+            )),
+            agent.clone(),
+            runtime::mailbox::InboxConvention::new(String::new()),
+        ));
+        let seen: Arc<std::sync::Mutex<Vec<(String, Instant)>>> = Arc::default();
+        let abort = runtime::HookAbortSignal::new();
+        let handle = {
+            let (seen, probe) = (Arc::clone(&seen), Arc::clone(&probe));
+            runtime::mailbox::spawn_inbox_poller(
+                receiver,
+                200,
+                "stall-rig",
+                abort.clone(),
+                move |m| {
+                    seen.lock().unwrap().push((m.body.clone(), Instant::now()));
+                    consume(&probe, m)
+                },
+            )
+        };
+        let rig = Self {
+            observer: mailbox(&dial(&endpoint), &agent, &auth),
+            sender: dial(&endpoint),
+            agent,
+            peer,
+            auth,
+            probe,
+            seen,
+            abort,
+            receiver: Some(handle),
+        };
+        wait_until("the seat", Duration::from_secs(20), &|| {
+            rig.probe.holds_seat()
+        });
+        rig
+    }
+
+    fn send(&self, body: &str) {
+        send_to(&self.sender, &self.peer, &self.agent, body, &self.auth).expect("send");
+    }
+
+    fn deliveries(&self, body: &str) -> Vec<Instant> {
+        self.seen
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(b, _)| b == body)
+            .map(|(_, at)| *at)
+            .collect()
+    }
+
+    fn position(&self) -> Option<u64> {
+        self.observer
+            .read_position(&self.peer)
+            .expect("read position")
+    }
+
+    fn stalls(&self) -> Vec<runtime::mailbox::DeliveryEvent> {
+        runtime::mailbox::delivery_events()
+            .into_iter()
+            .filter(|e| e.peer == self.peer)
+            .collect()
+    }
+
+    /// Deliver `gate` and hold the consumer in it while `batch` is appended,
+    /// so the batch arrives as one; `gate_open` lets the consumer go. Returns
+    /// the committed position after the gate, where the batch starts.
+    fn deliver_as_one_batch(
+        &self,
+        gate: &str,
+        gate_open: &std::sync::atomic::AtomicBool,
+        batch: &[&str],
+    ) -> u64 {
+        self.send(gate);
+        wait_until(
+            "the gate to reach the consumer",
+            Duration::from_secs(20),
+            &|| !self.deliveries(gate).is_empty(),
+        );
+        for body in batch {
+            self.send(body);
+        }
+        gate_open.store(true, std::sync::atomic::Ordering::Release);
+        wait_until("the gate to be committed", Duration::from_secs(20), &|| {
+            self.position().is_some_and(|p| p > 0)
+        });
+        self.position().unwrap()
+    }
+}
+
+impl Drop for StallRig {
+    fn drop(&mut self) {
+        // A held renewal parks the lease worker, and dropping the reader joins
+        // it: release before joining, or a failed assertion hangs instead.
+        self.probe.release_reader_renewal();
+        self.abort.abort();
+        if let Some(receiver) = self.receiver.take() {
+            let _ = receiver.join();
+        }
+    }
+}
+
+fn wait_until(what: &str, within: Duration, done: &dyn Fn() -> bool) {
+    let deadline = Instant::now() + within;
+    while !done() {
+        assert!(
+            Instant::now() < deadline,
+            "timed out after {within:?} waiting for {what}"
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// The consumer's side of a gate: wait in the gate message until it opens.
+fn hold_in_gate(gate_open: &std::sync::atomic::AtomicBool) -> bool {
+    while !gate_open.load(std::sync::atomic::Ordering::Acquire) {
+        thread::sleep(Duration::from_millis(20));
+    }
+    true
+}
+
+fn stall_cause_mid_batch(consumer_accepts: bool) {
+    use lease_fault::{Fault, Outcome};
+    use runtime::mailbox::{DeliveryStall, LeaseLoss, LeaseSite};
+    use std::sync::atomic::AtomicBool;
+    type At = Arc<std::sync::Mutex<Option<Instant>>>;
+    const GATE: &str = "s0 gate";
+    const M1: &str = "s1 first of the batch";
+    const M2: &str = "s2 second of the batch";
+    // The consumer decides only once the INJECTED renewal has been recorded,
+    // and then waits this much longer: the worker marks the lease invalid on
+    // its own thread a few instructions after that renewal returns, and the
+    // probe sees the return first. This test cannot observe the flag itself.
+    // Were the worker held off past the margin, the accepting case would fail
+    // (the batch would go on to a refused commit) rather than pass, but the
+    // refusing case's negative control (a classifier that asks `is_valid()`
+    // again afterwards) could then still see a valid lease and pass. So the
+    // margin is what makes that control fail, not luck in a narrow window.
+    const SETTLE: Duration = Duration::from_millis(300);
+
+    let gate_open = Arc::new(AtomicBool::new(false));
+    let armed_at: At = Arc::default();
+    let decided_at: At = Arc::default();
+    let rig = {
+        let (gate_open, armed_at, decided_at) = (
+            Arc::clone(&gate_open),
+            Arc::clone(&armed_at),
+            Arc::clone(&decided_at),
+        );
+        StallRig::start("stall-cause", move |probe, m| {
+            if m.body == GATE {
+                return hold_in_gate(&gate_open);
+            }
+            if m.body == M1 && armed_at.lock().unwrap().is_none() {
+                let armed = Instant::now();
+                *armed_at.lock().unwrap() = Some(armed);
+                probe.set(Fault::ReaderRenewFails(1));
+                let deadline = armed + Duration::from_secs(30);
+                while Instant::now() < deadline
+                    && !probe
+                        .reader_renewals()
+                        .iter()
+                        .any(|r| r.requested >= armed && r.outcome == Outcome::Injected)
+                {
+                    thread::sleep(Duration::from_millis(20));
+                }
+                thread::sleep(SETTLE);
+                *decided_at.lock().unwrap() = Some(Instant::now());
+                return consumer_accepts;
+            }
+            true
+        })
+    };
+    let p_gate = rig.deliver_as_one_batch(GATE, &gate_open, &[M1, M2]);
+    wait_until("the stall to be recorded", Duration::from_secs(45), &|| {
+        !rig.stalls().is_empty()
+    });
+    wait_until(
+        "the batch to be handed over again and committed",
+        Duration::from_secs(45),
+        &|| !rig.deliveries(M2).is_empty() && rig.position().is_some_and(|p| p > p_gate),
+    );
+    let p_end = rig.position().unwrap();
+
+    let (expected, wrong) = if consumer_accepts {
+        (DeliveryStall::LeaseLost, DeliveryStall::ConsumerRefused)
+    } else {
+        (DeliveryStall::ConsumerRefused, DeliveryStall::LeaseLost)
+    };
+    let recorded = rig.stalls();
+    assert!(
+        recorded.iter().all(|e| e.stall != wrong),
+        "the stall was recorded as {wrong:?}: {recorded:?}"
+    );
+    assert_one_batch_stall(&recorded, expected, p_gate);
+    // Why, not only which. A lease lost mid-batch carries the loss the lease
+    // recorded: the injected failure of the worker's renewal, an I/O error of
+    // kind `Other`. A refusal carries none, although by the time it is recorded
+    // this scenario has made the lease lost too: attaching that loss would give
+    // the refusal a cause it did not have.
+    if consumer_accepts {
+        assert!(
+            matches!(
+                recorded[0].loss,
+                Some(LeaseLoss::RenewFailed {
+                    site: LeaseSite::Worker,
+                    kind: std::io::ErrorKind::Other,
+                    ..
+                })
+            ),
+            "a lease lost mid-batch records the worker's failed renewal: {recorded:?}"
+        );
+    } else {
+        assert_eq!(
+            recorded[0].loss, None,
+            "a refusal carries no lease loss, even once the lease is lost: {recorded:?}"
+        );
+    }
+
+    let armed = armed_at
+        .lock()
+        .unwrap()
+        .expect("the consumer armed the fault on m1");
+    let decided = decided_at
+        .lock()
+        .unwrap()
+        .expect("the consumer decided on m1");
+    let injected: Vec<_> = rig
+        .probe
+        .reader_renewals()
+        .into_iter()
+        .filter(|r| r.outcome == Outcome::Injected)
+        .collect();
+    assert_eq!(
+        injected.len(),
+        1,
+        "exactly one INJECTED reader renewal: {injected:?}"
+    );
+    let failed = injected[0];
+    assert!(
+        failed.requested >= armed && failed.returned <= decided,
+        "the failed renewal is the worker's, made while the consumer held m1"
+    );
+    let (released, reached_node, reacquired) = assert_redelivered_once(&rig, GATE, M1, M2, decided);
+
+    println!(
+        "STALL CAUSE OK: m1 and m2 arrived as one batch at offset {p_gate}; ONE INJECTED reader renewal, by the worker, {:?} after the consumer took m1; the consumer {} m1 {:?} after that; recorded {expected:?} at offset {p_gate} and no {wrong:?}; reader released {:?} after the decision (reached node: {reached_node}) and re-acquired {:?} later; m1 delivered twice, m2 once, position {p_gate} -> {p_end}; seat untouched",
+        failed.requested.saturating_duration_since(armed),
+        if consumer_accepts { "accepted" } else { "refused" },
+        decided.saturating_duration_since(failed.returned),
+        released.saturating_duration_since(decided),
+        reacquired.saturating_duration_since(released),
+    );
+}
+
+/// Exactly one stall was recorded, as `expected`, at `p_gate`, for a batch of
+/// the two messages appended after the gate.
+fn assert_one_batch_stall(
+    recorded: &[runtime::mailbox::DeliveryEvent],
+    expected: runtime::mailbox::DeliveryStall,
+    p_gate: u64,
+) {
+    assert_eq!(
+        recorded.iter().map(|e| e.stall).collect::<Vec<_>>(),
+        vec![expected],
+        "exactly one stall, recorded as {expected:?}: {recorded:?}"
+    );
+    assert_eq!(
+        recorded[0].offset,
+        Some(p_gate),
+        "the stall is recorded at the batch's offset"
+    );
+    // Both messages were in the stalled batch: otherwise m1 alone would have
+    // gone on to a commit, and the second message would have met the lost
+    // lease in a batch of its own, which is a different path.
+    assert_eq!(
+        recorded[0].tail,
+        Some(p_gate + 2),
+        "the stalled batch held m1 and m2: {recorded:?}"
+    );
+}
+
+/// After a stall decided at `decided`: the gate was delivered once, `m1` twice
+/// and `m2` once, after the stall; the tail let the reader go, re-acquired it
+/// and handed the batch over again from it; the seat was never touched.
+/// Returns when the reader was released, whether that reached the node, and
+/// when it was re-acquired.
+fn assert_redelivered_once(
+    rig: &StallRig,
+    gate: &str,
+    m1: &str,
+    m2: &str,
+    decided: Instant,
+) -> (Instant, bool, Instant) {
+    let m1 = rig.deliveries(m1);
+    let m2 = rig.deliveries(m2);
+    assert_eq!(rig.deliveries(gate).len(), 1, "the gate is delivered once");
+    assert_eq!(
+        m1.len(),
+        2,
+        "m1 is handed over, stalled, and handed over once more: {m1:?}"
+    );
+    assert_eq!(
+        m2.len(),
+        1,
+        "m2 is never handed over before the stall, and once after it: {m2:?}"
+    );
+    assert!(m2[0] > decided, "m2 only comes with the redelivered batch");
+    let release = rig
+        .probe
+        .reader_releases()
+        .into_iter()
+        .find(|release| release.requested >= decided)
+        .expect("the tail let the reader go after the stall");
+    let released = release.requested;
+    let reached_node = release.reached_node;
+    let reacquired = rig
+        .probe
+        .reader_acquisitions()
+        .into_iter()
+        .find(|at| *at >= released)
+        .expect("the tail re-acquired the reader");
+    assert!(
+        reacquired <= m1[1],
+        "the batch is handed over again by the re-acquired reader"
+    );
+    assert!(
+        rig.probe.releases().is_empty(),
+        "the receiver seat must not be touched"
+    );
+    (released, reached_node, reacquired)
+}
+
+/// A lease whose renewal never answers stops being trusted on its own, and the
+/// stall says so: `LeaseLost`, with the lease's `Lapsed` age, on a REAL node
+/// through the test-only fault boundary (the held renewal is INJECTED).
+///
+/// A gate holds the consumer while two messages are appended, so they arrive
+/// as one batch. On the first, the consumer holds the reader's next renewal in
+/// flight (it neither fails nor answers) and keeps the message until the last
+/// renewal that did answer was requested longer ago than the grace allows: the
+/// TTL less the safety margin, 30 s - 10 s. Nothing failed, so only the age
+/// can end the lease: the check before the second message must find it lapsed,
+/// and the stall must carry `Lapsed` with at least that age, not a renewal
+/// failure and not nothing. The held renewal is released only once the stall
+/// is recorded; whatever it answers then cannot replace the first loss.
+#[test]
+#[ignore = "requires the harness's real mTLS Nexus daemon"]
+fn live_stall_from_a_lapsed_lease_is_recorded_as_lease_lost_with_its_age() {
+    use lease_fault::Outcome;
+    use runtime::mailbox::{DeliveryStall, LeaseLoss};
+    use std::sync::atomic::AtomicBool;
+    type At = Arc<std::sync::Mutex<Option<Instant>>>;
+    const GATE: &str = "l0 gate";
+    const M1: &str = "l1 first of the batch";
+    const M2: &str = "l2 second of the batch";
+    // The lease trusts a renewal for the TTL less the safety margin.
+    const GRACE: Duration = Duration::from_secs(20);
+    // Past the grace by this much before the consumer lets m1 go, so the lease
+    // has certainly lapsed when it is next asked.
+    const PAST_GRACE: Duration = Duration::from_millis(1_000);
+
+    let gate_open = Arc::new(AtomicBool::new(false));
+    let armed_at: At = Arc::default();
+    let decided_at: At = Arc::default();
+    let rig = {
+        let (gate_open, armed_at, decided_at) = (
+            Arc::clone(&gate_open),
+            Arc::clone(&armed_at),
+            Arc::clone(&decided_at),
+        );
+        StallRig::start("lapse", move |probe, m| {
+            if m.body == GATE {
+                return hold_in_gate(&gate_open);
+            }
+            if m.body == M1 && armed_at.lock().unwrap().is_none() {
+                let armed = Instant::now();
+                *armed_at.lock().unwrap() = Some(armed);
+                hold_reader_renewal_past(probe, armed, GRACE + PAST_GRACE);
+                *decided_at.lock().unwrap() = Some(Instant::now());
+                return true;
+            }
+            true
+        })
+    };
+    let p_gate = rig.deliver_as_one_batch(GATE, &gate_open, &[M1, M2]);
+    wait_until("the stall to be recorded", Duration::from_secs(60), &|| {
+        !rig.stalls().is_empty()
+    });
+    // The renewal was in flight for all of it; let it go, so the tail can drop
+    // the reader (dropping it joins the worker) and claim it again.
+    rig.probe.release_reader_renewal();
+    wait_until(
+        "the batch to be handed over again and committed",
+        Duration::from_secs(60),
+        &|| !rig.deliveries(M2).is_empty() && rig.position().is_some_and(|p| p > p_gate),
+    );
+    let p_end = rig.position().unwrap();
+
+    let recorded = rig.stalls();
+    assert_one_batch_stall(&recorded, DeliveryStall::LeaseLost, p_gate);
+    let grace_ms = u64::try_from(GRACE.as_millis()).unwrap();
+    let Some(LeaseLoss::Lapsed { since_ms }) = recorded[0].loss else {
+        panic!("a lease that lapsed records its age, not another cause or none: {recorded:?}");
+    };
+    assert!(
+        since_ms >= grace_ms,
+        "the lease lapsed only once its last answered renewal was older than the grace: {since_ms} ms"
+    );
+
+    let armed = armed_at
+        .lock()
+        .unwrap()
+        .expect("the consumer armed the hold on m1");
+    let decided = decided_at
+        .lock()
+        .unwrap()
+        .expect("the consumer decided on m1");
+    let renewals = rig.probe.reader_renewals();
+    assert!(
+        renewals.iter().all(|r| r.outcome != Outcome::Injected),
+        "no renewal failed; only the age ended the lease: {renewals:?}"
+    );
+    let held_since = rig
+        .probe
+        .reader_hold_started()
+        .expect("a reader renewal was held");
+    assert!(
+        held_since >= armed,
+        "the held renewal came after the consumer took m1"
+    );
+    let held = renewals
+        .iter()
+        .find(|r| r.requested == held_since)
+        .expect("the held renewal went on to the node once released");
+    assert!(
+        held.requested < decided && held.returned > decided,
+        "the renewal was still in flight when the batch was abandoned: {held:?}"
+    );
+    let (released, reached_node, reacquired) = assert_redelivered_once(&rig, GATE, M1, M2, decided);
+
+    println!(
+        "LAPSE OK: m1 and m2 arrived as one batch at offset {p_gate}; the reader's renewal was held {:?} after the consumer took m1 and answered {:?} only after release, {:?} after it was requested; recorded LeaseLost with Lapsed {{ since_ms: {since_ms} }} at offset {p_gate}; reader released {:?} after the decision (reached node: {reached_node}) and re-acquired {:?} later; position {p_gate} -> {p_end}; seat untouched",
+        held.requested.saturating_duration_since(armed),
+        held.outcome,
+        held.returned.saturating_duration_since(held.requested),
+        released.saturating_duration_since(decided),
+        reacquired.saturating_duration_since(released),
+    );
+}
+
+/// Hold the reader's next renewal in flight, from `armed` on, and return once
+/// the last renewal the node answered (or the claim) was requested `past` ago.
+/// The probe stamps each renewal a moment after the lease does, so the lease's
+/// own count is never shorter than this.
+fn hold_reader_renewal_past(probe: &lease_fault::Probe, armed: Instant, past: Duration) {
+    use lease_fault::{Fault, LockEvent, Outcome};
+    probe.set(Fault::ReaderRenewHeld);
+    let deadline = armed + Duration::from_secs(30);
+    while Instant::now() < deadline && probe.reader_hold_started().is_none_or(|held| held < armed) {
+        thread::sleep(Duration::from_millis(20));
+    }
+    let held = probe
+        .reader_hold_started()
+        .expect("a reader renewal was held");
+    let proven = probe
+        .reader_events()
+        .into_iter()
+        .filter_map(|e| match e {
+            LockEvent::Acquired(at) => Some(at),
+            LockEvent::Renewed(r) if r.outcome == Outcome::Held => Some(r.requested),
+            LockEvent::Renewed(_) | LockEvent::Released { .. } => None,
+        })
+        .filter(|at| *at < held)
+        .max()
+        .expect("the reader was claimed");
+    while Instant::now() < proven + past {
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// A commit the register write refused records no lease loss, even when the
+/// lease is lost while that write is in flight, on a REAL node through the
+/// test-only fault boundary (both faults are INJECTED).
+///
+/// The commit's own renewal succeeds. Its register write then fails one
+/// renewal of the reader's lock, waits until the renewal worker has hit it, and
+/// fails itself. The write is what refused the commit, so the stall is
+/// `CommitRefused` with no loss: reading the lease afterwards would find the
+/// worker's loss and give the commit a cause it did not have.
+#[test]
+#[ignore = "requires the harness's real mTLS Nexus daemon"]
+fn live_commit_refused_by_its_register_write_records_no_lease_loss() {
+    use lease_fault::{Fault, Outcome};
+    use runtime::mailbox::DeliveryStall;
+    const M1: &str = "w1 refused by its write";
+
+    let rig = StallRig::start("commit-write", |_, _| true);
+    rig.send("w0 settles the reader");
+    wait_until(
+        "the reader to commit once",
+        Duration::from_secs(20),
+        &|| rig.position().is_some_and(|p| p > 0),
+    );
+    let p_before = rig.position().unwrap();
+    let armed = Instant::now();
+    rig.probe.set(Fault::ReaderRegisterWriteFailsAfterLeaseLoss);
+    rig.send(M1);
+    wait_until("the commit to be refused", Duration::from_secs(45), &|| {
+        !rig.stalls().is_empty()
+    });
+    wait_until(
+        "m1 to be handed over again and committed",
+        Duration::from_secs(45),
+        &|| rig.deliveries(M1).len() == 2 && rig.position().is_some_and(|p| p > p_before),
+    );
+
+    let recorded = rig.stalls();
+    assert_eq!(
+        recorded.iter().map(|e| e.stall).collect::<Vec<_>>(),
+        vec![DeliveryStall::CommitRefused],
+        "exactly one stall, recorded as CommitRefused: {recorded:?}"
+    );
+    assert_eq!(
+        recorded[0].loss, None,
+        "the register write refused the commit; the lease held when it was asked: {recorded:?}"
+    );
+
+    let failed_write = rig
+        .probe
+        .register_write_failed_at()
+        .expect("the armed register write failed");
+    let renewals = rig.probe.reader_renewals();
+    let injected: Vec<_> = renewals
+        .iter()
+        .filter(|r| r.outcome == Outcome::Injected)
+        .collect();
+    assert_eq!(
+        injected.len(),
+        1,
+        "exactly one INJECTED renewal: {injected:?}"
+    );
+    // The commit's own renewal: the last one the node held before the
+    // injected failure, made after the fault was armed.
+    let confirmed = renewals
+        .iter()
+        .filter(|r| {
+            r.outcome == Outcome::Held
+                && r.requested >= armed
+                && r.requested < injected[0].requested
+        })
+        .map(|r| r.requested)
+        .max()
+        .expect("the commit's own renewal reached the node and held");
+    assert!(
+        injected[0].requested > confirmed && injected[0].returned < failed_write,
+        "the lease was lost after the commit's renewal held and before its write failed"
+    );
+    assert_eq!(rig.deliveries(M1).len(), 2, "m1 is redelivered once");
+    assert!(
+        rig.probe.releases().is_empty(),
+        "the receiver seat must not be touched"
+    );
+
+    println!(
+        "COMMIT WRITE OK: the commit's renewal held; the worker's renewal was INJECTED to fail {:?} later and the register write failed {:?} after that; recorded CommitRefused with no lease loss; m1 redelivered once and committed past {p_before}",
+        injected[0].requested.saturating_duration_since(confirmed),
+        failed_write.saturating_duration_since(injected[0].returned),
+    );
+}
 /// The receiver seat on a REAL node, through a test-only fault boundary
 /// (`common/lease_fault.rs`; every fault it causes is labelled INJECTED).
 ///
@@ -2570,9 +3260,10 @@ fn live_receiver_seat_trusts_only_fresh_renewals() {
         "after a prompt renewal the next one must follow a normal interval later, \
          timed from the request: it came {interval:?} later"
     );
-    let (a_released, a_reached_node) = a.releases()[a_released_before];
+    let release = a.releases()[a_released_before];
+    let a_released = release.requested;
     assert!(
-        a_reached_node,
+        release.reached_node,
         "A was not partitioned, so its release reached the node"
     );
     assert!(
@@ -2653,14 +3344,15 @@ fn live_receiver_seat_trusts_only_fresh_renewals() {
         last_try <= BOUND + Duration::from_secs(1),
         "{holder_label} kept renewing {last_try:?} after its last real renewal, past its bound"
     );
-    let (gave_up, reached_node) = *holder
+    let release = *holder
         .releases()
         .last()
         .expect("the holder gave the seat up");
     assert!(
-        !reached_node,
+        !release.reached_node,
         "partitioned, so the release never reached the node"
     );
+    let gave_up = release.returned;
     assert!(
         gave_up < took,
         "the cut-off holder must stop receiving before the node hands the seat on"
@@ -2758,6 +3450,9 @@ fn live_receiver_seat_trusts_only_fresh_renewals() {
     //       taken after the reply landed.
     let last_proof = next_real_renewal(owner, owner_label);
     let seat_releases_before = owner.releases().len();
+    // The node may grant the seat before its old client observes release
+    // completion. Force that ordering without delaying the real release.
+    let release_gate = owner.hold_next_seat_release();
     owner.set(Fault::SeatRenewReturnsLate(Duration::from_secs(19)));
     let stale_from = last_proof.requested + BOUND;
     thread::sleep((stale_from + Duration::from_secs(3)).saturating_duration_since(Instant::now()));
@@ -2782,9 +3477,13 @@ fn live_receiver_seat_trusts_only_fresh_renewals() {
                 && r.returned.saturating_duration_since(r.requested) >= Duration::from_secs(19)
         })
         .unwrap();
-    wait("m5 to be delivered", Duration::from_secs(30), &|| {
-        delivered("seat-a", stale_body) || delivered("seat-b", stale_body)
-    });
+    let delivery_deadline = Instant::now() + Duration::from_secs(30);
+    release_gate.wait_until_released(delivery_deadline.saturating_duration_since(Instant::now()));
+    wait(
+        "m5 to be delivered before old release completion is observed",
+        delivery_deadline.saturating_duration_since(Instant::now()),
+        &|| delivered("seat-a", stale_body) || delivered("seat-b", stale_body),
+    );
     let (m5_receiver, m5_at) = seen
         .lock()
         .unwrap()
@@ -2797,15 +3496,22 @@ fn live_receiver_seat_trusts_only_fresh_renewals() {
         "m5 was delivered by {m5_receiver} {:?} before the late reply landed, on a proof past the bound",
         very_late.returned.saturating_duration_since(m5_at)
     );
-    let (owner_released, owner_reached) = owner
+    drop(release_gate);
+    wait(
+        "the old release completion to be observed",
+        delivery_deadline.saturating_duration_since(Instant::now()),
+        &|| owner.releases().len() > seat_releases_before,
+    );
+    let release = owner
         .releases()
         .get(seat_releases_before)
         .copied()
         .expect("the holder must give up a seat whose last proof passed the bound");
     assert!(
-        owner_reached,
+        release.reached_node,
         "not partitioned, so the release reached the node"
     );
+    let owner_released = release.requested;
     assert!(
         owner_released >= very_late.returned,
         "the old seat is released once its renewal returns"
@@ -2817,6 +3523,10 @@ fn live_receiver_seat_trusts_only_fresh_renewals() {
         .filter(|at| *at >= owner_released)
         .min()
         .expect("a grant after the old seat was released");
+    assert!(
+        regrant < release.returned && m5_at < release.returned,
+        "the test must exercise regrant and delivery before release completion is observed"
+    );
     let deliverer = if m5_receiver == "seat-a" { &a } else { &b };
     assert!(
         deliverer

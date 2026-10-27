@@ -21,8 +21,10 @@ pub(crate) fn render_repl_help() -> String {
             .to_string(),
         "  Up/Down              Navigate prompt history".to_string(),
         "  Ctrl-R               Reverse-search prompt history".to_string(),
-        "  Tab                  Complete commands, modes, and recent sessions".to_string(),
-        "  Ctrl-C               Clear input (double Ctrl-C to exit)".to_string(),
+        "  Enter / Tab          Steer current work / queue next turn; Tab completes /commands"
+            .to_string(),
+        "  Ctrl-C twice         Exit (second press within 800 ms)".to_string(),
+        "  Esc / Ctrl+C         Flush pending input (or cancel) / always cancel".to_string(),
         "  Shift+Enter/Ctrl+J   Insert a newline".to_string(),
         "  Auto-save            .scode/sessions/<session-id>.jsonl".to_string(),
         "  Resume latest        /resume latest".to_string(),
@@ -377,8 +379,8 @@ pub(crate) fn render_diff_report_for(cwd: &Path) -> Result<String, Box<dyn std::
             cwd.display()
         ));
     }
-    let staged = run_git_diff_command_in(cwd, &["diff", "--cached"])?;
-    let unstaged = run_git_diff_command_in(cwd, &["diff"])?;
+    let staged = super::git::run_git_checked_in(cwd, &["diff", "--cached"])?;
+    let unstaged = super::git::run_git_checked_in(cwd, &["diff"])?;
     if staged.trim().is_empty() && unstaged.trim().is_empty() {
         return Ok(
             "Diff\n  Result           clean working tree\n  Detail           no current changes"
@@ -469,26 +471,14 @@ pub(crate) fn render_diff_json_for(
             "detail": format!("{} is not inside a git project", cwd.display()),
         }));
     }
-    let staged = run_git_diff_command_in(cwd, &["diff", "--cached"])?;
-    let unstaged = run_git_diff_command_in(cwd, &["diff"])?;
+    let staged = super::git::run_git_checked_in(cwd, &["diff", "--cached"])?;
+    let unstaged = super::git::run_git_checked_in(cwd, &["diff"])?;
     Ok(serde_json::json!({
         "kind": "diff",
         "result": if staged.trim().is_empty() && unstaged.trim().is_empty() { "clean" } else { "changes" },
         "staged": staged.trim(),
         "unstaged": unstaged.trim(),
     }))
-}
-
-pub(crate) fn run_git_diff_command_in(
-    cwd: &Path,
-    args: &[&str],
-) -> Result<String, Box<dyn std::error::Error>> {
-    let output = Command::new("git").args(args).current_dir(cwd).output()?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        return Err(format!("git {} failed: {stderr}", args.join(" ")).into());
-    }
-    Ok(String::from_utf8(output.stdout)?)
 }
 
 pub(crate) fn render_teleport_report(target: &str) -> Result<String, Box<dyn std::error::Error>> {
@@ -499,7 +489,8 @@ pub(crate) fn render_teleport_report(target: &str) -> Result<String, Box<dyn std
         .current_dir(&cwd)
         .output()?;
     let file_matches = if file_list.status.success() {
-        String::from_utf8(file_list.stdout)?
+        process_text::decode_process_output(&file_list.stdout)
+            .text
             .lines()
             .filter(|line| line.contains(target))
             .take(10)
@@ -526,7 +517,7 @@ pub(crate) fn render_teleport_report(target: &str) -> Result<String, Box<dyn std
     }
 
     if content_output.status.success() {
-        let matches = String::from_utf8(content_output.stdout)?;
+        let matches = process_text::decode_process_output(&content_output.stdout).text;
         if !matches.trim().is_empty() {
             lines.push(String::new());
             lines.push("Content matches".to_string());
@@ -662,6 +653,11 @@ pub(crate) fn print_help_to(out: &mut impl Write) -> io::Result<()> {
     writeln!(
         out,
         "      Diagnose local auth, config, workspace, and sandbox health"
+    )?;
+    writeln!(out, "  scode setup [--mode local|shared] [--check]")?;
+    writeln!(
+        out,
+        "      Select local execution or prepare shared local services"
     )?;
     writeln!(out, "  scode login")?;
     writeln!(

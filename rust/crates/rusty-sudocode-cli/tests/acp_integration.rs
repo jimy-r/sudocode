@@ -6326,6 +6326,15 @@ fn seed_legacy_completion(workspace: &TestWorkspace, sid: &str, context: &Value)
 
 #[tokio::test]
 async fn acp_legacy_completion_upgrade_preserves_context_and_model_history() {
+    exercise_legacy_completion_upgrade(false).await;
+}
+
+#[tokio::test]
+async fn acp_legacy_completion_upgrade_into_record_history_preserves_context_and_model_history() {
+    exercise_legacy_completion_upgrade(true).await;
+}
+
+async fn exercise_legacy_completion_upgrade(is_record_history: bool) {
     let server = MockAnthropicService::spawn().await.unwrap();
     let workspace = TestWorkspace::new("legacy-completion-upgrade");
     workspace.create();
@@ -6334,7 +6343,10 @@ async fn acp_legacy_completion_upgrade_preserves_context_and_model_history() {
         spawn_stdio_client_with_args_and_env(
             &workspace,
             &["--permission-mode", "danger-full-access"],
-            &[("SUDOCODE_EXPERIMENT_SHARED_SESSION_HISTORY", "0")],
+            &[(
+                "SUDOCODE_EXPERIMENT_SHARED_SESSION_HISTORY",
+                if is_record_history { "1" } else { "0" },
+            )],
         )
     };
     let mut producer = spawn();
@@ -7338,6 +7350,7 @@ const timer = setInterval(() => {
             .contains("session_writer_busy"),
         "{rejected}"
     );
+    let journals = find_session_transcript(&workspace.root, &sid).with_extension("completions");
     for label in ["B1", "A2", "A1"] {
         let client = if label == "B1" {
             &mut second
@@ -7366,6 +7379,34 @@ const timer = setInterval(() => {
                 "completionId":event["params"]["completionId"],"disposition":"stored"
             }}))
             .await;
+        // Flushing the response does not wait for the transport task to commit
+        // its receipt. Observe this exact ACK before replay or process shutdown.
+        timeout(SUBAGENT_EVENTS_WAIT, async {
+            loop {
+                let is_stored = fs::read_dir(&journals).unwrap().any(|entry| {
+                    let path = entry.unwrap().path();
+                    if path.extension().is_none_or(|extension| extension != "json") {
+                        return false;
+                    }
+                    let saved: Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+                    saved["sources"]
+                        .as_object()
+                        .unwrap()
+                        .values()
+                        .any(|source| {
+                            source["payload"]["completionId"] == event["params"]["completionId"]
+                                && source["ack"] == "stored"
+                                && source["settled"] == true
+                        })
+                });
+                if is_stored {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("completion ACK must be durable before replay and process shutdown");
     }
     for (client, expected) in [(&mut first, 2), (&mut second, 1)] {
         let (_, status) = client
@@ -7757,7 +7798,7 @@ async fn acp_task_completions_interrupted_shell_and_encoded_budget() {
 }
 
 /// Concurrent ACP contexts append to the same SID while retaining separate
-/// completion ownership. A sibling never repairs another context's live tool.
+/// completion ownership. A continuation repairs only its frozen inherited tail.
 #[tokio::test]
 async fn acp_completions_keep_live_contexts_independent_during_replay_and_load() {
     let server = MockAnthropicService::spawn().await.unwrap();
@@ -7785,13 +7826,17 @@ async fn acp_completions_keep_live_contexts_independent_during_replay_and_load()
         .await
         .unwrap();
     let transcript = find_session_transcript(&workspace.root, &sid);
+    let read_transcript = || {
+        runtime::FsBackend::read_snapshot(&runtime::StdFsBackend, &transcript.to_string_lossy())
+            .unwrap()
+    };
     let journal = completion_context_path(&workspace, &sid);
     // The question can reach ACP before the provider's final usage update is
     // persisted. Wait for that durable boundary while the question keeps the
     // turn open; otherwise the owner itself can change our byte snapshot.
     timeout(Duration::from_secs(10), async {
         loop {
-            let saved = fs::read_to_string(&transcript).unwrap();
+            let saved = String::from_utf8(read_transcript()).unwrap();
             let graph = runtime::history::HistoryGraph::decode(saved.as_bytes()).unwrap();
             let record: runtime::history::HistoryRecord =
                 serde_json::from_str(saved.lines().last().unwrap()).unwrap();
@@ -7814,7 +7859,7 @@ async fn acp_completions_keep_live_contexts_independent_during_replay_and_load()
     })
     .await
     .expect("owner persisted the final provider response before waiting for the user");
-    let before_transcript = fs::read(&transcript).unwrap();
+    let before_transcript = read_transcript();
     let before_journal = fs::read(&journal).unwrap();
     let state: Value = serde_json::from_slice(&before_journal).unwrap();
     assert_eq!(state["active_trace"], "live-owner");
@@ -7834,9 +7879,7 @@ async fn acp_completions_keep_live_contexts_independent_during_replay_and_load()
             "competing {method} changed journal"
         );
         assert!(
-            fs::read(&transcript)
-                .unwrap()
-                .starts_with(&before_transcript),
+            read_transcript().starts_with(&before_transcript),
             "competing {method} replaced durable history"
         );
     }
@@ -7864,9 +7907,7 @@ async fn acp_completions_keep_live_contexts_independent_during_replay_and_load()
         .await;
     assert!(replay.get("result").is_some(), "{replay}");
     assert!(
-        fs::read(&transcript)
-            .unwrap()
-            .starts_with(&before_transcript),
+        read_transcript().starts_with(&before_transcript),
         "replay replaced durable history"
     );
     assert_eq!(fs::read(&journal).unwrap(), before_journal);
@@ -7880,9 +7921,7 @@ async fn acp_completions_keep_live_contexts_independent_during_replay_and_load()
         .await;
     assert!(loaded.get("result").is_some(), "{loaded}");
     assert!(
-        fs::read(&transcript)
-            .unwrap()
-            .starts_with(&before_transcript),
+        read_transcript().starts_with(&before_transcript),
         "loading must preserve the original interrupted history"
     );
     let (_, continued) = competitor
@@ -7895,18 +7934,18 @@ async fn acp_completions_keep_live_contexts_independent_during_replay_and_load()
         )
         .await;
     assert_eq!(continued["result"]["stopReason"], "end_turn", "{continued}");
-    let continued_transcript = fs::read(&transcript).unwrap();
+    let continued_transcript = read_transcript();
     assert!(
-        !String::from_utf8_lossy(&continued_transcript)
+        String::from_utf8_lossy(&continued_transcript)
             .contains("Side effects may already have occurred"),
-        "a sibling must not repair another runtime's interrupted tool"
+        "the continuation must retain its inherited tool's unknown outcome"
     );
     let requests = server.captured_requests().await;
     let request = &requests.last().unwrap().raw_body;
     assert!(
-        !request.contains("Side effects may already have occurred")
-            && !request.contains(&format!("{SCENARIO_PREFIX}ask_user_question_roundtrip")),
-        "the resumed model must exclude the sibling's unfinished turn: {request}"
+        request.contains("Side effects may already have occurred")
+            && request.contains(&format!("{SCENARIO_PREFIX}ask_user_question_roundtrip")),
+        "the resumed model must inherit the written turn and its recovery result: {request}"
     );
     competitor.shutdown().await;
     assert_eq!(fs::read(&journal).unwrap(), before_journal);
@@ -7920,9 +7959,7 @@ async fn acp_completions_keep_live_contexts_independent_during_replay_and_load()
         .await;
     assert!(loaded_again.get("result").is_some(), "{loaded_again}");
     assert!(
-        fs::read(&transcript)
-            .unwrap()
-            .starts_with(&continued_transcript),
+        read_transcript().starts_with(&continued_transcript),
         "a further restart must retain both contexts and append history"
     );
     competitor.shutdown().await;
@@ -8443,6 +8480,7 @@ async fn acp_stdio_receives_peer_messages_on_the_pair_root() {
     let peer = runtime::mailbox::Mailbox::workspace_local(&pair_root, PEER.to_string());
     for (agent, _) in &sessions {
         peer.send(runtime::agent_mailbox::MailboxEnvelope {
+            delivery: runtime::turn_input::InputDelivery::Steer,
             from: PEER.to_string(),
             to: (*agent).to_string(),
             body: format!("for {agent} PARITY_SCENARIO:single_turn_text"),

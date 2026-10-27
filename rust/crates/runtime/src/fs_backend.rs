@@ -202,6 +202,11 @@ pub trait FsBackend: Send + Sync + 'static {
         ))
     }
     fn read(&self, path: &str) -> io::Result<Vec<u8>>;
+    /// Read a complete view coordinated with backend record writers.
+    /// Atomic object and framed-stream backends use their ordinary read.
+    fn read_snapshot(&self, path: &str) -> io::Result<Vec<u8>> {
+        self.read(path)
+    }
     fn write(&self, path: &str, data: &[u8]) -> io::Result<()>;
     fn append(&self, path: &str, data: &[u8]) -> io::Result<()>;
     fn delete(&self, path: &str) -> io::Result<()>;
@@ -544,6 +549,9 @@ impl FsBackend for Arc<dyn FsBackend> {
     fn read(&self, path: &str) -> io::Result<Vec<u8>> {
         (**self).read(path)
     }
+    fn read_snapshot(&self, path: &str) -> io::Result<Vec<u8>> {
+        (**self).read_snapshot(path)
+    }
     fn write(&self, path: &str, data: &[u8]) -> io::Result<()> {
         (**self).write(path, data)
     }
@@ -758,6 +766,8 @@ impl FsBackend for StdFsBackend {
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
             Err(error) => return Err(error),
         };
+        // Recovery mutates the same inode that snapshot readers lock.
+        file.lock()?;
         let length = file.metadata()?.len();
         if length == 0 {
             return Ok(());
@@ -845,6 +855,9 @@ impl FsBackend for StdFsBackend {
     fn read(&self, path: &str) -> io::Result<Vec<u8>> {
         std::fs::read(path)
     }
+    fn read_snapshot(&self, path: &str) -> io::Result<Vec<u8>> {
+        record_log::read_native_snapshot(path)
+    }
 
     /// A real OS link where the platform gives one without privilege, else a small
     /// file holding the path it points at.
@@ -910,9 +923,13 @@ impl FsBackend for StdFsBackend {
     fn append(&self, path: &str, data: &[u8]) -> io::Result<()> {
         use std::io::Write;
         let mut file = std::fs::OpenOptions::new()
+            // Windows requires read access to lock an append handle.
+            .read(cfg!(windows))
             .create(true)
             .append(true)
             .open(path)?;
+        // Coordinate legacy appends with native snapshots and record writers.
+        file.lock()?;
         file.write_all(data)
     }
 
@@ -1001,9 +1018,32 @@ impl FsBackend for StdFsBackend {
     }
 
     fn write_atomic(&self, path: &str, data: &[u8]) -> io::Result<()> {
-        let temp = format!("{path}.tmp.{}", std::process::id());
-        std::fs::write(&temp, data)?;
-        std::fs::rename(&temp, path)
+        use std::io::Write;
+
+        let temp = format!("{path}.tmp.{}", uuid::Uuid::new_v4());
+        let result = (|| {
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&temp)?;
+            file.write_all(data)?;
+            file.sync_all()?;
+            drop(file);
+            std::fs::rename(&temp, path)?;
+            #[cfg(unix)]
+            {
+                let parent = std::path::Path::new(path)
+                    .parent()
+                    .filter(|parent| !parent.as_os_str().is_empty())
+                    .unwrap_or_else(|| std::path::Path::new("."));
+                std::fs::File::open(parent)?.sync_all()?;
+            }
+            Ok(())
+        })();
+        if result.is_err() {
+            let _ = std::fs::remove_file(&temp);
+        }
+        result
     }
 
     /// The turn's workspace root (see [`crate::workspace_root`]), which is
@@ -2159,6 +2199,27 @@ impl NexusVfsFsBackend {
         self.client.inspect_target(path, access, &self.auth_token)
     }
 
+    /// The entry type at `path`, for choosing how to read or append it.
+    ///
+    /// The node's target query answers it. A node older than that query
+    /// answers `Unimplemented`, which arrives here as `Unsupported`; the
+    /// entry's own stat gives the type then, as it did before the query
+    /// existed, without following a link. Classification only: authorization
+    /// keeps the target query and fails closed without it.
+    fn entry_type(&self, path: &str, access: ResourceAccessKind) -> io::Result<Option<i32>> {
+        match self.inspect_target(path, access) {
+            Ok(target) => Ok(target.entry_type),
+            Err(error) if error.kind() == io::ErrorKind::Unsupported => {
+                match self.client.stat(path, &self.auth_token) {
+                    Ok(stat) => Ok(Some(stat.entry_type)),
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+                    Err(error) => Err(error),
+                }
+            }
+            Err(error) => Err(error),
+        }
+    }
+
     fn remote_stat(&self, path: &str) -> io::Result<nexus_vfs_client::VfsStat> {
         self.client.stat(path, &self.auth_token)
     }
@@ -2213,11 +2274,7 @@ impl FsBackend for NexusVfsFsBackend {
         self.authorize_target(path, ResourceAccessKind::Write)?;
         // Stream identity comes from the server's entry type and uses its
         // atomic frame append. Ordinary files retain their byte append path.
-        if self
-            .inspect_target(path, ResourceAccessKind::Write)?
-            .entry_type
-            == Some(i32::from(DT_STREAM))
-        {
+        if self.entry_type(path, ResourceAccessKind::Write)? == Some(i32::from(DT_STREAM)) {
             self.client
                 .stream_write(path, data.to_vec(), &self.auth_token)
                 .map(|_offset| ())
@@ -2241,8 +2298,8 @@ impl FsBackend for NexusVfsFsBackend {
 
     fn is_append_stream(&self, path: &str) -> io::Result<bool> {
         self.authorize_target(path, ResourceAccessKind::Read)?;
-        self.inspect_target(path, ResourceAccessKind::Read)
-            .map(|target| target.entry_type == Some(i32::from(DT_STREAM)))
+        self.entry_type(path, ResourceAccessKind::Read)
+            .map(|entry_type| entry_type == Some(i32::from(DT_STREAM)))
     }
 
     fn delete(&self, path: &str) -> io::Result<()> {

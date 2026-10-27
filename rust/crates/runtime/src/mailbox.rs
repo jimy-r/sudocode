@@ -11,6 +11,10 @@
 //! that maps agent names to inbox paths. Everything above this layer is
 //! backend-agnostic.
 
+// Receivers run behind terminal editors. Diagnostics belong in the shared
+// receiver observation and tracing path, never directly on terminal streams.
+#![deny(clippy::print_stderr, clippy::print_stdout)]
+
 use std::sync::Arc;
 
 use crate::agent_mailbox::MailboxEnvelope;
@@ -426,6 +430,27 @@ impl Mailbox {
     #[inline]
     pub fn self_id(&self) -> &str {
         &self.self_id
+    }
+
+    /// The persistent description in this mailbox's actual agent namespace.
+    pub fn description_store(
+        &self,
+        agent: &str,
+    ) -> std::io::Result<crate::agent_description::DescriptionStore> {
+        if agent.is_empty() || agent == "." || agent == ".." || agent.contains(['/', '\\', '\0']) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "invalid agent name",
+            ));
+        }
+        Ok(crate::agent_description::DescriptionStore::new(
+            Arc::clone(&self.backend),
+            format!(
+                "{}/{agent}/{}",
+                self.convention.agents_dir(),
+                crate::agent_description::DESCRIPTION_FILE
+            ),
+        ))
     }
 
     /// Read-only binding of this exact mailbox, before any A2A IO.
@@ -856,6 +881,7 @@ impl Mailbox {
         let mb = Arc::clone(self);
         Arc::new(move |to: &str, body: &str| {
             let env = MailboxEnvelope {
+                delivery: crate::turn_input::InputDelivery::Steer,
                 from: mb.self_id.clone(),
                 to: to.to_string(),
                 body: body.to_string(),
@@ -881,6 +907,8 @@ pub struct ReaderRegister {
     /// is free. Deliberately NOT the agent name: two instances of the SAME
     /// agent are exactly what this has to tell apart.
     #[serde(default)]
+    /// The claim that failed to advance, empty when no reader was held (see
+    /// [`DeliveryStall::ClaimFailed`]).
     pub holder: String,
     /// Legacy diagnostic deadline; the backend lock controls ownership.
     #[serde(default)]
@@ -1337,17 +1365,44 @@ impl OwnedReader {
         self.lease.is_valid()
     }
 
-    fn commit(&mut self, offset: u64) -> Result<(), String> {
-        if !self
-            .lease
-            .confirm()
-            .map_err(|e| format!("renew reader: {e}"))?
-        {
-            return Err("reader ownership lost; delivery remains unacknowledged".into());
+    fn commit(&mut self, offset: u64) -> Result<(), CommitRefusal> {
+        let confirmed = self.lease.confirm();
+        if !matches!(confirmed, Ok(true)) {
+            // Read the loss now: it is what refused this commit. The lease
+            // records it before it refuses, and only the first one is kept.
+            let message = match confirmed {
+                Err(e) => format!("renew reader: {e}"),
+                Ok(_) => "reader ownership lost; delivery remains unacknowledged".into(),
+            };
+            return Err(CommitRefusal {
+                loss: self.lease.loss(),
+                message,
+            });
         }
-        self.cursor.commit(offset, now_ms() + READER_LEASE_MS)?;
+        // The lease held. A write that fails now is the register's failure,
+        // even if the lease is lost while it is in flight.
+        self.cursor
+            .commit(offset, now_ms() + READER_LEASE_MS)
+            .map_err(|message| CommitRefusal {
+                loss: None,
+                message,
+            })?;
         self.offset = offset;
         Ok(())
+    }
+}
+
+/// Why a reader commit did not happen. `loss` is the lease's loss when the
+/// renewal ahead of the write refused it, and `None` when the lease held and
+/// the register write failed.
+struct CommitRefusal {
+    loss: Option<LeaseLoss>,
+    message: String,
+}
+
+impl std::fmt::Display for CommitRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
     }
 }
 /// A pending delivery. Only acknowledge after the consumer durably records its
@@ -1364,7 +1419,9 @@ impl UnreadBatch {
         &self.messages
     }
     pub fn acknowledge(mut self) -> Result<(), String> {
-        self.reader.commit(self.next)
+        self.reader
+            .commit(self.next)
+            .map_err(|refusal| refusal.message)
     }
 }
 
@@ -1423,8 +1480,8 @@ impl Mailbox {
 /// What a receiver in this process is doing for its agent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReceiverState {
-    /// Another instance of the agent holds its receiver seat; this one waits to
-    /// take over.
+    /// This instance does not hold the receiver seat. Another instance can
+    /// hold it, or the backend can be unavailable while this instance retries.
     Standby,
     /// This instance holds the agent's receiver seat and tails its
     /// conversations.
@@ -1465,6 +1522,9 @@ pub struct PeerStatus {
     pub cursor: &'static str,
     /// Why attaching failed, when it did.
     pub error: Option<String>,
+    /// Most recent background receiver failure in this process. Historical:
+    /// receiving can recover while this diagnostic remains inspectable.
+    pub last_receiver_error: Option<String>,
 }
 
 /// The cursor guarantee each agent's readers got in this process, as decided
@@ -1495,12 +1555,19 @@ pub fn cursor_guarantee(agent: &str) -> Option<crate::cursor_fence::CursorGuaran
 
 /// Receivers running in this process: per agent name, how many are standing
 /// by and how many are receiving.
+#[derive(Default)]
+struct ReceiverObservation {
+    standby: usize,
+    receiving: usize,
+    last_error: Option<String>,
+}
+
 static RECEIVER_STATES: std::sync::OnceLock<
-    std::sync::Mutex<std::collections::HashMap<String, (usize, usize)>>,
+    std::sync::Mutex<std::collections::HashMap<String, ReceiverObservation>>,
 > = std::sync::OnceLock::new();
 
 fn receiver_states(
-) -> std::sync::MutexGuard<'static, std::collections::HashMap<String, (usize, usize)>> {
+) -> std::sync::MutexGuard<'static, std::collections::HashMap<String, ReceiverObservation>> {
     RECEIVER_STATES
         .get_or_init(std::sync::Mutex::default)
         .lock()
@@ -1512,10 +1579,28 @@ fn receiver_states(
 #[must_use]
 pub fn receiver_state(agent: &str) -> Option<ReceiverState> {
     match receiver_states().get(agent) {
-        Some((_, receiving)) if *receiving > 0 => Some(ReceiverState::Receiving),
-        Some((standby, _)) if *standby > 0 => Some(ReceiverState::Standby),
+        Some(state) if state.receiving > 0 => Some(ReceiverState::Receiving),
+        Some(state) if state.standby > 0 => Some(ReceiverState::Standby),
         _ => None,
     }
+}
+
+/// Last background failure, retained with the receiver's transient state.
+#[must_use]
+pub fn last_receiver_error(agent: &str) -> Option<String> {
+    receiver_states()
+        .get(agent)
+        .and_then(|state| state.last_error.clone())
+}
+
+/// Background services never own the terminal. Hosts can inspect the same
+/// latest diagnostic through peer status or subscribe to structured tracing.
+fn report_receiver_error(mailbox: &Mailbox, label: &str, error: String) {
+    tracing::warn!(receiver = label, agent = mailbox.self_id(), %error, "mailbox receiver failed");
+    receiver_states()
+        .entry(mailbox.self_id().to_string())
+        .or_default()
+        .last_error = Some(error);
 }
 
 /// One receiver's entry in [`receiver_state`], withdrawn when it stops.
@@ -1532,13 +1617,13 @@ impl ReceiverStateEntry {
         let mut states = receiver_states();
         let counts = states.entry(self.agent.clone()).or_default();
         match self.state.replace(state) {
-            Some(ReceiverState::Standby) => counts.0 -= 1,
-            Some(ReceiverState::Receiving) => counts.1 -= 1,
+            Some(ReceiverState::Standby) => counts.standby -= 1,
+            Some(ReceiverState::Receiving) => counts.receiving -= 1,
             None => {}
         }
         match state {
-            ReceiverState::Standby => counts.0 += 1,
-            ReceiverState::Receiving => counts.1 += 1,
+            ReceiverState::Standby => counts.standby += 1,
+            ReceiverState::Receiving => counts.receiving += 1,
         }
     }
 }
@@ -1548,11 +1633,11 @@ impl Drop for ReceiverStateEntry {
         let mut states = receiver_states();
         if let Some(counts) = states.get_mut(&self.agent) {
             match self.state {
-                Some(ReceiverState::Standby) => counts.0 -= 1,
-                Some(ReceiverState::Receiving) => counts.1 -= 1,
+                Some(ReceiverState::Standby) => counts.standby -= 1,
+                Some(ReceiverState::Receiving) => counts.receiving -= 1,
                 None => {}
             }
-            if *counts == (0, 0) {
+            if counts.standby == 0 && counts.receiving == 0 {
                 states.remove(&self.agent);
             }
         }
@@ -1614,16 +1699,21 @@ pub fn spawn_inbox_poller(
     std::thread::Builder::new()
         .name(format!("{label}-inbox"))
         .spawn(move || {
-            // Announce before listening. A receiver that only becomes visible
-            // once someone has written to it cannot be found by whoever wants
-            // to write, and cannot be observed to be running at all.
-            if let Err(e) = mailbox.ensure_presence() {
-                eprintln!("[{label}] announcing this agent failed: {e}");
-            }
             let mut state = ReceiverStateEntry {
                 agent: mailbox.self_id().to_string(),
                 state: None,
             };
+            state.set(ReceiverState::Standby);
+            // Announce before listening. A receiver that only becomes visible
+            // once someone has written to it cannot be found by whoever wants
+            // to write, and cannot be observed to be running at all.
+            if let Err(e) = mailbox.ensure_presence() {
+                report_receiver_error(
+                    &mailbox,
+                    label,
+                    format!("announcing this agent failed: {e}"),
+                );
+            }
             // Keep retrying an offline node without repainting the terminal
             // with the same error on every discovery tick. A changed error or
             // a new outage after a successful receiver-seat check is reported again.
@@ -1639,7 +1729,7 @@ pub fn spawn_inbox_poller(
                     }
                     Err(e) => {
                         if last_claim_error.as_ref() != Some(&e) {
-                            eprintln!("[{label}] {e}");
+                            report_receiver_error(&mailbox, label, e.clone());
                             last_claim_error = Some(e);
                         }
                         sleep_unless_aborted(&abort, CONVERSATION_DISCOVERY_MS);
@@ -1688,12 +1778,14 @@ fn receive_while_seated(
                     tailing.insert(peer, tail);
                 }
             }
-            Err(e) => eprintln!("[{label}] listing conversations failed: {e}"),
+            Err(e) => {
+                report_receiver_error(mailbox, label, format!("listing conversations failed: {e}"));
+            }
         }
         sleep_unless_aborted(abort, CONVERSATION_DISCOVERY_MS);
     }
     if let Some(loss) = seat.loss() {
-        eprintln!("[{label}] receiver seat lost: {loss}");
+        report_receiver_error(mailbox, label, format!("receiver seat lost: {loss}"));
     }
     // Joining is what makes the receiver's handle mean "the receiver has
     // stopped". Without it the caller's join returns while N tails are still
@@ -1705,6 +1797,182 @@ fn receive_while_seated(
 }
 /// One conversation's tail: hold the reader seat, park on the transcript,
 /// deliver, commit.
+/// Why a delivery attempt left the reader where it was.
+///
+/// Recorded because the interesting case was previously invisible. Three of
+/// these only reached an `eprintln!` on a stderr nobody captures, and
+/// [`DeliveryStall::ConsumerRefused`] — the one that actually re-hands a batch
+/// to a consumer and so produces duplicate deliveries — was logged nowhere at
+/// all. Six agents then had to argue from inference about whether a repeat was
+/// transport or a peer saying something twice, which is the distinction
+/// [`MailboxEnvelope::timestamp`] is documented to settle but which nothing
+/// persisted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeliveryStall {
+    /// The consumer did not accept every message in the batch, so the whole
+    /// batch is re-read from the same offset. This is the DESIGNED
+    /// at-least-once boundary, not a fault — it is recorded so that a repeat
+    /// can be attributed instead of guessed at.
+    ///
+    /// Recorded only when the lease was still valid, so this really is the
+    /// consumer's refusal. The batch test is
+    /// `msgs.iter().all(|m| reader.is_valid() && sink(m))`, which also goes
+    /// false when the lease lapses mid-batch; attributing that to the consumer
+    /// would blame the wrong cause for exactly the repeats this record exists
+    /// to explain — and the "not a fault" note above would then be asserted
+    /// about a fault. That case is [`DeliveryStall::LeaseLost`].
+    ConsumerRefused,
+    /// The lease went invalid part-way through the batch, so the handover was
+    /// abandoned and the batch is re-read. Distinct from
+    /// [`DeliveryStall::ConsumerRefused`] because this one IS a fault, and
+    /// because a repeat caused by it has a different remedy.
+    LeaseLost,
+    /// The batch was accepted but `commit` refused to store the new offset, so
+    /// the accepted work will be handed over again.
+    CommitRefused,
+    /// The reader could not be claimed at all.
+    ClaimFailed,
+    /// Reading the conversation failed.
+    PollFailed,
+}
+
+/// One delivery attempt that did not advance a reader.
+///
+/// Carries only what attributes the stall — peer, holder, offset — and never
+/// message bodies: the transcript already holds those, and a diagnostic has no
+/// business copying them.
+#[derive(Debug, Clone)]
+pub struct DeliveryEvent {
+    pub peer: String,
+    pub holder: String,
+    /// The offset that did NOT advance, or `None` when no reader was held and
+    /// there is no offset to report.
+    ///
+    /// `Option` for the same reason as `tail`: offset **0** is a real and common
+    /// value — the start of a conversation, which the integration tests assert
+    /// on — so a zero standing for "unknown" would be indistinguishable from a
+    /// genuine stall at the first frame. [`DeliveryStall::ClaimFailed`] happens
+    /// before a reader exists, so it has no offset rather than an invented one.
+    pub offset: Option<u64>,
+    /// End of the transcript as of the poll that observed this stall, or `None`
+    /// when no poll succeeded and nothing beyond the cursor is known.
+    ///
+    /// This is the field that makes the record self-sufficient. `offset` alone
+    /// cannot tell a re-hand from a peer speaking again: while a consumer keeps
+    /// refusing, the offset stays put in BOTH cases, so both look identical on
+    /// `offset` and `repeats`. `tail` separates them — it is unchanged when the
+    /// same frames are handed over again, and larger when the peer appended
+    /// something new.
+    ///
+    /// `Option` rather than a sentinel because `Some(tail) == Some(offset)`
+    /// already means something definite — the reader is caught up, nothing
+    /// pending. Encoding "unknown" the same way would make "no backlog" and
+    /// "could not see the backlog" indistinguishable, which is the exact
+    /// ambiguity this field exists to remove. A type keeps them apart for every
+    /// reader; a doc comment only helps the ones who read it.
+    pub tail: Option<u64>,
+    pub stall: DeliveryStall,
+    /// Why the lease stopped being trusted, when that is what stopped this
+    /// delivery.
+    ///
+    /// - [`DeliveryStall::LeaseLost`]: always `Some`. The lease records its
+    ///   loss before it reads invalid, so a `LeaseLost` with `None` here is a
+    ///   bug, not a missing measurement.
+    /// - [`DeliveryStall::CommitRefused`]: `Some` when the commit was refused
+    ///   because the lease was lost — the renewal ahead of the write returned
+    ///   an error, answered "not held" or answered too late, or the lease was
+    ///   already lost — captured the moment the renewal refused it. `None` when
+    ///   the lease held and the register write itself failed, even if the
+    ///   lease is lost while that write is in flight: the write is what
+    ///   refused the commit.
+    /// - Every other stall: `None` **by construction**, not by observation. A
+    ///   consumer refusal is classified at the moment it happens, and the lease
+    ///   may lapse a moment later; attaching that later loss would give the
+    ///   refusal a cause it did not have — the misattribution `stall` exists to
+    ///   prevent.
+    pub loss: Option<LeaseLoss>,
+    /// Consecutive stalls at the current `offset` within one reader claim.
+    ///
+    /// Reset when a batch is accepted, and started afresh when the reader is
+    /// re-acquired — so it never carries a stale count across a claim or back
+    /// to an earlier offset.
+    pub repeats: u32,
+    pub at_ms: u64,
+}
+
+/// Bounded so a long-lived agent cannot accumulate these without limit.
+const DELIVERY_EVENT_CAP: usize = 256;
+
+/// A bounded record of delivery stalls.
+///
+/// A type rather than loose statics so it can be exercised in isolation: the
+/// process-wide instance is just one of these, and a test gets its own instead
+/// of racing its peers through shared state.
+#[derive(Default)]
+struct DeliveryLog {
+    events: std::sync::Mutex<std::collections::VecDeque<DeliveryEvent>>,
+}
+
+impl DeliveryLog {
+    /// Infallible and side-effect-free with respect to delivery: recording must
+    /// never influence whether a batch is acknowledged.
+    fn record(&self, event: DeliveryEvent) {
+        let mut events = self
+            .events
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if events.len() == DELIVERY_EVENT_CAP {
+            events.pop_front();
+        }
+        events.push_back(event);
+    }
+
+    fn events(&self) -> Vec<DeliveryEvent> {
+        self.events
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .cloned()
+            .collect()
+    }
+}
+
+fn global_delivery_log() -> &'static DeliveryLog {
+    static LOG: std::sync::OnceLock<DeliveryLog> = std::sync::OnceLock::new();
+    LOG.get_or_init(DeliveryLog::default)
+}
+
+fn record_delivery_stall(
+    peer: &str,
+    holder: &str,
+    offset: Option<u64>,
+    tail: Option<u64>,
+    stall: DeliveryStall,
+    loss: Option<LeaseLoss>,
+    repeats: u32,
+) {
+    global_delivery_log().record(DeliveryEvent {
+        peer: peer.to_string(),
+        holder: holder.to_string(),
+        offset,
+        tail,
+        stall,
+        loss,
+        repeats,
+        at_ms: now_ms(),
+    });
+}
+
+/// Delivery stalls observed by this process, oldest first.
+///
+/// Process-scoped by design: the question being answered is "what is happening
+/// on this receiver", and draining to disk from the tail thread would add a new
+/// failure mode to the delivery path for a diagnostic's sake.
+#[must_use]
+pub fn delivery_events() -> Vec<DeliveryEvent> {
+    global_delivery_log().events()
+}
+
 fn spawn_conversation_tail(
     mailbox: Arc<Mailbox>,
     peer: String,
@@ -1724,37 +1992,119 @@ fn spawn_conversation_tail(
                         continue;
                     }
                     Err(e) => {
-                        eprintln!("[{label}] claiming reader for {peer}: {e}");
+                        report_receiver_error(
+                            &mailbox,
+                            label,
+                            format!("claiming reader for {peer}: {e}"),
+                        );
+                        record_delivery_stall(
+                            &peer,
+                            "",
+                            None,
+                            None,
+                            DeliveryStall::ClaimFailed,
+                            None,
+                            0,
+                        );
                         sleep_unless_aborted(&abort, block_ms.max(1));
                         continue;
                     }
                 };
                 let mut retry_delay_ms = DELIVERY_RETRY_INITIAL_MS;
+                let mut stall_repeats = 0_u32;
                 while !abort.is_aborted() && reader.is_valid() {
                     let (msgs, next) =
                         match mailbox.poll_conversation(&peer, reader.offset, block_ms) {
                             Ok(batch) => batch,
                             Err(e) => {
-                                eprintln!("[{label}] polling conversation with {peer}: {e}");
+                                report_receiver_error(
+                                    &mailbox,
+                                    label,
+                                    format!("polling conversation with {peer}: {e}"),
+                                );
+                                record_delivery_stall(
+                                    &peer,
+                                    reader.cursor.holder(),
+                                    Some(reader.offset),
+                                    None,
+                                    DeliveryStall::PollFailed,
+                                    None,
+                                    0,
+                                );
                                 sleep_unless_aborted(&abort, block_ms.max(1));
                                 continue;
                             }
                         };
-                    if msgs.iter().all(|m| reader.is_valid() && sink(m)) {
+                    let mut lease_lost = false;
+                    if msgs.iter().all(|m| {
+                        // Record which step failed as it happens. Asking
+                        // `is_valid()` again afterwards would be a second
+                        // question with a window between: a sink that refused
+                        // under a held lease, followed by the lease lapsing
+                        // before the check, would be filed as `LeaseLost` when
+                        // the consumer was the actual cause.
+                        if !reader.is_valid() {
+                            lease_lost = true;
+                            return false;
+                        }
+                        sink(m)
+                    }) {
                         retry_delay_ms = DELIVERY_RETRY_INITIAL_MS;
+                        stall_repeats = 0;
                         if next > reader.offset {
                             if let Err(e) = reader.commit(next) {
-                                eprintln!("[{label}] committing reader for {peer}: {e}");
+                                report_receiver_error(
+                                    &mailbox,
+                                    label,
+                                    format!("committing reader for {peer}: {e}"),
+                                );
+                                record_delivery_stall(
+                                    &peer,
+                                    reader.cursor.holder(),
+                                    Some(reader.offset),
+                                    Some(next),
+                                    DeliveryStall::CommitRefused,
+                                    e.loss,
+                                    0,
+                                );
                                 break;
                             }
                         }
                     } else {
+                        // The batch is re-read from this same offset, so every
+                        // message in it is handed over again. Recorded: this is
+                        // the path that produces a byte-identical redelivery,
+                        // and it used to leave no trace whatsoever.
+                        if !msgs.is_empty() {
+                            stall_repeats = stall_repeats.saturating_add(1);
+                            // Which step actually failed, captured above rather
+                            // than re-derived here. Only a lost lease carries
+                            // the lease's loss; see `DeliveryEvent::loss`.
+                            let (stall, loss) = if lease_lost {
+                                (DeliveryStall::LeaseLost, reader.lease.loss())
+                            } else {
+                                (DeliveryStall::ConsumerRefused, None)
+                            };
+                            record_delivery_stall(
+                                &peer,
+                                reader.cursor.holder(),
+                                Some(reader.offset),
+                                Some(next),
+                                stall,
+                                loss,
+                                stall_repeats,
+                            );
+                        }
                         sleep_unless_aborted(&abort, retry_delay_ms);
                         retry_delay_ms = retry_delay_ms.saturating_mul(2).min(READER_RENEW_MS);
                     }
                 }
                 if let Some(loss) = reader.lease.loss() {
-                    eprintln!("[{label}] reader for {peer} lost: {loss}");
+                    report_receiver_error(
+                        &mailbox,
+                        label,
+                        format!("reader for {peer} lost: {loss}"),
+                    );
                 }
             }
         })
@@ -1883,6 +2233,7 @@ mod tests {
 
     fn note(from: &str, to: &str, body: &str) -> MailboxEnvelope {
         MailboxEnvelope {
+            delivery: crate::turn_input::InputDelivery::Steer,
             from: from.to_string(),
             to: to.to_string(),
             body: body.to_string(),
@@ -2030,6 +2381,7 @@ mod tests {
         let mb = local_mailbox(&ws, "team-lead");
 
         mb.send(MailboxEnvelope {
+            delivery: crate::turn_input::InputDelivery::Steer,
             from: "team-lead".to_string(),
             to: "worker".to_string(),
             body: "hello worker".to_string(),
@@ -2058,6 +2410,7 @@ mod tests {
         // Both land in the SAME transcript — that is the point of a shared
         // conversation. Each side tells its own appends apart by `from`.
         mb.send(MailboxEnvelope {
+            delivery: crate::turn_input::InputDelivery::Steer,
             from: "agent-a".to_string(),
             to: "agent-b".to_string(),
             body: "self-write".to_string(),
@@ -2069,6 +2422,7 @@ mod tests {
         })
         .unwrap();
         mb.send(MailboxEnvelope {
+            delivery: crate::turn_input::InputDelivery::Steer,
             from: "agent-b".to_string(),
             to: "agent-b".to_string(),
             body: "from peer".to_string(),
@@ -2094,6 +2448,7 @@ mod tests {
 
         for i in 0..3 {
             mb.send(MailboxEnvelope {
+                delivery: crate::turn_input::InputDelivery::Steer,
                 from: format!("agent-{i}"),
                 to: "worker".to_string(),
                 body: format!("msg-{i}"),
@@ -2118,6 +2473,7 @@ mod tests {
         let mb = local_mailbox(&ws, "coordinator");
 
         mb.send(MailboxEnvelope {
+            delivery: crate::turn_input::InputDelivery::Steer,
             from: "coordinator".to_string(),
             to: "alpha".to_string(),
             body: "hi".to_string(),
@@ -2129,6 +2485,7 @@ mod tests {
         })
         .unwrap();
         mb.send(MailboxEnvelope {
+            delivery: crate::turn_input::InputDelivery::Steer,
             from: "coordinator".to_string(),
             to: "beta".to_string(),
             body: "hi".to_string(),
@@ -2159,6 +2516,7 @@ mod tests {
         let ws = temp_workspace("list-recip-shape");
         let mb = local_mailbox(&ws, "coordinator");
         mb.send(MailboxEnvelope {
+            delivery: crate::turn_input::InputDelivery::Steer,
             from: "coordinator".to_string(),
             to: "alpha".to_string(),
             body: "hi".to_string(),
@@ -2342,6 +2700,7 @@ mod tests {
         // Write a message from a sub-agent to team-lead.
         let mb = local_mailbox(&ws, "sub-agent-1");
         mb.send(MailboxEnvelope {
+            delivery: crate::turn_input::InputDelivery::Steer,
             from: "sub-agent-1".to_string(),
             to: "team-lead".to_string(),
             body: "task complete".to_string(),

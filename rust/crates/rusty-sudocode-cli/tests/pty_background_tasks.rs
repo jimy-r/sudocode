@@ -1,5 +1,11 @@
 //! Background task discovery, inspection and control through the real terminal.
 mod common;
+#[path = "support/wire_requests.rs"]
+#[allow(
+    dead_code,
+    reason = "This journey decodes tool blocks; other PTYs use the shared dump-file filter."
+)]
+mod wire_requests;
 
 use common::TestEnv;
 use pty_expect::PtySession;
@@ -32,20 +38,9 @@ fn task_env(label: &str) -> (TestEnv, ReleaseOnDrop) {
 }
 
 fn expect_input_ready(session: &PtySession, budget: Duration, context: &str) {
-    common::expect_screen_settled(
+    common::expect_screen_rows_settled(
         session,
-        |_| {
-            session.render(|screen| {
-                // contents() joins soft-wrapped rows. At 80 columns the input
-                // can otherwise appear to contain the following rule/footer.
-                let rows = screen
-                    .raw()
-                    .rows(0, screen.raw().size().1)
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                rows.contains('\u{276f}') && common::input_line_of(&rows).is_empty()
-            })
-        },
+        |rows| rows.contains('\u{276f}') && common::input_line_of(rows).is_empty(),
         budget,
         context,
     );
@@ -187,6 +182,90 @@ fn background_shell_footer_and_details_keep_output_after_parent_finishes() {
 }
 
 #[test]
+fn background_status_is_static_and_results_do_not_displace_turn_statistics() {
+    let (env, _release) = task_env("background-status-conclusion");
+    let mut session = start(
+        &env,
+        &[shell(
+            "status",
+            "while [ ! -f release ]; do sleep 0.1; done; echo STATUS_RESULT_READY",
+            "Status conclusion fixture",
+        )],
+    );
+    let view = common::expect_screen_rows_settled(
+        &session,
+        |view| {
+            view.lines().any(|line| {
+                line.starts_with("1 task still running · turn ")
+                    && line.trim_end().ends_with(" finished")
+            }) && view
+                .lines()
+                .any(|line| line.contains("danger-full-access") && line.contains("1 terminal"))
+        },
+        common::LIVE_TURN_BUDGET,
+        "foreground conclusion and task footer have distinct content",
+    );
+    std::thread::sleep(Duration::from_millis(400));
+    assert_eq!(
+        session.render(|s| s
+            .raw()
+            .rows(0, s.raw().size().1)
+            .collect::<Vec<_>>()
+            .join("\n")),
+        view,
+        "background overview does not animate or advance a clock"
+    );
+    session.send("后台-draft").unwrap();
+    common::expect_input_line(
+        &session,
+        "后台-draft",
+        common::DEFAULT_TIMEOUT,
+        "idle typing",
+    );
+    session.resize(12, 32).unwrap();
+    common::expect_screen_rows(
+        &session,
+        |view| view.lines().any(|line| line.trim() == "1 running"),
+        common::DEFAULT_TIMEOUT,
+        "compact status preserves the task conclusion",
+    );
+    session.resize(40, 100).unwrap();
+    common::expect_input_line(
+        &session,
+        "后台-draft",
+        common::DEFAULT_TIMEOUT,
+        "resize retained draft",
+    );
+    session.send("\x15").unwrap();
+    common::expect_input_line_cleared(&session, common::DEFAULT_TIMEOUT, "clear draft");
+    let marker = common::turn_status_marker(&session);
+    fs::write(env.workspace_root().join("release"), "go").unwrap();
+    common::expect_turn_complete_after(
+        &session,
+        &marker,
+        common::LIVE_TURN_BUDGET,
+        "completion notification starts and finishes a new foreground turn",
+    );
+    common::expect_screen_rows_settled(
+        &session,
+        |view| {
+            let statistics = view.lines().position(|line| line.contains("· turn "));
+            let unread = view.lines().position(|line| {
+                line.contains("danger-full-access") && line.contains("1 new result")
+            });
+            matches!((statistics, unread), (Some(a), Some(b)) if a != b)
+                && view.contains("ctx ")
+                && !common::turn_status_line(view).contains("still running")
+        },
+        common::LIVE_TURN_BUDGET,
+        "statistics and unread result remain on their own surfaces",
+    );
+    open(&mut session);
+    screen(&session, "STATUS_RESULT_READY");
+    close(session);
+}
+
+#[test]
 fn urgent_tip_shares_the_footer_and_survives_task_browsing_and_resize() {
     let (env, _release) = task_env("background-with-tip");
     let calls = [
@@ -253,6 +332,7 @@ fn failed_background_shell_exposes_unread_result_and_exit_code() {
         )],
     );
     screen(&session, "1 new result");
+    screen(&session, "1 background task failed");
     open(&mut session);
     screen(&session, "  FAILURE_EVIDENCE");
     screen(&session, "exit 7");
@@ -267,11 +347,57 @@ fn failed_background_shell_exposes_unread_result_and_exit_code() {
         !view.contains("new result"),
         "read result must hide footer:\n{view}"
     );
+    common::expect_screen_rows_settled(
+        &session,
+        |view| {
+            view.contains("ctx ")
+                && !view
+                    .lines()
+                    .any(|line| line.starts_with("1 background task failed"))
+        },
+        common::LIVE_TURN_BUDGET,
+        "reading the failed result restores turn statistics",
+    );
     session.send("/ps\r").unwrap();
     screen(&session, "Enter details");
     session.send("\r").unwrap();
     screen(&session, "  FAILURE_EVIDENCE");
     close(session);
+}
+
+#[test]
+fn task_command_enter_opens_the_list_without_also_opening_details() {
+    let (env, _release) = task_env("background-task-command-key-owner");
+    let mut session = start(
+        &env,
+        &[shell(
+            "key-owner",
+            "echo TASK_COMMAND_RESULT; exit 7",
+            "Task command keyboard ownership",
+        )],
+    );
+    screen(&session, "1 new result");
+    // The editor drains its event batch before parent hooks are polled. Ctrl+A/E
+    // give the asynchronous /ps command time to reach the UI in that batch.
+    // Its submission Enter must never also navigate the newly opened panel.
+    for cursor_pairs in [0, 64, 1024, 8192] {
+        let input = format!("/ps\r{}", "\x01\x05".repeat(cursor_pairs));
+        session.send(&input).unwrap();
+        common::expect_screen_settled(
+            &session,
+            |s| {
+                common::input_and_footer_of(s).is_some_and(|area| {
+                    area.contains("Enter details") && !area.contains("Esc task list")
+                })
+            },
+            common::DEFAULT_TIMEOUT,
+            &format!("/ps Enter opens only the list ({cursor_pairs} cursor pairs)"),
+        );
+        session.send("\x1b").unwrap();
+        expect_input_ready(&session, common::DEFAULT_TIMEOUT, "task list closed");
+    }
+    session.send("/exit\r").unwrap();
+    assert_eq!(session.expect_eof().unwrap(), 0);
 }
 
 #[test]
@@ -444,39 +570,70 @@ fn task_updates_do_not_take_keyboard_ownership_from_questions() {
             json!({"id":"question","name":"AskUserQuestion","input":{"questions":[{"id":"choice","header":"Choice","question":"Select the second answer","options":[{"label":"First","value":"First","description":"First option"},{"label":"Second","value":"Second","description":"Second option"}],"multiSelect":false}]}}),
         ],
     );
-    common::expect_screen(
+    common::expect_screen_rows_settled(
         &session,
-        |view| {
-            view.lines()
-                .any(|line| line.starts_with("1/1") && line.contains("Select the second answer"))
-                && view.contains("[2] Second")
+        |_view| {
+            session.render(|screen| {
+                // ConPTY can mark the full-width rule above the question as
+                // wrapped. Inspect physical rows so contents() cannot join it
+                // to the header and hide the visible line boundary.
+                let rows = screen
+                    .raw()
+                    .rows(0, screen.raw().size().1)
+                    .collect::<Vec<_>>();
+                rows.iter().any(|line| {
+                    line.starts_with("1/1") && line.contains("Select the second answer")
+                }) && rows.iter().any(|line| line.contains("[2] Second"))
+            })
         },
         Duration::from_secs(90),
         "actual question options, rather than the echoed prompt",
     );
     screen(&session, "1 terminal");
-    session.send("\x1b[B\r").unwrap();
-    common::expect_input_line_cleared(&session, Duration::from_secs(90), "question answered");
+    let before = common::turn_status_marker(&session);
+    session.send("\x1b[B").unwrap();
+    common::expect_screen_rows_settled(
+        &session,
+        |view| {
+            view.lines()
+                .any(|line| line.trim_start().starts_with("> [2] Second"))
+        },
+        Duration::from_secs(90),
+        "second answer selected before confirming",
+    );
+    session.send("\r").unwrap();
+    expect_parent_complete(&session, &before);
     if env.is_mock() {
-        let bodies = env.captured_message_bodies();
+        let results: Vec<Value> = env
+            .captured_message_bodies()
+            .iter()
+            .flat_map(|body| {
+                wire_requests::request_tool_blocks(&serde_json::from_str(body).unwrap())
+            })
+            .filter(|block| block["type"] == "tool_result" && block["tool_use_id"] == "question")
+            .map(|block| {
+                assert_ne!(block["is_error"], true, "question failed: {block}");
+                let content = &block["content"];
+                let text = content.as_str().map(str::to_owned).unwrap_or_else(|| {
+                    content
+                        .as_array()
+                        .expect("question text blocks")
+                        .iter()
+                        .map(|part| part["text"].as_str().expect("question text"))
+                        .collect::<Vec<_>>()
+                        .join("")
+                });
+                serde_json::from_str(&text).expect("question result JSON")
+            })
+            .collect();
         assert!(
-            bodies.iter().any(|body| {
-                let request: Value = serde_json::from_str(body).unwrap();
-                request["messages"]
-                    .as_array()
-                    .unwrap()
-                    .iter()
-                    .any(|message| {
-                        message["content"].as_array().is_some_and(|blocks| {
-                            blocks.iter().any(|block| {
-                                block["type"] == "tool_result"
-                                    && block["tool_use_id"] == "question"
-                                    && block["content"].to_string().contains("Second")
-                            })
-                        })
-                    })
-            }),
-            "actual selected answer must reach provider"
+            !results.is_empty()
+                && results.iter().all(|result| {
+                    result["answers"][0]["value"] == "Second"
+                        && result["answers"][0]["label"] == "Second"
+                }),
+            "actual selected answer must reach provider: question_results={results:?}; screen={}",
+            common::screen_tail(&session, 5000)
         );
     }
     open(&mut session);
@@ -590,6 +747,90 @@ fn exiting_during_a_foreground_tool_reaps_both_process_groups() {
     }
 }
 
+/// The tools promise "end your turn — you will be notified". A shell that
+/// finishes while the prompt is idle must reach the model by itself: nobody
+/// types after the launch turn ends.
+#[test]
+fn a_background_shell_finishing_at_an_idle_prompt_reports_to_the_model() {
+    let (env, _release) = task_env("background-idle-wake");
+    let mut session = start(
+        &env,
+        &[shell(
+            "wake",
+            "while [ ! -f release ]; do sleep 0.1; done; echo IDLE_WAKE_OUTPUT",
+            "Idle wake fixture",
+        )],
+    );
+    let before = common::turn_status_marker(&session);
+    let launched = env.is_mock().then(|| env.captured_message_count());
+    fs::write(env.workspace_root().join("release"), "go").unwrap();
+    common::expect_screen(
+        &session,
+        |s| s.contains("Background task \"Idle wake fixture\" completed (exit 0)"),
+        common::LIVE_TURN_BUDGET,
+        "completion shown in scrollback",
+    );
+    common::expect_turn_complete_after(
+        &session,
+        &before,
+        common::LIVE_TURN_BUDGET,
+        "the completion ran a turn with no human input",
+    );
+    if let Some(launched) = launched {
+        let bodies = env.captured_message_bodies();
+        let woke = &bodies[launched..];
+        assert!(
+            woke.iter()
+                .any(|body| body.contains("<task-notification>")
+                    && body.contains("IDLE_WAKE_OUTPUT")),
+            "the model never received the finished shell: {woke:?}"
+        );
+    }
+    expect_input_ready(&session, common::DEFAULT_TIMEOUT, "back at input");
+    session.send("/exit\r").unwrap();
+    assert_eq!(session.expect_eof().unwrap(), 0);
+}
+
+/// `/exit` while the provider is still answering ends that turn (`Close`
+/// aborts in-flight work). A finished task now starts turns at idle, so a
+/// turn under a racing `/exit` is ordinary and must not hold shutdown.
+#[test]
+fn exiting_while_the_provider_is_answering_cancels_the_turn() {
+    let (env, _release) = task_env("exit-cancels-streaming-turn");
+    if !env.is_mock() {
+        // The stall is a mock control; a live provider has no such switch.
+        return;
+    }
+    // Never released: the mock holds its stream until its own deadline.
+    let stall = env.workspace_root().join("stream-never-released");
+    let calls = [
+        json!({"id":"stalled","name":"Bash","input":{"command":"echo unreachable","description":"Stalled stream fixture"},"stream_wait_for":stall}),
+    ];
+    let mut session = spawn_for_calls(&env, &calls);
+    session.resize(40, 100).unwrap();
+    expect_input_ready(&session, Duration::from_secs(30), "ready");
+    send_calls(&env, &mut session, &calls);
+    let deadline = Instant::now() + common::DEFAULT_TIMEOUT;
+    while env.captured_message_count() == 0 {
+        assert!(
+            Instant::now() < deadline,
+            "the turn never reached the provider"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    // Let the stream reach its stall point before leaving.
+    std::thread::sleep(Duration::from_millis(500));
+    let exit_started = Instant::now();
+    session.set_default_timeout(Duration::from_secs(45));
+    session.send("/exit\r").unwrap();
+    assert_eq!(session.expect_eof().unwrap(), 0);
+    let took = exit_started.elapsed();
+    assert!(
+        took < Duration::from_secs(10),
+        "exit waited for the stalled turn instead of cancelling it: {took:?}"
+    );
+}
+
 /// Run the same real-shell workload against baseline and candidate releases.
 #[test]
 #[ignore = "manual release A/B measurement"]
@@ -604,11 +845,15 @@ fn release_background_task_input_measurement() {
             "Background output workload",
         )],
     );
-    common::expect_screen(
+    // start already waits for the parent turn; measure while the producer lives.
+    common::expect_screen_rows(
         &session,
-        |s| s.contains("Concurrency batch done.") && s.contains("ctx "),
+        |view| {
+            view.lines()
+                .any(|line| line.contains("danger-full-access") && line.contains("1 terminal"))
+        },
         Duration::from_secs(30),
-        "background launch complete",
+        "background producer active before measurement",
     );
     report_resources("background_before_wait");
     std::thread::sleep(Duration::from_secs(5));

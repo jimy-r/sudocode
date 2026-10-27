@@ -5,6 +5,7 @@
 //! that drives interactive and one-shot turns.
 
 pub mod agent_color;
+pub mod agent_description;
 pub mod agent_mailbox;
 pub mod agent_types;
 pub mod background_tasks;
@@ -73,6 +74,7 @@ pub mod session_control;
 pub mod session_history;
 pub mod session_writer;
 pub mod test_support;
+pub mod turn_input;
 pub mod verification_watcher;
 pub use session::history;
 pub use session_control::SessionStore;
@@ -104,7 +106,8 @@ pub use bash::{
     clear_bash_progress_callback, execute_bash, execute_bash_with_abort,
     execute_bash_with_progress, execute_bash_with_tasks, launch_background_command,
     set_bash_progress_callback, shell_command_in, shell_process_group, BashCommandInput,
-    BashCommandOutput, BashProgress, BashProgressCallback, DEFAULT_TOOL_SUBPROCESS_TIMEOUT_MS,
+    BashCommandOutput, BashProgress, BashProgressCallback, ShellStatus,
+    DEFAULT_TOOL_SUBPROCESS_TIMEOUT_MS,
 };
 pub use bootstrap::{BootstrapPhase, BootstrapPlan};
 pub use branch_lock::{detect_branch_lock_collisions, BranchLockCollision, BranchLockIntent};
@@ -208,7 +211,7 @@ pub use permissions::{
     PermissionContext, PermissionMode, PermissionOutcome, PermissionOverride, PermissionPolicy,
     PermissionPromptDecision, PermissionPromptSink, PermissionPrompter, PermissionRequest,
     PromptQueue, PromptReply, PromptText, QuestionField, QuestionKind, QuestionOption,
-    QuestionPromptAnswer, QuestionPromptRequest, QuestionPrompter,
+    QuestionPresentation, QuestionPromptAnswer, QuestionPromptRequest, QuestionPrompter,
 };
 pub use plugin_lifecycle::{
     DegradedMode, DiscoveryResult, PluginHealthcheck, PluginLifecycle, PluginLifecycleEvent,

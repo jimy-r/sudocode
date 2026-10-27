@@ -117,16 +117,15 @@ NEXUS_A2A_TEST_ENDPOINT="$ENDPOINT" NEXUS_A2A_TEST_CERT_DIR="$CLIENT_BUNDLE" \
   "${CARGO_TEST[@]}" live_inbox_roundtrip -- --ignored --nocapture
 
 echo "== [deterministic] independent clients commit complete durable WAL records =="
-RECORD_TEST=(cargo test --manifest-path "$RUST_DIR/Cargo.toml" -q -p runtime --test fs_record_log)
+RECORD_TEST=(cargo_in_workspace test --manifest-path "$RUST_DIR/Cargo.toml" -q -p runtime --test fs_record_log)
 RECORD_RECEIPT="$AUTHON_DATA_DIR/record-log.json"
 NEXUS_A2A_TEST_ENDPOINT="$ENDPOINT" NEXUS_A2A_TEST_CERT_DIR="$CLIENT_BUNDLE" \
   NEXUS_RECORD_LOG_RECEIPT="$(native_path "$RECORD_RECEIPT")" \
   "${RECORD_TEST[@]}" live_record_log_commits_large_frames_from_independent_clients -- --ignored --nocapture
 
-echo "== [deterministic] completed context forks while a sibling tool is live =="
-echo "== [deterministic] runtime resume excludes a sibling's native tool turn =="
-cargo test --manifest-path "$RUST_DIR/Cargo.toml" -q -p runtime --test shared_runtime_history -- --nocapture
-HISTORY_TEST=(cargo test --manifest-path "$RUST_DIR/Cargo.toml" -q -p runtime --test shared_history_records)
+echo "== [deterministic] runtime resume inherits the written prefix while a native tool runs =="
+cargo_in_workspace test --manifest-path "$RUST_DIR/Cargo.toml" -q -p runtime --test shared_runtime_history -- --nocapture
+HISTORY_TEST=(cargo_in_workspace test --manifest-path "$RUST_DIR/Cargo.toml" -q -p runtime --test shared_history_records)
 HISTORY_RECEIPT="$AUTHON_DATA_DIR/shared-history.json"
 NEXUS_A2A_TEST_ENDPOINT="$ENDPOINT" NEXUS_A2A_TEST_CERT_DIR="$CLIENT_BUNDLE" \
   NEXUS_HISTORY_RECEIPT="$(native_path "$HISTORY_RECEIPT")" \
@@ -135,8 +134,8 @@ NEXUS_A2A_TEST_ENDPOINT="$ENDPOINT" NEXUS_A2A_TEST_CERT_DIR="$CLIENT_BUNDLE" \
 RUNTIME_HISTORY_RECEIPT="$AUTHON_DATA_DIR/runtime-history.json"
 NEXUS_A2A_TEST_ENDPOINT="$ENDPOINT" NEXUS_A2A_TEST_CERT_DIR="$CLIENT_BUNDLE" \
   NEXUS_RUNTIME_HISTORY_RECEIPT="$(native_path "$RUNTIME_HISTORY_RECEIPT")" \
-  cargo test --manifest-path "$RUST_DIR/Cargo.toml" -q -p runtime --test shared_runtime_history \
-    live_runtime_resume_preserves_completed_fork_and_native_tool_result -- --ignored --nocapture
+  cargo_in_workspace test --manifest-path "$RUST_DIR/Cargo.toml" -q -p runtime --test shared_runtime_history \
+    live_runtime_resume_inherits_written_prefix_and_keeps_native_tool_result -- --ignored --nocapture
 
 if [ "$(uname -s)" = Linux ]; then
   echo "== [deterministic] native failed flush requires a durable read barrier =="
@@ -158,7 +157,7 @@ NEXUS_A2A_TEST_ENDPOINT="$ENDPOINT" NEXUS_A2A_TEST_CERT_DIR="$CLIENT_BUNDLE" \
 
 NEXUS_A2A_TEST_ENDPOINT="$ENDPOINT" NEXUS_A2A_TEST_CERT_DIR="$CLIENT_BUNDLE" \
   NEXUS_RUNTIME_HISTORY_RECEIPT="$(native_path "$RUNTIME_HISTORY_RECEIPT")" \
-  cargo test --manifest-path "$RUST_DIR/Cargo.toml" -q -p runtime --test shared_runtime_history \
+  cargo_in_workspace test --manifest-path "$RUST_DIR/Cargo.toml" -q -p runtime --test shared_runtime_history \
     live_runtime_history_restores_both_branches_after_daemon_restart -- --ignored --nocapture
 
 # /agents and /sessions are mounted from one zone; a router that drops the mount
@@ -194,6 +193,13 @@ NEXUS_A2A_TEST_ENDPOINT="$ENDPOINT" \
   cargo_in_workspace test --manifest-path "$RUST_DIR/Cargo.toml" -q -p rusty-sudocode-cli \
   --test acp_a2a_receive live_session_close_releases_an_acquired_receiver_seat_before_reply \
   -- --ignored --nocapture
+
+echo "== [deterministic] a real receiver lease handoff preserves terminal drafts =="
+NEXUS_A2A_TEST_ENDPOINT="$ENDPOINT" \
+  NEXUS_A2A_TEST_RECEIVER_CREDENTIAL="$(authon_mint "receiver-draft-probe")" \
+  cargo_in_workspace test --manifest-path "$RUST_DIR/Cargo.toml" -q -p rusty-sudocode-cli \
+  --test pty_node_record live_node_lease_loss_preserves_editable_draft \
+  -- --ignored --exact --test-threads=1 --nocapture
 
 echo "== [deterministic] direct ACP uses no model; pause and lost reply use real mTLS =="
 NEXUS_A2A_TEST_ENDPOINT="$ENDPOINT" NEXUS_A2A_TEST_CERT_DIR="$CLIENT_BUNDLE" \
@@ -231,6 +237,23 @@ echo "== [deterministic] a failed reader renewal refuses the commit; the reader 
 NEXUS_A2A_TEST_ENDPOINT="$ENDPOINT" NEXUS_A2A_TEST_CERT_DIR="$CLIENT_BUNDLE" \
   "${CARGO_TEST[@]}" live_reader_commit_refused_on_renew_error_then_reacquired_from_durable_offset -- --ignored --nocapture
 
+# A stalled batch is recorded by the step that stopped it: a lease lost
+# mid-batch (INJECTED worker renewal failure) is LeaseLost, a consumer that
+# refused under a held lease is ConsumerRefused.
+echo "== [deterministic] a stalled batch records the step that stopped it =="
+NEXUS_A2A_TEST_ENDPOINT="$ENDPOINT" NEXUS_A2A_TEST_CERT_DIR="$CLIENT_BUNDLE" \
+  "${CARGO_TEST[@]}" live_stall_from_lease_lost_mid_batch_is_recorded_as_lease_lost -- --ignored --nocapture
+NEXUS_A2A_TEST_ENDPOINT="$ENDPOINT" NEXUS_A2A_TEST_CERT_DIR="$CLIENT_BUNDLE" \
+  "${CARGO_TEST[@]}" live_refusal_under_a_held_lease_is_recorded_as_consumer_refused -- --ignored --nocapture
+
+# A lease whose renewal never answers lapses on its own (INJECTED: the renewal
+# is held in flight), and its stall carries the lapse; a commit refused by its
+# register write (INJECTED, with the lease lost meanwhile) carries no lease loss.
+echo "== [deterministic] a stall carries the loss that caused it, captured when it happened =="
+NEXUS_A2A_TEST_ENDPOINT="$ENDPOINT" NEXUS_A2A_TEST_CERT_DIR="$CLIENT_BUNDLE" \
+  "${CARGO_TEST[@]}" live_stall_from_a_lapsed_lease_is_recorded_as_lease_lost_with_its_age -- --ignored --nocapture
+NEXUS_A2A_TEST_ENDPOINT="$ENDPOINT" NEXUS_A2A_TEST_CERT_DIR="$CLIENT_BUNDLE" \
+  "${CARGO_TEST[@]}" live_commit_refused_by_its_register_write_records_no_lease_loss -- --ignored --nocapture
 # The receiver seat trusts only fresh renewals: a late reply, a partition and a
 # slow-but-successful renewal are injected by the test-only wrapper; the node's
 # TTL is what any takeover waits on.
