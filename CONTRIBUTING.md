@@ -437,18 +437,15 @@ keyboard input, rendering, resize, cancellation, descendant process cleanup and
 recovery in the next turn. The process checks inspect actual child PIDs and fresh
 files. They do not require paid credentials.
 
-The default funded acceptance runs ACP and co-host model journeys plus four PTY
-workflows on Linux and Windows: file read/resume, cancellation/recovery, child
-approval and the Azure reasoning/file round trip. It runs on main pushes and
-manual dispatch. Before merging a change to those paths, run it on the PR branch:
+Funded acceptance runs ACP and co-host model journeys, plus every live PTY
+journey in the `live-model-pty` job on Linux and Windows. It runs on main pushes
+and manual dispatch. Before merging a change to those paths, run it on the PR
+branch:
 
 ```bash
 gh workflow run rust-ci.yml --ref <branch> -f live_only=true
 ```
 
-For expanded provider compatibility, including step budgets, edit recovery,
-task inspection and report verification, add `-f live_extended=true`. These tests
-retain their original assertions and remain available for focused acceptance.
 Provider preflight and traces identify quota, authentication, rate-limit and
 service failures separately. A failed preflight keeps the job failed and retains
 its evidence; it never counts as model acceptance. Successful small probes do
@@ -471,15 +468,6 @@ Validate this route with the complete file-read scenario on Linux and Windows.
 The provider probe and CLI profile share `AZURE_PROXY_AUTH_TOKEN`. Evidence names
 the auth profile separately from the model, so the same model can be checked on
 different provider channels without silently reusing another credential.
-
-The child approval journey executes the invoice once, then requests report
-verification in a separate user turn. It takes the report path from the completed
-child's actual tool result and gives the verification child only `read_file`.
-The invoice command uses the shared workspace. The report reader receives the
-producer's absolute `outputFile` path unchanged in a JSON tool input object.
-A missing persisted invoice result fails immediately after the child completes.
-The gate still requires both children, the approved Bash command exactly once,
-the real report contents, inherited model credentials, and the follow-up total.
 
 Verify a changed native route with the original real subagent/cache scenario,
 retaining its output/thinking budgets and assertions. A small successful request
