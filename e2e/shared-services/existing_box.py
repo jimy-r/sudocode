@@ -195,6 +195,8 @@ def run(args, root):
         discovery = json.loads((services / 'run/service.json').read_bytes())
         children.append(discovery)
         assert all(result['service']['persistedNodeId'] == profile['nodeId'] for result in results)
+        assert all(result['service']['managed'] is True for result in results), results
+        assert all(result['service']['instance'] == discovery['instance'] for result in results), results
         assert broker('service.status')['result']['managed'] is True
         for method in ['files.read', 'vault.list', 'sessions.call', 'service.shutdown', 'service.restart']:
             assert 'error' in broker(method), method
