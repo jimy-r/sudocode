@@ -191,7 +191,7 @@ impl EngineDelegate for DeferredDelegate {
         name: &str,
         input: &str,
         prompter: &mut dyn PermissionPrompter,
-    ) -> Result<(String, bool), DirectToolError> {
+    ) -> Result<runtime::external_a2a::ExternalToolResult, DirectToolError> {
         self.get()
             .map_err(DirectToolError::Refused)?
             .run_direct_tool(name, input, prompter)
@@ -212,6 +212,10 @@ impl EngineDelegate for DeferredDelegate {
     }
     fn background_tasks(&self) -> Option<runtime::background_tasks::BackgroundTasks> {
         self.get().ok()?.background_tasks()
+    }
+
+    fn turn_input_inbox(&self) -> Option<runtime::turn_input::TurnInputInbox> {
+        self.get().ok()?.turn_input_inbox()
     }
     fn set_model(&self, model: &str) -> Result<(String, Vec<String>), String> {
         self.get()?.set_model(model)

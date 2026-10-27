@@ -61,7 +61,7 @@ fn interrupted_tool_output(tool_name: &str) -> String {
     if tool_name.eq_ignore_ascii_case("bash") {
         crate::bash::interrupted_bash_output(
             "Command interrupted by user",
-            "interrupted",
+            crate::bash::ShellStatus::Interrupted,
             None,
             None,
         )
@@ -76,6 +76,16 @@ const EMPTY_POST_TOOL_DELIVERABLE_REMINDER: &str = "\
 <system-reminder>
 The previous model response was empty after a tool completed. The user requested a file deliverable, but the current turn has not produced a matching final file yet. Continue the same task now: create or execute whatever is needed to produce the requested file, then verify it exists before ending the turn.
 </system-reminder>";
+
+const STREAM_INTERRUPTED_REMINDER: &str = "\
+<system-reminder>
+Your previous response was cut off by a connection error before it finished. Continue from where it stopped. Do not repeat what you already wrote.
+</system-reminder>";
+
+/// How many times one turn continues by itself after its model stream drops
+/// mid-response. Each continuation starts from the saved partial reply and
+/// tool results, never from a resend of the failed request.
+const MAX_STREAM_CONTINUATIONS: u32 = 3;
 
 /// Prefix of the user-side date announcement injected on the first turn.
 /// The current date deliberately lives in a content block instead of the
@@ -176,6 +186,8 @@ pub enum AssistantEvent {
     Usage(TokenUsage),
     PromptCache(PromptCacheEvent),
     MessageStop,
+    /// A non-thinking block starts; any preceding thinking sequence is complete.
+    ResponseBlockStart,
 }
 
 /// Prompt-cache telemetry captured from the provider response stream.
@@ -430,6 +442,9 @@ pub trait ApiClient: Send {
 /// `engine_events::EngineEvent`s forwards all seven `AssistantEvent` variants,
 /// so every hook below must be forwarded from the loop.
 pub trait RuntimeObserver {
+    /// The initial user blocks, including attachments, reached durable history.
+    fn on_prompt_committed(&mut self) {}
+    fn on_input_committed(&mut self, _input: &crate::turn_input::InputView) {}
     /// Non-fatal runtime maintenance notices, forwarded through the engine seam.
     fn on_notice(&mut self, _text: &str) {}
 
@@ -451,6 +466,7 @@ pub trait RuntimeObserver {
 
     fn on_tool_result(
         &mut self,
+        _assistant_message_id: Option<&str>,
         _tool_use_id: &str,
         _tool_name: &str,
         _output: &str,
@@ -732,6 +748,10 @@ pub struct ToolDispatchContext {
     pub background_tasks: Option<crate::background_tasks::BackgroundTasks>,
     /// The `tool_use` id of this invocation, including concurrent calls.
     pub tool_use_id: Option<String>,
+    /// Host provenance for a direct A2A invocation, kept out of model history.
+    /// Keep this cold state shared: ordinary model calls must not carry its
+    /// strings inline through every scheduler context and async frame.
+    pub external_a2a: Option<Arc<crate::external_a2a::ExternalA2aCall>>,
     /// The parent session's active permission mode. A spawned sub-agent runs
     /// under this mode rather than an unconditional full-access policy, so a
     /// read-only session spawns read-only workers and a workspace-write
@@ -745,6 +765,16 @@ pub struct ToolDispatchContext {
 }
 
 impl ToolDispatchContext {
+    /// Stable identity assigned before dispatch, shared by all call producers.
+    #[must_use]
+    pub fn assistant_message_id(&self) -> Option<&str> {
+        self.parent_assistant_message
+            .as_ref()?
+            .history
+            .as_ref()
+            .map(|history| history.id.as_str())
+    }
+
     /// Returns `true` when the parent session's history contains a user
     /// message tagged with [`FORK_BOILERPLATE_TAG`] — meaning this
     /// dispatch is happening inside a fork child. Mirrors CC-fork's
@@ -773,7 +803,17 @@ impl ToolDispatchContext {
 /// crosses a thread boundary and needs no `Sync`). Any per-invocation mutable
 /// state (spinner, prompter) lives behind single-threaded interior mutability
 /// in the impl.
+#[allow(
+    async_fn_in_trait,
+    reason = "Tool futures are polled on the owning thread and deliberately do not require Send."
+)]
 pub trait ToolExecutor: Send {
+    /// The mailbox actually installed in this executor. A direct A2A call
+    /// requires this binding instead of resolving an unscoped disk default.
+    fn external_a2a_binding(&self) -> Option<crate::external_a2a::MailboxBinding> {
+        None
+    }
+
     /// Scheduling capability of the effective (post-hook) invocation.
     /// Dynamic executors may add metadata-backed tools without changing the
     /// conversation scheduler. Permission checks remain independent.
@@ -865,6 +905,9 @@ enum RuntimeErrorKind {
     CompactionPathNotSupported,
     /// A provider completed its response, but its summary cannot be installed.
     InvalidCompactionSummary,
+    /// The provider stream failed after delivering events. The partial reply
+    /// and every tool result are saved, so the turn can continue from them.
+    StreamInterrupted,
     /// The request was rejected — locally by the API client's preflight or
     /// by the provider — because it does not fit the model's context window.
     ContextWindowBlocked,
@@ -932,6 +975,21 @@ impl RuntimeError {
             kind: RuntimeErrorKind::ContextWindowBlocked,
             retryable: false,
         }
+    }
+
+    /// A provider stream that failed after delivering events.
+    #[must_use]
+    pub fn stream_interrupted(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            kind: RuntimeErrorKind::StreamInterrupted,
+            retryable: false,
+        }
+    }
+
+    #[must_use]
+    pub fn is_stream_interrupted(&self) -> bool {
+        self.kind == RuntimeErrorKind::StreamInterrupted
     }
 
     /// Set the transport-retryable classification. Chainable so the api→runtime
@@ -1188,6 +1246,7 @@ pub struct ConversationRuntime<C, T> {
     /// `maybe_auto_compact` short-circuits for the rest of the session.
     consecutive_auto_compact_noops: u8,
     hook_abort_signal: HookAbortSignal,
+    turn_inputs: crate::turn_input::TurnInputInbox,
     hook_progress_reporter: Option<HookProgressSink>,
     session_tracer: Option<SessionTracer>,
     /// File operation tracker for the current turn.
@@ -1204,6 +1263,7 @@ pub struct ConversationRuntime<C, T> {
     compaction_source_revision: Option<CompactionSourceRevision>,
     /// An unreadable or changed durable source forbids writing this snapshot.
     session_source_stale: bool,
+    agent_description_store: Option<crate::agent_description::DescriptionStore>,
 }
 
 impl<C, T> ConversationRuntime<C, T>
@@ -1266,6 +1326,7 @@ where
             hook_runner: HookRunner::from_feature_config(feature_config),
             consecutive_auto_compact_noops: 0,
             hook_abort_signal: HookAbortSignal::default(),
+            turn_inputs: crate::turn_input::TurnInputInbox::default(),
             hook_progress_reporter: None,
             session_tracer: None,
             file_tracker: crate::file_tracker::TurnFileTracker::new(workspace_root),
@@ -1276,6 +1337,34 @@ where
             last_compaction_report: None,
             compaction_source_revision: None,
             session_source_stale: false,
+            agent_description_store: None,
+        }
+    }
+
+    pub fn set_turn_input_inbox(&mut self, inbox: crate::turn_input::TurnInputInbox) {
+        self.turn_inputs = inbox;
+    }
+
+    /// Hosts bind regular peer runtimes; delegated child runtimes leave this unset.
+    pub fn set_agent_description_store(
+        &mut self,
+        store: crate::agent_description::DescriptionStore,
+    ) {
+        self.agent_description_store = Some(store);
+    }
+
+    /// Optional metadata never turns a committed checkpoint into a failure.
+    pub fn publish_agent_description(
+        &self,
+        update: Option<&crate::agent_description::DescriptionUpdate>,
+    ) {
+        if !crate::experiments::is_enabled(crate::experiments::Experiment::PeerDescriptions) {
+            return;
+        }
+        if let Some((store, update)) = self.agent_description_store.as_ref().zip(update) {
+            if let Err(error) = store.publish(update) {
+                tracing::warn!(%error, "peer description publication failed; checkpoint remains committed");
+            }
         }
     }
 
@@ -1639,7 +1728,8 @@ where
                         thought_signature,
                     });
                 }
-                AssistantEvent::Model(_)
+                AssistantEvent::ResponseBlockStart
+                | AssistantEvent::Model(_)
                 | AssistantEvent::Usage(_)
                 | AssistantEvent::PromptCache(_)
                 | AssistantEvent::MessageStop => {}
@@ -1720,6 +1810,7 @@ where
             .offload_tool_result(tool_use_id, output.as_bytes())
         {
             Ok((_path, total)) => {
+                let output_id = self.session.tool_output_id(tool_use_id);
                 // The physical path never leaves the engine; the model only
                 // ever sees the opaque tool_use id. The full result is paged
                 // back in as byte windows via `read_tool_output`, continuing
@@ -1727,7 +1818,7 @@ where
                 // first with its `pattern` seek.
                 let end = offload_preview_end(&output);
                 format!(
-                    "<persisted-output bytes={total} id=\"{tool_use_id}\">\nOutput too large ({total} bytes). Preview (first {end} bytes):\n{}\n…\n[Read the rest with read_tool_output(id=\"{tool_use_id}\", offset={end}) — continue from each response's nextOffset until it is null — or pass pattern=<regex> to find the offsets of specific lines first.]\n</persisted-output>",
+                    "<persisted-output bytes={total} id=\"{output_id}\">\nOutput too large ({total} bytes). Preview (first {end} bytes):\n{}\n…\n[Read the rest with read_tool_output(id=\"{output_id}\", offset={end}) — continue from each response's nextOffset until it is null — or pass pattern=<regex> to find the offsets of specific lines first.]\n</persisted-output>",
                     &output[..end]
                 )
             }
@@ -1818,7 +1909,8 @@ where
             .is_some();
         let catalog = self.api_client.model_catalog();
         let (blocks, pending_notifications) = Self::prepend_pending_task_notifications(blocks)?;
-        let turn = self.run_turn_with_blocks_inner(blocks, prompter, observer);
+        let turn_id = format!("turn-{}", uuid::Uuid::new_v4());
+        let turn = self.run_turn_with_blocks_inner(blocks, prompter, observer, turn_id.clone());
         let summary = if let Some(catalog) = catalog {
             catalog.refresh_in_background();
             catalog.scope(turn).await
@@ -1848,11 +1940,9 @@ where
                     "refusing to persist a stale session; durable history preserved: {error}"
                 ))
             })?;
-            if let Some(path) = self.session.persistence_path() {
-                self.session.save_to_path(path).map_err(|error| {
-                    RuntimeError::new(format!("failed to persist session: {error}"))
-                })?;
-            }
+            self.session.finish_turn(&turn_id).map_err(|error| {
+                RuntimeError::new(format!("failed to complete durable session turn: {error}"))
+            })?;
             pending_notifications
                 .acknowledge()
                 .map_err(RuntimeError::new)?;
@@ -1860,11 +1950,27 @@ where
         summary
     }
 
+    /// Normalize incoming images consistently for initial and steering input.
+    #[inline]
+    fn prepare_input_blocks(
+        &self,
+        mut blocks: Vec<ContentBlock>,
+    ) -> Result<Vec<ContentBlock>, RuntimeError> {
+        for block in &mut blocks {
+            if let ContentBlock::Image { data, mime_type } = block {
+                *block = crate::image_input::prepare_image(data, mime_type, self.running_model())
+                    .map_err(RuntimeError::new)?;
+            }
+        }
+        Ok(blocks)
+    }
+
     async fn run_turn_with_blocks_inner(
         &mut self,
         blocks: Vec<ContentBlock>,
         mut prompter: Option<&mut dyn PermissionPrompter>,
         mut observer: Option<&mut dyn RuntimeObserver>,
+        turn_id: String,
     ) -> Result<TurnSummary, RuntimeError> {
         let blocks = self.inject_date_context(blocks);
         let blocks = self.inject_model_context(blocks);
@@ -1886,28 +1992,9 @@ where
             }
         }
 
-        let mut prepared_blocks = Vec::with_capacity(blocks.len());
-        for block in blocks {
-            let block = match block {
-                ContentBlock::Image { data, mime_type } => {
-                    let model = self.running_model().to_string();
-                    crate::image_input::prepare_image(&data, &mime_type, &model)
-                        .map_err(RuntimeError::new)?
-                }
-                other => other,
-            };
-            prepared_blocks.push(block);
-        }
+        let prepared_blocks = self.prepare_input_blocks(blocks)?;
 
         // Start file tracking for this turn
-        let turn_id = format!(
-            "turn-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_millis())
-                .unwrap_or(0)
-        );
         self.current_turn_id = Some(turn_id.clone());
         self.file_tracker.start_turn(turn_id.clone());
 
@@ -1940,6 +2027,9 @@ where
         self.session
             .push_user_blocks(prepared_blocks)
             .map_err(|error| RuntimeError::new(error.to_string()))?;
+        if let Some(observer) = observer.as_deref_mut() {
+            observer.on_prompt_committed();
+        }
         self.compaction_pending_input_tokens = 0;
 
         // Hook workers share the current observer's progress sink, so slow
@@ -1964,6 +2054,7 @@ where
         let mut completed_steps = 0u32;
         let mut final_answer_requested = false;
         let mut retried_empty_post_tool_deliverable = false;
+        let mut stream_continuations = 0u32;
         let mut turn_compactions = 0usize;
         let mut recorded_compaction_budget_exhausted = false;
         let mut overflow_compaction: Option<AutoCompactionEvent> = None;
@@ -1988,6 +2079,35 @@ where
                 });
             }
 
+            for input in self.turn_inputs.batch() {
+                if self.hook_abort_signal.is_aborted() {
+                    break;
+                }
+                let view = input.view();
+                // Resolve human references through the session filesystem;
+                // peer and task notifications keep their literal text.
+                let prepared = if input.source == crate::turn_input::InputSource::Human {
+                    crate::image_input::prompt_blocks(input.text, self.session.fs_handle().as_ref())
+                        .map_err(|error| RuntimeError::new(error.to_string()))
+                        .and_then(|mut blocks| {
+                            blocks.extend(input.attachments);
+                            self.prepare_input_blocks(blocks)
+                        })
+                } else {
+                    Ok(vec![ContentBlock::Text { text: input.text }])
+                };
+                // Preparation can perform I/O; cancellation still owns admission.
+                if self.hook_abort_signal.is_aborted() {
+                    break;
+                }
+                self.session
+                    .push_user_blocks(prepared?)
+                    .map_err(|error| RuntimeError::new(error.to_string()))?;
+                self.turn_inputs.committed(input.id);
+                if let Some(observer) = observer.as_deref_mut() {
+                    observer.on_input_committed(&view);
+                }
+            }
             let final_answer = self.max_steps.is_some_and(|limit| completed_steps >= limit);
             if final_answer && !final_answer_requested {
                 self.session.push_user_text(format!(
@@ -2075,6 +2195,7 @@ where
                 // the abort signal so ESC/Ctrl-C cancels even during retries.
                 let stream_result = {
                     let abort = &self.hook_abort_signal;
+                    let inbox = self.turn_inputs.clone();
                     tokio::select! {
                         biased;
                         () = abort.cancelled() => {
@@ -2093,6 +2214,7 @@ where
                                 response_model: None,
                             });
                         }
+                        () = inbox.ready() => break None,
                         result = async {
                             if final_answer {
                                 self.api_client.stream_final_answer(request).await
@@ -2172,6 +2294,12 @@ where
             let (mut assistant_message, usage, turn_prompt_cache_events, iter_response_model) =
                 match build_assistant_message(events) {
                     Ok(result) => result,
+                    Err(error)
+                        if response.yielded
+                            && error.message == "assistant stream produced no content" =>
+                    {
+                        continue;
+                    }
                     Err(error) if final_answer => {
                         self.record_turn_failed(iterations, &error);
                         return Err(error);
@@ -2180,6 +2308,9 @@ where
                         if assistant_messages.last().is_some_and(has_pending_tool_uses)
                             && error.message == "assistant stream produced no content" =>
                     {
+                        if self.turn_inputs.has_pending() {
+                            continue;
+                        }
                         self.record_empty_post_tool_completion(iterations);
                         let has_unfinished_deliverable = self
                             .has_unfinished_requested_deliverable_after_tool_empty(
@@ -2199,6 +2330,9 @@ where
                             );
                             self.record_turn_failed(iterations, &error);
                             return Err(error);
+                        }
+                        if !self.turn_inputs.seal_if_empty() {
+                            continue;
                         }
                         let attempt = self
                             .maybe_auto_compact(runtime_observer_mut(&mut observer))
@@ -2297,6 +2431,41 @@ where
                 if let Some(path) = self.session.persistence_path() {
                     self.session.save_to_path(path).map_err(|failure| RuntimeError::new(format!("failed to persist interrupted tools: {failure}; provider error: {error}")))?;
                 }
+                // The partial reply and every tool result are saved above, so
+                // continue from them as a user's "continue" would. Never resend
+                // the failed request: its output, usage and tools already ran.
+                if error.is_stream_interrupted()
+                    && stream_continuations < MAX_STREAM_CONTINUATIONS
+                    && !response.cancelled
+                {
+                    stream_continuations += 1;
+                    // The failed response latched the shared abort flag to stop
+                    // its unfinished tools. Those workers hold the old turn
+                    // generation and stay cancelled; clear the flag so the
+                    // continuation runs and a later Esc still stops it.
+                    self.hook_abort_signal.reset();
+                    if let Some(observer) = observer.as_deref_mut() {
+                        // The interrupted reply never received its stop event.
+                        // Close it for observers as it is saved, so the
+                        // continuation is a separate message.
+                        observer.on_message_stop();
+                        observer.on_notice(&format!(
+                            "Model stream dropped mid-response; continuing ({stream_continuations}/{MAX_STREAM_CONTINUATIONS})."
+                        ));
+                    }
+                    for _ in 0..10 {
+                        if self.hook_abort_signal.is_aborted() {
+                            break;
+                        }
+                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    }
+                    if pending_tool_uses.is_empty() {
+                        self.session
+                            .push_user_text(STREAM_INTERRUPTED_REMINDER)
+                            .map_err(|error| RuntimeError::new(error.to_string()))?;
+                    }
+                    continue;
+                }
                 self.record_turn_failed(iterations, &error);
                 return Err(error);
             }
@@ -2311,7 +2480,7 @@ where
             if let Some(action) = response.context_action {
                 self.apply_tool_context_action(action, exchange_start, &mut observer)?;
             }
-            if pending_tool_uses.is_empty() {
+            if pending_tool_uses.is_empty() && self.turn_inputs.seal_if_empty() {
                 break;
             }
             completed_steps = completed_steps.saturating_add(1);
@@ -2352,15 +2521,11 @@ where
             .as_millis()
             .min(u128::from(u64::MAX)) as u64;
         self.usage_tracker.record_turn_duration(turn_duration_ms);
-        if let Some(message) = self
-            .session
-            .messages
-            .iter_mut()
-            .rev()
-            .find(|m| m.role == MessageRole::Assistant)
-        {
-            message.duration_ms = Some(turn_duration_ms);
-        }
+        self.session
+            .record_turn_duration(turn_duration_ms)
+            .map_err(|error| {
+                RuntimeError::new(format!("failed to persist turn duration: {error}"))
+            })?;
 
         let turn_usage = sum_assistant_message_usage(&assistant_messages);
         let session_usage = self.usage_tracker.cumulative_usage();
@@ -2838,7 +3003,23 @@ where
             }
         }
         let config = self.compaction_retention(&frozen, config);
-        let prepared = PreparedCompaction::new(&frozen, config, target, ideal);
+        let description = if crate::experiments::is_enabled(
+            crate::experiments::Experiment::PeerDescriptions,
+        ) {
+            self.agent_description_store.as_ref().and_then(|store| {
+                match store.snapshot(&source.session_id) {
+                    Ok(snapshot) => Some(snapshot),
+                    Err(error) => {
+                        tracing::warn!(%error, "peer description unavailable; keeping ordinary checkpoint format");
+                        None
+                    }
+                }
+            })
+        } else {
+            None
+        };
+        let prepared =
+            PreparedCompaction::new(&frozen, config, target, ideal).with_description(description);
         if !prepared.has_source() {
             if options.allow_repeat_skip && before <= report.safe_history_budget {
                 report.outcome = CompactionOutcome::Skipped;
@@ -3327,6 +3508,7 @@ where
         let removed = result.removed_message_count;
         let summary_source = result.summary_source;
         self.install_compacted_session(result.compacted_session);
+        self.publish_agent_description(result.agent_description.as_ref());
         self.record_compaction(trigger, removed, before, after, Some(&summary_source));
         Ok(Some(event))
     }
@@ -3431,6 +3613,11 @@ where
         if removed == 0 {
             return Ok(0);
         }
+        // Repaired payloads form a new context projection. Reuse the existing
+        // replacement path so prior immutable nodes and sibling tool origins
+        // survive; a metadata-only save would silently retain the old thinking.
+        let messages = std::mem::take(&mut candidate.messages);
+        candidate = candidate.with_messages(messages);
         if let Some(path) = self.session.persistence_path() {
             candidate
                 .save_thinking_repaired_to_path_checked(&self.session, path, revision.as_deref())
@@ -3744,6 +3931,7 @@ fn build_assistant_message(
 
     for event in events {
         match event {
+            AssistantEvent::ResponseBlockStart => {}
             AssistantEvent::ThinkingStart => start_thinking_block(&mut text, &mut blocks),
             AssistantEvent::Model(model) => {
                 response_model = Some(model);
@@ -3914,7 +4102,13 @@ fn notify_tool_result(
         return;
     };
 
-    observer.on_tool_result(tool_use_id, tool_name, output, *is_error);
+    observer.on_tool_result(
+        crate::session_history::tool_origin(result_message, tool_use_id),
+        tool_use_id,
+        tool_name,
+        output,
+        *is_error,
+    );
 }
 
 fn runtime_observer_mut<'a>(
@@ -4278,6 +4472,7 @@ mod tests {
 
         fn on_tool_result(
             &mut self,
+            _assistant_message_id: Option<&str>,
             tool_use_id: &str,
             tool_name: &str,
             output: &str,
@@ -4878,11 +5073,12 @@ mod tests {
             .expect("conversation loop should succeed");
 
         // 1. Full blob spilled to the session's tool-results/<id>, byte-exact.
+        let output_id = runtime.session().tool_output_id("big-1");
         let offloaded = runtime
             .session()
             .tool_results_dir()
             .expect("tool-results dir")
-            .join("big-1");
+            .join(&output_id);
         let spilled = fs::read_to_string(&offloaded).expect("offloaded blob should exist");
         assert_eq!(spilled, big);
 
@@ -4899,7 +5095,7 @@ mod tests {
             panic!("expected a tool_result block");
         };
         assert!(output.contains("<persisted-output"));
-        assert!(output.contains("id=\"big-1\""));
+        assert!(output.contains(&format!("id=\"{output_id}\"")));
         assert!(!output.contains(SENTINEL), "tail must not be inlined");
         assert!(output.len() < big.len());
         let inline_output = output.clone();
@@ -6188,7 +6384,15 @@ mod tests {
 
         let forked = runtime.fork_session(Some("alt-path".to_string()));
 
-        assert_eq!(forked.messages, session.messages);
+        let mut inherited = forked.messages.clone();
+        for message in &mut inherited {
+            message.history = None;
+        }
+        let mut original = session.messages.clone();
+        for message in &mut original {
+            message.history = None;
+        }
+        assert_eq!(inherited, original);
         assert_ne!(forked.session_id, session.session_id);
         assert_eq!(
             forked

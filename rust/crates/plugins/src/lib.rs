@@ -538,6 +538,17 @@ impl PluginTool {
     }
 
     pub fn execute(&self, input: &Value) -> Result<String, PluginError> {
+        self.execute_with_call_id(input, None)
+    }
+
+    /// Correlate an external effect with the host's existing invocation. The ID
+    /// is not an identity or permission credential. Never inherit another
+    /// process's call ID when this dispatch has no context.
+    pub fn execute_with_call_id(
+        &self,
+        input: &Value,
+        call_id: Option<&str>,
+    ) -> Result<String, PluginError> {
         let input_json = input.to_string();
         let mut process = Command::new(&self.command);
         process
@@ -548,7 +559,11 @@ impl PluginTool {
             .env("SUDOCODE_PLUGIN_ID", &self.plugin_id)
             .env("SUDOCODE_PLUGIN_NAME", &self.plugin_name)
             .env("SUDOCODE_TOOL_NAME", &self.definition.name)
-            .env("SUDOCODE_TOOL_INPUT", &input_json);
+            .env("SUDOCODE_TOOL_INPUT", &input_json)
+            .env_remove("SUDOCODE_TOOL_CALL_ID");
+        if let Some(call_id) = call_id {
+            process.env("SUDOCODE_TOOL_CALL_ID", call_id);
+        }
         if let Some(root) = &self.root {
             process
                 .current_dir(root)
@@ -563,9 +578,15 @@ impl PluginTool {
 
         let output = child.wait_with_output()?;
         if output.status.success() {
-            Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+            Ok(process_text::decode_process_output(&output.stdout)
+                .text
+                .trim()
+                .to_string())
         } else {
-            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            let stderr = process_text::decode_process_output(&output.stderr)
+                .text
+                .trim()
+                .to_string();
             Err(PluginError::CommandFailed(format!(
                 "plugin tool `{}` from `{}` failed for `{}`: {}",
                 self.definition.name,
@@ -2711,7 +2732,10 @@ fn run_lifecycle_commands(
         let output = process.output()?;
 
         if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            let stderr = process_text::decode_process_output(&output.stderr)
+                .text
+                .trim()
+                .to_string();
             return Err(PluginError::CommandFailed(format!(
                 "plugin `{}` {} failed for `{}`: {}",
                 metadata.id,
@@ -2783,7 +2807,9 @@ fn materialize_source(
             if !output.status.success() {
                 return Err(PluginError::CommandFailed(format!(
                     "git clone failed for `{url}`: {}",
-                    String::from_utf8_lossy(&output.stderr).trim()
+                    process_text::decode_process_output(&output.stderr)
+                        .text
+                        .trim()
                 )));
             }
             Ok(destination)
@@ -2912,6 +2938,58 @@ fn ensure_object<'a>(root: &'a mut Map<String, Value>, key: &str) -> &'a mut Map
     root.get_mut(key)
         .and_then(Value::as_object_mut)
         .expect("object should exist")
+}
+
+#[cfg(test)]
+mod invocation_tests {
+    use super::*;
+
+    #[test]
+    fn plugin_call_context_child() {
+        if std::env::var("SUDOCODE_PLUGIN_ID").as_deref() == Ok("call-context@local") {
+            println!(
+                "PLUGIN_CALL_CONTEXT={}",
+                std::env::var("SUDOCODE_TOOL_CALL_ID").unwrap_or_else(|_| "absent".to_string())
+            );
+        }
+    }
+
+    #[test]
+    fn plugin_process_gets_the_actual_invocation_without_cross_call_leakage() {
+        let tool = PluginTool::new(
+            "call-context@local",
+            "call-context",
+            PluginToolDefinition {
+                name: "context_probe".to_string(),
+                description: Some("test subprocess".to_string()),
+                input_schema: serde_json::json!({"type": "object"}),
+            },
+            std::env::current_exe()
+                .expect("test binary")
+                .to_string_lossy()
+                .to_string(),
+            vec![
+                "--exact".to_string(),
+                "invocation_tests::plugin_call_context_child".to_string(),
+                "--nocapture".to_string(),
+            ],
+            PluginToolPermission::ReadOnly,
+            None,
+        );
+        let input = serde_json::json!({});
+        let first = tool
+            .execute_with_call_id(&input, Some("host-tool-雪-1"))
+            .expect("first invocation");
+        assert!(first.contains("PLUGIN_CALL_CONTEXT=host-tool-雪-1"));
+        let absent = tool.execute(&input).expect("context-free invocation");
+        assert!(absent.contains("PLUGIN_CALL_CONTEXT=absent"));
+        assert!(!absent.contains("host-tool-雪-1"));
+        let next = tool
+            .execute_with_call_id(&input, Some("host-tool-2"))
+            .expect("next invocation");
+        assert!(next.contains("PLUGIN_CALL_CONTEXT=host-tool-2"));
+        assert!(!next.contains("host-tool-雪-1"));
+    }
 }
 
 /// Environment variable lock for test isolation.

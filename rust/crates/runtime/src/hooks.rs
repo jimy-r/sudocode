@@ -1,6 +1,6 @@
 use std::ffi::OsStr;
 use std::fmt::Write as FmtWrite;
-use std::io::Write;
+use std::io::{ErrorKind, Write};
 use std::process::{Command, Stdio};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
@@ -547,8 +547,14 @@ impl HookRunner {
 
         match child.output_with_stdin(payload.as_bytes(), abort_signal) {
             Ok(CommandExecution::Finished(output)) => {
-                let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-                let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+                let stdout = process_text::decode_process_output(&output.stdout)
+                    .text
+                    .trim()
+                    .to_string();
+                let stderr = process_text::decode_process_output(&output.stderr)
+                    .text
+                    .trim()
+                    .to_string();
                 let parsed = parse_hook_output(event, tool_name, command, &stdout, &stderr);
                 let primary_message = parsed.primary_message().map(ToOwned::to_owned);
                 match output.status.code() {
@@ -992,10 +998,13 @@ impl CommandWithStdin {
     ) -> std::io::Result<CommandExecution> {
         let mut child = self.command.spawn()?;
         if let Some(mut child_stdin) = child.stdin.take() {
+            // Hooks can ignore their input and finish before it is written; a
+            // broken pipe still leaves their exit status and output to decide
+            // allow, deny or failure. Any other write error is fatal, and the
+            // child is reaped first: `Child` does not kill on drop, so returning
+            // without it would leave the hook process running.
             if let Err(error) = child_stdin.write_all(stdin) {
-                // Hooks may finish without consuming their JSON input. Their
-                // exit status and output still decide allow, deny or failure.
-                if error.kind() != std::io::ErrorKind::BrokenPipe {
+                if error.kind() != ErrorKind::BrokenPipe {
                     let _ = child.kill();
                     let _ = child.wait();
                     return Err(error);

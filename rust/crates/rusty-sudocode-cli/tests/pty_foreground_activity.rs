@@ -28,15 +28,9 @@ fn running_status(screen: &str) -> bool {
     let line = live_status(screen);
     line.chars().next().is_some_and(|glyph| {
         ('\u{2800}'..='\u{28ff}').contains(&glyph) || ['◐', '◓', '◑', '◒'].contains(&glyph)
-    }) && [
-        "Working...",
-        "Thinking...",
-        "Reasoning...",
-        "Running",
-        "Retry",
-    ]
-    .iter()
-    .any(|label| line.contains(label))
+    }) && ["Working...", "Thinking...", "Running", "Retry"]
+        .iter()
+        .any(|label| line.contains(label))
 }
 
 fn submit(session: &mut PtySession, prompt: &str) {
@@ -198,7 +192,7 @@ fn question_owns_the_status_until_answered_then_running_resumes() {
             .into()
     };
     submit(&mut session, &prompt);
-    common::expect_screen(
+    common::expect_screen_rows(
         &session,
         |view| {
             common::input_and_footer_of(view).is_some_and(|input| {
@@ -343,6 +337,22 @@ fn brand_animation_and_parallel_summary_share_one_status_row() {
                 "Idx(214)",
                 "logo uses brand amber"
             );
+        }
+        for (text, color) in [
+            ("Running", "Default"),
+            ("[claude", "Idx(247)"),
+            ("s)", "Idx(247)"),
+        ] {
+            let column = unicode_width::UnicodeWidthStr::width(&line[..line.find(text).unwrap()]);
+            let cell = raw
+                .cell(u16::try_from(*row).unwrap(), u16::try_from(column).unwrap())
+                .unwrap();
+            assert_eq!(
+                format!("{:?}", cell.fgcolor()),
+                color,
+                "activity stays distinct from secondary metadata: {text}"
+            );
+            assert!(!cell.dim(), "muted metadata uses a readable theme color");
         }
         logo
     });

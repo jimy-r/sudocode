@@ -219,21 +219,25 @@ fn run_background_verification(workflow: Workflow) {
             .expect("saved parent transcript");
         let saved = runtime::Session::load_from_path(&path).unwrap();
         assert!(
-            saved.messages.iter().flat_map(|m| &m.blocks).any(|block| {
-                let runtime::ContentBlock::ToolResult {
-                    tool_name, output, ..
-                } = block
-                else {
-                    return false;
-                };
-                tool_name.eq_ignore_ascii_case("bash")
-                    && serde_json::from_str::<Value>(output).is_ok_and(|result| {
-                        result["exit_code"] == 0
-                            && result["stdout"]
-                                .as_str()
-                                .is_some_and(|text| text.trim() == "PARENT_WORK_FINISHED")
-                    })
-            }),
+            saved
+                .messages()
+                .iter()
+                .flat_map(|m| &m.blocks)
+                .any(|block| {
+                    let runtime::ContentBlock::ToolResult {
+                        tool_name, output, ..
+                    } = block
+                    else {
+                        return false;
+                    };
+                    tool_name.eq_ignore_ascii_case("bash")
+                        && serde_json::from_str::<Value>(output).is_ok_and(|result| {
+                            result["exit_code"] == 0
+                                && result["stdout"]
+                                    .as_str()
+                                    .is_some_and(|text| text.trim() == "PARENT_WORK_FINISHED")
+                        })
+                }),
             "foreground tool must finish normally after task view dismissal"
         );
     }
@@ -312,6 +316,7 @@ fn manifests(env: &TestEnv) -> Vec<Value> {
         .flatten()
         .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "json"))
         .filter_map(|entry| serde_json::from_slice(&fs::read(entry.path()).ok()?).ok())
+        .filter(|manifest: &Value| manifest.get("agentId").is_some())
         .collect()
 }
 
@@ -340,10 +345,14 @@ fn explicitly_collected_result_does_not_trigger_another_turn() {
         Duration::from_secs(180),
         "explicit result collection",
     );
-    assert!(common::screen_contains(
-        &parent.render(|s| s.contents()),
-        evidence
-    ));
+    // Results are append-only transcript output and may already have scrolled
+    // out of the viewport when ConPTY publishes the completed-turn footer.
+    parent.expect(evidence).unwrap_or_else(|error| {
+        panic!(
+            "collected evidence must reach the terminal: {error}\n{}",
+            common::screen_tail(&parent, 4000)
+        )
+    });
     let before = common::turn_status_marker(&parent);
     parent
         .send("While CI runs, what is 17 + 25? Answer the number only.\r")
@@ -356,6 +365,29 @@ fn explicitly_collected_result_does_not_trigger_another_turn() {
     );
     parent.send("/exit\r").unwrap();
     assert_eq!(parent.expect_eof().unwrap(), 0);
+    let path = common::find_session_transcript(&env.workspace_root().join(".scode/sessions"))
+        .expect("saved parent transcript");
+    let saved = runtime::Session::load_from_path(&path).unwrap();
+    assert!(
+        saved
+            .messages()
+            .iter()
+            .flat_map(|m| &m.blocks)
+            .any(|block| {
+                matches!(block, runtime::ContentBlock::ToolResult { tool_name, output, .. }
+                if tool_name == "pid_output" && output.contains(evidence))
+            }),
+        "the parent must persist the explicitly collected child result"
+    );
+    assert!(
+        saved.messages().iter().any(|message| {
+            message.role == runtime::MessageRole::Assistant
+                && message.blocks.iter().any(|block| {
+                    matches!(block, runtime::ContentBlock::Text { text } if text.contains(evidence))
+                })
+        }),
+        "the parent must report the collected evidence in its answer"
+    );
     if env.is_mock() {
         let requests: Vec<Value> = env
             .captured_message_bodies()

@@ -287,6 +287,7 @@ use runtime::{
     cron_registry::CronRegistry,
     current_workspace_root, dedupe_superseded_commit_events, edit_file, glob_search,
     permission_enforcer::{EnforcementResult, PermissionEnforcer},
+    plan_store::compose_task_framing,
     read_file,
     summary_compression::compress_summary_text,
     todo_store::TodoStore,
@@ -1030,7 +1031,10 @@ impl GlobalToolRegistry {
             .iter()
             .find(|tool| tool.definition().name == name)
             .ok_or_else(|| format!("unsupported tool: {name}"))?
-            .execute(input)
+            .execute_with_call_id(
+                input,
+                ctx.and_then(|context| context.tool_use_id.as_deref()),
+            )
             .map_err(|error| error.to_string())
     }
 
@@ -1722,6 +1726,10 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
             input_schema: with_task_template(json!({
                 "type": "object",
                 "properties": {
+                    "delivery": {
+                        "type": "string", "enum": ["steer", "queue"],
+                        "description": "Interactive recipient: steer (default) offers this message within its current task; queue waits for its next turn. Other hosts deliver at their turn boundary. Neither cancels work or requires a change of direction."
+                    },
                     "to": {
                         "type": "string",
                         "description": "Recipient: agent name, pid, or \"*\" for broadcast."
@@ -1919,9 +1927,9 @@ fn execute_tool_with_enforcer(
                 bash_input,
                 abort_signal,
                 ctx.and_then(|ctx| {
-                    ctx.background_tasks
-                        .as_ref()
-                        .map(|tasks| tasks.for_tool(ctx.tool_use_id.as_deref()))
+                    ctx.background_tasks.as_ref().map(|tasks| {
+                        tasks.for_tool(ctx.assistant_message_id(), ctx.tool_use_id.as_deref())
+                    })
                 })
                 .as_ref(),
             )
@@ -1931,9 +1939,20 @@ fn execute_tool_with_enforcer(
             // A watch runs arbitrary shell, so it is gated exactly like bash.
             let classified_mode = classify_bash_permission(&monitor_input.command);
             maybe_enforce_permission_check_with_mode(enforcer, name, input, classified_mode)?;
+            // Scoped to this tool call exactly like `bash`: the launcher calls
+            // `prepare_terminal`, which REQUIRES the tool identity to register
+            // the terminal in the completion journal. Without `for_tool` the
+            // launch fails outright ("terminal tool identity missing") in any
+            // session that has a journal bound — so a watch has to carry the
+            // same identity a background command does.
             run_monitor(
                 monitor_input,
-                ctx.and_then(|ctx| ctx.background_tasks.as_ref()),
+                ctx.and_then(|ctx| {
+                    ctx.background_tasks.as_ref().map(|tasks| {
+                        tasks.for_tool(ctx.assistant_message_id(), ctx.tool_use_id.as_deref())
+                    })
+                })
+                .as_ref(),
             )
         }
         "read_file" => {
@@ -1998,9 +2017,9 @@ fn execute_tool_with_enforcer(
                 ps_input,
                 abort_signal,
                 ctx.and_then(|ctx| {
-                    ctx.background_tasks
-                        .as_ref()
-                        .map(|tasks| tasks.for_tool(ctx.tool_use_id.as_deref()))
+                    ctx.background_tasks.as_ref().map(|tasks| {
+                        tasks.for_tool(ctx.assistant_message_id(), ctx.tool_use_id.as_deref())
+                    })
                 })
                 .as_ref(),
             )
@@ -2404,6 +2423,10 @@ pub struct AgentListRow {
     pub task_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub role: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description_updated_at: Option<String>,
 }
 
 /// Collect the addressable agents this session can reach, plus the workers it
@@ -2437,12 +2460,25 @@ pub fn collect_agent_list(
         .iter()
         .filter_map(|(id, runtime)| runtime.mailbox_root.as_ref().map(|_| id.clone()))
         .collect();
-    Ok(merge_agent_list(
-        &peers,
-        subagents,
-        &active_tasks,
-        active_only,
-    ))
+    let mut rows = merge_agent_list(&peers, subagents, &active_tasks, active_only);
+    if runtime::experiments::is_enabled(runtime::experiments::Experiment::PeerDescriptions) {
+        for row in rows.iter_mut().filter(|row| row.kind == "peer") {
+            match mailbox
+                .description_store(&row.name)
+                .and_then(|store| store.read())
+            {
+                Ok(Some(description)) => {
+                    row.description = Some(description.description);
+                    row.description_updated_at = Some(description.updated_at);
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    tracing::warn!(%error, agent = %row.name, "peer description unavailable")
+                }
+            }
+        }
+    }
+    Ok(rows)
 }
 
 /// Pure core of [`collect_agent_list`], sources injected so it is testable
@@ -2473,6 +2509,8 @@ pub fn merge_agent_list(
                 kind: "peer".to_string(),
                 task_id: None,
                 role: None,
+                description: None,
+                description_updated_at: None,
             });
     }
 
@@ -2491,6 +2529,8 @@ pub fn merge_agent_list(
                 kind: "subagent".to_string(),
                 task_id: Some(snap.agent_id.clone()),
                 role,
+                description: None,
+                description_updated_at: None,
             });
     }
 
@@ -3132,7 +3172,7 @@ fn resolve_sender(input: &SendMessageInput, mailbox: &runtime::mailbox::Mailbox)
 fn write_envelope(
     mailbox: &runtime::mailbox::Mailbox,
     recipient: &str,
-    from: &str,
+    input: &SendMessageInput,
     text: &str,
     summary: Option<&str>,
     kind: &str,
@@ -3140,7 +3180,8 @@ fn write_envelope(
 ) -> Result<PathBuf, String> {
     let recipient_sanitized = sanitize_recipient(recipient);
     let envelope = MailboxEnvelope {
-        from: from.to_string(),
+        delivery: input.delivery,
+        from: resolve_sender(input, mailbox),
         to: recipient.to_string(),
         body: text.to_string(),
         summary: summary.map(str::to_string),
@@ -3286,7 +3327,7 @@ fn run_send_message(
                 write_envelope(
                     &mailbox,
                     r,
-                    &sender,
+                    &input,
                     text,
                     summary,
                     mailbox_kinds::MESSAGE,
@@ -3316,7 +3357,7 @@ fn run_send_message(
         let path = write_envelope(
             &mailbox,
             &input.to,
-            &sender,
+            &input,
             text,
             input.summary.as_deref(),
             mailbox_kinds::MESSAGE,
@@ -3362,7 +3403,7 @@ fn run_send_message(
             write_envelope(
                 &mailbox,
                 &input.to,
-                &sender,
+                &input,
                 &body,
                 None,
                 mailbox_kinds::SHUTDOWN_REQUEST,
@@ -3413,7 +3454,7 @@ fn run_send_message(
             write_envelope(
                 &mailbox,
                 &input.to,
-                &sender,
+                &input,
                 &body,
                 None,
                 mailbox_kinds::SHUTDOWN_RESPONSE,
@@ -3447,7 +3488,7 @@ fn run_send_message(
             write_envelope(
                 &mailbox,
                 &input.to,
-                &sender,
+                &input,
                 &body,
                 None,
                 mailbox_kinds::PLAN_APPROVAL_RESPONSE,
@@ -3776,7 +3817,10 @@ fn git_stdout(args: &[&str]) -> Option<String> {
     if !output.status.success() {
         return None;
     }
-    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let stdout = process_text::decode_process_output(&output.stdout)
+        .text
+        .trim()
+        .to_string();
     (!stdout.is_empty()).then_some(stdout)
 }
 
@@ -3801,20 +3845,10 @@ fn branch_divergence_output(
         "branch divergence detected before workspace tests: `{branch}` {relation} `{main_ref}`. Missing commits: {missing_summary}. Merge or rebase `{main_ref}` before re-running `{command}`."
     );
 
-    BashCommandOutput {
-        exit_code: None,
-        stdout: String::new(),
-        stderr: stderr.clone(),
-        raw_output_path: None,
-        interrupted: false,
-        is_image: None,
-        background_task_id: None,
-        backgrounded_by_user: None,
-        assistant_auto_backgrounded: None,
-        dangerously_disable_sandbox: None,
-        return_code_interpretation: Some("preflight_blocked:branch_divergence".to_string()),
-        no_output_expected: Some(false),
-        structured_content: Some(vec![serde_json::to_value(
+    BashCommandOutput::blocked(
+        "branch_divergence",
+        stderr.clone(),
+        Some(vec![serde_json::to_value(
             LaneEvent::new(
                 LaneEventName::BranchStaleAgainstMain,
                 LaneEventStatus::Blocked,
@@ -3833,8 +3867,7 @@ fn branch_divergence_output(
             })),
         )
         .expect("lane event should serialize")]),
-        sandbox_status: None,
-    }
+    )
 }
 
 #[allow(clippy::needless_pass_by_value)]
@@ -4168,17 +4201,6 @@ fn with_task_template(mut schema: serde_json::Value, required: bool) -> serde_js
     schema
 }
 
-/// Compose the shared task-framing sections into a markdown block, prepended to
-/// a plan body or a handed-off task prompt so both carry the same structure.
-fn compose_task_framing(context: &str, constraints: &str, acceptance: &str) -> String {
-    format!(
-        "## Context\n{}\n\n## Constraints\n{}\n\n## Acceptance Criteria\n{}\n",
-        context.trim(),
-        constraints.trim(),
-        acceptance.trim(),
-    )
-}
-
 /// Like [`compose_task_framing`] but for the optional `send` path: returns
 /// `None` when none of the three fields carry content (a plain chat message),
 /// so only a genuine task hand-off gets the framing block. Empty fields are
@@ -4206,14 +4228,19 @@ fn run_write_plan(input: WritePlanInput, fs: &Arc<dyn FsBackend>) -> Result<Stri
     }
     // The plan file is the SSOT — always structured: the three framing sections
     // (enforced as required params) then the plan body.
-    let framing = compose_task_framing(&input.context, &input.constraints, &input.acceptance);
-    let document = format!("{framing}\n{content}\n");
+    let document = runtime::plan_store::compose_document(
+        &input.context,
+        &input.constraints,
+        &input.acceptance,
+        content,
+    );
     let path = runtime::plan_store::write_plan(&document, fs)?;
-    to_pretty_json(json!({
-        "ok": true,
-        "planFile": path.display().to_string(),
-        "message": "Plan saved.",
-    }))
+    serde_json::to_string_pretty(&runtime::plan_store::PlanReviewResult::new(
+        runtime::plan_store::PlanReviewStatus::DraftSaved,
+        path.display().to_string(),
+        "Plan saved.".into(),
+    ))
+    .map_err(|error| error.to_string())
 }
 
 fn run_structured_output(input: StructuredOutputInput) -> Result<String, String> {
@@ -4299,7 +4326,8 @@ fn run_powershell(
 ) -> Result<String, String> {
     to_pretty_json(
         execute_powershell_in_session(&input, abort_signal, tasks)
-            .map_err(|error| error.to_string())?,
+            .map_err(|error| error.to_string())?
+            .model_output(),
     )
 }
 
@@ -4648,6 +4676,8 @@ struct CronDeleteInput {
 // fork-compatible error messages verbatim.
 #[derive(Debug, Deserialize)]
 struct SendMessageInput {
+    #[serde(default)]
+    delivery: runtime::turn_input::InputDelivery,
     to: String,
     message: Value,
     #[serde(default)]
@@ -4878,7 +4908,11 @@ impl SubagentLink {
         );
         Some(Self {
             tasks: ctx.background_tasks.clone(),
-            scope: Arc::new(SubagentScope::new(manifest.agent_id.clone(), spawn_call_id)),
+            scope: Arc::new(SubagentScope::new(
+                manifest.agent_id.clone(),
+                spawn_call_id,
+                ctx.assistant_message_id().map(str::to_owned),
+            )),
             spawner,
             identity: SubagentIdentity {
                 agent_id: manifest.agent_id.clone(),
@@ -4912,6 +4946,7 @@ impl SubagentLink {
             spawner.register_completion(
                 SubagentLifecycle {
                     tool_call_id: self.scope.parent_tool_call_id().to_string(),
+                    assistant_message_id: self.scope.assistant_message_id().map(str::to_owned),
                     phase: SubagentPhase::Started,
                     seq: 0,
                     agent: self.identity.clone(),
@@ -4949,6 +4984,7 @@ impl SubagentLink {
             &self.scope,
             SubagentLifecycle {
                 tool_call_id: self.scope.parent_tool_call_id().to_string(),
+                assistant_message_id: self.scope.assistant_message_id().map(str::to_owned),
                 phase: SubagentPhase::Started,
                 seq: 0,
                 agent: self.identity.clone(),
@@ -5016,6 +5052,7 @@ impl SubagentLink {
             &self.scope,
             SubagentLifecycle {
                 tool_call_id: self.scope.parent_tool_call_id().to_string(),
+                assistant_message_id: self.scope.assistant_message_id().map(str::to_owned),
                 phase: SubagentPhase::Finished,
                 seq: 0,
                 agent: self.identity.clone(),
@@ -5082,7 +5119,14 @@ impl RuntimeObserver for SubagentForwarder {
         });
     }
 
-    fn on_tool_result(&mut self, tool_use_id: &str, tool_name: &str, output: &str, is_error: bool) {
+    fn on_tool_result(
+        &mut self,
+        _assistant_message_id: Option<&str>,
+        tool_use_id: &str,
+        tool_name: &str,
+        output: &str,
+        is_error: bool,
+    ) {
         if let Some(tasks) = &self.tasks {
             tasks.update(&self.agent_id, |task| {
                 use std::fmt::Write as _;
@@ -7779,10 +7823,12 @@ fn current_git_branch() -> Option<String> {
         command.current_dir(root);
     }
     let output = command.output().ok()?;
-    output
-        .status
-        .success()
-        .then(|| String::from_utf8_lossy(&output.stdout).trim().to_string())
+    output.status.success().then(|| {
+        process_text::decode_process_output(&output.stdout)
+            .text
+            .trim()
+            .to_string()
+    })
 }
 
 fn append_agent_output(path: &str, suffix: &str, fs: &dyn FsBackend) -> Result<(), String> {
@@ -9149,6 +9195,7 @@ fn build_forked_messages(
     user_blocks.push(ContentBlock::Text { text: child_text });
 
     let user_message = ConversationMessage {
+        history: None,
         role: MessageRole::User,
         blocks: user_blocks,
         usage: None,
@@ -9649,6 +9696,9 @@ fn resolve_powershell_shell(
 fn powershell_command(shell: &Path, command: &str) -> std::process::Command {
     let mut process = std::process::Command::new(shell);
     process.args(["-NoProfile", "-NonInteractive", "-Command", command]);
+    // Output is read by the model and drawn in a card, never by a terminal:
+    // PowerShell 7 would otherwise colour its errors with escape codes.
+    process.env("NO_COLOR", "1");
     if let Ok(root) = current_workspace_root() {
         process.current_dir(root);
     }
@@ -9687,7 +9737,49 @@ fn execute_shell_command(
 
     let timeout_ms = timeout.unwrap_or(runtime::DEFAULT_TOOL_SUBPROCESS_TIMEOUT_MS);
     let result = run_in_process_group(&mut process, timeout_ms, abort_signal)?;
-    Ok(shell_run_to_bash_output(result, timeout_ms))
+    let output = shell_run_to_bash_output(result, timeout_ms).with_powershell_parse_error();
+    Ok(explain_silent_powershell_failure(shell, command, output))
+}
+
+/// The script [`explain_silent_powershell_failure`] runs: parse the command
+/// held in [`POWERSHELL_PARSE_INPUT_ENV`] and report each error on stderr.
+const POWERSHELL_PARSE_CHECK: &str = "$errors = $null; $null = [System.Management.Automation.Language.Parser]::ParseInput($env:SCODE_POWERSHELL_PARSE_INPUT, [ref]$null, [ref]$errors); foreach ($e in $errors) { [Console]::Error.WriteLine(('ParserError: line {0}, column {1}: {2}' -f $e.Extent.StartLineNumber, $e.Extent.StartColumnNumber, $e.Message)) }";
+const POWERSHELL_PARSE_INPUT_ENV: &str = "SCODE_POWERSHELL_PARSE_INPUT";
+
+/// PowerShell 7 exits 1 without a word when a `-Command` script cannot be
+/// parsed; Windows PowerShell writes the parser's error. A silent exit 1 is
+/// put to PowerShell's own parser, and what it reports becomes the result's
+/// stderr, so the model and the user see why nothing ran.
+fn explain_silent_powershell_failure(
+    shell: &Path,
+    command: &str,
+    mut output: runtime::BashCommandOutput,
+) -> runtime::BashCommandOutput {
+    let silent_exit_1 = output.return_code_interpretation == Some(runtime::ShellStatus::Exit(1))
+        && output.stdout.trim().is_empty()
+        && output.stderr.trim().is_empty();
+    if !silent_exit_1 {
+        return output;
+    }
+    let Ok(check) = std::process::Command::new(shell)
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            POWERSHELL_PARSE_CHECK,
+        ])
+        .env(POWERSHELL_PARSE_INPUT_ENV, command)
+        .stdin(std::process::Stdio::null())
+        .output()
+    else {
+        return output;
+    };
+    let report = process_text::decode_process_output(&check.stderr).text;
+    if report.trim().is_empty() {
+        return output;
+    }
+    output.stderr = report;
+    output.with_powershell_parse_error()
 }
 
 /// Outcome of polling a `GroupChild` to completion / abort / timeout.
@@ -9753,48 +9845,27 @@ fn run_in_process_group(
 }
 
 fn shell_run_to_bash_output(result: ShellRunResult, timeout_ms: u64) -> runtime::BashCommandOutput {
-    let stdout_text = String::from_utf8_lossy(&result.stdout).into_owned();
-    let stderr_text = String::from_utf8_lossy(&result.stderr).into_owned();
-
-    match result.outcome {
+    let ShellRunResult {
+        outcome,
+        stdout,
+        stderr,
+    } = result;
+    match outcome {
         ShellOutcome::Completed(status) => {
-            runtime::BashCommandOutput::completed(status, stdout_text, stderr_text)
+            runtime::BashCommandOutput::from_process(status, &stdout, &stderr)
         }
-        ShellOutcome::Interrupted => runtime::BashCommandOutput {
-            exit_code: None,
-            stdout: stdout_text,
-            stderr: append_status_line(&stderr_text, "Command interrupted by user"),
-            raw_output_path: None,
-            interrupted: true,
-            is_image: None,
-            background_task_id: None,
-            backgrounded_by_user: None,
-            assistant_auto_backgrounded: None,
-            dangerously_disable_sandbox: None,
-            return_code_interpretation: Some(String::from("interrupted")),
-            no_output_expected: Some(false),
-            structured_content: None,
-            sandbox_status: None,
-        },
-        ShellOutcome::TimedOut => runtime::BashCommandOutput {
-            exit_code: None,
-            stdout: stdout_text,
-            stderr: append_status_line(
-                &stderr_text,
-                &format!("Command exceeded timeout of {timeout_ms} ms"),
-            ),
-            raw_output_path: None,
-            interrupted: true,
-            is_image: None,
-            background_task_id: None,
-            backgrounded_by_user: None,
-            assistant_auto_backgrounded: None,
-            dangerously_disable_sandbox: None,
-            return_code_interpretation: Some(String::from("timeout")),
-            no_output_expected: Some(false),
-            structured_content: None,
-            sandbox_status: None,
-        },
+        ShellOutcome::Interrupted => runtime::BashCommandOutput::stopped(
+            runtime::ShellStatus::Interrupted,
+            &stdout,
+            &stderr,
+            "Command interrupted by user",
+        ),
+        ShellOutcome::TimedOut => runtime::BashCommandOutput::stopped(
+            runtime::ShellStatus::Timeout,
+            &stdout,
+            &stderr,
+            &format!("Command exceeded timeout of {timeout_ms} ms"),
+        ),
     }
 }
 
@@ -9856,14 +9927,6 @@ fn drain_budget_for(timeout_ms: u64) -> Duration {
     const MAX_DRAIN_MS: u64 = 10_000;
     let derived = timeout_ms / 4;
     Duration::from_millis(derived.clamp(MIN_DRAIN_MS, MAX_DRAIN_MS))
-}
-
-fn append_status_line(stderr: &str, status_line: &str) -> String {
-    if stderr.trim().is_empty() {
-        status_line.to_string()
-    } else {
-        format!("{}\n{status_line}", stderr.trim_end())
-    }
 }
 
 #[cfg(test)]
@@ -11717,6 +11780,7 @@ mod tests {
 
     #[test]
     fn core_definitions_includes_all_tools_with_defer_loading() {
+        let _guard = env_guard();
         let registry = GlobalToolRegistry::builtin();
         let core = registry.core_definitions(None, None);
         let all = registry.definitions(None);
@@ -11770,6 +11834,8 @@ mod tests {
 
     #[test]
     fn deferred_tool_listing_returns_non_core_tools() {
+        // Cron visibility shares process-global configuration with the host-gating test.
+        let _guard = env_guard();
         let registry = GlobalToolRegistry::builtin();
         let listing = registry.deferred_tool_listing();
         let names: BTreeSet<_> = listing.iter().map(|(n, _)| n.as_str()).collect();
@@ -11874,6 +11940,7 @@ mod tests {
             },
         ])];
         messages.push(ConversationMessage {
+            history: None,
             role: MessageRole::Tool,
             blocks: vec![ContentBlock::ToolResult {
                 tool_use_id: "tu_1".to_string(),
@@ -11930,6 +11997,7 @@ mod tests {
         });
         let messages = vec![
             ConversationMessage {
+                history: None,
                 role: MessageRole::Tool,
                 blocks: vec![ContentBlock::ToolResult {
                     tool_use_id: "tu_1".to_string(),
@@ -11942,6 +12010,7 @@ mod tests {
                 duration_ms: None,
             },
             ConversationMessage {
+                history: None,
                 role: MessageRole::Tool,
                 blocks: vec![ContentBlock::ToolResult {
                     tool_use_id: "tu_2".to_string(),
@@ -12876,7 +12945,7 @@ mod tests {
         );
         assert!(runtime
             .session()
-            .messages
+            .messages()
             .iter()
             .flat_map(|message| message.blocks.iter())
             .any(|block| matches!(
@@ -14337,15 +14406,23 @@ printf 'pwsh:%s' "$1"
         let _ = std::fs::remove_dir_all(dir);
 
         let output: serde_json::Value = serde_json::from_str(&result).expect("json");
-        assert_eq!(output["exit_code"], 0, "{output}");
-        assert_eq!(output["interrupted"], false, "{output}");
-        assert_eq!(output["stdout"], "pwsh:Write-Output hello", "{output}");
-        assert!(output["stderr"].as_str().expect("stderr").is_empty());
+        // The model gets the compact shell result bash gets: what happened,
+        // without null or default fields.
+        assert_eq!(
+            output,
+            json!({"stdout": "pwsh:Write-Output hello", "exit_code": 0}),
+            "{output}"
+        );
 
         let background_output: serde_json::Value = serde_json::from_str(&background).expect("json");
-        assert!(background_output["backgroundTaskId"].as_str().is_some());
-        assert_eq!(background_output["backgroundedByUser"], true);
-        assert_eq!(background_output["assistantAutoBackgrounded"], false);
+        assert!(
+            background_output["backgroundTaskId"].as_str().is_some(),
+            "{background_output}"
+        );
+        assert!(
+            background_output.get("exit_code").is_none(),
+            "a background run has not exited yet: {background_output}"
+        );
     }
 
     fn powershell_test_candidate(dir: &Path, shell: &str) -> PathBuf {

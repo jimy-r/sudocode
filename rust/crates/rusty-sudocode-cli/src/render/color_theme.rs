@@ -15,6 +15,13 @@ pub struct ToolBorderColors {
     pub error: Color,
 }
 
+/// One terminal-capability snapshot for the existing activity row's roles.
+pub struct ActivityColors {
+    pub logo: Color,
+    pub label: Color,
+    pub metadata: Color,
+}
+
 /// Semantic color theme — coder picks a scenario token, never a raw color.
 ///
 /// Two built-in palettes: `dark()` (default) and `light()` for light
@@ -200,26 +207,26 @@ impl ColorTheme {
         }
     }
 
-    /// Info — active spinner, thinking indicator and informational labels.
+    /// Informational labels and task-detail status; activity uses its own roles.
     /// Shares the soft-green palette source with completed tool borders.
     pub fn info(&self) -> Color {
         self.soft_green(ColorSupport::detect())
     }
 
-    /// Spinner activity and waiting share the info/warning semantic roles.
-    pub fn spinner_fg(&self, is_warning: bool) -> String {
+    /// Activity, warning and secondary details resolve through one palette.
+    #[inline]
+    pub fn activity_colors(&self, is_warning: bool) -> ActivityColors {
         let support = ColorSupport::detect();
-        let color = if is_warning {
+        let label = if is_warning {
             self.warning
         } else {
-            self.soft_green(support)
+            Color::Reset
         };
-        ansi_fg(support.color(color))
-    }
-
-    /// Brand animation uses the existing logo role, independently of status.
-    pub fn logo_fg(&self) -> String {
-        ansi_fg(ColorSupport::detect().color(self.logo))
+        ActivityColors {
+            logo: support.color(self.logo),
+            label: support.color(label),
+            metadata: support.color(self.muted),
+        }
     }
 
     /// Inline-code and file-link foreground from the selected syntax asset.

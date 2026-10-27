@@ -556,13 +556,15 @@ pub fn build_engine_runtime(
 
 pub fn build_runtime_for_host(
     host: &HostContext,
-    session: Session,
+    mut session: Session,
     session_id: &str,
     config: RuntimeConfig,
     session_mcp: &std::collections::BTreeMap<String, runtime::ScopedMcpServerConfig>,
 ) -> Result<BuiltRuntime, Box<dyn std::error::Error>> {
     let loader = ConfigLoader::default_for(&host.config_root);
     let file_config = loader.load()?;
+    runtime::experiments::init_config_flags(file_config.experiments().clone());
+    session.activate_persistence()?;
     let runtime_plugin_state = build_runtime_plugin_state_with_loader(
         &host.config_root,
         &loader,
@@ -730,7 +732,10 @@ pub(crate) fn build_runtime_with_plugin_state(
         config.enable_tools,
         config.allowed_tools.clone(),
         &engine_core::ModelAccess {
-            fs: Arc::clone(&host.fs),
+            fs: match &peer {
+                Some(crate::peer::Peer::Node(node)) => node.fs(),
+                _ => Arc::clone(&host.fs),
+            },
             require_mount: host.require_model_mount,
         },
     ) {
@@ -766,11 +771,14 @@ pub(crate) fn build_runtime_with_plugin_state(
     // Hand the dispatcher this session's peer mailbox, so a recipient name means
     // the same destination to the `send` tool, to a sub-agent reporting back,
     // and to the receiver tailing its own inbox.
-    if let Some(mailbox) = host
+    let mailbox = host
         .mailbox
         .clone()
-        .or_else(|| peer.as_ref().map(crate::peer::Peer::mailbox))
-    {
+        .or_else(|| peer.as_ref().map(crate::peer::Peer::mailbox));
+    let description_store = mailbox
+        .as_ref()
+        .map(|mailbox| mailbox.description_store(mailbox.self_id()));
+    if let Some(mailbox) = mailbox {
         tool_executor.set_mailbox(mailbox);
     }
     let session_tracer = client.session_tracer().cloned();
@@ -784,6 +792,13 @@ pub(crate) fn build_runtime_with_plugin_state(
     )
     .with_session_known_date(runtime::today_local())
     .with_session_known_model(config.model.clone());
+    if runtime::experiments::is_enabled(runtime::experiments::Experiment::PeerDescriptions) {
+        match description_store {
+            Some(Ok(store)) => runtime.set_agent_description_store(store),
+            Some(Err(error)) => tracing::warn!(%error, "peer description store unavailable"),
+            None => {}
+        }
+    }
     // Runtime maintenance and provider requests must share the session's
     // existing local trace sink, including signed-history recovery notices.
     if let Some(tracer) = session_tracer {

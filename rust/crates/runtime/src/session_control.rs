@@ -274,9 +274,31 @@ impl SessionStore {
     }
 
     pub fn latest_session(&self) -> Result<ManagedSessionSummary, SessionControlError> {
-        self.list_sessions()?.into_iter().next().ok_or_else(|| {
-            SessionControlError::Format(format_no_managed_sessions(&self.sessions_root))
-        })
+        let mut sessions = self.list_sessions()?;
+        let Some(candidate) = sessions.first() else {
+            return Err(SessionControlError::Format(format_no_managed_sessions(
+                &self.sessions_root,
+            )));
+        };
+        // An unreadable transcript lists as an empty session, so it sorts last.
+        // If it is newer than the session `latest` would pick, the user's most
+        // recent work is probably in it (written by a newer scode, or damaged):
+        // resuming another session would silently drop that context.
+        let newest_unreadable = sessions
+            .iter()
+            .filter(|session| session.load_error.is_some())
+            .max_by_key(|session| session.modified_epoch_millis);
+        if let Some(unreadable) = newest_unreadable {
+            if candidate.load_error.is_some()
+                || unreadable.modified_epoch_millis > candidate.modified_epoch_millis
+            {
+                return Err(SessionControlError::Format(format_unreadable_latest(
+                    &unreadable.path,
+                    unreadable.load_error.as_deref().unwrap_or_default(),
+                )));
+            }
+        }
+        Ok(sessions.swap_remove(0))
     }
 
     pub fn load_session(
@@ -313,7 +335,7 @@ impl SessionStore {
         let forked = forked
             .with_persistence_path(handle.path.clone())
             .with_fs_backend(Arc::clone(&self.fs));
-        forked.save_to_path(&handle.path)?;
+        forked.save_fork_to_path(session, &handle.path)?;
         Ok(ForkedManagedSession {
             parent_session_id,
             handle,
@@ -328,11 +350,17 @@ impl SessionStore {
         session: &Session,
     ) -> Result<(), SessionControlError> {
         if let Some(expected) = &self.identity {
-            return if session.identity.as_ref() == Some(expected) {
+            let is_bound = session.identity.as_ref().is_some_and(|actual| {
+                actual.matches_storage_binding(expected)
+                    && (actual.agent_name == expected.agent_name
+                        || self.has_session_link(&expected.agent_name, session_path, session))
+            });
+            return if is_bound {
                 Ok(())
             } else {
                 Err(SessionControlError::Format(
-                    "session ownership or repository bindings do not match (legacy sessions without identity cannot be restored by this host)".into(),
+                    "session ownership, repository bindings or Agent association do not match"
+                        .into(),
                 ))
             };
         }
@@ -350,6 +378,19 @@ impl SessionStore {
         Err(SessionControlError::WorkspaceMismatch {
             expected: self.workspace_root.clone(),
             actual: actual.to_path_buf(),
+        })
+    }
+
+    fn has_session_link(&self, agent_name: &str, transcript: &Path, session: &Session) -> bool {
+        let alias = format!("/agents/{agent_name}/sessions/{}", session.session_id);
+        let target = if transcript.file_name() == Some(std::ffi::OsStr::new(TRANSCRIPT_FILE)) {
+            transcript.parent().unwrap_or(transcript)
+        } else {
+            transcript
+        };
+        self.fs.read_link(&alias).is_ok_and(|linked| {
+            canonicalize_for_compare(Path::new(&linked), self.fs.as_ref())
+                == canonicalize_for_compare(target, self.fs.as_ref())
         })
     }
 
@@ -418,9 +459,10 @@ impl SessionStore {
                             .as_ref()
                             .and_then(|fork| fork.branch_name.clone()),
                         interactive: session.mode == SessionMode::Interactive,
+                        load_error: None,
                     }
                 }
-                Err(_) => ManagedSessionSummary {
+                Err(error) => ManagedSessionSummary {
                     id: path
                         .file_stem()
                         .and_then(|value| value.to_str())
@@ -434,6 +476,7 @@ impl SessionStore {
                     parent_session_id: None,
                     branch_name: None,
                     interactive: false,
+                    load_error: Some(error.to_string()),
                 },
             };
             sessions.push(summary);
@@ -507,6 +550,8 @@ pub struct ManagedSessionSummary {
     pub parent_session_id: Option<String>,
     pub branch_name: Option<String>,
     interactive: bool,
+    /// Why the transcript could not be read, when it could not.
+    load_error: Option<String>,
 }
 
 fn sort_managed_sessions(sessions: &mut [ManagedSessionSummary]) {
@@ -651,6 +696,9 @@ pub fn resolve_managed_session_path_for(
 
 #[must_use]
 pub fn is_managed_session_file(path: &Path) -> bool {
+    if crate::subagent_completion::is_completion_binding_file(path) {
+        return false;
+    }
     // Rotation snapshots (`<id>.rot-<ts>.jsonl`) share the .jsonl extension but
     // are NOT resumable sessions: each carries the same internal session_id as
     // its parent, so listing them yields duplicate entries for one session.
@@ -753,6 +801,13 @@ fn format_missing_session_reference(reference: &str, sessions_root: &Path) -> St
         .unwrap_or("<unknown>");
     format!(
         "session not found: {reference}\nHint: managed sessions live in .scode/sessions/{fingerprint_dir}/ (workspace-specific partition).\nTry `{LATEST_SESSION_REFERENCE}` for the most recent session or `/session list` in the REPL."
+    )
+}
+
+fn format_unreadable_latest(path: &Path, error: &str) -> String {
+    format!(
+        "the most recent session {} could not be read: {error}\nIt may have been written by a newer scode. Update scode, or resume another session explicitly with `--resume <session id or path>` (`--resume list` shows them).",
+        path.display()
     )
 }
 
@@ -957,6 +1012,7 @@ mod tests {
                 parent_session_id: None,
                 branch_name: None,
                 interactive: true,
+                load_error: None,
             },
             ManagedSessionSummary {
                 id: "newer-file-older-session".to_string(),
@@ -968,6 +1024,7 @@ mod tests {
                 parent_session_id: None,
                 branch_name: None,
                 interactive: true,
+                load_error: None,
             },
         ];
 

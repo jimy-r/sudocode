@@ -195,7 +195,7 @@ pub fn run_git_capture_in(cwd: &Path, args: &[&str]) -> Option<String> {
     if !output.status.success() {
         return None;
     }
-    String::from_utf8(output.stdout).ok()
+    Some(process_text::decode_process_output(&output.stdout).text)
 }
 
 /// # Errors
@@ -208,7 +208,10 @@ pub fn find_git_root_in(cwd: &Path) -> Result<PathBuf, Box<dyn std::error::Error
     if !output.status.success() {
         return Err("not a git repository".into());
     }
-    let path = String::from_utf8(output.stdout)?.trim().to_string();
+    let path = process_text::decode_process_output(&output.stdout)
+        .text
+        .trim()
+        .to_string();
     if path.is_empty() {
         return Err("empty git root".into());
     }
@@ -368,7 +371,7 @@ fn discover_tmux_panes() -> Vec<TmuxPaneSnapshot> {
     if !output.status.success() {
         return Vec::new();
     }
-    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stdout = process_text::decode_process_output(&output.stdout).text;
     parse_tmux_pane_snapshots(&stdout)
 }
 
@@ -608,7 +611,7 @@ fn format_peer_report(peer: &runtime::mailbox::PeerStatus) -> String {
             "receiving; waiting messages run at the next prompt (press Enter)"
         }
         ("receiving", _) => "receiving",
-        ("standby", _) => "standing by: another instance of this agent is receiving",
+        ("standby", _) => "standing by: waiting for the receiver seat",
         _ => "not running in this process",
     };
     let cursor = match peer.cursor {
@@ -619,14 +622,19 @@ fn format_peer_report(peer: &runtime::mailbox::PeerStatus) -> String {
         }
         _ => "decided when this process first claims a conversation",
     };
-    format!(
+    let mut report = format!(
         "Peers
   Agent            {}
   Namespace        {namespace}
   Receiver         {receiver}
   Cursor           {cursor}",
         peer.agent
-    )
+    );
+    if let Some(error) = &peer.last_receiver_error {
+        use std::fmt::Write as _;
+        let _ = write!(report, "\n  Last RX error    {error}");
+    }
+    report
 }
 
 // ===========================================================================

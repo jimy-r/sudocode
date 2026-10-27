@@ -58,6 +58,7 @@ fn send(mailbox: &SessionMailbox<Kernel>, message: Value) {
     mailbox.send(SessionPayload::Rpc { message }).unwrap();
 }
 
+#[track_caller]
 fn until(
     mailbox: &SessionMailbox<Kernel>,
     predicate: impl Fn(&Value) -> bool,
@@ -76,7 +77,9 @@ fn until(
                 );
                 seen.push(message);
             }
-            Some(SessionPayload::Closed { reason }) => panic!("session closed: {reason}"),
+            Some(SessionPayload::Closed { reason }) => {
+                panic!("session closed: {reason}; seen: {seen:?}")
+            }
             None => {}
         }
     }
@@ -109,10 +112,15 @@ fn cohost_waits_for_permission_cancels_and_runs_the_next_turn() {
     a2a::install_a2a_stamp_hook(&kernel, true).unwrap();
     let path = a2a::conversation_transcript_path(&a2a::conversation_id("worker", "operator"));
     common::provision_stream_transcript(&kernel, &path);
+    let seeded = common::managed_session::seed_managed_session(
+        &kernel,
+        &common::make_desc("seed", "worker", "scripted"),
+    );
     let started = call(
         &kernel,
         "start_session_v1",
-        json!({"agent_id":"worker","model":"scripted"}),
+        json!({"agent_id":"worker","model":"scripted",
+            "resume_session_id":seeded.resume_session_id}),
     );
     let endpoint: SessionEndpoint =
         serde_json::from_value(started["session_endpoint"].clone()).unwrap();
@@ -501,12 +509,18 @@ fn cohost_waits_for_permission_cancels_and_runs_the_next_turn() {
     }
 
     // A fresh session has no earlier parity marker to replay. The provider's
-    // existing missing-scenario HTTP 400 is a permanent rejection, isolated
-    // from the successful session and the shared benchmark fixture.
+    // existing missing-scenario HTTP 400 rejects model execution after input
+    // commitment. Receipt belongs to durable history, not a successful answer:
+    // recovery must retain this input without inserting it a second time.
+    let failed_seed = common::managed_session::seed_managed_session(
+        &kernel,
+        &common::make_desc("seed", "failed-worker", "scripted"),
+    );
     let failed_start = call(
         &kernel,
         "start_session_v1",
-        json!({"agent_id":"failed-worker","model":"scripted"}),
+        json!({"agent_id":"failed-worker","model":"scripted",
+            "resume_session_id":failed_seed.resume_session_id}),
     );
     let failed_endpoint: SessionEndpoint =
         serde_json::from_value(failed_start["session_endpoint"].clone()).unwrap();
@@ -528,7 +542,9 @@ fn cohost_waits_for_permission_cancels_and_runs_the_next_turn() {
         json!({"jsonrpc":"2.0","id":"failed-new","method":"session/new",
         "params":{"cwd":"/","mcpServers":[]}}),
     );
-    until(&failed_mailbox, |message| message["id"] == "failed-new");
+    let (failed_created, _) = until(&failed_mailbox, |message| message["id"] == "failed-new");
+    let failed_sid = failed_created["result"]["sessionId"].as_str().unwrap();
+    let failed_transcript = format!("/sessions/{failed_sid}/transcript.jsonl");
     let failed_path =
         a2a::conversation_transcript_path(&a2a::conversation_id("failed-worker", "failed-peer"));
     common::provision_stream_transcript(&kernel, &failed_path);
@@ -542,6 +558,7 @@ fn cohost_waits_for_permission_cancels_and_runs_the_next_turn() {
     );
     failed_peer
         .send(runtime::agent_mailbox::MailboxEnvelope {
+            delivery: runtime::turn_input::InputDelivery::Steer,
             from: "failed-peer".into(),
             to: "failed-worker".into(),
             body: "FAILED-ACP-DELIVERY".into(),
@@ -555,16 +572,83 @@ fn cohost_waits_for_permission_cancels_and_runs_the_next_turn() {
     until(&failed_mailbox, |message| {
         message.to_string().contains("missing parity scenario")
     });
-    let worker = runtime::mailbox::Mailbox::daemon_absolute(Arc::new(fs), "failed-worker".into());
+    let fs = Arc::new(fs);
+    let stored_peer_count = || {
+        runtime::Session::load_from_path_with(fs.as_ref(), &failed_transcript)
+            .unwrap()
+            .messages()
+            .iter()
+            .filter(|message| {
+                message.role == runtime::MessageRole::User
+                    && message.blocks.iter().any(|block| {
+                        matches!(block, runtime::ContentBlock::Text { text }
+                            if text.contains("FAILED-ACP-DELIVERY"))
+                    })
+            })
+            .count()
+    };
+    assert_eq!(
+        stored_peer_count(),
+        1,
+        "the failed turn must retain its input"
+    );
+    let worker = runtime::mailbox::Mailbox::daemon_absolute(fs.clone(), "failed-worker".into());
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let delivered_position = loop {
+        if let Some(position) = worker.read_position("failed-peer").unwrap() {
+            if position > 0 {
+                break position;
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "durably stored input was not acknowledged"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    };
     let observation = Instant::now() + Duration::from_millis(500);
     while Instant::now() < observation {
         assert_eq!(
             worker.read_position("failed-peer").unwrap(),
-            Some(0),
-            "ACP must not acknowledge a failed turn"
+            Some(delivered_position),
+            "model failure must not replay an already committed peer input"
         );
+        assert_eq!(stored_peer_count(), 1);
         std::thread::sleep(Duration::from_millis(20));
     }
+    send(
+        &failed_mailbox,
+        json!({"jsonrpc":"2.0","id":"recover-model","method":"session/prompt",
+            "params":{"sessionId":failed_sid,"prompt":[{"type":"text","text":"PARITY_SCENARIO:single_turn_text"}]}}),
+    );
+    let (recovered, events) = until(&failed_mailbox, |message| message["id"] == "recover-model");
+    assert_eq!(recovered["result"]["stopReason"], "end_turn");
+    assert!(events
+        .iter()
+        .any(|event| event.to_string().contains("The answer is 4")));
+    assert_eq!(
+        stored_peer_count(),
+        1,
+        "recovery must not duplicate peer input"
+    );
+    let requests = rt.block_on(service.captured_requests());
+    let recovery_request = requests
+        .iter()
+        .rev()
+        .find(|request| {
+            request
+                .raw_body
+                .contains("PARITY_SCENARIO:single_turn_text")
+        })
+        .expect("recovery must reach the model");
+    assert_eq!(
+        recovery_request
+            .raw_body
+            .matches("FAILED-ACP-DELIVERY")
+            .count(),
+        1,
+        "the recovered model must receive the earlier peer input exactly once"
+    );
 
     failed_mailbox
         .send(SessionPayload::Closed {

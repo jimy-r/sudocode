@@ -595,7 +595,7 @@ coverage starts fresh and is tracked here as the single source.</p>
     <tr><td>Double Ctrl-C force exit (CC parity)</td><td data-priority="must-have">must-have</td><td data-status="covered" data-live-verified="live-verified"><strong>Covered</strong></td><td><code>pty_double_ctrlc_exit::double_ctrlc_exits_sync_repl</code> · <code>pty_double_ctrlc_exit::double_ctrlc_exits_async_repl</code></td><td>Two rapid Ctrl-C within 800ms exits the process cleanly. Unified through <code>cancel.rs</code> SSOT — same API for sync (HookAbortMonitor) and async (LineEditor abort_hook) paths. Live-verified 2026-07-30.</td></tr>
     <tr><td><code>/config set</code> runtime toggle</td><td data-priority="must-have">must-have</td><td data-status="covered" data-live-verified="live-verified"><strong>Covered</strong></td><td><code>pty_config_set::config_set_auto_interrupt_toggles</code> · <code>pty_config_set::config_set_queue_toggles</code></td><td><code>/config set auto-interrupt on|off</code> and <code>/config set queue on|off</code> toggle the shared atomic QueueMode at runtime. Slash commands dispatch synchronously on the coordinator thread via <code>TurnDriver::try_handle_slash_command</code> (PR #354). Live-verified 2026-08-03.</td></tr>
     <tr><td>REPL input chrome (separator + permission-mode footer)</td><td data-priority="must-have">must-have</td><td data-status="covered" data-live-verified="live-verified"><strong>Covered</strong></td><td><code>pty_repl_async_queue::async_repl_processes_single_turn_and_exits</code></td><td>CC-parity input chrome: <code>❯</code> prompt with separator + permission-mode footer (<code>⏵⏵ full access mode</code>) below. Two-phase stdin ownership: readline (idle) ↔ HookAbortMonitor (turn running), gated by <code>prompt_ready</code> channel so <code>❯</code> only appears after output is fully flushed. <code>input_chrome.rs</code> SSOT. Live-verified 2026-08-03.</td></tr>
-    <tr><td>REPL interrupt + input queue (batched flush · <a href="https://s.shareone.vip/s/sudowork-interrupt-queue">§3.2 cross-product parity</a>)</td><td data-priority="must-have">must-have</td><td data-status="covered" data-live-verified="live-verified"><strong>Covered</strong></td><td><code>input_queue::matrix_docs::*</code> (7) · <code>repl_async::loop_docs::*</code> (2) · <code>pty_repl_async_queue</code></td><td>Cross-product alignment with sudowork's batched-flush semantics. <strong>Queue default ON since PR #347.</strong> <code>prompt_ready</code> channel gates readline after turn output (PR #361/365); queue-during-turn PTY tests (batched_flush, interrupt, up_dequeue) temporarily ignored pending input-during-turn redesign. Unit tests (matrix_docs, loop_docs) still validate the coordinator logic. Live-verified 2026-08-03.</td></tr>
+    <tr><td>REPL steering, next-turn queue and cancellation</td><td data-priority="must-have">must-have</td><td data-status="covered"><strong>Separate delivery and cancellation</strong></td><td><code>pty_turn_steering</code> · <code>pty_queue_overlay</code> · <code>pty_a2a_overlay</code></td><td><strong>CCB validation:</strong> read <code>src/utils/messageQueueManager.ts</code>: one queue carries human input and task notifications, with FIFO ordering within priority and an editable-human recall path. Codex reference <code>970111f6</code>: composer Enter/Tab separate steering and queueing; engine preempts sampling for steering, settles admitted tools, and commits input before the next request. Ordinary steering adds no mandatory redirection instruction. <strong>Product contract:</strong> Enter steers the current task; Tab explicitly queues the next turn (slash completion remains Tab). Esc flushes all pending messages without cancellation, or cancels when none are pending. Ctrl+C always cancels and preserves unapplied input. Unlike Codex's interrupt-and-resubmit shortcut, flush never emits an interruption marker or restarts a task. One runtime inbox receives human, peer and task-completion steering through engine-core; the session execution lock never gates these controls. Replayable text deltas, complete non-text blocks and settled tool results bound insertion, preserving signed thinking, complete tool arguments and result pairing. Stable ids distinguish pending from durably committed input. A2A <code>send.delivery</code> selects <code>steer</code> (default) or <code>queue</code>, retains peer provenance and body, and cannot cancel the recipient. Existing structured subagent shutdown retains its separate authorization contract. Busy session-management commands return immediately. Pending overlays and footer hints project delivery state through the existing iocraft and ColorTheme paths. <strong>Host delivery:</strong> ACP exposes <code>_sudocode/session/input</code> and revisioned input updates. The coordinator lives in engine-core and is shared with the CLI; Desktop, WebUI and Moss forward intent and render admission versus durable consumption. Human recall retains images and editor metadata; peer messages and completion notifications retain provenance and cannot cancel the recipient. Automatic next turns use the same permission/question route and lifecycle fence. Cancellation pauses unapplied input, including background results; explicit steering or flush resumes it. Ordinary ACP hosts share the CLI background-notification reducer; clients using durable task receipts acknowledge only committed input. Pending human drafts remain session-memory state, not a crash-recovery guarantee.</td></tr>
   </tbody>
 </table>
 
@@ -614,15 +614,15 @@ coverage starts fresh and is tracked here as the single source.</p>
   (3) bash streaming output → (4) MCP progress notifications.
 </div>
 
-<p><strong>CCB validation:</strong> <code>src/screens/REPL.tsx</code> derives query activity from <code>QueryGuard</code> separately from <code>showSpinner</code>, and distinguishes approval/input waiting from busy and idle. Codex's <code>BottomPane::set_task_running</code> likewise keeps task state independent of status visibility. Scode uses its existing ordered <code>EngineEvent::State</code> stream as the foreground authority. Its activity cue stays visible through streamed output, with input waiting owned by the question/approval panel; temporary legacy spinner suspension cannot change the engine lifecycle.</p>
+<p><strong>CCB validation:</strong> <code>src/screens/REPL.tsx</code> derives query activity from <code>QueryGuard</code> separately from <code>showSpinner</code>, and distinguishes approval/input waiting from busy and idle. Codex's <code>BottomPane::set_task_running</code> likewise keeps task state independent of status visibility. CCB <code>src/components/Spinner/TeammateSpinnerLine.tsx</code> distinguishes teammate idle from active work; scode keeps its existing task browser rather than adding a teammate tree. Codex <code>970111f6</code> uses terminal foreground/brightness for activity and dim secondary metadata; scode retains its amber brand animation and central <code>ColorTheme</code>. Scode uses its existing ordered <code>EngineEvent::State</code> stream as the foreground authority. Its activity cue stays visible through streamed output, with input waiting owned by the question/approval panel; temporary legacy spinner suspension cannot change the engine lifecycle.</p>
 
 <table>
   <thead><tr><th>Feature</th><th>Hacker Priority</th><th>Status</th><th>Test</th><th>Notes</th></tr></thead>
   <tbody>
     <tr><td>Inline terminal refresh (unified render loop)</td><td data-priority="must-have">must-have</td><td data-status="covered"><strong>Covered</strong></td><td><code>repl_ui.rs ReplApp</code></td><td>Async REPL uses <strong>iocraft</strong> <code>render_loop()</code> — Rust equivalent of CC's Ink. Bottom chrome (spinner + separator + TextInput prompt + separator + footer) is a single iocraft component tree. <code>UseOutput::println()</code> routes turn output above the fixed chrome. Spinner ticks via <code>use_future</code> at 80ms. Keyboard input via <code>use_terminal_events</code> replaces rustyline in the async path. PR #382 removed MultiProgress; PR #383 added iocraft.</td></tr>
-    <tr><td>Foreground lifecycle and elapsed timer</td><td data-priority="must-have">must-have</td><td data-status="covered"><strong>Covered</strong></td><td><code>pty_foreground_activity</code></td><td><code>render/activity.rs ActivityState</code> projects <code>Running / AwaitingInput / Idle</code> from the engine event bridge. Status and footer share one lifecycle snapshot. Thinking/Reasoning and running-tool content share the existing status row, with one amber brand animation. Questions and approvals stop activity and own the existing input panel; idle restores the result/footer. Shared inline/one-shot formatters preserve elapsed time, model, tokens and ETA.</td></tr>
+    <tr><td>Foreground lifecycle and elapsed timer</td><td data-priority="must-have">must-have</td><td data-status="covered"><strong>Covered</strong></td><td><code>pty_foreground_activity</code> · <code>pty_background_tasks</code></td><td><code>render/activity.rs ActivityState</code> projects <code>Running / AwaitingInput / Idle</code> from the engine event bridge. Status and footer share one foreground lifecycle snapshot and the task browser's cached event projection. Foreground activity owns the status row, then a static background conclusion with the completed turn number, then turn statistics. Running, stopping, unconfirmed execution and unread failures remain distinct; ordinary unread results stay in the footer. Questions and approvals own the input panel. Hidden task output introduces no animation or clock redraw. Shared inline/one-shot formatters preserve elapsed time, model, tokens and ETA.</td></tr>
     <tr><td>Spinner status line — token counter (↓ N tokens)</td><td data-priority="must-have">must-have</td><td data-status="covered"><strong>Covered</strong></td><td><code>pty_spinner_token_counter::status_line_shows_token_count_after_turn</code> · <code>live_spinner_shows_token_counter_during_streaming</code></td><td>Spinner shows <code>↓ N tokens</code> (bytes/4 approximation) after 1s of streaming. Shared <code>AtomicU32</code> counter incremented on each <code>TextDelta</code> in <code>api_client.rs</code>, read by spinner thread in <code>render.rs</code>.</td></tr>
-    <tr><td>Spinner status line — reasoning status</td><td data-priority="must-have">must-have</td><td data-status="covered"><strong>Covered</strong></td><td><code>pty_render_boundaries</code> · <code>pty_chrome_styles</code></td><td>Actual thinking deltas select <code>Reasoning...</code>; other model work uses <code>Thinking...</code>. A fixed four-cell animation approximates the Sudoprivacy mark and uses the existing <code>ColorTheme.logo</code> role. Tools prioritize available progress; quiet tools show their canonical name or active count. Time and tokens share the same row. Streamed prose does not hide foreground activity. Asynchronous output suspension does not reset reasoning or retry phase. All colors use <code>ColorTheme</code>.</td></tr>
+    <tr><td>Spinner status line — reasoning status</td><td data-priority="must-have">must-have</td><td data-status="covered"><strong>Covered</strong></td><td><code>pty_render_boundaries</code> · <code>pty_chrome_styles</code></td><td>Actual thinking deltas select <code>Thinking...</code>; other model work uses <code>Working...</code>. A fixed four-cell animation approximates the Sudoprivacy mark and uses the existing <code>ColorTheme.logo</code> role. Tools prioritize available progress; quiet tools show their canonical name or active count. Time and tokens share the same row; ordinary activity text uses terminal foreground and metadata uses the muted role. Streamed prose does not hide foreground activity. Asynchronous output suspension does not reset reasoning or retry phase. All colors use <code>ColorTheme</code>.</td></tr>
     <tr><td>Spinner status line — token budget / ETA</td><td data-priority="must-have">must-have</td><td data-status="covered"><strong>Covered</strong></td><td><code>render.rs Spinner</code></td><td>When <code>max_output_tokens</code> is set (from <code>max_tokens_for_model</code>), spinner shows <code>↓ 1.2k / 16k (8%) ~3m</code>. Rate-based ETA: <code>output_tokens / elapsed</code>. Falls back to plain <code>↓ N tokens</code> when budget unknown.</td></tr>
     <tr><td>Spinner status line — stall detection (yellow status text)</td><td data-priority="must-have">must-have</td><td data-status="covered"><strong>Covered</strong></td><td><code>render.rs Spinner</code></td><td>Shared <code>SpinnerProgress</code> records response, tool progress and phase activity; after response bytes arrive, status text uses <code>ColorTheme.warning</code> when no progress occurs for 3s (reasoning is exempt). The brand animation stays amber. Same semantic as CC's <code>useStalledAnimation</code>.</td></tr>
     <tr><td>Bash tool streaming output (onProgress)</td><td data-priority="must-have">must-have</td><td data-status="covered"><strong>Covered</strong></td><td><code>pty_bash_streaming::bash_streaming_shows_progress_for_slow_commands</code></td><td><code>execute_bash_streaming</code> in <code>bash.rs</code> pipes stdout/stderr via <code>tokio::io::BufReader</code>, reads line-by-line, calls <code>BashProgressCallback</code> every ~1s. <code>CliToolExecutor</code> installs a callback that pauses the spinner and prints the last 3 lines in dim style. Thread-local callback avoids changing <code>ToolExecutor</code> trait.</td></tr>
@@ -642,6 +642,17 @@ coverage starts fresh and is tracked here as the single source.</p>
     <tr><td>Live API smoke (real Anthropic)</td><td data-priority="na">N/A</td><td data-status="na">N/A</td><td>—</td><td>Covered by <code>acp_live_smoke.rs</code>; runs only on main with <code>CLAUDE_CODE_OAUTH_TOKEN</code>; live-gate, not a coverage-denominator concern</td></tr>
   </tbody>
 </table>
+
+<p><strong>Direct ACP A2A hardening (source in progress).</strong>
+<code>_sudocode/a2a/send</code> and <code>agent_list</code> keep the existing
+engine command lane and scheduler, with no model inference or invented model
+history. The follow-up adds typed pre-submission refusals, unique native command
+IDs bound to the actual executor mailbox, and the session operation registry
+covering hooks, approval and blocking Node work. Native result metadata remains
+separate from the transcript; timeout/disconnect remains Unknown. Real stdio
+hook/allowlist cases and isolated TLS-daemon pause/withheld-reply cases are wired
+to CI; source preparation is not deployment or cross-host callback acceptance.
+See <a href="docs/acp.md#direct-a2a-requests">the wire contract and test limits</a>.</p>
 
 <h4>2. Tool usage — file operations</h4>
 <table>
@@ -2109,6 +2120,17 @@ impact, lowest implementation cost first:</p>
 
 <h4>Inline rendering design principles</h4>
 
+<p><strong>Plan review presentation.</strong> The existing question boundary
+carries explicit plan-review intent and the authoritative saved-file path.
+Both REPLs and the document inspector use the shared Markdown renderer and
+left frame to separate the complete plan from preceding reasoning and the
+decision controls. Structured review results distinguish approval, revision,
+cancellation and draft saving; ordinary review feedback is not a tool error.
+The completed card retains the decision, path and feedback without repeating
+abbreviated input fields. Acceptance: <code>pty_plan_presentation</code>,
+<code>pty_plan_markdown</code>, <code>pty_plan_review</code> and
+<code>pty_plan_confirm</code>, including real-provider review and revision.</p>
+
 <p><strong>Todo semantic emphasis.</strong> All summary quantities, including
 zero, use bold terminal foreground; labels and punctuation use readable muted
 color without an extra dim attribute. A shared count-span role applies to every
@@ -2326,6 +2348,33 @@ Logged here so the insight isn't lost to discussion-only memory.</p>
 
 <h2 id="goal-4">Goal 4 · Agent storage, communication and execution</h2>
 
+<h3 id="peer-descriptions">Persistent peer descriptions</h3>
+<p><b>CCB validation.</b> Read <code>claude-code-best/src/memdir/memoryAge.ts</code>,
+<code>memoryScan.ts</code>, and <code>memoryTypes.ts</code> at <code>8d80e740</code>.
+The reference separates short relevance descriptions from memory bodies and
+shows age so recalled observations can be rechecked. An isolated official
+Claude Code <code>2.1.310</code> Windows binary (SHA-256
+<code>f9a3920634ae3b961ee92c2eb58d0051f5f8852b120983d0a4f57b6a5efeba61</code>)
+also stamps modification time and session provenance. Five executions of its
+exact extracted age helper confirm its two-day freshness note. Those findings
+support runtime timestamps and provenance; they do not establish a per-file
+expiry policy or a peer-description feature in Claude Code.</p>
+<p>The <code>peerDescriptions</code> experiment is off by default. The existing
+model-backed compaction call may return a short description after its checkpoint.
+The runtime strips metadata from continuation context and publishes it only
+after the checkpoint commits. Discovery reads the same persistent agent file.
+There is no scheduled model call, automatic expiry, or child-agent profile
+change. Pruning and failed or incomplete metadata preserve the prior record.
+PTY acceptance covers compaction, process restart, peer discovery, optional
+metadata failures, and exact historical cache-marker equality with the feature
+off and on. Native and in-process cohost tests cover persistent storage and
+stale writes. Live Sudorouter acceptance with <code>claude-opus-4-8</code>
+verified one completed compaction response and discovery from a second real-model
+session after the author exited. Two provider-usage samples are observations,
+not a cache-efficiency benchmark; deployed Moss and gRPC daemon journeys remain
+outside this experiment's acceptance. See <a href="docs/usage.md#persistent-peer-descriptions">usage</a>
+for storage and the backend concurrency guarantee.</p>
+
 <p id="collaboration-as-unit">Product principles and the component overview live in
 <a href="README.md#position-in-the-larger-picture">README</a>.
 The <a href="docs/design/agent-context-storage-matrix.html#agent-delivery-contract">Agent storage contract</a>
@@ -2347,16 +2396,18 @@ allows two terminals to resume and append one transcript. The behavioral referen
 The consequence is precise: both continuations survive in durable history; each
 running instance continues its own context. Interleaving file writes does not
 mean inserting another instance's half-finished tool batch into a model request.
-This is source and documentation evidence; a dual-terminal run of installed CC
-remains a separate acceptance check.</p>
+An isolated run of Claude Code 2.1.301 confirmed that two independent resumes
+preserve both branches and that a fresh continuation selects the latest durable
+branch. A second run resumed while the original instance executed a real tool:
+the new context received an interrupted-call result with an unknown outcome,
+and the original tool subsequently completed in its own context.</p>
 
-<p><b>Default restore boundary · confirmed by the user.</b> A new runtime forks
-from the most recently completed turn. If A is still executing tools when B
-opens the SID, A keeps its in-flight turn and real results on A's branch; B
-continues the completed prefix. Opening B does not establish that A was
-interrupted and must not repair or consume A's unfinished calls. Selection
-follows committed history order. This is Sudo Code's selected restore boundary;
-the CCB evidence above establishes the record/ancestry pattern.</p>
+<p><b>Restore parity acceptance.</b> Verify the written-prefix and branch-local
+recovery contract in the
+<a href="docs/design/agent-context-storage-matrix.html#shared-session-context">storage matrix</a>
+against the isolated CC run above. Acceptance includes a pending model response,
+an executing native tool, a sibling's synthetic interrupted result, the source's
+actual result, and a fresh restore after both branches finish.</p>
 
 <p>The durable object and authorization contract lives in the
 <a href="docs/design/agent-context-storage-matrix.html#shared-session-context">storage matrix</a>.
@@ -2404,8 +2455,9 @@ Exercise cancellation, stale candidates, crash and restart.</td></tr>
 context, and a durable repair targets that specific call. Opening another context
 does not establish that a live call in its sibling has ended.</td><td>Resume while
 the sibling tool is still running; A receives its real result once, while B
-continues the completed prefix without synthesizing a failure for A. Recover
-an actually interrupted call without repeating its effects.</td></tr>
+inherits the already written prefix and persists an unknown-outcome interrupted
+result in B's branch. A's live call and actual result retain their original
+identity. A fresh restore reuses the persisted repair without repeating effects.</td></tr>
 <tr><td>Completion delivery</td><td>Separate transcript append from completion
 ownership. The completion protocol binds active traces, context revisions,
 terminal sources, reservations and acknowledgements to the originating context.
@@ -2429,25 +2481,52 @@ through standalone, cohost and Moss.</td></tr>
 </table>
 
 <h4>Source audit and delivery tasks · 2026-10-18</h4>
-<p>Audited main <code>bea57f49</code>. Shared SID is the agreed target and requires
-the changes above. <code>engine-host/managed_session.rs</code> still holds a
-session-lifetime lease. <code>runtime/session_writer.rs</code> adds another lifetime
-lock on native storage. <code>session.rs</code> updates assistants by array index,
-replays <code>session_meta</code> as complete replacement, and persists maintenance
-as snapshots. <code>subagent_completion.rs</code> has a session-wide
-<code>active_trace</code> and treats a newly opened journal as recovery from its
-previous writer. <code>SessionStore::validate_loaded_session</code> compares the
-entire hosted identity, including the original Agent name.</p>
+<p>The shared record/replay layer, native commit locks, atomic stream appends,
+context-owned completion journals and Agent-link checks are implemented in the
+shared-session branch. Native CLI PTYs, ACP cold recovery, the real cohost daemon
+and funded Anthropic and OpenAI-compatible turns have exercised concurrent
+contexts and tool identity. Final default-path checks, CI and production host
+acceptance track delivery below.</p>
+
+<p><b>Backend implementation in progress.</b> <code>FsBackend::record_log</code>
+provides a separate complete-record contract: native files lock the actual log
+for each record, sync successful appends and discard an interrupted suffix;
+Nexus adapters create a fresh <code>wal</code> stream with keep-forever retention,
+propagate committed cursors and reject regular-file fallback. Existing streams
+require a trusted initialization binding; a stream type alone cannot verify its
+profile or retention. Real native subprocesses and four independent mTLS clients
+have exercised large records, process death and official-daemon restart. The
+native suite and the real-daemon restart journey are included in CI.</p>
+
+<p><b>Record/replay implementation in progress.</b> The history interpreter assigns
+stable message identities and parents, retains tool-result origins, and commits
+context revisions independently. Written-prefix restoration and frozen inherited
+messages are being checked against the CC reference. Streaming updates can change
+only that context's own uncommitted assistant; compaction retains unchanged message IDs.
+Real native writer processes and independent mTLS clients against official Nexus
+0.8.22 have exercised a live child tool while a sibling opens and compacts its
+own context. Both branches and the real tool result survive daemon restart.
+An ambiguous durable append retry retains its record identity, and an invalid
+tool association is rejected without blocking later valid records. These storage
+journeys are included in CI. Product Session persistence now uses this layer
+for fresh sessions when <code>sharedSessionHistory</code> is enabled, and for
+recognized v3 logs. The experiment remains off by default. Ten deterministic
+PTY cases and a funded two-terminal journey have passed with real subprocess
+tools and isolated full outputs. The funded case also runs in the existing
+live CI workflow. Legacy transcripts retain their lifetime admission guards.
+Native completion journals remain scoped to their originating context; remote
+completion ownership and coordinated deletion still require a durable fencing
+contract. Passing transcript append tests does not enable those operations on
+a backend that lacks that contract. Final CI, release and consumer adoption
+remain open; concurrent CLI/cohost use has not yet shipped.</p>
 
 <ol>
-<li>Implement and accept the shared record/replay layer and backend append
-transactions, including the legacy-reader and older-live-writer boundary.</li>
-<li>Move snapshot, maintenance, streaming update and repair consumers onto that
-layer; accept cross-context compaction and restore.</li>
-<li>Align completion ownership, Agent-link authorization and the two host adapters;
-remove the session-lifetime exclusions together after their replacement passes.</li>
-<li>Accept real concurrent CLI processes, independent cohost runtimes, and
-browser/desktop → Moss → pod execution before publishing concurrency support.</li>
+<li>Complete default-path regression checks and CI for the shared history and
+completion storage change, including retained-host shutdown and legacy recovery.</li>
+<li>Publish the validated runtime and accept browser/desktop → Moss → pod
+execution against that artifact.</li>
+<li>Expose unambiguous Agent and runtime destinations through the existing
+<code>agent_list</code> and <code>send</code> tools.</li>
 </ol>
 <h3 id="contract-zone-p1a">Contract-zone P1a — runtime zone context</h3>
 

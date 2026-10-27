@@ -446,6 +446,7 @@ impl EngineEventRenderer {
                 name,
                 output,
                 is_error,
+            ..
             } => {
                 let input = self.tool_inputs.take(&id);
                 // Footer advice is rendered once in its slot; traces and
@@ -475,6 +476,18 @@ impl EngineEventRenderer {
                 self.render_retry(&ev);
                 RenderOutcome::Continue
             }
+            EngineEvent::InputCommitted(input) => {
+                self.finish_response();
+                let text = match input.source {
+                    engine_events::InputSource::Human => crate::cli::format::format_input_echo(&input.display, crate::render::query_terminal_width()).0,
+                    engine_events::InputSource::Peer => crate::cli::received::render_prompt(&input.display, crate::render::query_terminal_width(), &self.renderer),
+                    _ => input.display,
+                };
+                self.write_block(&text, OutputBlock::Notice);
+                self.resume_spinner();
+                RenderOutcome::Continue
+            }
+            EngineEvent::InputDeferred(_) => RenderOutcome::Continue,
             EngineEvent::Notice { text } => {
                 if !text.is_empty() {
                     self.write_block(&text, OutputBlock::Notice);
@@ -531,6 +544,7 @@ impl EngineEventRenderer {
             EngineEvent::PermissionDenied { .. }
             | EngineEvent::TurnStarted { .. }
             | EngineEvent::State(_)
+            | EngineEvent::InputState(_)
             | EngineEvent::ModelResolved { .. }
             | EngineEvent::Usage(_)
             | EngineEvent::PromptCache(_)
