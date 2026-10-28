@@ -7800,7 +7800,7 @@ async fn acp_task_completions_interrupted_shell_and_encoded_budget() {
 }
 
 /// Concurrent ACP contexts append to the same SID while retaining separate
-/// completion ownership. A continuation repairs only its frozen inherited tail.
+/// completion ownership. A continuation inherits only a completed turn.
 #[tokio::test]
 async fn acp_completions_keep_live_contexts_independent_during_replay_and_load() {
     let server = MockAnthropicService::spawn().await.unwrap();
@@ -7939,15 +7939,24 @@ async fn acp_completions_keep_live_contexts_independent_during_replay_and_load()
     let continued_transcript = read_transcript();
     assert!(
         String::from_utf8_lossy(&continued_transcript)
-            .contains("Side effects may already have occurred"),
-        "the continuation must retain its inherited tool's unknown outcome"
+            .contains(&format!("{SCENARIO_PREFIX}ask_user_question_roundtrip")),
+        "the source's unfinished turn must remain in durable history"
     );
+    let selected = runtime::Session::load_from_path(&transcript)
+        .unwrap()
+        .to_json()
+        .unwrap()
+        .render();
+    assert!(!selected.contains("Side effects may already have occurred"));
+    assert!(!selected.contains(&format!("{SCENARIO_PREFIX}ask_user_question_roundtrip")));
+    assert!(selected.contains(&format!("{SCENARIO_PREFIX}streaming_text")));
     let requests = server.captured_requests().await;
     let request = &requests.last().unwrap().raw_body;
     assert!(
-        request.contains("Side effects may already have occurred")
-            && request.contains(&format!("{SCENARIO_PREFIX}ask_user_question_roundtrip")),
-        "the resumed model must inherit the written turn and its recovery result: {request}"
+        !request.contains("Side effects may already have occurred")
+            && !request.contains(&format!("{SCENARIO_PREFIX}ask_user_question_roundtrip"))
+            && request.contains(&format!("{SCENARIO_PREFIX}streaming_text")),
+        "the resumed model must exclude the sibling's unfinished turn and synthetic result: {request}"
     );
     competitor.shutdown().await;
     assert_eq!(fs::read(&journal).unwrap(), before_journal);

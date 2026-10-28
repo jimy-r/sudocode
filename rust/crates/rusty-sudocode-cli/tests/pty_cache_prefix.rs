@@ -1706,6 +1706,19 @@ fn spawn(env: &TestEnv, path: &std::path::Path) -> PtySession {
 }
 
 fn spawn_with_env(env: &TestEnv, path: &std::path::Path, extra: &[(&str, &str)]) -> PtySession {
+    // TestEnv defaults to the synchronous loop, which has no restored result.
+    let restored_turn = extra
+        .iter()
+        .rev()
+        .find(|(name, _)| *name == "SUDOCODE_INTERRUPT_QUEUE_MODE")
+        .is_some_and(|(_, mode)| *mode != "off")
+        .then(|| {
+            let restored = Session::load_from_path(path).unwrap();
+            runtime::UsageTracker::from_session(&restored)
+                .turns()
+                .to_string()
+        })
+        .filter(|turn| turn != "0");
     let log = env.workspace_root().join("cache-prefix-requests.jsonl");
     let mut variables = vec![("SCODE_LOG_PATH", log.to_str().unwrap())];
     variables.extend_from_slice(extra);
@@ -1718,7 +1731,19 @@ fn spawn_with_env(env: &TestEnv, path: &std::path::Path, extra: &[(&str, &str)])
         ],
         &variables,
     );
+    let ready_deadline = std::time::Instant::now() + WAIT;
     common::expect_input_line_cleared(&cli, WAIT, "resume ready");
+    if let Some(restored_turn) = restored_turn {
+        // The input row can appear before the restored result command reaches
+        // the UI. Establish its persisted counter before taking a turn marker,
+        // or that old result can satisfy the next turn's completion check.
+        common::expect_screen(
+            &cli,
+            |screen| common::turn_status_identity(screen) == restored_turn,
+            ready_deadline.saturating_duration_since(std::time::Instant::now()),
+            "persisted turn result restored before the next submission",
+        );
+    }
     cli
 }
 
