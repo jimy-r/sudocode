@@ -65,6 +65,7 @@ impl RequestRow {
             });
         }
         // Without attempt timing, only exact legacy repeats are safe to merge.
+        // Preserve all known observation fields, even when timing is absent.
         Some(RequestIdentity::Legacy {
             id,
             at: self.at_unix_secs?,
@@ -73,6 +74,12 @@ impl RequestRow {
             input: self.input_tokens,
             read: self.cache_read_input_tokens,
             write: self.cache_creation_input_tokens,
+            observation: self
+                .observation
+                .as_ref()
+                .map(serde_json::to_string)
+                .transpose()
+                .ok()?,
         })
     }
 }
@@ -95,6 +102,7 @@ enum RequestIdentity {
         input: Option<u64>,
         read: Option<u64>,
         write: Option<u64>,
+        observation: Option<String>,
     },
 }
 

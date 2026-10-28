@@ -519,6 +519,54 @@ fn stats_keep_attempt_metadata_and_malformed_adjacency_barriers() {
 }
 
 #[test]
+fn untimed_observations_preserve_known_metadata_and_exact_repeats() {
+    let env = TestEnv::new_mock("cache-untimed-observations");
+    let fixture = usage_fixture("repeated_final_snapshots");
+    write_usage_fixture(&env, &fixture);
+    let path = env
+        .config_home()
+        .join("cache/prompt-cache")
+        .join(fixture["session_id"].as_str().unwrap())
+        .join("requests.jsonl");
+    let original = std::fs::read_to_string(&path).unwrap();
+    let mut row: Value = serde_json::from_str(original.lines().next().unwrap()).unwrap();
+    row["observation"]["request_started_ms"] = json!(0);
+    let mut rows = vec![row.clone()];
+    for (field, value) in [
+        ("attempts", json!(2)),
+        ("route_key", json!("other-route")),
+        ("context_segment", json!(1)),
+        ("requested_ttls_seconds", json!([3600])),
+    ] {
+        let mut distinct = row.clone();
+        distinct["observation"][field] = value;
+        rows.push(distinct);
+    }
+    let mut legacy = row.clone();
+    legacy.as_object_mut().unwrap().remove("observation");
+    rows.extend([legacy.clone(), row, legacy]);
+    std::fs::write(
+        path,
+        rows.iter()
+            .map(Value::to_string)
+            .collect::<Vec<_>>()
+            .join("\n"),
+    )
+    .unwrap();
+    let report = cache_stats_report(&env);
+    let session = &report["per_session"][0];
+    assert_eq!(session["completion_intervals"]["rows"], 6);
+    assert_eq!(session["completion_intervals"]["duplicate_rows_ignored"], 2);
+    let advisor = &session["ttl_advisor"];
+    assert_eq!(advisor["coverage"]["rows"], 6);
+    assert_eq!(advisor["coverage"]["duplicate_snapshots_ignored"], 2);
+    assert_eq!(advisor["coverage"]["ineligible_rows"], 6);
+    assert_eq!(advisor["coverage"]["legacy_or_malformed_rows"], 1);
+    assert!(advisor["decisions"].as_array().unwrap().is_empty());
+    assert!(advisor["forward_comparison"].as_array().unwrap().is_empty());
+}
+
+#[test]
 fn legacy_missing_usage_is_not_a_zero_usage_snapshot() {
     let env = TestEnv::new_mock("cache-legacy-missing-usage");
     std::fs::write(
