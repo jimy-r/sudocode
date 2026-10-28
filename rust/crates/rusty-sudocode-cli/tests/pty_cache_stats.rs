@@ -466,6 +466,37 @@ fn growing_snapshots_replace_usage_without_merging_distinct_attempts() {
 }
 
 #[test]
+fn automatic_ttl_state_and_final_snapshots_share_one_report() {
+    let fixture = usage_fixture("growing_snapshots_distinct_attempts");
+    let env = TestEnv::new_mock("cache-auto-final-snapshots");
+    write_usage_fixture(&env, &fixture);
+    let directory = env
+        .config_home()
+        .join("cache/prompt-cache")
+        .join(fixture["session_id"].as_str().unwrap());
+    // A saved automatic boundary decision is report input, not evidence of
+    // provider cache hits or savings. Its later snapshots still count once.
+    std::fs::write(
+        directory.join("ttl-advice.json"),
+        json!({"decisions":[{
+            "made_at_ms":0, "context_segment":0, "model":fixture["model"],
+            "route_key":"fixture-route", "configured_ttl_seconds":300,
+            "suggested_ttl_seconds":300, "reason":"insufficient_evidence",
+            "training":{"rows":0,"eligible_intervals":0,"fixed_5m_usd":0.0,
+                "fixed_1h_usd":0.0,"boundary_policy_usd":0.0,"transition_writes":0},
+            "trigger":"boundary", "applied":true
+        }]})
+        .to_string(),
+    )
+    .unwrap();
+    let report = cache_stats_report(&env);
+    assert_report_counts_fixture(&fixture, &report);
+    let advisor = &report["per_session"][0]["ttl_advisor"];
+    assert_eq!(advisor["mode"], "automatic");
+    assert_eq!(advisor["applied"], true);
+}
+
+#[test]
 fn stats_keep_attempt_metadata_and_malformed_adjacency_barriers() {
     let env = TestEnv::new_mock("cache-attempt-barriers");
     let fixture = usage_fixture("repeated_final_snapshots");
