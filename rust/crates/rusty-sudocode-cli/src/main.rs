@@ -25,6 +25,7 @@ mod render;
 mod render_engine;
 mod repl_ui;
 mod startup;
+mod stderr_capture;
 mod windows_console;
 
 use engine_acp::AcpError;
@@ -81,7 +82,8 @@ use cli::format::{
 };
 use cli::git::{
     enforce_broad_cwd_policy, git_output, parse_git_status_branch, parse_git_status_metadata,
-    parse_git_workspace_summary, resolve_git_branch_for, GitWorkspaceSummary,
+    parse_git_workspace_summary, resolve_git_branch_for, resolve_git_head_label_for,
+    GitWorkspaceSummary,
 };
 use cli::help::{
     print_help, print_help_topic, render_config_json, render_config_report, render_diff_json_for,
@@ -939,7 +941,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             permission_mode,
             auth_mode,
             reasoning_effort,
-        ),
+        )?,
         CliAction::ListSessions { output_format } => {
             list_sessions_cli(output_format)?;
         }
@@ -1282,7 +1284,7 @@ fn run_cache_stats(output_format: CliOutputFormat) -> Result<(), Box<dyn std::er
     }
     println!("  interval data   per-session in JSON; response completion, expiry unconfirmed");
     if runtime::experiments::is_enabled(runtime::experiments::Experiment::CacheTtlAdvisor) {
-        println!("  TTL advice      advisory only; decisions and forward scenarios in JSON; requests unchanged");
+        println!("  TTL advice      unpinned sessions follow it (cache_ttl_1h pins); decisions and forward scenarios in JSON");
     }
     println!("  breaks          {unexpected} unexpected, {expected} expected");
     if !by_cause.is_empty() {
@@ -1633,7 +1635,7 @@ fn run_resume(
     permission_mode: PermissionMode,
     auth_mode: Option<AuthMode>,
     reasoning_effort: Option<String>,
-) {
+) -> Result<(), Box<dyn std::error::Error>> {
     let session_reference = session_path.display().to_string();
     let (handle, session) = match load_session_reference(&session_reference) {
         Ok(loaded) => loaded,
@@ -1671,7 +1673,7 @@ fn run_resume(
                     "message_count": session.messages().len(),
                 })
             );
-            return;
+            return Ok(());
         }
         // No commands — enter the interactive REPL with the restored session.
         let mut cli = match LiveCli::new(
@@ -1695,15 +1697,9 @@ fn run_resume(
             std::process::exit(1);
         }
         // Enter the REPL loop (it renders banner + any existing messages).
-        let mode = input_queue::QueueMode::from_env();
-        if !matches!(mode, input_queue::QueueMode::Off) {
-            if let Err(e) = run_repl_iocraft_dispatch(cli, mode) {
-                eprintln!("{}{e}{}", ansi_fg(theme().error), RESET);
-            }
-        } else if let Err(e) = run_repl_loop(cli) {
-            eprintln!("{}{e}{}", ansi_fg(theme().error), RESET);
-        }
-        return;
+        // Propagate terminal/save errors to the same top-level handler used
+        // by a new REPL, after the loop has cleaned up its receiver/editor.
+        return dispatch_repl(cli);
     }
 
     let mut session = session;
@@ -1827,6 +1823,7 @@ fn run_resume(
             }
         }
     }
+    Ok(())
 }
 
 #[derive(Debug, Clone)]
@@ -2353,6 +2350,14 @@ fn run_repl(
         auth_mode,
     )?;
 
+    dispatch_repl(cli)
+}
+
+/// New and resumed sessions share renderer selection and error propagation.
+#[inline]
+fn dispatch_repl(cli: LiveCli) -> Result<(), Box<dyn std::error::Error>> {
+    // Select the input owner once for both entry paths. Either loop's returned
+    // error reaches main's normal diagnostic and nonzero-exit handling.
     // The default async REPL accepts steering during a running turn.
     // Explicit startup `off` retains the legacy synchronous receive loop.
     let mode = input_queue::QueueMode::from_env();
@@ -2376,6 +2381,7 @@ fn run_repl_loop(mut cli: LiveCli) -> Result<(), Box<dyn std::error::Error>> {
     // raw-mode state. Thread-local because the sync REPL turn runs on this
     // thread; `LiveCli` must stay `Send` for the iocraft path.
     SYNC_REPL_EDITOR.with(|cell| *cell.borrow_mut() = Some(Rc::clone(&editor)));
+    let _editor_scope = SyncReplEditorScope;
     println!("{}", cli.startup_banner());
 
     // The session's one receiver, on the same peer namespace its `send` tool
@@ -2398,22 +2404,23 @@ fn run_repl_loop(mut cli: LiveCli) -> Result<(), Box<dyn std::error::Error>> {
         },
         peer_abort.clone(),
     );
-    // The notice is written straight to the terminal rather than through
-    // rustyline's external printer. On Unix that printer makes rustyline
-    // `select()` on the raw tty before every key while its own read buffer
-    // already holds the rest of a fast burst of input, so typed or pasted text
-    // stalls after its first character.
-    let peer_receiver = engine_host::peer::attach(&cli.lifecycle.agent_name())?.spawn_receiver(
+    // The same native output handle preserves the current input for notices
+    // and stderr. Rustyline 19 checks already-buffered input before selecting,
+    // fixing the fast-burst stall that previously ruled this printer out.
+    let notice_printer = editor.borrow().background_printer();
+    let peer_receiver = engine_host::peer::attach(&cli.lifecycle.agent_name()).spawn_receiver(
         peer_abort.clone(),
         move |message| {
-            let mut out = io::stdout().lock();
-            let _ = write!(
-                out,
-                "\r\nMessage from {} is waiting; it runs before the next prompt (press Enter)\r\n",
+            let notice = format!(
+                "Message from {} is waiting; it runs before the next prompt (press Enter)\n",
                 message.from
             );
-            let _ = out.flush();
-            drop(out);
+            if let Some(printer) = &notice_printer {
+                let _ = printer.print(notice);
+            } else {
+                // Noninteractive/unsupported terminals have no active editor.
+                let _ = write!(io::stdout().lock(), "{notice}");
+            }
             deliver(message)
         },
     );
@@ -2461,94 +2468,94 @@ fn run_repl_loop(mut cli: LiveCli) -> Result<(), Box<dyn std::error::Error>> {
     // Track session metrics for session_ended event
     let session_start = Instant::now();
 
-    loop {
-        run_pending_peer_turns(&mut cli, &pending_peer_turns, &waiting_turns);
-        editor
-            .borrow_mut()
-            .set_completions(cli.repl_completion_candidates().unwrap_or_default());
-        input_chrome::print_before_prompt(cli.lifecycle.current_permission_mode().as_str());
-        let read = editor.borrow_mut().read_line()?;
-        match read {
-            input::ReadOutcome::Submit(input) => {
-                // Clear the pre-printed bottom sep + footer. After
-                // readline, cursor is at the start of the bottom sep
-                // line. \x1b[J clears from cursor to end of screen.
-                print!("\x1b[J");
-                let _ = io::stdout().flush();
-                let trimmed = input.trim().to_string();
-                // An empty line only comes back while peer messages wait: the
-                // user handing the prompt back so they run, at the loop's top.
-                if trimmed.is_empty() {
-                    continue;
-                }
-                if matches!(trimmed.as_str(), "/exit" | "/quit") {
-                    cli.persist_session()?;
-                    break;
-                }
-                // `!<cmd>` bash mode: run it here, no model turn.
-                if let Some(command) = bash_mode::parse_bang_command(&trimmed) {
-                    println!("{}", bash_mode::render_input_line(command));
-                    cli.run_bash_mode(command);
-                    continue;
-                }
-                match SlashCommand::parse(&trimmed) {
-                    Ok(Some(command)) => {
-                        match cli.handle_repl_command(command) {
-                            Ok(true) => {
-                                if let Err(e) = cli.persist_session() {
+    let loop_result = (|| -> Result<(), Box<dyn std::error::Error>> {
+        loop {
+            run_pending_peer_turns(&mut cli, &pending_peer_turns, &waiting_turns);
+            editor
+                .borrow_mut()
+                .set_completions(cli.repl_completion_candidates().unwrap_or_default());
+            input_chrome::print_before_prompt(cli.lifecycle.current_permission_mode().as_str());
+            let read = editor.borrow_mut().read_line()?;
+            match read {
+                input::ReadOutcome::Submit(input) => {
+                    // Clear the pre-printed bottom sep + footer. After
+                    // readline, cursor is at the start of the bottom sep
+                    // line. \x1b[J clears from cursor to end of screen.
+                    print!("\x1b[J");
+                    let _ = io::stdout().flush();
+                    let trimmed = input.trim().to_string();
+                    // An empty line only comes back while peer messages wait: the
+                    // user handing the prompt back so they run, at the loop's top.
+                    if trimmed.is_empty() {
+                        continue;
+                    }
+                    if matches!(trimmed.as_str(), "/exit" | "/quit") {
+                        cli.persist_session()?;
+                        break;
+                    }
+                    // `!<cmd>` bash mode: run it here, no model turn.
+                    if let Some(command) = bash_mode::parse_bang_command(&trimmed) {
+                        println!("{}", bash_mode::render_input_line(command));
+                        cli.run_bash_mode(command);
+                        continue;
+                    }
+                    match SlashCommand::parse(&trimmed) {
+                        Ok(Some(command)) => {
+                            match cli.handle_repl_command(command) {
+                                Ok(true) => {
+                                    if let Err(e) = cli.persist_session() {
+                                        eprintln!("{}{e}{}", ansi_fg(theme().error), RESET);
+                                    }
+                                }
+                                Ok(false) => {}
+                                Err(e) => {
                                     eprintln!("{}{e}{}", ansi_fg(theme().error), RESET);
                                 }
                             }
-                            Ok(false) => {}
-                            Err(e) => {
-                                eprintln!("{}{e}{}", ansi_fg(theme().error), RESET);
-                            }
+                            continue;
+                        }
+                        Ok(None) => {}
+                        Err(error) => {
+                            eprintln!("{}{error}{}", ansi_fg(theme().error), RESET);
+                            continue;
+                        }
+                    }
+                    // Bare-word skill dispatch: if the first token of the input
+                    // matches a known skill name, invoke it as `/skills <input>`
+                    // rather than forwarding raw text to the LLM (ROADMAP #36).
+                    let cwd = std::env::current_dir().unwrap_or_default();
+                    let plugin_outcome = cli.lifecycle.plugin_load_outcome();
+                    if let Some(prompt) = try_resolve_bare_skill_prompt_with_plugins(
+                        &cwd,
+                        &trimmed,
+                        Some(&plugin_outcome),
+                    ) {
+                        cli.record_prompt_history(&trimmed);
+                        if let Err(e) = cli.run_turn_interactive(&prompt) {
+                            eprintln!("{}{e}{}", ansi_fg(theme().error), RESET);
                         }
                         continue;
                     }
-                    Ok(None) => {}
-                    Err(error) => {
-                        eprintln!("{}{error}{}", ansi_fg(theme().error), RESET);
-                        continue;
-                    }
-                }
-                // Bare-word skill dispatch: if the first token of the input
-                // matches a known skill name, invoke it as `/skills <input>`
-                // rather than forwarding raw text to the LLM (ROADMAP #36).
-                let cwd = std::env::current_dir().unwrap_or_default();
-                let plugin_outcome = cli.lifecycle.plugin_load_outcome();
-                if let Some(prompt) = try_resolve_bare_skill_prompt_with_plugins(
-                    &cwd,
-                    &trimmed,
-                    Some(&plugin_outcome),
-                ) {
                     cli.record_prompt_history(&trimmed);
-                    if let Err(e) = cli.run_turn_interactive(&prompt) {
+                    if let Err(e) = cli.run_turn_interactive(&trimmed) {
                         eprintln!("{}{e}{}", ansi_fg(theme().error), RESET);
                     }
-                    continue;
                 }
-                cli.record_prompt_history(&trimmed);
-                if let Err(e) = cli.run_turn_interactive(&trimmed) {
-                    eprintln!("{}{e}{}", ansi_fg(theme().error), RESET);
+                input::ReadOutcome::Exit => {
+                    cli.persist_session()?;
+                    break;
                 }
-            }
-            input::ReadOutcome::Exit => {
-                cli.persist_session()?;
-                break;
             }
         }
-    }
+        Ok(())
+    })();
 
     // Dropping the queue refuses whatever is still waiting, which unblocks the
     // receiver so it can be joined; those messages stay unread.
     peer_abort.abort();
     drop(pending_peer_turns);
     let _ = peer_receiver.join();
-
-    // Release the shared editor from the thread-local before this thread's frame
-    // unwinds.
-    SYNC_REPL_EDITOR.with(|cell| *cell.borrow_mut() = None);
+    loop_result?;
 
     // Record token usage and session ended event
     let duration_ms = session_start.elapsed().as_millis() as u64;
@@ -3447,7 +3454,7 @@ impl Drop for ReplTurnCancelMonitor {
 /// line separates the echo from the turn output that follows, matching the
 /// spacing between other scrollback blocks.
 fn echo_submit_to_scrollback(output: &repl_ui::OutputSender, display: &str) {
-    output.print_block(cli::format::format_input_echo(display, render::query_terminal_width()).0);
+    output.user_prompt(display);
 }
 
 /// Commit a received envelope through the same formatter used by replay.
@@ -3461,16 +3468,23 @@ fn echo_peer_to_scrollback(output: &repl_ui::OutputSender, prompt: &str) {
     output.print_block(rendered);
 }
 
-/// The footer's cache-TTL tip and whether it offers a switch.
+/// The footer's cache-TTL tip and whether it offers a choice. Pinned, the tip
+/// suggests the other TTL; automatic, it is a stop only while a move to 1h
+/// waits for a cold point, which can be applied now or pinned instead.
 fn cache_tip(session_id: &str, model: &str) -> repl_ui::CacheTip {
     let advice = engine_core::cache_advisor::ttl_advice(session_id, model);
+    let just_switched = engine_core::cache_ttl::take_switch_notice(session_id);
     let actionable = advice.as_ref().is_some_and(|advice| {
-        advice.pending.is_none()
-            && advice.has_saving
-            && advice.suggested_seconds != advice.effective_seconds
+        if advice.auto {
+            !just_switched && advice.auto_target() == 3600 && advice.effective_seconds == 300
+        } else {
+            advice.pending.is_none()
+                && advice.has_saving
+                && advice.suggested_seconds != advice.effective_seconds
+        }
     });
     repl_ui::CacheTip {
-        tip: engine_core::cache_advisor::session_tip(session_id, model),
+        tip: engine_core::cache_advisor::session_tip(session_id, model, just_switched),
         advice,
         actionable,
     }
@@ -3497,8 +3511,18 @@ fn apply_cache_ttl(
         }
         (TtlChoice::OneHour, true) => "1h from the next request (rewrites the cached prefix once)",
         (TtlChoice::FiveMinutes, _) => "5m from the next request",
-        (TtlChoice::Auto, _) => {
+        (TtlChoice::Auto, _)
+            if !runtime::experiments::is_enabled(
+                runtime::experiments::Experiment::CacheTtlAdvisor,
+            ) =>
+        {
             "auto: the auth mode decides (1h on a subscription, 5m on an API key)"
+        }
+        (TtlChoice::Auto, false) => {
+            "auto: follows this session's cache stats (to 5m at once, to 1h at the next cold start)"
+        }
+        (TtlChoice::Auto, true) => {
+            "auto: follows this session's cache stats, from the next request"
         }
     };
     match saved {
@@ -3508,12 +3532,41 @@ fn apply_cache_ttl(
 }
 
 /// `Prompt cache TTL: …` for `/cache` and `/cache ttl`.
-fn cache_ttl_status(session_id: &str) -> String {
+fn cache_ttl_status(session_id: &str, model: &str) -> String {
+    use engine_core::cache_advisor::{ttl_label, MIN_INTERVALS};
     use engine_core::cache_ttl::TtlChoice;
     let status = engine_core::cache_ttl::status(session_id);
-    let now = status
-        .effective_seconds
-        .map_or("not sent yet", engine_core::cache_advisor::ttl_label);
+    let now = status.effective_seconds.map_or("not sent yet", ttl_label);
+    if status.auto {
+        let verdict = engine_core::cache_advisor::ttl_advice(session_id, model).map_or(
+            String::new(),
+            |advice| {
+                let target = advice.auto_target();
+                let heading = if target == advice.effective_seconds {
+                    String::new()
+                } else if target == 3600 {
+                    ", switching to 1h at the next cold start".to_owned()
+                } else {
+                    format!(", switching to {} at the next request", ttl_label(target))
+                };
+                if !advice.has_evidence {
+                    format!(
+                        ": collecting {}/{MIN_INTERVALS} reuse intervals{heading}",
+                        advice.intervals
+                    )
+                } else if advice.has_saving {
+                    format!(
+                        ": {} ≈{:.0}% cheaper here{heading}",
+                        ttl_label(advice.suggested_seconds),
+                        advice.saving_pct()
+                    )
+                } else {
+                    format!(": 5m and 1h within 10% here{heading}")
+                }
+            },
+        );
+        return format!("Prompt cache TTL: {now} · auto{verdict}");
+    }
     let pending = status.pending.map_or(String::new(), |pending| {
         let (label, when) = match (pending.choice, pending.force_now) {
             (TtlChoice::OneHour, false) => ("1h", "at the next cold start"),
@@ -3536,13 +3589,20 @@ fn run_repl_iocraft_dispatch(
     // session's messages to scrollback (same as the rustyline path), not just
     // the banner — otherwise a resumed conversation looks empty. Both come from
     // one println in spawn_repl_ui, before raw mode.
-    let banner = {
+    let (banner, startup_prompts) = {
         let banner = cli.startup_banner();
-        let history = cli.render_restored_scrollback();
+        let (history, prompts) = cli.render_restored_scrollback();
         if history.is_empty() {
-            banner
+            (banner, Vec::new())
         } else {
-            format!("{banner}\n{history}")
+            let offset = banner.len() + 1;
+            (
+                format!("{banner}\n{history}"),
+                prompts
+                    .into_iter()
+                    .map(|position| position + offset)
+                    .collect(),
+            )
         }
     };
     let permission_label = cli.lifecycle.current_permission_mode().as_str().to_string();
@@ -3585,12 +3645,19 @@ fn run_repl_iocraft_dispatch(
                 .dequeue_all_human()
         })
     };
-    let repl = repl_ui::spawn_repl_ui(&permission_label, &banner, seed_todos, Some(dequeue_hook));
+    let repl = repl_ui::spawn_repl_ui(
+        &permission_label,
+        &banner,
+        startup_prompts,
+        seed_todos,
+        Some(dequeue_hook),
+    );
     let (repl_output, repl_ui_cmd, input_rx, repl_spinner, repl_join) = repl.split();
     if let Some(status) = resume_status {
         repl_ui_cmd.set_turn_result(&status, cli.lifecycle.usage_snapshot().turns());
     }
     repl_ui_cmd.set_cache_tip(cli.cache_ttl_tip());
+    repl_ui_cmd.set_branch(workspace_head_label());
     let pending_question_answer: PendingQuestionAnswer = Arc::new(Mutex::new(None));
 
     // Route LiveCli output through iocraft's OutputSender so it goes
@@ -3712,10 +3779,10 @@ fn run_repl_iocraft_dispatch(
     // here: the session already resolved it (config `agentName`, else derived
     // from its workspace) and signs outbound messages with it, and a second
     // derivation from the process directory is how a peer's reply arrives at
-    // an inbox nothing is polling. `attach` reuses the node dial the session
-    // build already made, so it cannot newly fail here.
+    // an inbox nothing is polling. `attach` reuses the session's selected
+    // mailbox, including a pending binding that this receiver retries.
     let mailbox_abort = runtime::HookAbortSignal::new();
-    let mailbox_receiver = engine_host::peer::attach(&session_agent_name)?.spawn_receiver(
+    let mailbox_receiver = engine_host::peer::attach(&session_agent_name).spawn_receiver(
         mailbox_abort.clone(),
         peer_turn_sink(
             coord_tx.clone(),
@@ -4635,6 +4702,17 @@ thread_local! {
         const { RefCell::new(None) };
 }
 
+/// Release the editor in ordinary stack cleanup, including errors before the
+/// prompt loop starts. Its capture worker must not be joined by TLS teardown.
+struct SyncReplEditorScope;
+
+impl Drop for SyncReplEditorScope {
+    #[inline]
+    fn drop(&mut self) {
+        SYNC_REPL_EDITOR.with(|cell| *cell.borrow_mut() = None);
+    }
+}
+
 /// Read one choice line through the sync REPL's shared editor, so mid-turn
 /// prompts (write_plan approval, tool-permission y/N) never spawn a second
 /// terminal owner — a throwaway `rustyline::Editor` / `dialoguer::Select`
@@ -4955,16 +5033,23 @@ impl LiveCli {
     /// `render_messages` the rustyline REPL replays on resume, so both REPL
     /// paths render the session SSOT identically — the iocraft path previously
     /// printed only the banner, leaving a resumed session's history invisible.
-    fn render_restored_scrollback(&self) -> String {
+    fn render_restored_scrollback(&self) -> (String, Vec<usize>) {
         let session = self.lifecycle.session_snapshot();
         if session.messages().is_empty() {
-            return String::new();
+            return (String::new(), Vec::new());
         }
         let term_width = crossterm::terminal::size()
             .map(|(cols, _)| cols as usize)
             .unwrap_or(80);
         let renderer = render::TerminalRenderer::new();
-        render_messages(&session.messages(), term_width, &renderer)
+        if runtime::experiments::is_enabled(runtime::experiments::Experiment::PromptViewport) {
+            cli::format::render_messages_with_prompts(&session.messages(), term_width, &renderer)
+        } else {
+            (
+                render_messages(&session.messages(), term_width, &renderer),
+                Vec::new(),
+            )
+        }
     }
 
     /// Build the status line for a freshly resumed session: the same B2 line the
@@ -4989,9 +5074,6 @@ impl LiveCli {
         let cumulative_duration = (tracker.cumulative_duration_ms() > 0)
             .then(|| Duration::from_millis(tracker.cumulative_duration_ms()));
         let elapsed = tracker.latest_turn_duration_ms().map(Duration::from_millis);
-        let branch = env::current_dir()
-            .ok()
-            .and_then(|cwd| resolve_git_branch_for(&cwd));
         let account = self.lifecycle.current_billing_account();
         let status = TurnStatus {
             model: &model,
@@ -5002,7 +5084,6 @@ impl LiveCli {
             context_window: Some(context.window),
             elapsed,
             cumulative_duration,
-            branch: branch.as_deref(),
             account: account.name(),
         };
         Some(if context.estimated {
@@ -5379,9 +5460,6 @@ impl LiveCli {
         let turns = usage_tracker.turns();
         // The current request meter and compaction share the live route's window.
         let context = self.lifecycle.context_occupancy();
-        let branch = env::current_dir()
-            .ok()
-            .and_then(|cwd| resolve_git_branch_for(&cwd));
         // Read once per turn, from the engine's own selector rather than a
         // second copy of the precedence rules. A turn takes seconds; the config
         // read behind this does not register next to it.
@@ -5395,7 +5473,6 @@ impl LiveCli {
             context_window: Some(context.window),
             elapsed: Some(elapsed),
             cumulative_duration,
-            branch: branch.as_deref(),
             account: account.name(),
         };
         let line = if context.estimated {
@@ -5405,6 +5482,8 @@ impl LiveCli {
         };
         if let Some(ui) = ui {
             ui.set_cache_tip(self.cache_ttl_tip());
+            // A turn can switch branches (its tools run git), so refresh here.
+            ui.set_branch(workspace_head_label());
         }
         match (ui, output) {
             // Show in the ChromeSlot only (visible until the next turn). The
@@ -5818,7 +5897,10 @@ impl LiveCli {
                 let session = self.lifecycle.session_snapshot();
                 let usage = UsageTracker::from_session(&session).cumulative_usage();
                 self.out_println(format_cost_report(usage));
-                self.out_println(cache_ttl_status(&self.lifecycle.session_handle().id));
+                self.out_println(cache_ttl_status(
+                    &self.lifecycle.session_handle().id,
+                    &self.lifecycle.current_model(),
+                ));
                 false
             }
             SlashCommand::CacheTtl { value, now } => {
@@ -5832,7 +5914,10 @@ impl LiveCli {
                 };
                 match choice {
                     Some(choice) => self.out_println(apply_cache_ttl(&session_id, choice, now)),
-                    None => self.out_println(cache_ttl_status(&session_id)),
+                    None => self.out_println(cache_ttl_status(
+                        &session_id,
+                        &self.lifecycle.current_model(),
+                    )),
                 }
                 false
             }
@@ -6901,6 +6986,13 @@ impl LiveCli {
         self.out_println(format_issue_report(context));
         Ok(())
     }
+}
+
+/// The footer's workspace label: the branch, or the short commit when detached.
+fn workspace_head_label() -> Option<String> {
+    env::current_dir()
+        .ok()
+        .and_then(|cwd| resolve_git_head_label_for(&cwd))
 }
 
 fn print_skills_for_outcome(
