@@ -3457,7 +3457,7 @@ impl Drop for ReplTurnCancelMonitor {
 /// line separates the echo from the turn output that follows, matching the
 /// spacing between other scrollback blocks.
 fn echo_submit_to_scrollback(output: &repl_ui::OutputSender, display: &str) {
-    output.print_block(cli::format::format_input_echo(display, render::query_terminal_width()).0);
+    output.user_prompt(display);
 }
 
 /// Commit a received envelope through the same formatter used by replay.
@@ -3592,13 +3592,20 @@ fn run_repl_iocraft_dispatch(
     // session's messages to scrollback (same as the rustyline path), not just
     // the banner — otherwise a resumed conversation looks empty. Both come from
     // one println in spawn_repl_ui, before raw mode.
-    let banner = {
+    let (banner, startup_prompts) = {
         let banner = cli.startup_banner();
-        let history = cli.render_restored_scrollback();
+        let (history, prompts) = cli.render_restored_scrollback();
         if history.is_empty() {
-            banner
+            (banner, Vec::new())
         } else {
-            format!("{banner}\n{history}")
+            let offset = banner.len() + 1;
+            (
+                format!("{banner}\n{history}"),
+                prompts
+                    .into_iter()
+                    .map(|position| position + offset)
+                    .collect(),
+            )
         }
     };
     let permission_label = cli.lifecycle.current_permission_mode().as_str().to_string();
@@ -3641,7 +3648,13 @@ fn run_repl_iocraft_dispatch(
                 .dequeue_all_human()
         })
     };
-    let repl = repl_ui::spawn_repl_ui(&permission_label, &banner, seed_todos, Some(dequeue_hook));
+    let repl = repl_ui::spawn_repl_ui(
+        &permission_label,
+        &banner,
+        startup_prompts,
+        seed_todos,
+        Some(dequeue_hook),
+    );
     let (repl_output, repl_ui_cmd, input_rx, repl_spinner, repl_join) = repl.split();
     if let Some(status) = resume_status {
         repl_ui_cmd.set_turn_result(&status, cli.lifecycle.usage_snapshot().turns());
@@ -5023,16 +5036,23 @@ impl LiveCli {
     /// `render_messages` the rustyline REPL replays on resume, so both REPL
     /// paths render the session SSOT identically — the iocraft path previously
     /// printed only the banner, leaving a resumed session's history invisible.
-    fn render_restored_scrollback(&self) -> String {
+    fn render_restored_scrollback(&self) -> (String, Vec<usize>) {
         let session = self.lifecycle.session_snapshot();
         if session.messages().is_empty() {
-            return String::new();
+            return (String::new(), Vec::new());
         }
         let term_width = crossterm::terminal::size()
             .map(|(cols, _)| cols as usize)
             .unwrap_or(80);
         let renderer = render::TerminalRenderer::new();
-        render_messages(&session.messages(), term_width, &renderer)
+        if runtime::experiments::is_enabled(runtime::experiments::Experiment::PromptViewport) {
+            cli::format::render_messages_with_prompts(&session.messages(), term_width, &renderer)
+        } else {
+            (
+                render_messages(&session.messages(), term_width, &renderer),
+                Vec::new(),
+            )
+        }
     }
 
     /// Build the status line for a freshly resumed session: the same B2 line the
